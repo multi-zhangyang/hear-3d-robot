@@ -1,13 +1,41 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { loadRuntimeCatalog } from "../config/load.js";
-import { createOperatorServer, EventStreamWriter } from "./operator-server.js";
+import { createOperatorServer, EventStreamWriter, runtimeEventRecord } from "./operator-server.js";
+
+const RUN_FIXTURE = resolve(
+  process.cwd(),
+  "tests/fixtures/runs/20000101T000000Z_fetch_red_block_00000000"
+);
 
 describe("Operator API", () => {
+  it("does not publish a resumable SSE cursor for live-only frames", () => {
+    const live = runtimeEventRecord({
+      event_id: "live-frame",
+      run_id: "run",
+      type: "world_frames",
+      at: "2026-07-30T00:00:00.000Z",
+      data: { frames: [] },
+      durable: false
+    });
+    const durable = runtimeEventRecord({
+      event_id: "committed",
+      run_id: "run",
+      type: "action_committed",
+      at: "2026-07-30T00:00:01.000Z",
+      data: {},
+      durable: true
+    });
+
+    expect(live).not.toContain("id: live-frame");
+    expect(live).toContain("event: world_frames");
+    expect(durable).toContain("id: committed");
+  });
+
   it("protects runtime data and exposes the current hierarchy contract", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-api-"));
     const catalog = await loadRuntimeCatalog();
@@ -169,8 +197,9 @@ describe("Operator API", () => {
     }
   });
 
-  it("fences mutating requests and drains after the Operator lease is replaced", async () => {
+  it("fences RunStore repairs and mutating requests after the Operator lease is replaced", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-operator-fencing-"));
+    await cp(RUN_FIXTURE, join(runsDir, basename(RUN_FIXTURE)), { recursive: true });
     const catalog = await loadRuntimeCatalog();
     const app = await createOperatorServer({
       server: { host: "127.0.0.1", port: 0, password: "", runsDir },
@@ -193,6 +222,13 @@ describe("Operator API", () => {
       "utf8"
     );
     try {
+      const journal = await app.inject({
+        method: "GET",
+        url: `/api/runs/${basename(RUN_FIXTURE)}/journal?name=events&from=0&limit=1`
+      });
+      expect(journal.statusCode).toBe(503);
+      expect(journal.json().error).toMatch(/lease token was replaced/);
+
       const response = await app.inject({
         method: "POST",
         url: "/api/runs/missing/stop",

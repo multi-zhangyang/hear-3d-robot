@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -78,6 +78,27 @@ describe("FileSession", () => {
       ]);
     } finally {
       atomicWriteControl.failAfterPublish = false;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not publish SDK session state when its mutation fence rejects", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hear-session-fence-"));
+    const path = join(directory, "session.json");
+    const rejected = new Error("stale persistence owner");
+    let attempts = 0;
+    const session = new FileSession(path, "run_fenced", {
+      async runMutation<T>(_operation: () => Promise<T>): Promise<T> {
+        attempts += 1;
+        throw rejected;
+      }
+    });
+    try {
+      await expect(session.addItems([{ role: "user", content: "stale item" }]))
+        .rejects.toBe(rejected);
+      expect(attempts).toBe(1);
+      await expect(access(path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });

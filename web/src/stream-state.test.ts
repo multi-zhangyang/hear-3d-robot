@@ -8,6 +8,7 @@ import {
   isWorldSnapshot,
   latestProviderActivity,
   mergeWorldFrames,
+  nextRuntimeEventCursor,
   taskNodesFrom,
   updateRunListStatus,
   upsertAction,
@@ -82,6 +83,32 @@ describe("mergeWorldFrames", () => {
     const current = [frame(1), frame(3)];
     mergeWorldFrames(current, [frame(2)], 10);
     expect(current.map((entry) => entry.frame)).toEqual([1, 3]);
+  });
+});
+
+describe("runtime event cursor", () => {
+  it("does not advance past a live-only physics frame", () => {
+    const liveFrame = {
+      event_id: "live-frame",
+      run_id: "run",
+      type: "world_frames",
+      at: "2026-07-30T00:00:00.000Z",
+      data: {},
+      durable: false
+    };
+    expect(nextRuntimeEventCursor("durable-event", liveFrame)).toBe("durable-event");
+  });
+
+  it("advances for durable and legacy journal events", () => {
+    const event = {
+      event_id: "committed",
+      run_id: "run",
+      type: "action_committed",
+      at: "2026-07-30T00:00:00.000Z",
+      data: {}
+    };
+    expect(nextRuntimeEventCursor("older", { ...event, durable: true })).toBe("committed");
+    expect(nextRuntimeEventCursor("older", event)).toBe("committed");
   });
 });
 

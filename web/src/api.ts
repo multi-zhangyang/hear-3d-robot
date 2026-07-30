@@ -6,6 +6,7 @@ import type {
   RuntimeEvent,
   StreamState
 } from "./types";
+import { nextRuntimeEventCursor } from "./stream-state";
 
 let password = sessionStorage.getItem("hear.password") ?? "";
 
@@ -135,7 +136,7 @@ async function consumeEventLoop(
         runId,
         signal,
         (event) => {
-          cursor = event.event_id;
+          cursor = nextRuntimeEventCursor(cursor, event);
           onEvent(event);
         },
         () => onState?.("connected"),

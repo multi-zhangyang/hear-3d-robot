@@ -730,6 +730,24 @@ export const RunStatusSchema = z.enum([
   "interrupted"
 ]);
 
+export const RunLifecycleEventTypeSchema = z.enum([
+  "run_started",
+  "run_resumed",
+  "run_succeeded",
+  "run_failed",
+  "run_interrupted"
+]);
+export type RunLifecycleEventType = z.infer<typeof RunLifecycleEventTypeSchema>;
+
+export const RunLifecycleEventSchema = z.object({
+  event_id: z.string().min(1),
+  run_id: z.string().min(1),
+  type: RunLifecycleEventTypeSchema,
+  at: z.string().datetime(),
+  data: JsonValueSchema
+}).strict();
+export type RunLifecycleEvent = z.infer<typeof RunLifecycleEventSchema>;
+
 export const RunCheckpointSchema = z.object({
   version: z.literal(3),
   run_id: z.string(),
@@ -747,6 +765,7 @@ export const RunCheckpointSchema = z.object({
   committed_actions: z.record(z.string(), ActionReceiptSchema),
   spatial_memory: z.array(SpatialMemoryRecordSchema).default([]),
   context_memory: ContextMemoryStateSchema.default(EmptyContextMemoryState),
+  pending_lifecycle_events: z.array(RunLifecycleEventSchema).default([]),
   total_model_calls: z.number().int().nonnegative(),
   checker: CheckerResultSchema.nullable(),
   final_output: z.string().nullable(),

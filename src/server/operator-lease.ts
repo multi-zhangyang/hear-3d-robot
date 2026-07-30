@@ -12,6 +12,7 @@ import {
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 import { z } from "zod";
+import type { MutationFence } from "../persistence/mutation-fence.js";
 
 const LegacyLeaseRecordSchema = z.object({
   token: z.string().uuid(),
@@ -32,7 +33,9 @@ const LeaseRecordSchema = z.union([
 ]);
 const GuardRecordSchema = z.object({
   token: z.string().uuid(),
-  created_at: z.string().datetime()
+  pid: z.number().int().positive(),
+  hostname: z.string().min(1),
+  started_at: z.string().datetime()
 }).strict();
 
 type LeaseRecord = z.infer<typeof LeaseRecordSchema>;
@@ -55,6 +58,7 @@ const INVALID_LEASE_GRACE_MS = 30_000;
 const GUARD_RETRY_MS = 10;
 const MAX_GUARD_ATTEMPTS = 1_000;
 const RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100] as const;
+const GUARD_RELEASE_RETRY_DELAYS_MS = [10, 25, 50] as const;
 
 export interface OperatorLeaseOptions {
   heartbeatIntervalMs?: number;
@@ -62,7 +66,7 @@ export interface OperatorLeaseOptions {
   reclaimConfirmationMs?: number;
 }
 
-export interface OperatorLease {
+export interface OperatorLease extends MutationFence {
   readonly signal: AbortSignal;
   assertOwned(): Promise<void>;
   release(): Promise<void>;
@@ -190,6 +194,39 @@ class RenewableOperatorLease implements OperatorLease {
     });
   }
 
+  async runMutation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.#closing) throw new OperatorLeaseLostError("Operator lease is closing");
+    this.signal.throwIfAborted();
+    return this.#enqueue(async () => {
+      if (this.#closing) throw new OperatorLeaseLostError("Operator lease is closing");
+      this.signal.throwIfAborted();
+      return withLeaseGuard(this.#path, async () => {
+        await this.#renewMutationLease();
+        this.signal.throwIfAborted();
+        let result: T;
+        try {
+          result = await operation();
+        } catch (operationError) {
+          try {
+            await this.#renewMutationLease();
+          } catch {
+            // The original persistence error remains authoritative. Renewal
+            // failure has already fenced this owner through #lose().
+          }
+          throw operationError;
+        }
+        await this.#renewMutationLease();
+        return result;
+      }, {
+        onReleaseFailure: (error) => {
+          this.#lose(new OperatorLeaseLostError(
+            `Operator lease guard cleanup failed: ${errorMessage(error)}`
+          ));
+        }
+      });
+    });
+  }
+
   release(): Promise<void> {
     if (this.#releaseOperation) return this.#releaseOperation;
     this.#closing = true;
@@ -213,7 +250,26 @@ class RenewableOperatorLease implements OperatorLease {
     }
   }
 
-  #enqueue(operation: () => Promise<void>): Promise<void> {
+  async #renewWhileGuarded(): Promise<void> {
+    const current = await readLeaseSnapshot(this.#path);
+    if (current?.record?.token !== this.#record.token) {
+      throw new OperatorLeaseLostError("Operator lease token was replaced");
+    }
+    const now = new Date();
+    await utimes(this.#path, now, now);
+  }
+
+  async #renewMutationLease(): Promise<void> {
+    try {
+      await this.#renewWhileGuarded();
+    } catch (error) {
+      const lost = leaseLostError(error);
+      this.#lose(lost);
+      throw lost;
+    }
+  }
+
+  #enqueue<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.#tail.then(operation, operation);
     this.#tail = result.then(() => undefined, () => undefined);
     return result;
@@ -226,37 +282,100 @@ class RenewableOperatorLease implements OperatorLease {
   }
 }
 
-async function withLeaseGuard<T>(path: string, operation: () => Promise<T>): Promise<T> {
+async function withLeaseGuard<T>(
+  path: string,
+  operation: () => Promise<T>,
+  options: {
+    onReleaseFailure?: (error: unknown) => void;
+  } = {}
+): Promise<T> {
   const guardPath = `${path}.guard`;
-  const guard = { token: randomUUID(), created_at: new Date().toISOString() };
+  const guard = {
+    token: randomUUID(),
+    pid: process.pid,
+    hostname: hostname(),
+    started_at: new Date().toISOString()
+  };
   for (let attempt = 0; attempt < MAX_GUARD_ATTEMPTS; attempt += 1) {
     try {
-      await createExclusiveJsonFile(guardPath, guard);
-      try {
-        return await operation();
-      } finally {
-        await releaseTokenFile(guardPath, guard.token);
-      }
+      await createExclusiveJsonFile(guardPath, guard, false);
     } catch (error) {
       if (!isExists(error)) throw error;
       const existing = await readLeaseSnapshot(guardPath);
       if (!existing) continue;
-      if (Date.now() - existing.modifiedAt >= INVALID_LEASE_GRACE_MS) {
+      const localHolder = existing.record
+        && sameHostname(existing.record.hostname, guard.hostname);
+      const deadLocalHolder = localHolder && !processExists(existing.record!.pid);
+      const staleUnverifiableHolder = !localHolder
+        && Date.now() - existing.modifiedAt >= INVALID_LEASE_GRACE_MS;
+      if (deadLocalHolder || staleUnverifiableHolder) {
         await removeLeaseSnapshot(guardPath, existing, guard.token);
         continue;
       }
       await delay(GUARD_RETRY_MS);
+      continue;
     }
+    let result: T;
+    try {
+      result = await operation();
+    } catch (operationError) {
+      try {
+        await releaseGuardWithRetry(guardPath, guard.token);
+      } catch (releaseError) {
+        notifyGuardReleaseFailure(options, releaseError);
+      }
+      throw operationError;
+    }
+    try {
+      await releaseGuardWithRetry(guardPath, guard.token);
+    } catch (releaseError) {
+      notifyGuardReleaseFailure(options, releaseError);
+      throw releaseError;
+    }
+    return result;
   }
   throw new OperatorLeaseError("Runs directory lease guard could not be acquired");
 }
 
-async function createExclusiveJsonFile(path: string, value: unknown): Promise<void> {
+async function releaseGuardWithRetry(path: string, token: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await releaseTokenFile(path, token);
+      return;
+    } catch (error) {
+      const waitMs = GUARD_RELEASE_RETRY_DELAYS_MS[attempt];
+      if (waitMs === undefined) {
+        throw new OperatorLeaseError(
+          `Runs directory lease guard could not be released: ${errorMessage(error)}`,
+          { cause: error }
+        );
+      }
+      await delay(waitMs);
+    }
+  }
+}
+
+function notifyGuardReleaseFailure(
+  options: { onReleaseFailure?: (error: unknown) => void },
+  error: unknown
+): void {
+  try {
+    options.onReleaseFailure?.(error);
+  } catch {
+    // Cleanup diagnostics must not replace the operation's authoritative error.
+  }
+}
+
+async function createExclusiveJsonFile(
+  path: string,
+  value: unknown,
+  durable = true
+): Promise<void> {
   const handle = await open(path, "wx", 0o600);
   let complete = false;
   try {
     await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
-    await handle.sync();
+    if (durable) await handle.sync();
     complete = true;
   } finally {
     await handle.close();
@@ -417,8 +536,11 @@ function ownedLeaseError(record: LeaseRecord): OperatorLeaseError {
 
 function leaseLostError(reason: unknown): OperatorLeaseLostError {
   if (reason instanceof OperatorLeaseLostError) return reason;
-  const detail = reason instanceof Error ? reason.message : String(reason);
-  return new OperatorLeaseLostError(`Operator lease was lost: ${detail}`);
+  return new OperatorLeaseLostError(`Operator lease was lost: ${errorMessage(reason)}`);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function sameHostname(left: string, right: string): boolean {

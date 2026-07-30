@@ -1,6 +1,10 @@
 import { readFile } from "node:fs/promises";
 import type { Session, AgentInputItem } from "@openai/agents";
 import { writeTextAtomically } from "./atomic-file.js";
+import {
+  runFencedMutation,
+  type MutationFence
+} from "./mutation-fence.js";
 
 interface SessionData {
   version: 1;
@@ -11,12 +15,14 @@ interface SessionData {
 export class FileSession implements Session {
   readonly #path: string;
   readonly #sessionId: string;
+  readonly #mutationFence: MutationFence | undefined;
   #pending: Promise<void> = Promise.resolve();
   #cache: SessionData | undefined;
 
-  constructor(path: string, sessionId: string) {
+  constructor(path: string, sessionId: string, mutationFence?: MutationFence) {
     this.#path = path;
     this.#sessionId = sessionId;
+    this.#mutationFence = mutationFence;
   }
 
   async getSessionId(): Promise<string> {
@@ -84,7 +90,10 @@ export class FileSession implements Session {
 
   async #write(data: SessionData): Promise<void> {
     try {
-      await writeTextAtomically(this.#path, `${JSON.stringify(data)}\n`);
+      await runFencedMutation(
+        this.#mutationFence,
+        () => writeTextAtomically(this.#path, `${JSON.stringify(data)}\n`)
+      );
       this.#cache = structuredClone(data);
     } catch (error) {
       // A durability error may be reported after rename has already published

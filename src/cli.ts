@@ -9,6 +9,7 @@ import {
   type ProviderConfig
 } from "./config/load.js";
 import { GoalSchema } from "./domain/schema.js";
+import type { MutationFence } from "./persistence/mutation-fence.js";
 import { resolveRunDirectory } from "./persistence/run-store.js";
 import { resumeMission, startMission } from "./runtime/mission-runner.js";
 import { errorMessage } from "./runtime/error-message.js";
@@ -65,7 +66,7 @@ async function main(argv: string[]): Promise<void> {
         Promise.resolve(loadProviderConfig()),
         Promise.resolve(loadServerConfig())
       ]);
-      const result = await withMissionSignals(server.runsDir, (signal) => startMission({
+      const result = await withMissionSignals(server.runsDir, (signal, mutationFence) => startMission({
         runsDir: server.runsDir,
         mission,
         scenarioId,
@@ -73,7 +74,8 @@ async function main(argv: string[]): Promise<void> {
         catalog,
         provider,
         ...(seed === undefined ? {} : { seed }),
-        signal
+        signal,
+        mutationFence
       }));
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return;
@@ -86,12 +88,13 @@ async function main(argv: string[]): Promise<void> {
         Promise.resolve(loadProviderConfig()),
         Promise.resolve(loadServerConfig())
       ]);
-      const result = await withMissionSignals(server.runsDir, (signal) => resumeMission({
+      const result = await withMissionSignals(server.runsDir, (signal, mutationFence) => resumeMission({
         runDir: resolveRunDirectory(server.runsDir, runId),
         catalog,
         provider,
         freshContext: options["fresh-context"] === "true",
-        signal
+        signal,
+        mutationFence
       }));
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return;
@@ -188,7 +191,7 @@ function requireConfirmation(options: Record<string, string>): void {
 
 export async function withMissionSignals<T>(
   runsDir: string,
-  operation: (signal: AbortSignal) => Promise<T>,
+  operation: (signal: AbortSignal, mutationFence: MutationFence) => Promise<T>,
   leaseOptions?: OperatorLeaseOptions
 ): Promise<T> {
   const lease = await acquireOperatorLease(runsDir, leaseOptions);
@@ -199,7 +202,7 @@ export async function withMissionSignals<T>(
   process.on("SIGTERM", interrupt);
   try {
     await lease.assertOwned();
-    return await operation(signal);
+    return await operation(signal, lease);
   } finally {
     process.off("SIGINT", interrupt);
     process.off("SIGTERM", interrupt);

@@ -1,8 +1,12 @@
-import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import type { ProviderConfig, RuntimeCatalog } from "../config/load.js";
 import type { Goal, JsonValue, RunCheckpoint } from "../domain/schema.js";
 import type { RuntimeEvent, RuntimeEventSink } from "../harness/runtime-context.js";
+import type { MutationFence } from "../persistence/mutation-fence.js";
+import {
+  createLifecycleEvent,
+  reconcileLifecycleOutbox
+} from "../persistence/lifecycle-outbox.js";
 import {
   type JournalPage,
   listRunDirectories,
@@ -24,12 +28,14 @@ export interface RunListItem {
 type Subscriber = (event: RuntimeEvent) => void | Promise<void>;
 
 const MAX_BUFFERED_LIVE_EVENTS_DURING_BACKFILL = 256;
+const MAX_BUFFERED_LIVE_BYTES_DURING_BACKFILL = 1024 * 1024;
 
 export class RunManager {
   readonly #runsDir: string;
   readonly #catalog: RuntimeCatalog;
   readonly #provider: ProviderConfig | undefined;
   readonly #providerError: string | undefined;
+  readonly #mutationFence: MutationFence | undefined;
   readonly #subscribers = new Map<string, Set<Subscriber>>();
   readonly #controllers = new Map<string, AbortController>();
   readonly #operations = new Map<string, Promise<void>>();
@@ -43,51 +49,58 @@ export class RunManager {
     catalog: RuntimeCatalog;
     provider?: ProviderConfig;
     providerError?: string;
+    mutationFence?: MutationFence;
   }) {
     this.#runsDir = input.runsDir;
     this.#catalog = input.catalog;
     this.#provider = input.provider;
     this.#providerError = input.providerError;
+    this.#mutationFence = input.mutationFence;
   }
 
   /** Converts process-owned nonterminal checkpoints left by a prior operator into resumable state. */
   async recoverOrphanedRuns(): Promise<number> {
-    const directories = await listRunDirectories(this.#runsDir);
+    const directories = await listRunDirectories(this.#runsDir, this.#storeOptions());
     let recovered = 0;
     for (const directory of directories) {
       let store: RunStore;
       let checkpoint: RunCheckpoint;
       try {
-        store = await RunStore.open(directory);
+        store = await RunStore.open(directory, this.#storeOptions());
         checkpoint = await store.readCheckpoint();
       } catch {
         // A malformed local artifact remains visible through list() but cannot
         // be rewritten safely without a valid definition and checkpoint.
         continue;
       }
+      await reconcileLifecycleOutbox({
+        store,
+        checkpoint,
+        persistCheckpoint: () => store.writeCheckpoint(checkpoint)
+      });
       if (checkpoint.status !== "starting" && checkpoint.status !== "running") continue;
       const at = new Date().toISOString();
       const reason = "The previous operator process ended before this mission reached a terminal state.";
-      await store.writeCheckpoint({
-        ...checkpoint,
-        status: "interrupted",
-        error: reason,
-        updated_at: at
+      checkpoint.status = "interrupted";
+      checkpoint.error = reason;
+      checkpoint.updated_at = at;
+      checkpoint.pending_lifecycle_events.push(createLifecycleEvent({
+        runId: store.definition.run_id,
+        type: "run_interrupted",
+        at,
+        data: { reason, recovered_on_operator_start: true }
+      }));
+      await store.writeCheckpoint(checkpoint);
+      await store.append("provider", {
+        status: "operator_process_recovered",
+        automatic_actuation: false,
+        at
       });
-      await Promise.all([
-        store.append("provider", {
-          status: "operator_process_recovered",
-          automatic_actuation: false,
-          at
-        }),
-        store.append("events", {
-          event_id: randomUUID(),
-          run_id: store.definition.run_id,
-          type: "run_interrupted",
-          at,
-          data: { reason, recovered_on_operator_start: true }
-        })
-      ]);
+      await reconcileLifecycleOutbox({
+        store,
+        checkpoint,
+        persistCheckpoint: () => store.writeCheckpoint(checkpoint)
+      });
       recovered += 1;
     }
     return recovered;
@@ -114,7 +127,8 @@ export class RunManager {
       provider,
       ...(input.seed === undefined ? {} : { seed: input.seed }),
       eventSink: sink,
-      signal: controller.signal
+      signal: controller.signal,
+      ...(this.#mutationFence ? { mutationFence: this.#mutationFence } : {})
     });
     return this.#trackLaunch(operation, created, controller);
   }
@@ -131,7 +145,8 @@ export class RunManager {
       catalog: this.#catalog,
       provider,
       eventSink: sink,
-      signal: controller.signal
+      signal: controller.signal,
+      ...(this.#mutationFence ? { mutationFence: this.#mutationFence } : {})
     });
     return this.#trackLaunch(operation, created, controller);
   }
@@ -150,6 +165,7 @@ export class RunManager {
     const buffered: RuntimeEvent[] = [];
     const bufferedIds = new Set<string>();
     const replayedBufferedIds = new Set<string>();
+    let bufferedBytes = 0;
     let backfilling = true;
     let backfillFailure: Error | undefined;
     const throwIfUnavailable = (): void => {
@@ -175,7 +191,11 @@ export class RunManager {
     const unsubscribe = this.#addSubscriber(runId, (event) => {
       if (!backfilling) return deliver(event, "live");
       if (bufferedIds.has(event.event_id)) return;
-      if (buffered.length >= MAX_BUFFERED_LIVE_EVENTS_DURING_BACKFILL) {
+      const bytes = Buffer.byteLength(JSON.stringify(event));
+      if (
+        buffered.length >= MAX_BUFFERED_LIVE_EVENTS_DURING_BACKFILL
+        || bytes > MAX_BUFFERED_LIVE_BYTES_DURING_BACKFILL - bufferedBytes
+      ) {
         backfillFailure ??= new Error(
           `Event stream for run ${runId} fell behind during journal backfill`
         );
@@ -183,6 +203,7 @@ export class RunManager {
       }
       buffered.push(event);
       bufferedIds.add(event.event_id);
+      bufferedBytes += bytes;
     });
 
     try {
@@ -196,7 +217,7 @@ export class RunManager {
           signal
         );
       } else {
-        await RunStore.open(resolveRunDirectory(this.#runsDir, runId));
+        await RunStore.open(resolveRunDirectory(this.#runsDir, runId), this.#storeOptions());
         throwIfUnavailable();
         await onReady();
       }
@@ -208,6 +229,7 @@ export class RunManager {
       throwIfUnavailable();
       backfilling = false;
       buffered.length = 0;
+      bufferedBytes = 0;
       bufferedIds.clear();
       replayedBufferedIds.clear();
       return unsubscribe;
@@ -252,7 +274,7 @@ export class RunManager {
   }
 
   async list(): Promise<RunListItem[]> {
-    const directories = await listRunDirectories(this.#runsDir);
+    const directories = await listRunDirectories(this.#runsDir, this.#storeOptions());
     const items = await Promise.all(directories.map((directory) => this.#summarize(directory)));
     return items.sort((left, right) => (right.created_at ?? "").localeCompare(left.created_at ?? ""));
   }
@@ -269,7 +291,10 @@ export class RunManager {
     framework: JsonValue[];
     event_cursor: string | null;
   }> {
-    const store = await RunStore.open(resolveRunDirectory(this.#runsDir, runId));
+    const store = await RunStore.open(
+      resolveRunDirectory(this.#runsDir, runId),
+      this.#storeOptions()
+    );
     // Read the journal high-water mark first, then the checkpoint. If a live
     // event lands between those reads, the checkpoint is at least as new and
     // the SSE subscription safely re-delivers the event after this cursor.
@@ -302,7 +327,10 @@ export class RunManager {
     from: number,
     limit: number
   ): Promise<JournalPage> {
-    const store = await RunStore.open(resolveRunDirectory(this.#runsDir, runId));
+    const store = await RunStore.open(
+      resolveRunDirectory(this.#runsDir, runId),
+      this.#storeOptions()
+    );
     return store.readJournalPage(name, from, limit);
   }
 
@@ -319,7 +347,10 @@ export class RunManager {
     signal?: AbortSignal
   ): Promise<void> {
     signal?.throwIfAborted();
-    const store = await RunStore.open(resolveRunDirectory(this.#runsDir, runId));
+    const store = await RunStore.open(
+      resolveRunDirectory(this.#runsDir, runId),
+      this.#storeOptions()
+    );
     const tail = await store.readJournalTail("events", 1);
     const latest = tail.entries.at(-1);
     if (latest && runtimeEvent(latest, runId).event_id === after) {
@@ -349,6 +380,10 @@ export class RunManager {
     if (this.#launching || this.#controllers.size > 0) {
       throw new RunConflictError("Another mission is already active");
     }
+  }
+
+  #storeOptions(): { mutationFence?: MutationFence } {
+    return this.#mutationFence ? { mutationFence: this.#mutationFence } : {};
   }
 
   #requireProvider(): ProviderConfig {
@@ -417,7 +452,7 @@ export class RunManager {
 
   async #summarize(directory: string): Promise<RunListItem> {
     try {
-      const store = await RunStore.open(directory);
+      const store = await RunStore.open(directory, this.#storeOptions());
       const checkpoint = await store.readCheckpoint();
       return {
         run_id: store.definition.run_id,

@@ -8,7 +8,7 @@ const FIXTURE_RUNS_DIR = resolve(
   process.env.HEAR_E2E_RUNS_SOURCE ?? resolve(process.cwd(), "tests", "fixtures", "runs")
 );
 
-export default async function globalSetup(): Promise<void> {
+export async function prepareE2ERuns(): Promise<void> {
   await rm(E2E_RUNS_DIR, { recursive: true, force: true });
   await mkdir(E2E_RUNS_DIR, { recursive: true });
   await cp(FIXTURE_RUNS_DIR, E2E_RUNS_DIR, { recursive: true });

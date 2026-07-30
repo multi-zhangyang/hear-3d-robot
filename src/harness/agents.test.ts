@@ -9,7 +9,8 @@ import {
   WorkerOutcomeSchema,
   agentToolTopology,
   capabilityCatalog,
-  createAgentHierarchy
+  createAgentHierarchy,
+  rethrowDelegationInterruption
 } from "./agents.js";
 import { coordinatorInstructions, workerInstructions } from "./agent-prompts.js";
 import { receiptEvidenceRequirement } from "./evidence-contract.js";
@@ -190,6 +191,20 @@ describe("agent tool topology", () => {
     expect(caught).toBeInstanceOf(Error);
     expect(caught).toMatchObject({ name: "ModelTransportError", statusCode: 503 });
     expect(isTransportInterruption(caught)).toBe(true);
+  });
+
+  it("rethrows nested transport and abort failures before business handling", () => {
+    const unavailable = Object.assign(new Error("upstream unavailable"), { status: 503 });
+    expect(() => rethrowDelegationInterruption(unavailable)).toThrow(unavailable);
+
+    const controller = new AbortController();
+    const stopped = new Error("operator stopped");
+    controller.abort(stopped);
+    expect(() => rethrowDelegationInterruption(new Error("nested run stopped"), controller.signal))
+      .toThrow(stopped);
+
+    expect(() => rethrowDelegationInterruption(new Error("invalid terminal outcome")))
+      .not.toThrow();
   });
 
   it("permits only supervisors to fan out independent model-selected delegations", () => {

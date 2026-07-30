@@ -12,9 +12,14 @@ import {
   type Goal,
   type JsonValue,
   type RunCheckpoint,
+  type RunLifecycleEventType,
   type TaskNode,
   type WorldSnapshot
 } from "../domain/schema.js";
+import {
+  createLifecycleEvent,
+  reconcileLifecycleOutbox
+} from "../persistence/lifecycle-outbox.js";
 import type { RunStore } from "../persistence/run-store.js";
 import {
   AgentSkillInputs,
@@ -35,6 +40,7 @@ import {
   assertEvidenceRequirementsJointlySatisfiable,
   assertReceiptRequirementDefinition,
   verifyBlockerEvidence,
+  verifyGoalPredicateBlockerEvidence,
   verifyReceiptEvidence
 } from "./evidence-contract.js";
 import {
@@ -55,6 +61,7 @@ export interface RuntimeEvent {
   type: string;
   at: string;
   data: JsonValue;
+  durable?: boolean;
 }
 
 export type RuntimeEventSink = (event: RuntimeEvent) => void | Promise<void>;
@@ -347,14 +354,14 @@ export class HarnessRuntimeContext {
 
   async start(resumed = false): Promise<void> {
     this.#signal?.throwIfAborted();
+    await this.#reconcileLifecycleOutbox();
     if (resumed) {
       await this.#reconcileCommittedActionJournals();
       await this.#recoverInflightActions();
     }
     this.#checkpoint.status = "running";
     this.#checkpoint.error = null;
-    await this.#persistHierarchy();
-    await this.emit(resumed ? "run_resumed" : "run_started", json({
+    await this.#commitLifecycle(resumed ? "run_resumed" : "run_started", () => json({
       scenario_id: this.#checkpoint.scenario_id,
       goal: this.#goal,
       status: this.#checkpoint.status,
@@ -630,13 +637,22 @@ export class HarnessRuntimeContext {
           `Criterion ${item.criterion_index} cannot be blocked because goal predicate ${requirement.predicate_index} passes`
         );
       }
+      const blockerEvidence: JsonValue[] = isUnmet
+        ? receipts.map((receipt) => verifyGoalPredicateBlockerEvidence(
+            item.criterion_index,
+            this.#goal.predicates[requirement.predicate_index]!,
+            receipt,
+            currentWorld.world_revision
+          ) as unknown as JsonValue)
+        : [];
       verified.push({
         criterion_index: item.criterion_index,
         authority: "goal_predicate",
         predicate_index: requirement.predicate_index,
         passed,
         check: check ?? null,
-        world_revision: currentWorld.world_revision
+        world_revision: currentWorld.world_revision,
+        ...(blockerEvidence.length > 0 ? { blocker_evidence: blockerEvidence } : {})
       });
     }
 
@@ -855,8 +871,7 @@ export class HarnessRuntimeContext {
     this.#checkpoint.status = "succeeded";
     this.#checkpoint.final_output = finalOutput;
     this.#checkpoint.error = null;
-    await this.#persistHierarchy();
-    await this.emit("run_succeeded", { checker, final_output: finalOutput });
+    await this.#commitLifecycle("run_succeeded", () => ({ checker, final_output: finalOutput }));
   }
 
   async fail(error: unknown): Promise<void> {
@@ -865,15 +880,13 @@ export class HarnessRuntimeContext {
     this.#checkpoint.status = "failed";
     this.#checkpoint.error = message;
     this.#checkpoint.final_output = null;
-    await this.#persistHierarchy();
-    await this.emit("run_failed", { error: message });
+    await this.#commitLifecycle("run_failed", () => ({ error: message }));
   }
 
   async interrupt(reason: string): Promise<void> {
     this.#checkpoint.status = "interrupted";
     this.#checkpoint.error = reason;
-    await this.#persistHierarchy();
-    await this.emit("run_interrupted", { reason });
+    await this.#commitLifecycle("run_interrupted", () => ({ reason }));
   }
 
   async emit(type: string, data: JsonValue): Promise<void> {
@@ -882,7 +895,8 @@ export class HarnessRuntimeContext {
       run_id: this.#checkpoint.run_id,
       type,
       at: new Date().toISOString(),
-      data: structuredClone(data)
+      data: structuredClone(data),
+      durable: true
     };
     await this.#store.append("events", event as unknown as JsonValue);
     await this.#eventSink(event);
@@ -895,7 +909,8 @@ export class HarnessRuntimeContext {
       run_id: this.#checkpoint.run_id,
       type,
       at: new Date().toISOString(),
-      data: structuredClone(data)
+      data: structuredClone(data),
+      durable: false
     });
   }
 
@@ -1562,12 +1577,41 @@ export class HarnessRuntimeContext {
   }
 
   async #persistHierarchy(): Promise<void> {
+    this.#synchronizeHierarchy(new Date().toISOString());
+    await this.#writeCheckpoint();
+  }
+
+  #synchronizeHierarchy(at: string): void {
     this.#checkpoint.active_agent_id = this.#hierarchy.activeId;
     this.#checkpoint.active_agent_ids = this.#hierarchy.activeIds;
     this.#checkpoint.nodes = this.#hierarchy.snapshot();
     this.#checkpoint.world = this.#world.snapshot();
-    this.#checkpoint.updated_at = new Date().toISOString();
+    this.#checkpoint.updated_at = at;
+  }
+
+  async #commitLifecycle(
+    type: RunLifecycleEventType,
+    data: () => JsonValue
+  ): Promise<void> {
+    const at = new Date().toISOString();
+    this.#synchronizeHierarchy(at);
+    this.#checkpoint.pending_lifecycle_events.push(createLifecycleEvent({
+      runId: this.#checkpoint.run_id,
+      type,
+      at,
+      data: data()
+    }));
     await this.#writeCheckpoint();
+    await this.#reconcileLifecycleOutbox();
+  }
+
+  async #reconcileLifecycleOutbox(): Promise<void> {
+    await reconcileLifecycleOutbox({
+      store: this.#store,
+      checkpoint: this.#checkpoint,
+      persistCheckpoint: () => this.#writeCheckpoint(),
+      eventSink: this.#eventSink
+    });
   }
 
   async #emitHierarchyChanged(): Promise<void> {
@@ -1768,7 +1812,8 @@ export class HarnessRuntimeContext {
   }
 
   async #writeCheckpoint(): Promise<void> {
-    const write = this.#checkpointWrite.then(() => this.#store.writeCheckpoint(this.#checkpoint));
+    const checkpoint = structuredClone(this.#checkpoint);
+    const write = this.#checkpointWrite.then(() => this.#store.writeCheckpoint(checkpoint));
     this.#checkpointWrite = write.catch(() => undefined);
     await write;
   }
@@ -1799,6 +1844,7 @@ export function createCheckpoint(input: {
     committed_actions: {},
     spatial_memory: [],
     context_memory: structuredClone(EmptyContextMemoryState),
+    pending_lifecycle_events: [],
     total_model_calls: 0,
     checker: null,
     final_output: null,
@@ -1889,7 +1935,8 @@ function reconciledRuntimeEvent(
     run_id: runId,
     type,
     at: receipt.committed_at,
-    data
+    data,
+    durable: true
   };
 }
 

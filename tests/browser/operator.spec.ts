@@ -1,9 +1,12 @@
+import { access } from "node:fs/promises";
 import { resolve } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
+import { E2E_RUNS_DIR } from "./e2e-runs.js";
 
 const UPDATE_README_SCREENSHOTS = process.env.HEAR_UPDATE_SCREENSHOTS === "1";
 
 test("渲染自主体素世界与实时机器人界面", async ({ page }, testInfo) => {
+  await access(resolve(E2E_RUNS_DIR, ".operator.lock"));
   await page.goto("/");
   const passwordInput = page.getByLabel("操作密码");
   if (await passwordInput.isVisible().catch(() => false)) {
@@ -63,16 +66,16 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
   await expect(firstPerson).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator(".sensor-reticle")).toBeVisible();
   if (testInfo.project.name === "desktop") {
-    await expect(page.getByLabel("第一人称鼠标锁定")).toHaveText("单击进入视角");
+    await expect(page.getByLabel("第一人称视角交互")).toHaveText("单击进入视角");
     const box = await canvas.boundingBox();
     expect(box).not.toBeNull();
     await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height / 2);
-    await expect(page.getByLabel("第一人称鼠标锁定")).toHaveText("移动鼠标观察 · ESC 退出");
+    await expect(page.getByLabel("第一人称视角交互")).toHaveText("移动鼠标观察 · ESC 退出");
     await page.evaluate(() => document.exitPointerLock());
-    await expect(page.getByLabel("第一人称鼠标锁定")).toHaveText("单击进入视角");
+    await expect(page.getByLabel("第一人称视角交互")).toHaveText("单击进入视角");
   } else {
-    await expect(page.getByLabel("第一人称鼠标锁定")).toHaveCount(0);
-    await expect.poll(() => canvas.evaluate((element) => getComputedStyle(element).touchAction)).toBe("pan-y");
+    await expect(page.getByLabel("第一人称视角交互")).toHaveText("拖动屏幕观察");
+    await expect.poll(() => canvas.evaluate((element) => getComputedStyle(element).touchAction)).toBe("none");
   }
   await world.click();
   await expect(world).toHaveAttribute("aria-pressed", "true");
@@ -136,6 +139,10 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
     contextLost: boolean;
     error: number | null;
   }>((resolvePainted) => {
+    if (!(element instanceof HTMLCanvasElement)) {
+      resolvePainted({ colors: 0, opaque: 0, contextLost: true, error: null });
+      return;
+    }
     const fit = document.querySelector<HTMLButtonElement>(
       'button[aria-label="适配相机范围"]'
     );
@@ -151,12 +158,14 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
           return;
         }
         context.finish();
-        const pixels = new Uint8Array(element.width * element.height * 4);
+        const bandHeight = Math.min(96, element.height);
+        const bandY = Math.max(0, Math.floor((element.height - bandHeight) / 2));
+        const pixels = new Uint8Array(element.width * bandHeight * 4);
         context.readPixels(
           0,
-          0,
+          bandY,
           element.width,
-          element.height,
+          bandHeight,
           context.RGBA,
           context.UNSIGNED_BYTE,
           pixels
@@ -164,7 +173,7 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
         const error = context.getError();
         const colors = new Set<string>();
         let opaque = 0;
-        const pixelCount = element.width * element.height;
+        const pixelCount = element.width * bandHeight;
         const stride = Math.max(1, Math.floor(pixelCount / 12_000));
         for (let pixel = 0; pixel < pixelCount; pixel += stride) {
           const offset = pixel * 4;

@@ -128,6 +128,7 @@ describe("concurrent hierarchy actuation", () => {
       delete legacy.inflight_actions;
       delete legacy.spatial_memory;
       delete legacy.context_memory;
+      delete legacy.pending_lifecycle_events;
       const world = legacy.world as Record<string, unknown>;
       delete world.active_commands;
 
@@ -143,6 +144,7 @@ describe("concurrent hierarchy actuation", () => {
       expect(parsed.spatial_memory).toEqual([]);
       expect(parsed.world.active_commands).toEqual([]);
       expect(parsed.context_memory.total_compactions).toBe(0);
+      expect(parsed.pending_lifecycle_events).toEqual([]);
     } finally {
       await dispose(value);
     }

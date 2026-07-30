@@ -119,6 +119,43 @@ describe("RunManager event and process lifecycle", () => {
     }
   });
 
+  it("reconciles an orphan interruption after its first event append fails", async () => {
+    const { runsDir, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const checkpoint = await store.readCheckpoint();
+    await store.writeCheckpoint({ ...checkpoint, status: "running", error: null });
+    const originalAppend = RunStore.prototype.append;
+    let rejected = false;
+    const append = vi.spyOn(RunStore.prototype, "append").mockImplementation(async function (
+      name,
+      value
+    ) {
+      if (!rejected && name === "events"
+        && (value as Record<string, unknown>).type === "run_interrupted") {
+        rejected = true;
+        throw new Error("event journal unavailable");
+      }
+      await originalAppend.call(this, name, value);
+    });
+    try {
+      const manager = new RunManager({ runsDir, catalog });
+      await expect(manager.recoverOrphanedRuns()).rejects.toThrow("event journal unavailable");
+
+      const pending = await store.readCheckpoint();
+      expect(pending.status).toBe("interrupted");
+      expect(pending.pending_lifecycle_events).toHaveLength(1);
+
+      await expect(manager.recoverOrphanedRuns()).resolves.toBe(0);
+      const recovered = await store.readCheckpoint();
+      expect(recovered.pending_lifecycle_events).toEqual([]);
+      expect((await store.readJournal("events")).filter(
+        (entry) => (entry as Record<string, unknown>).type === "run_interrupted"
+      )).toHaveLength(1);
+    } finally {
+      append.mockRestore();
+    }
+  });
+
   it("backfills only complete crash-safe events and cancels a disconnected replay", async () => {
     const { runsDir, runId, store } = await copiedFixture();
     const catalog = await loadRuntimeCatalog();
@@ -235,6 +272,58 @@ describe("RunManager event and process lifecycle", () => {
             for (let liveIndex = 0; liveIndex < 300; liveIndex += 1) {
               emit?.(runtimeEvent(runId, `live-overflow-${liveIndex}`));
             }
+          }
+        }
+      }
+    );
+    try {
+      await expect(manager.subscribe(
+        runId,
+        entries[cursorIndex]!.event_id,
+        async () => Promise.resolve()
+      )).rejects.toThrow(/fell behind during journal backfill/);
+    } finally {
+      scan.mockRestore();
+      finishMission({ runId, runDir: store.runDir, output: "done" });
+      await manager.drain();
+      missionRunner.startMission.mockReset();
+    }
+  });
+
+  it("bounds live-event bytes while a journal cursor is being replayed", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const entries = await store.readJournal("events") as unknown as RuntimeEvent[];
+    const cursorIndex = entries.length - 3;
+    let emit: RuntimeEventSink | undefined;
+    let finishMission!: (value: { runId: string; runDir: string; output: string }) => void;
+    missionRunner.startMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
+      emit = input.eventSink;
+      return new Promise((resolveMission) => {
+        finishMission = resolveMission;
+      });
+    });
+    const manager = new RunManager({ runsDir, catalog, provider: TEST_PROVIDER });
+    const starting = manager.start({
+      mission: store.definition.mission,
+      scenarioId: store.definition.scenario_id,
+      goal: store.definition.goal
+    });
+    if (!emit) throw new Error("Mission event sink was not installed");
+    emit(runtimeEvent(runId, "mission-created"));
+    await starting;
+
+    const scan = vi.spyOn(RunStore.prototype, "scanJournal").mockImplementationOnce(
+      async (_name, visit) => {
+        for (const [index, event] of entries.entries()) {
+          await visit(event, index);
+          if (index === cursorIndex) {
+            emit?.({
+              ...runtimeEvent(runId, "oversized-live-frame"),
+              type: "world_frames",
+              durable: false,
+              data: { frames: [], payload: "x".repeat(1024 * 1024) }
+            });
           }
         }
       }

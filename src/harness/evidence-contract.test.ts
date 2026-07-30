@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ActionReceipt, EvidenceRequirement, JsonValue } from "../domain/schema.js";
+import type { ActionReceipt, EvidenceRequirement, Goal, JsonValue } from "../domain/schema.js";
 import {
   assertEvidenceRequirementsJointlySatisfiable,
   assertReceiptRequirementDefinition,
@@ -7,6 +7,7 @@ import {
   receiptEvidenceRequirement,
   type ReceiptEvidenceProvenanceContext,
   verifyBlockerEvidence,
+  verifyGoalPredicateBlockerEvidence,
   verifyReceiptEvidence
 } from "./evidence-contract.js";
 
@@ -148,9 +149,20 @@ describe("typed hierarchy evidence", () => {
   });
 
   it.each([
+    "authority_denied",
     "repeated_accepted_action",
     "body_channel_busy",
-    "repeated_denied_action"
+    "repeated_denied_action",
+    "invalid_skill_input",
+    "unknown_planning_transaction",
+    "planning_transaction_not_granted",
+    "invalid_planning_transaction",
+    "planning_receipt_missing_plan",
+    "unknown_base_plan",
+    "unknown_arm_plan",
+    "plan_already_consumed",
+    "stale_plan_revision",
+    "command_interrupted"
   ])("rejects non-terminal blocker source %s", (code) => {
     expect(() => verifyBlockerEvidence(0, requirement, receipt({
       accepted: false,
@@ -167,6 +179,13 @@ describe("typed hierarchy evidence", () => {
       result_code: "entity_not_visible",
       world_revision: 7
     });
+  });
+
+  it("rejects unknown blocker codes instead of treating them as terminal", () => {
+    expect(() => verifyBlockerEvidence(0, requirement, receipt({
+      accepted: false,
+      code: "future_unclassified_failure"
+    }), 7)).toThrow("unsupported inspect_entity code future_unclassified_failure");
   });
 
   it("rotates only unfinished legacy branches that cannot provide typed evidence", () => {
@@ -214,6 +233,240 @@ describe("typed hierarchy evidence", () => {
         ]
       }
     }, "root")).toBe(true);
+  });
+});
+
+describe("goal predicate blocker evidence", () => {
+  const coordinate = { column: 0, level: 0, row: 3 };
+
+  function voxelBlocker(overrides: Partial<ReceiptWithBeforeRevision> = {}): ActionReceipt {
+    return receipt({
+      transaction_id: "agent_a:voxel_blocked",
+      kind: "skill",
+      name: "break_voxel",
+      input: { coordinate },
+      accepted: false,
+      code: "voxel_boundary_protected",
+      detail: { coordinate },
+      channels: ["arm", "gripper"],
+      ...overrides
+    });
+  }
+
+  it("accepts only the exact protected-boundary mutation intent", () => {
+    const emptyPredicate = {
+      type: "voxel_at",
+      coordinate,
+      material: null
+    } satisfies Goal["predicates"][number];
+    expect(verifyGoalPredicateBlockerEvidence(
+      0,
+      emptyPredicate,
+      voxelBlocker(),
+      7
+    )).toMatchObject({
+      criterion_index: 0,
+      action: "break_voxel",
+      result_code: "voxel_boundary_protected",
+      accepted: false,
+      target: { kind: "voxel", coordinate }
+    });
+
+    const materialPredicate = {
+      type: "voxel_at",
+      coordinate,
+      material: "grass"
+    } satisfies Goal["predicates"][number];
+    expect(verifyGoalPredicateBlockerEvidence(
+      0,
+      materialPredicate,
+      voxelBlocker({
+        name: "place_voxel",
+        input: { coordinate, material: "grass" }
+      }),
+      7
+    )).toMatchObject({
+      action: "place_voxel",
+      result_code: "voxel_boundary_protected",
+      target: { kind: "voxel", coordinate }
+    });
+  });
+
+  it("requires a rejected current skill receipt", () => {
+    const predicate = {
+      type: "voxel_at",
+      coordinate,
+      material: null
+    } satisfies Goal["predicates"][number];
+    expect(() => verifyGoalPredicateBlockerEvidence(0, predicate, voxelBlocker({
+      accepted: true,
+      code: "voxel_broken"
+    }), 7)).toThrow("requires a rejected physical transaction");
+    expect(() => verifyGoalPredicateBlockerEvidence(0, predicate, voxelBlocker(), 8))
+      .toThrow("current revision is 8");
+    expect(() => verifyGoalPredicateBlockerEvidence(0, predicate, voxelBlocker({
+      kind: "tool"
+    }), 7)).toThrow("requires break_voxel");
+  });
+
+  it("rejects unknown and recoverable voxel failures", () => {
+    const predicate = {
+      type: "voxel_at",
+      coordinate,
+      material: null
+    } satisfies Goal["predicates"][number];
+    for (const code of [
+      "future_unclassified_failure",
+      "voxel_broken",
+      "voxel_world_unavailable",
+      "voxel_out_of_bounds",
+      "voxel_chunk_unloaded",
+      "voxel_empty",
+      "voxel_not_visible",
+      "robot_link_state_unavailable",
+      "voxel_interaction_surface_unavailable",
+      "voxel_out_of_reach",
+      "voxel_placement_blocked",
+      "voxel_unsupported",
+      "voxel_occupied",
+      "voxel_material_unavailable"
+    ]) {
+      expect(() => verifyGoalPredicateBlockerEvidence(
+        0,
+        predicate,
+        voxelBlocker({ code }),
+        7
+      )).toThrow(`code ${code} does not prove`);
+    }
+  });
+
+  it("matches coordinate, reported coordinate, material, and mutation direction", () => {
+    const materialPredicate = {
+      type: "voxel_at",
+      coordinate,
+      material: "grass"
+    } satisfies Goal["predicates"][number];
+    expect(() => verifyGoalPredicateBlockerEvidence(0, materialPredicate, voxelBlocker({
+      name: "place_voxel",
+      input: {
+        coordinate: { column: 1, level: 0, row: 3 },
+        material: "grass"
+      }
+    }), 7)).toThrow("not voxel");
+    expect(() => verifyGoalPredicateBlockerEvidence(0, materialPredicate, voxelBlocker({
+      name: "place_voxel",
+      input: { material: "grass" }
+    }), 7)).toThrow("has no canonical coordinate");
+    expect(() => verifyGoalPredicateBlockerEvidence(0, materialPredicate, voxelBlocker({
+      name: "place_voxel",
+      input: { coordinate, material: "grass" },
+      detail: {}
+    }), 7)).toThrow("has no canonical coordinate");
+    expect(() => verifyGoalPredicateBlockerEvidence(0, materialPredicate, voxelBlocker({
+      name: "place_voxel",
+      input: { coordinate, material: "grass" },
+      detail: { coordinate: { column: 0, level: 0, row: 4 } }
+    }), 7)).toThrow("reports voxel");
+    expect(() => verifyGoalPredicateBlockerEvidence(0, materialPredicate, voxelBlocker({
+      name: "place_voxel",
+      input: { coordinate, material: "stone" }
+    }), 7)).toThrow("targets material \"stone\", not \"grass\"");
+    expect(() => verifyGoalPredicateBlockerEvidence(0, materialPredicate, voxelBlocker(), 7))
+      .toThrow("requires place_voxel");
+  });
+
+  it.each([
+    {
+      type: "robot_at",
+      target: { x: 8, y: 0, z: 8 },
+      tolerance: 0.2
+    },
+    { type: "robot_in_zone", zone_id: "arrival", tolerance: 0.1 },
+    { type: "terrain_explored", minimum_fraction: 0.8 },
+    {
+      type: "object_in_zone",
+      object_id: "crate",
+      zone_id: "arrival",
+      expected: true,
+      tolerance: 0.1
+    },
+    {
+      type: "object_at",
+      object_id: "crate",
+      target: { x: 4, y: 0.5, z: 4 },
+      tolerance: 0.2
+    },
+    {
+      type: "object_property",
+      object_id: "crate",
+      property: "enabled",
+      expected: true
+    },
+    { type: "object_attached", object_id: "crate", expected: true }
+  ] satisfies Goal["predicates"])("rejects local attempts for $type", (predicate) => {
+    const localFailures = [
+      voxelBlocker({
+        name: "drive_base",
+        input: {
+          linear_meters_per_second: 0.4,
+          angular_radians_per_second: 0,
+          duration_seconds: 2
+        },
+        code: "base_motion_blocked",
+        detail: { object_id: "crate", zone_id: "arrival" },
+        channels: ["base"]
+      }),
+      voxelBlocker({
+        name: "execute_joint_plan",
+        input: { planning_transaction_id: "agent_a:arm_plan" },
+        code: "joint_motion_blocked",
+        detail: { object_id: "crate", property: "enabled", expected: true },
+        channels: ["arm"]
+      }),
+      voxelBlocker({
+        name: "set_gripper_target",
+        input: { aperture: 0.04 },
+        code: "gripper_force_limit",
+        detail: { contacted_object_id: "crate", expected: true },
+        channels: ["gripper"]
+      })
+    ];
+    for (const localFailure of localFailures) {
+      expect(() => verifyGoalPredicateBlockerEvidence(
+        0,
+        predicate,
+        localFailure,
+        7
+      )).toThrow(`Goal predicate ${predicate.type} has no single-receipt blocker contract`);
+    }
+  });
+
+  it("does not turn planner target or executor failures into global reachability proof", () => {
+    const predicate = {
+      type: "robot_at",
+      target: { x: 8, y: 0, z: 8 },
+      tolerance: 0.2
+    } satisfies Goal["predicates"][number];
+    for (const failed of [
+      receipt({
+        kind: "tool",
+        name: "plan_base_path",
+        input: { target: predicate.target },
+        accepted: false,
+        code: "base_path_unavailable"
+      }),
+      receipt({
+        kind: "skill",
+        name: "execute_base_plan",
+        input: { planning_transaction_id: "agent_a:matching_plan" },
+        accepted: false,
+        code: "base_plan_blocked",
+        channels: ["base"]
+      })
+    ]) {
+      expect(() => verifyGoalPredicateBlockerEvidence(0, predicate, failed, 7))
+        .toThrow("has no single-receipt blocker contract");
+    }
   });
 });
 

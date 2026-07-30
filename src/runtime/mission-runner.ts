@@ -26,6 +26,7 @@ import {
 import { providerEventJson, sdkEventJson } from "../harness/sdk-events.js";
 import { createConfiguredModel, providerIdentity } from "../model/factory.js";
 import { FileSession } from "../persistence/file-session.js";
+import type { MutationFence } from "../persistence/mutation-fence.js";
 import { RunStore } from "../persistence/run-store.js";
 import { RapierWorld } from "../world/rapier-world.js";
 import { drawSeed } from "../world/world-generator.js";
@@ -85,6 +86,7 @@ export async function startMission(input: {
   seed?: number;
   eventSink?: RuntimeEventSink;
   signal?: AbortSignal;
+  mutationFence?: MutationFence;
 }): Promise<MissionRunResult> {
   const worldSeed = input.seed ?? drawSeed();
   // Movement entropy is fresh even when a caller fixes the world seed. It only
@@ -98,7 +100,7 @@ export async function startMission(input: {
     scenarioId: input.scenarioId,
     scenario,
     goal: input.goal
-  });
+  }, input.mutationFence ? { mutationFence: input.mutationFence } : {});
   const world = await RapierWorld.create(scenario);
   try {
     const capabilities = capabilityCatalog();
@@ -141,8 +143,12 @@ export async function resumeMission(input: {
   freshContext?: boolean;
   eventSink?: RuntimeEventSink;
   signal?: AbortSignal;
+  mutationFence?: MutationFence;
 }): Promise<MissionRunResult> {
-  const store = await RunStore.open(input.runDir);
+  const store = await RunStore.open(
+    input.runDir,
+    input.mutationFence ? { mutationFence: input.mutationFence } : {}
+  );
   const checkpoint = await store.readCheckpoint();
   if (checkpoint.status === "succeeded") throw new Error("A succeeded run cannot be resumed");
   const scenario = store.definition.scenario;
@@ -225,7 +231,8 @@ async function executeMission(input: {
         : input.runtime.store.workerSessionPath(agentId),
       agentId === input.runtime.rootAgentId
         ? input.runtime.runId
-        : `${input.runtime.runId}:${agentId}`
+        : `${input.runtime.runId}:${agentId}`,
+      input.runtime.store.mutationFence
     );
     sessions.set(agentId, created);
     return created;
@@ -412,6 +419,21 @@ async function executeMission(input: {
       }
     }
   } catch (error) {
+    // succeed() updates memory before its first checkpoint write, so the
+    // in-memory status alone cannot prove success is durable. Once the stored
+    // checkpoint is successful, however, a later journal, sink, or outbox-clear
+    // error is only a lifecycle-delivery failure and must never overwrite the
+    // committed outcome with fail(). If storage cannot be read here, preserve
+    // the original error instead of risking a destructive terminal rewrite.
+    if (input.runtime.checkpoint.status === "succeeded") {
+      let persistedStatus: string;
+      try {
+        persistedStatus = (await input.runtime.store.readCheckpoint()).status;
+      } catch {
+        throw error;
+      }
+      if (persistedStatus === "succeeded") throw error;
+    }
     const message = errorMessage(error);
     const recoverableInterruption = input.signal?.aborted === true
       || isTransportInterruption(error);

@@ -5,6 +5,7 @@ import type {
   EvidenceFreshness,
   EvidenceRequirement,
   EvidenceTarget,
+  Goal,
   JsonValue,
   TaskNode
 } from "../domain/schema.js";
@@ -51,10 +52,103 @@ const TERMINAL_EFFECTS: ReadonlySet<EvidenceEffect> = new Set([
   "world_mutation"
 ]);
 const NON_TERMINAL_BLOCKER_CODES: ReadonlySet<string> = new Set([
+  "authority_denied",
   "repeated_accepted_action",
   "body_channel_busy",
-  "repeated_denied_action"
+  "repeated_denied_action",
+  "invalid_skill_input",
+  "unknown_planning_transaction",
+  "planning_transaction_not_granted",
+  "invalid_planning_transaction",
+  "planning_receipt_missing_plan",
+  "unknown_base_plan",
+  "unknown_arm_plan",
+  "plan_already_consumed",
+  "stale_plan_revision",
+  "command_interrupted"
 ]);
+
+const RECEIPT_BLOCKER_CODES: Readonly<Record<string, readonly string[]>> = {
+  read_proprioception: [],
+  sense_scene: [],
+  survey_terrain: ["terrain_unavailable", "navigation_projection_failed"],
+  scan_voxels: ["voxel_world_unavailable"],
+  inspect_voxel: ["voxel_world_unavailable", "voxel_out_of_bounds", "voxel_chunk_unloaded"],
+  recall_spatial_memory: ["spatial_memory_context_unavailable"],
+  inspect_entity: ["entity_not_visible", "unknown_entity"],
+  query_contacts: [],
+  inspect_command: [],
+  plan_base_path: ["invalid_base_face_point", "base_path_collision", "base_path_unavailable"],
+  plan_arm_retraction: [
+    "invalid_base_face_point",
+    "arm_retraction_unavailable",
+    "base_path_unavailable"
+  ],
+  plan_joint_targets: ["joint_trajectory_blocked"],
+  solve_end_effector_position: [
+    "ik_solver_error",
+    "ik_not_converged",
+    "ik_solution_outside_limits",
+    "ik_residual_too_large",
+    "ik_trajectory_endpoint_blocked",
+    "ik_trajectory_blocked"
+  ],
+  solve_end_effector_pose: [
+    "ik_solver_error",
+    "ik_not_converged",
+    "ik_solution_outside_limits",
+    "ik_residual_too_large",
+    "ik_trajectory_endpoint_blocked",
+    "ik_trajectory_blocked"
+  ],
+  execute_base_plan: [
+    "base_path_collision",
+    "base_plan_timeout",
+    "base_rotation_blocked",
+    "base_plan_blocked"
+  ],
+  execute_joint_plan: [
+    "joint_motion_blocked",
+    "joint_motion_timeout",
+    "end_effector_verification_failed"
+  ],
+  drive_base: ["base_motion_blocked"],
+  set_head_target: ["head_motion_timeout", "head_motion_blocked"],
+  set_joint_targets: ["joint_motion_blocked", "joint_motion_timeout"],
+  set_gripper_target: [
+    "gripper_motion_timeout",
+    "gripper_motion_blocked",
+    "gripper_force_limit",
+    "grasp_unstable"
+  ],
+  break_voxel: [
+    "voxel_world_unavailable",
+    "voxel_out_of_bounds",
+    "voxel_chunk_unloaded",
+    "voxel_boundary_protected",
+    "voxel_empty",
+    "voxel_not_visible",
+    "robot_link_state_unavailable",
+    "voxel_interaction_surface_unavailable",
+    "voxel_out_of_reach"
+  ],
+  place_voxel: [
+    "voxel_world_unavailable",
+    "voxel_out_of_bounds",
+    "voxel_chunk_unloaded",
+    "voxel_boundary_protected",
+    "voxel_occupied",
+    "voxel_not_visible",
+    "robot_link_state_unavailable",
+    "voxel_interaction_surface_unavailable",
+    "voxel_out_of_reach",
+    "voxel_unsupported",
+    "voxel_placement_blocked",
+    "voxel_material_unavailable"
+  ]
+};
+
+const GOAL_VOXEL_BLOCKER_CODES: readonly string[] = ["voxel_boundary_protected"];
 
 const robot = (): EvidenceTarget => ({ kind: "robot" });
 const world = (): EvidenceTarget => ({ kind: "world" });
@@ -338,6 +432,12 @@ export function verifyBlockerEvidence(
       `Rejected blocker transaction ${receipt.transaction_id} uses successful result code ${receipt.code}`
     );
   }
+  const blockerCodes = RECEIPT_BLOCKER_CODES[receipt.name] ?? [];
+  if (!blockerCodes.includes(receipt.code)) {
+    throw new Error(
+      `Blocker transaction ${receipt.transaction_id} returned unsupported ${receipt.name} code ${receipt.code}`
+    );
+  }
   if (requirement.freshness === "current_world"
     && receipt.world_revision !== currentWorldRevision) {
     throw new Error(
@@ -356,6 +456,86 @@ export function verifyBlockerEvidence(
     action: receipt.name,
     result_code: receipt.code,
     accepted: receipt.accepted,
+    effect: policy.effect,
+    target: actualTarget,
+    freshness: policy.freshness,
+    world_revision: receipt.world_revision
+  };
+}
+
+/** A single rejection may close a blocked branch only when it proves the exact
+ * final-state mutation is structurally impossible. Recoverable motion,
+ * perception, planning, collision, and grasp failures prove only that attempt. */
+export function verifyGoalPredicateBlockerEvidence(
+  criterionIndex: number,
+  predicate: Goal["predicates"][number],
+  receipt: ActionReceipt,
+  currentWorldRevision: number
+): VerifiedBlockerEvidence {
+  if (receipt.accepted) {
+    throw new Error(
+      `Goal blocker evidence requires a rejected physical transaction; ${receipt.transaction_id} was accepted`
+    );
+  }
+  if (receipt.world_revision !== currentWorldRevision) {
+    throw new Error(
+      `Goal blocker transaction ${receipt.transaction_id} is from world revision ${receipt.world_revision}; current revision is ${currentWorldRevision}`
+    );
+  }
+  if (predicate.type !== "voxel_at") {
+    throw new Error(
+      `Goal predicate ${predicate.type} has no single-receipt blocker contract; `
+      + `${receipt.name} proves only one attempted action`
+    );
+  }
+  const expectedAction = predicate.material === null ? "break_voxel" : "place_voxel";
+  if (receipt.kind !== "skill" || receipt.name !== expectedAction) {
+    throw new Error(
+      `Goal blocker transaction ${receipt.transaction_id} used ${receipt.name}; `
+      + `${predicate.type} with material ${JSON.stringify(predicate.material)} requires ${expectedAction}`
+    );
+  }
+  const policy = POLICIES[receipt.name];
+  if (!policy || !TERMINAL_EFFECTS.has(policy.effect)) {
+    throw new Error(
+      `Goal blocker transaction ${receipt.transaction_id} is not physical evidence`
+    );
+  }
+  if (!GOAL_VOXEL_BLOCKER_CODES.includes(receipt.code)) {
+    throw new Error(
+      `Rejected ${receipt.name} code ${receipt.code} does not prove the voxel goal is structurally blocked`
+    );
+  }
+  const actualTarget = policy.target(receipt);
+  if (actualTarget.kind !== "voxel"
+    || !isDeepStrictEqual(actualTarget.coordinate, predicate.coordinate)) {
+    throw new Error(
+      `Goal blocker transaction ${receipt.transaction_id} targets ${JSON.stringify(actualTarget)}, `
+      + `not voxel ${JSON.stringify(predicate.coordinate)}`
+    );
+  }
+  const reportedCoordinate = voxelField(receipt.detail, "coordinate", receipt.name);
+  if (!isDeepStrictEqual(reportedCoordinate, predicate.coordinate)) {
+    throw new Error(
+      `Goal blocker transaction ${receipt.transaction_id} reports voxel `
+      + `${JSON.stringify(reportedCoordinate)}, not ${JSON.stringify(predicate.coordinate)}`
+    );
+  }
+  if (receipt.name === "place_voxel") {
+    const material = stringField(receipt.input, "material", receipt.name);
+    if (material !== predicate.material) {
+      throw new Error(
+        `Goal blocker transaction ${receipt.transaction_id} targets material ${JSON.stringify(material)}, `
+        + `not ${JSON.stringify(predicate.material)}`
+      );
+    }
+  }
+  return {
+    criterion_index: criterionIndex,
+    transaction_id: receipt.transaction_id,
+    action: receipt.name,
+    result_code: receipt.code,
+    accepted: false,
     effect: policy.effect,
     target: actualTarget,
     freshness: policy.freshness,

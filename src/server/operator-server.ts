@@ -10,6 +10,7 @@ import { GoalSchema } from "../domain/schema.js";
 import { capabilityCatalog } from "../harness/agents.js";
 import type { RuntimeEvent } from "../harness/runtime-context.js";
 import { providerIdentity } from "../model/factory.js";
+import type { MutationFence } from "../persistence/mutation-fence.js";
 import {
   acquireOperatorLease,
   type OperatorLease,
@@ -57,14 +58,22 @@ export async function createOperatorServer(input: {
       redact: ["req.headers.authorization", "req.headers.x-hear-password"]
     }
   });
+  let lease: OperatorLease | undefined;
+  const mutationFence: MutationFence = {
+    runMutation: (operation) => {
+      const currentLease = lease;
+      if (!currentLease) throw new OperatorLeaseLostError("Operator lease is unavailable");
+      return currentLease.runMutation(operation);
+    }
+  };
   const manager = new RunManager({
     runsDir: input.server.runsDir,
     catalog: input.catalog,
     ...(input.provider ? { provider: input.provider } : {}),
-    ...(input.providerError ? { providerError: input.providerError } : {})
+    ...(input.providerError ? { providerError: input.providerError } : {}),
+    mutationFence
   });
   const activeStreams = new Set<() => void>();
-  let lease: OperatorLease | undefined;
   let leaseLossDrain: Promise<void> | undefined;
   app.addHook("onRequest", async (request, reply) => {
     if (!request.url.startsWith("/api/") || request.url === "/api/health") return;
@@ -315,8 +324,9 @@ function sameSecret(left: string, right: string): boolean {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
-function runtimeEventRecord(event: RuntimeEvent): string {
-  return `id: ${event.event_id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+export function runtimeEventRecord(event: RuntimeEvent): string {
+  const cursor = event.durable === false ? "" : `id: ${event.event_id}\n`;
+  return `${cursor}event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 function isMissingFile(error: unknown): boolean {

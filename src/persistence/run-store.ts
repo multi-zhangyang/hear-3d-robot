@@ -26,6 +26,10 @@ import {
   readIndexedWindow
 } from "./journal-index.js";
 import { writeTextAtomically } from "./atomic-file.js";
+import {
+  runFencedMutation,
+  type MutationFence
+} from "./mutation-fence.js";
 
 const RunDefinitionSchema = z.object({
   version: z.literal(1),
@@ -55,18 +59,23 @@ export interface JournalPage {
   total: number;
 }
 
+export interface RunStoreOptions {
+  mutationFence?: MutationFence;
+}
+
 export class RunStore {
   readonly runDir: string;
   readonly definition: RunDefinition;
+  readonly #mutationFence: MutationFence | undefined;
   readonly #journalWrites = new Map<JournalName, Promise<void>>();
 
   static async create(
     runsDir: string,
-    input: { mission: string; scenarioId: string; scenario: Scenario; goal: Goal }
+    input: { mission: string; scenarioId: string; scenario: Scenario; goal: Goal },
+    options: RunStoreOptions = {}
   ): Promise<RunStore> {
     const runId = createRunId(input.scenarioId);
     const runDir = resolve(runsDir, runId);
-    await mkdir(runDir, { recursive: false });
     const definition: RunDefinition = {
       version: 1,
       run_id: runId,
@@ -76,22 +85,34 @@ export class RunStore {
       goal: structuredClone(input.goal),
       created_at: new Date().toISOString()
     };
-    await atomicJson(resolve(runDir, "run.json"), definition);
-    return new RunStore(runDir, definition);
+    await runFencedMutation(options.mutationFence, async () => {
+      await mkdir(runDir, { recursive: false });
+      await atomicJson(resolve(runDir, "run.json"), definition);
+    });
+    return new RunStore(runDir, definition, options.mutationFence);
   }
 
-  static async open(runDir: string): Promise<RunStore> {
+  static async open(runDir: string, options: RunStoreOptions = {}): Promise<RunStore> {
     const resolved = resolve(runDir);
     const definition = RunDefinitionSchema.parse(
       JSON.parse(await readFile(resolve(resolved, "run.json"), "utf8"))
     );
     if (basename(resolved) !== definition.run_id) throw new Error("Run directory identity mismatch");
-    return new RunStore(resolved, definition);
+    return new RunStore(resolved, definition, options.mutationFence);
   }
 
-  private constructor(runDir: string, definition: RunDefinition) {
+  private constructor(
+    runDir: string,
+    definition: RunDefinition,
+    mutationFence: MutationFence | undefined
+  ) {
     this.runDir = runDir;
     this.definition = definition;
+    this.#mutationFence = mutationFence;
+  }
+
+  get mutationFence(): MutationFence | undefined {
+    return this.#mutationFence;
   }
 
   async append(name: JournalName, value: JsonValue): Promise<void> {
@@ -104,7 +125,10 @@ export class RunStore {
   }
 
   async writeCheckpoint(checkpoint: RunCheckpoint): Promise<void> {
-    await atomicJson(resolve(this.runDir, "checkpoint.json"), RunCheckpointSchema.parse(checkpoint));
+    const parsed = RunCheckpointSchema.parse(checkpoint);
+    await this.#runMutation(
+      () => atomicJson(resolve(this.runDir, "checkpoint.json"), parsed)
+    );
   }
 
   async readCheckpoint(): Promise<RunCheckpoint> {
@@ -126,12 +150,12 @@ export class RunStore {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Journal limit must be positive");
 
     await this.#journalWrites.get(name);
-    const window = await readIndexedWindow(
+    const window = await this.#runMutation(() => readIndexedWindow(
       this.#journalPath(name),
       this.#journalIndexPath(name),
       from,
       limit
-    );
+    ));
     return {
       entries: window.lines.map(parseJournalLine),
       next: window.next,
@@ -143,11 +167,11 @@ export class RunStore {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Journal limit must be positive");
 
     await this.#journalWrites.get(name);
-    const window = await readIndexedTail(
+    const window = await this.#runMutation(() => readIndexedTail(
       this.#journalPath(name),
       this.#journalIndexPath(name),
       limit
-    );
+    ));
     return {
       entries: window.lines.map(parseJournalLine),
       next: null,
@@ -163,7 +187,9 @@ export class RunStore {
   }
 
   async writeAgentState(state: string): Promise<void> {
-    await atomicText(resolve(this.runDir, "agent-state.json"), state);
+    await this.#runMutation(
+      () => atomicText(resolve(this.runDir, "agent-state.json"), state)
+    );
   }
 
   async readAgentState(): Promise<string | undefined> {
@@ -180,11 +206,13 @@ export class RunStore {
    * action and hierarchy journals plus the authoritative checkpoint remain.
    */
   async clearAgentState(): Promise<void> {
-    try {
-      await unlink(resolve(this.runDir, "agent-state.json"));
-    } catch (error) {
-      if (!isMissing(error)) throw error;
-    }
+    await this.#runMutation(async () => {
+      try {
+        await unlink(resolve(this.runDir, "agent-state.json"));
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
+    });
   }
 
   sessionPath(): string {
@@ -197,27 +225,29 @@ export class RunStore {
   }
 
   async clearWorkerSessions(): Promise<void> {
-    const directory = resolve(this.runDir, "sessions");
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch (error) {
-      if (isMissing(error)) return;
-      throw error;
-    }
-    await Promise.all(entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-      .map((entry) => unlink(resolve(directory, entry.name))));
+    await this.#runMutation(async () => {
+      const directory = resolve(this.runDir, "sessions");
+      let entries;
+      try {
+        entries = await readdir(directory, { withFileTypes: true });
+      } catch (error) {
+        if (isMissing(error)) return;
+        throw error;
+      }
+      await Promise.all(entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => unlink(resolve(directory, entry.name))));
+    });
   }
 
   async #append(name: JournalName, records: string[]): Promise<void> {
     const previous = this.#journalWrites.get(name) ?? Promise.resolve();
     const write = previous.then(async () => {
-      await appendIndexedRecords(
+      await this.#runMutation(() => appendIndexedRecords(
         this.#journalPath(name),
         this.#journalIndexPath(name),
         records
-      );
+      ));
     });
     this.#journalWrites.set(name, write.catch(() => undefined));
     await write;
@@ -237,7 +267,9 @@ export class RunStore {
   ): Promise<void> {
     await this.#journalWrites.get(name);
     const path = resolve(this.runDir, `${name}.jsonl`);
-    const state = await ensureJournalIndex(path, this.#journalIndexPath(name));
+    const state = await this.#runMutation(
+      () => ensureJournalIndex(path, this.#journalIndexPath(name))
+    );
     if (state.completeByteLength === 0) return;
     try {
       await access(path);
@@ -265,14 +297,23 @@ export class RunStore {
       stream.destroy();
     }
   }
+
+  async #runMutation<T>(operation: () => Promise<T>): Promise<T> {
+    return runFencedMutation(this.#mutationFence, operation);
+  }
 }
 
 function parseJournalLine(line: string): JsonValue {
   return JSON.parse(line) as JsonValue;
 }
 
-export async function listRunDirectories(runsDir: string): Promise<string[]> {
-  await mkdir(runsDir, { recursive: true });
+export async function listRunDirectories(
+  runsDir: string,
+  options: RunStoreOptions = {}
+): Promise<string[]> {
+  await runFencedMutation(options.mutationFence, async () => {
+    await mkdir(runsDir, { recursive: true });
+  });
   const entries = await readdir(runsDir, { withFileTypes: true });
   return entries
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))

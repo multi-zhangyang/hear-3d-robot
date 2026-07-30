@@ -20,7 +20,6 @@ interface RenderedChunk {
   mesh: THREE.InstancedMesh;
   instances: BlockInstance[];
   mutationSignature: string;
-  explorationRevision: number;
 }
 
 interface ChunkReference {
@@ -49,11 +48,12 @@ export class VoxelTerrain {
   readonly #material: THREE.MeshStandardMaterial;
   readonly #chunks = new Map<string, RenderedChunk>();
   readonly #chunksByMesh = new Map<THREE.Object3D, RenderedChunk>();
+  readonly #exploredChunkCounts = new Map<string, number>();
+  readonly #exploredChunks = new Map<string, ChunkReference>();
   #mutations = new Map<string, VoxelMaterial | null>();
   #mutationLists = new Map<string, VoxelMutation[]>();
   #explorationKey = "";
   #explorationBits: Uint8Array<ArrayBufferLike> = new Uint8Array();
-  #explorationRevision = 0;
   #stateRevision = -1;
 
   constructor(terrain: TerrainDefinition, worldSeed: number) {
@@ -76,7 +76,7 @@ export class VoxelTerrain {
   }
 
   update(state: VoxelWorldState | null | undefined, encodedExploration: string): void {
-    this.#updateExploration(encodedExploration);
+    const dirtyExplorationChunks = this.#updateExploration(encodedExploration);
     if (state && state.revision !== this.#stateRevision) {
       this.#stateRevision = state.revision;
       this.#indexMutations(state.mutations);
@@ -86,7 +86,7 @@ export class VoxelTerrain {
     // old real-run artifacts viewable; current runs always take the streamed set.
     const loaded = state?.loaded_chunks ?? allChunks(this.#terrain);
     const desired = new Map<string, { reference: ChunkReference; physical: boolean }>();
-    for (const reference of exploredChunks(this.#terrain, this.#explorationBits)) {
+    for (const reference of this.#exploredChunks.values()) {
       desired.set(chunkKey(reference), { reference, physical: false });
     }
     for (const reference of loaded) {
@@ -98,9 +98,14 @@ export class VoxelTerrain {
       this.root.remove(chunk.mesh);
       this.#chunksByMesh.delete(chunk.mesh);
       this.#chunks.delete(key);
+      chunk.mesh.dispose();
     }
     for (const { reference, physical } of desired.values()) {
-      this.#synchronizeChunk(reference, physical);
+      this.#synchronizeChunk(
+        reference,
+        physical,
+        dirtyExplorationChunks.has(chunkKey(reference))
+      );
     }
   }
 
@@ -170,7 +175,11 @@ export class VoxelTerrain {
     }
   }
 
-  #synchronizeChunk(reference: ChunkReference, physical: boolean): void {
+  #synchronizeChunk(
+    reference: ChunkReference,
+    physical: boolean,
+    explorationDirty: boolean
+  ): void {
     const key = chunkKey(reference);
     const signature = (this.#mutationLists.get(key) ?? [])
       .map((mutation) => `${coordinateKey(mutation.coordinate)}=${mutation.after ?? "air"}@${mutation.revision}`)
@@ -179,15 +188,14 @@ export class VoxelTerrain {
     if (existing?.mutationSignature === signature) {
       existing.mesh.userData.loaded_in_physics = physical;
       existing.mesh.receiveShadow = physical;
-      if (existing.explorationRevision !== this.#explorationRevision) {
-        this.#updateChunkColors(existing);
-      }
+      if (explorationDirty) this.#updateChunkColors(existing);
       return;
     }
     if (existing) {
       this.root.remove(existing.mesh);
       this.#chunksByMesh.delete(existing.mesh);
       this.#chunks.delete(key);
+      existing.mesh.dispose();
     }
 
     const instances = this.#instancesInChunk(reference);
@@ -218,8 +226,7 @@ export class VoxelTerrain {
     const rendered = {
       mesh,
       instances,
-      mutationSignature: signature,
-      explorationRevision: -1
+      mutationSignature: signature
     };
     this.#updateChunkColors(rendered);
     this.#chunks.set(key, rendered);
@@ -274,11 +281,44 @@ export class VoxelTerrain {
     return level === 0 && height >= 3 ? "stone" : "dirt";
   }
 
-  #updateExploration(encoded: string): void {
-    if (encoded === this.#explorationKey) return;
+  #updateExploration(encoded: string): Set<string> {
+    const dirtyChunks = new Set<string>();
+    if (encoded === this.#explorationKey) return dirtyChunks;
+    const nextBits = decodeBase64(encoded);
+    const byteLength = Math.max(this.#explorationBits.length, nextBits.length);
+    const cellCount = this.#terrain.columns * this.#terrain.rows;
+    for (let byteIndex = 0; byteIndex < byteLength; byteIndex += 1) {
+      const previousByte = this.#explorationBits[byteIndex] ?? 0;
+      const nextByte = nextBits[byteIndex] ?? 0;
+      const changed = previousByte ^ nextByte;
+      if (changed === 0) continue;
+      for (let bit = 0; bit < 8; bit += 1) {
+        const mask = 1 << bit;
+        if ((changed & mask) === 0) continue;
+        const cell = byteIndex * 8 + bit;
+        if (cell >= cellCount) break;
+        const column = cell % this.#terrain.columns;
+        const row = (cell - column) / this.#terrain.columns;
+        const reference = {
+          column: Math.floor(column / this.#terrain.chunk_size),
+          row: Math.floor(row / this.#terrain.chunk_size)
+        };
+        const key = chunkKey(reference);
+        const count = this.#exploredChunkCounts.get(key) ?? 0;
+        const nextCount = count + ((nextByte & mask) === 0 ? -1 : 1);
+        if (nextCount > 0) {
+          this.#exploredChunkCounts.set(key, nextCount);
+          this.#exploredChunks.set(key, reference);
+        } else {
+          this.#exploredChunkCounts.delete(key);
+          this.#exploredChunks.delete(key);
+        }
+        dirtyChunks.add(key);
+      }
+    }
     this.#explorationKey = encoded;
-    this.#explorationBits = decodeBase64(encoded);
-    this.#explorationRevision += 1;
+    this.#explorationBits = nextBits;
+    return dirtyChunks;
   }
 
   #updateChunkColors(chunk: RenderedChunk): void {
@@ -293,7 +333,6 @@ export class VoxelTerrain {
       ));
     }
     if (chunk.mesh.instanceColor) chunk.mesh.instanceColor.needsUpdate = true;
-    chunk.explorationRevision = this.#explorationRevision;
   }
 }
 
@@ -305,25 +344,6 @@ function allChunks(terrain: TerrainDefinition): ChunkReference[] {
     for (let column = 0; column < columns; column += 1) chunks.push({ column, row });
   }
   return chunks;
-}
-
-function exploredChunks(
-  terrain: TerrainDefinition,
-  explorationBits: Uint8Array<ArrayBufferLike>
-): ChunkReference[] {
-  const chunks = new Map<string, ChunkReference>();
-  for (let cell = 0; cell < terrain.columns * terrain.rows; cell += 1) {
-    const seen = ((explorationBits[cell >> 3] ?? 0) & (1 << (cell & 7))) !== 0;
-    if (!seen) continue;
-    const column = cell % terrain.columns;
-    const row = (cell - column) / terrain.columns;
-    const reference = {
-      column: Math.floor(column / terrain.chunk_size),
-      row: Math.floor(row / terrain.chunk_size)
-    };
-    chunks.set(chunkKey(reference), reference);
-  }
-  return [...chunks.values()];
 }
 
 function chunkKey(chunk: ChunkReference): string {

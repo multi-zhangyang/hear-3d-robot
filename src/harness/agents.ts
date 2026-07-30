@@ -28,6 +28,7 @@ import {
   type ToolName
 } from "../runtime/actions.js";
 import { errorMessage } from "../runtime/error-message.js";
+import { isTransportInterruption } from "../runtime/transport-recovery.js";
 import { coordinatorInstructions, workerInstructions } from "./agent-prompts.js";
 import {
   assertEvidenceRequirementsJointlySatisfiable,
@@ -503,6 +504,7 @@ function delegationTool(
         await activeRuntime.completeChild(entry.node.id, completedOutput);
         return completedOutput;
       } catch (error) {
+        rethrowDelegationInterruption(error, activeRuntime.signal);
         await activeRuntime.failChild(entry.node.id, errorMessage(error));
         return JSON.stringify({
           accepted: false,
@@ -517,6 +519,14 @@ function delegationTool(
       }
     }
   });
+}
+
+export function rethrowDelegationInterruption(
+  error: unknown,
+  signal?: AbortSignal
+): void {
+  signal?.throwIfAborted();
+  if (isTransportInterruption(error)) throw error;
 }
 
 function delegatedAgentTool(

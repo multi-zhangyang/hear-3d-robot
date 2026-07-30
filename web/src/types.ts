@@ -459,6 +459,7 @@ export interface RuntimeEvent {
   type: string;
   at: string;
   data: unknown;
+  durable?: boolean;
 }
 
 export type StreamState = "inactive" | "connecting" | "connected" | "disconnected";

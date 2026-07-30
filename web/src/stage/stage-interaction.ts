@@ -9,6 +9,7 @@ export interface FirstPersonLook {
 export interface FirstPersonStatus {
   available: boolean;
   locked: boolean;
+  touch: boolean;
 }
 
 interface StageInteractionOptions {
@@ -22,9 +23,13 @@ interface PointerStart {
   id: number;
   x: number;
   y: number;
+  lastX: number;
+  lastY: number;
+  dragged: boolean;
 }
 
 const LOOK_SENSITIVITY = 0.0022;
+const TOUCH_LOOK_SENSITIVITY = 0.003;
 const MAX_PITCH = THREE.MathUtils.degToRad(82);
 const MAX_CLICK_TRAVEL_SQUARED = 36;
 
@@ -32,6 +37,8 @@ export class StageInteraction {
   readonly #canvas: HTMLCanvasElement;
   readonly #options: StageInteractionOptions;
   readonly #pointerLockAvailable: boolean;
+  readonly #touchLookAvailable: boolean;
+  #touchHint: boolean;
   #pointerStart: PointerStart | null = null;
   #look: FirstPersonLook = { yaw: 0, pitch: 0 };
 
@@ -40,9 +47,12 @@ export class StageInteraction {
     this.#options = options;
     this.#pointerLockAvailable = typeof canvas.requestPointerLock === "function"
       && window.matchMedia?.("(hover: hover) and (pointer: fine)").matches === true
-      && window.innerWidth > 560
-      && navigator.maxTouchPoints === 0;
+      && window.innerWidth > 560;
+    this.#touchLookAvailable = navigator.maxTouchPoints > 0
+      || window.matchMedia?.("(pointer: coarse)").matches === true;
+    this.#touchHint = this.#touchLookAvailable && !this.#pointerLockAvailable;
     canvas.addEventListener("pointerdown", this.#handlePointerDown);
+    canvas.addEventListener("pointermove", this.#handlePointerMove);
     canvas.addEventListener("pointerup", this.#handlePointerUp);
     canvas.addEventListener("pointercancel", this.#handlePointerCancel);
     document.addEventListener("mousemove", this.#handleMouseMove);
@@ -70,6 +80,7 @@ export class StageInteraction {
 
   dispose(): void {
     this.#canvas.removeEventListener("pointerdown", this.#handlePointerDown);
+    this.#canvas.removeEventListener("pointermove", this.#handlePointerMove);
     this.#canvas.removeEventListener("pointerup", this.#handlePointerUp);
     this.#canvas.removeEventListener("pointercancel", this.#handlePointerCancel);
     document.removeEventListener("mousemove", this.#handleMouseMove);
@@ -80,7 +91,48 @@ export class StageInteraction {
 
   readonly #handlePointerDown = (event: PointerEvent): void => {
     if (!event.isPrimary || event.button !== 0) return;
-    this.#pointerStart = { id: event.pointerId, x: event.clientX, y: event.clientY };
+    const touch = event.pointerType === "touch";
+    if (this.#touchLookAvailable && this.#pointerLockAvailable && this.#touchHint !== touch) {
+      this.#touchHint = touch;
+      this.#publishStatus();
+    }
+    this.#pointerStart = {
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      dragged: false
+    };
+    if (event.pointerType === "touch" && this.#options.getCameraMode() === "sensor") {
+      event.preventDefault();
+      this.#canvas.setPointerCapture?.(event.pointerId);
+    }
+  };
+
+  readonly #handlePointerMove = (event: PointerEvent): void => {
+    const start = this.#pointerStart;
+    if (!start || start.id !== event.pointerId || !event.isPrimary) return;
+    const travelled = (event.clientX - start.x) ** 2 + (event.clientY - start.y) ** 2;
+    const dragged = start.dragged || travelled > MAX_CLICK_TRAVEL_SQUARED;
+    const movementX = event.clientX - (start.dragged ? start.lastX : start.x);
+    const movementY = event.clientY - (start.dragged ? start.lastY : start.y);
+    this.#pointerStart = {
+      ...start,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      dragged
+    };
+    if (!dragged || event.pointerType !== "touch"
+      || this.#options.getCameraMode() !== "sensor") return;
+    event.preventDefault();
+    this.#look = nextFirstPersonLook(
+      this.#look,
+      movementX,
+      movementY,
+      TOUCH_LOOK_SENSITIVITY
+    );
+    this.#options.onLook();
   };
 
   readonly #handlePointerUp = (event: PointerEvent): void => {
@@ -88,7 +140,7 @@ export class StageInteraction {
     this.#pointerStart = null;
     if (!start || start.id !== event.pointerId || !event.isPrimary || event.button !== 0) return;
     const travelled = (event.clientX - start.x) ** 2 + (event.clientY - start.y) ** 2;
-    if (travelled > MAX_CLICK_TRAVEL_SQUARED) return;
+    if (start.dragged || travelled > MAX_CLICK_TRAVEL_SQUARED) return;
 
     const firstPerson = this.#options.getCameraMode() === "sensor";
     const locked = document.pointerLockElement === this.#canvas;
@@ -137,8 +189,9 @@ export class StageInteraction {
 
   #publishStatus(): void {
     this.#options.onFirstPersonStatus({
-      available: this.#pointerLockAvailable,
-      locked: document.pointerLockElement === this.#canvas
+      available: this.#pointerLockAvailable || this.#touchLookAvailable,
+      locked: document.pointerLockElement === this.#canvas,
+      touch: this.#touchHint
     });
   }
 }

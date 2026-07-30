@@ -34,6 +34,62 @@ interface RuntimeFixture {
   activeId: string;
 }
 
+interface UnstartedRuntimeFixture {
+  runsDir: string;
+  scenario: Scenario;
+  store: RunStore;
+  world: RapierWorld;
+  runtime: HarnessRuntimeContext;
+}
+
+async function createUnstartedRuntimeFixture(
+  eventSink?: RuntimeEventSink
+): Promise<UnstartedRuntimeFixture> {
+  const runsDir = await mkdtemp(join(tmpdir(), "hear-runtime-lifecycle-"));
+  const catalog = await loadRuntimeCatalog();
+  const scenario = catalog.materialize("open_navigation", 0);
+  const goal: Goal = {
+    summary: "Robot remains at the requested coordinate.",
+    predicates: [
+      { type: "robot_at", target: { x: 1, y: 0, z: 1 }, tolerance: 0.25 }
+    ]
+  };
+  const store = await RunStore.create(runsDir, {
+    mission: "Maintain the requested robot state",
+    scenarioId: "open_navigation",
+    scenario,
+    goal
+  });
+  const world = await RapierWorld.create(scenario);
+  const available = capabilityCatalog();
+  const hierarchy = HierarchyProjection.create(
+    "Maintain the requested robot state",
+    available,
+    goal.predicates.length
+  );
+  const checkpoint = createCheckpoint({
+    store,
+    hierarchy,
+    capabilityCatalog: available,
+    world
+  });
+  await store.writeCheckpoint(checkpoint);
+  return {
+    runsDir,
+    scenario,
+    store,
+    world,
+    runtime: new HarnessRuntimeContext({
+      store,
+      goal,
+      world,
+      hierarchy,
+      checkpoint,
+      ...(eventSink ? { eventSink } : {})
+    })
+  };
+}
+
 async function createRuntimeFixture(
   capabilities: string[],
   eventSink?: RuntimeEventSink,
@@ -166,8 +222,9 @@ function runtimeEventTransactionId(value: unknown): string | undefined {
 }
 
 async function resumedRuntime(
-  fixture: RuntimeFixture,
-  checkpoint: RunCheckpoint
+  fixture: Pick<RuntimeFixture, "scenario" | "store">,
+  checkpoint: RunCheckpoint,
+  eventSink?: RuntimeEventSink
 ): Promise<{ world: RapierWorld; runtime: HarnessRuntimeContext }> {
   const world = await RapierWorld.create(fixture.scenario, checkpoint.world);
   const hierarchy = new HierarchyProjection(
@@ -183,12 +240,137 @@ async function resumedRuntime(
       goal: fixture.store.definition.goal,
       world,
       hierarchy,
-      checkpoint
+      checkpoint,
+      ...(eventSink ? { eventSink } : {})
     })
   };
 }
 
 describe("HarnessRuntimeContext", () => {
+  it("recovers a started lifecycle event after its first journal append fails", async () => {
+    const fixture = await createUnstartedRuntimeFixture();
+    let resumedWorld: RapierWorld | undefined;
+    const originalAppend = fixture.store.append.bind(fixture.store);
+    const append = vi.spyOn(fixture.store, "append").mockImplementation(async (name, value) => {
+      if (name === "events" && objectRecord(value)?.type === "run_started") {
+        throw new Error("event journal unavailable");
+      }
+      await originalAppend(name, value);
+    });
+    try {
+      await expect(fixture.runtime.start()).rejects.toThrow("event journal unavailable");
+      append.mockRestore();
+
+      const pending = await fixture.store.readCheckpoint();
+      expect(pending.status).toBe("running");
+      expect(pending.pending_lifecycle_events).toHaveLength(1);
+      expect(pending.pending_lifecycle_events[0]).toMatchObject({ type: "run_started" });
+      expect(await fixture.store.readJournal("events")).toEqual([]);
+
+      const delivered: RuntimeEvent[] = [];
+      const resumed = await resumedRuntime(fixture, pending, (event) => delivered.push(event));
+      resumedWorld = resumed.world;
+      await resumed.runtime.start(true);
+
+      const lifecycle = (await fixture.store.readJournal("events"))
+        .filter((entry) => ["run_started", "run_resumed"].includes(
+          String(objectRecord(entry)?.type)
+        ));
+      expect(lifecycle.map((entry) => objectRecord(entry)?.type)).toEqual([
+        "run_started",
+        "run_resumed"
+      ]);
+      expect(new Set(lifecycle.map((entry) => objectRecord(entry)?.event_id)).size).toBe(2);
+      expect(delivered.map((event) => event.type)).toEqual(["run_started", "run_resumed"]);
+      expect((await fixture.store.readCheckpoint()).pending_lifecycle_events).toEqual([]);
+    } finally {
+      append.mockRestore();
+      resumedWorld?.dispose();
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("does not duplicate a lifecycle event when clearing its published outbox fails", async () => {
+    const fixture = await createUnstartedRuntimeFixture();
+    let resumedWorld: RapierWorld | undefined;
+    const originalWrite = fixture.store.writeCheckpoint.bind(fixture.store);
+    let writes = 0;
+    const write = vi.spyOn(fixture.store, "writeCheckpoint")
+      .mockImplementation(async (checkpoint) => {
+        writes += 1;
+        if (writes === 2) throw new Error("checkpoint clear unavailable");
+        await originalWrite(checkpoint);
+      });
+    try {
+      await expect(fixture.runtime.start()).rejects.toThrow("checkpoint clear unavailable");
+      write.mockRestore();
+
+      const pending = await fixture.store.readCheckpoint();
+      expect(pending.pending_lifecycle_events).toHaveLength(1);
+      expect((await fixture.store.readJournal("events")).filter(
+        (entry) => objectRecord(entry)?.type === "run_started"
+      )).toHaveLength(1);
+
+      const delivered: RuntimeEvent[] = [];
+      const resumed = await resumedRuntime(fixture, pending, (event) => delivered.push(event));
+      resumedWorld = resumed.world;
+      await resumed.runtime.start(true);
+
+      expect((await fixture.store.readJournal("events")).filter(
+        (entry) => objectRecord(entry)?.type === "run_started"
+      )).toHaveLength(1);
+      expect(delivered.map((event) => event.type)).toEqual(["run_resumed"]);
+      expect((await fixture.store.readCheckpoint()).pending_lifecycle_events).toEqual([]);
+    } finally {
+      write.mockRestore();
+      resumedWorld?.dispose();
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("recovers an interrupted lifecycle event before resuming a terminal checkpoint", async () => {
+    const fixture = await createRuntimeFixture(["set_head_target"]);
+    let resumedWorld: RapierWorld | undefined;
+    const originalAppend = fixture.store.append.bind(fixture.store);
+    const append = vi.spyOn(fixture.store, "append").mockImplementation(async (name, value) => {
+      if (name === "events" && objectRecord(value)?.type === "run_interrupted") {
+        throw new Error("terminal event journal unavailable");
+      }
+      await originalAppend(name, value);
+    });
+    try {
+      await expect(fixture.runtime.interrupt("operator stopped"))
+        .rejects.toThrow("terminal event journal unavailable");
+      append.mockRestore();
+
+      const interrupted = await fixture.store.readCheckpoint();
+      expect(interrupted.status).toBe("interrupted");
+      expect(interrupted.pending_lifecycle_events).toHaveLength(1);
+      expect(interrupted.pending_lifecycle_events[0]).toMatchObject({
+        type: "run_interrupted",
+        data: { reason: "operator stopped" }
+      });
+
+      const delivered: RuntimeEvent[] = [];
+      const resumed = await resumedRuntime(fixture, interrupted, (event) => delivered.push(event));
+      resumedWorld = resumed.world;
+      await resumed.runtime.start(true);
+
+      expect((await fixture.store.readJournal("events")).filter(
+        (entry) => objectRecord(entry)?.type === "run_interrupted"
+      )).toHaveLength(1);
+      expect(delivered.map((event) => event.type)).toEqual([
+        "run_interrupted",
+        "run_resumed"
+      ]);
+      expect((await fixture.store.readCheckpoint()).pending_lifecycle_events).toEqual([]);
+    } finally {
+      append.mockRestore();
+      resumedWorld?.dispose();
+      await disposeFixture(fixture);
+    }
+  });
+
   it("commits one receipt when a skill transaction is reused with identical data", async () => {
     const fixture = await createRuntimeFixture(["set_head_target"]);
     try {
@@ -1021,6 +1203,82 @@ describe("HarnessRuntimeContext", () => {
         [{ criterion_index: 0, transaction_ids: [transactionId] }],
         [0]
       )).toThrow("Blocker evidence requires a rejected transaction");
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("rejects an accepted observation as blocker evidence for an unmet goal predicate", async () => {
+    const fixture = await createRuntimeFixture(["drive_base"], undefined, 1);
+    try {
+      await fixture.runtime.invokeSkill(
+        "drive_base",
+        {
+          linear_meters_per_second: 0.4,
+          angular_radians_per_second: 0,
+          duration_seconds: 1
+        },
+        "sdk_leave_goal"
+      );
+      await fixture.runtime.completeChild(fixture.activeId, "Robot left the goal");
+
+      const blocker = await fixture.runtime.beginDelegation(
+        null,
+        {
+          name: "Goal blocker leaf",
+          objective: "Reach the requested robot position or prove a physical blocker",
+          success_criteria: ["The requested robot position is reached."],
+          evidence_requirements: [{
+            kind: "goal_predicate",
+            criterion_index: 0,
+            predicate_index: 0
+          }],
+          goal_predicate_indexes: [0],
+          capabilities: ["read_proprioception", "drive_base"],
+          may_delegate: false,
+          references: []
+        },
+        "delegate_goal_blocker"
+      );
+      await fixture.runtime.invokeTool(
+        "read_proprioception",
+        {},
+        "sdk_irrelevant_goal_observation",
+        blocker.node.id
+      );
+      const transactionId = `${blocker.node.id}:sdk_irrelevant_goal_observation`;
+
+      expect(() => fixture.runtime.assertChildEvidence(
+        blocker.node.id,
+        "blocked",
+        [{ criterion_index: 0, transaction_ids: [transactionId] }],
+        [0]
+      )).toThrow("requires a rejected physical transaction");
+    } finally {
+      await disposeFixture(fixture);
+    }
+  }, 10_000);
+
+  it("rejects a planning protocol error as body-motion blocker evidence", async () => {
+    const fixture = await createRuntimeFixture(["execute_base_plan"]);
+    try {
+      const output = outputRecord(await fixture.runtime.invokeSkill(
+        "execute_base_plan",
+        { planning_transaction_id: "missing_planning_transaction" },
+        "sdk_protocol_blocker"
+      ));
+      expect(output).toMatchObject({
+        accepted: false,
+        code: "unknown_planning_transaction"
+      });
+      const transactionId = `${fixture.activeId}:sdk_protocol_blocker`;
+
+      expect(() => fixture.runtime.assertChildEvidence(
+        fixture.activeId,
+        "blocked",
+        [{ criterion_index: 0, transaction_ids: [transactionId] }],
+        [0]
+      )).toThrow("non-terminal code unknown_planning_transaction");
     } finally {
       await disposeFixture(fixture);
     }

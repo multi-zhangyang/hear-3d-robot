@@ -27,7 +27,8 @@ function RobotStageComponent({
   const [selection, setSelection] = useState<WorldSelection | null>(null);
   const [firstPerson, setFirstPerson] = useState<FirstPersonStatus>({
     available: false,
-    locked: false
+    locked: false,
+    touch: false
   });
   const stageRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<StageController | null>(null);

@@ -40,6 +40,7 @@ import {
   asRecord,
   isAbortError,
   latestProviderActivity,
+  nextRuntimeEventCursor,
   providerActivityFrom,
   updateRunListStatus,
   worldSnapshotsFrom
@@ -189,7 +190,14 @@ export function App(): React.JSX.Element {
 
   const handleRuntimeEvent = useCallback((runId: string, event: RuntimeEvent): void => {
     if (selectedRunRef.current !== runId) return;
-    eventCursorRef.current = { runId, eventId: event.event_id };
+    const previousCursor = eventCursorRef.current?.runId === runId
+      ? eventCursorRef.current.eventId
+      : undefined;
+    const nextCursor = nextRuntimeEventCursor(previousCursor, event);
+    eventCursorRef.current = {
+      runId,
+      ...(nextCursor === undefined ? {} : { eventId: nextCursor })
+    };
     const floor = eventFloorRef.current;
     // Events at or before the snapshot the details were loaded from are already
     // reflected in that snapshot; replaying them would double-count steps.

@@ -95,6 +95,7 @@ export function createStage(
   terrainSurface?.update(currentSnapshot.voxels);
   let lastSynchronizedVersion = frameBuffer.version;
   let cameraMode: CameraMode = "robot";
+  let canvasWidth = 1;
   let live = initiallyLive;
   let fitted = false;
   let lastRobotPosition: Vec3 | null = null;
@@ -243,7 +244,8 @@ export function createStage(
   const resize = (): void => {
     const width = Math.max(1, host.clientWidth);
     const height = Math.max(1, host.clientHeight);
-    renderer.domElement.style.touchAction = width <= 560 ? "pan-y" : "none";
+    canvasWidth = width;
+    renderer.domElement.style.touchAction = cameraMode === "sensor" || width > 560 ? "none" : "pan-y";
     renderer.setPixelRatio(renderPixelRatio(width, height, window.devicePixelRatio));
     renderer.setSize(width, height, false);
     camera.aspect = width / height;
@@ -265,6 +267,7 @@ export function createStage(
     },
     setCameraMode: (mode) => {
       cameraMode = mode;
+      renderer.domElement.style.touchAction = mode === "sensor" || canvasWidth > 560 ? "none" : "pan-y";
       interaction.setCameraMode(mode);
       controls.enabled = mode !== "sensor";
       scene.fog = mode === "world" ? worldFog : robotFog;

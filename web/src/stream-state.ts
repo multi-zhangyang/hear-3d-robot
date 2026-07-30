@@ -4,9 +4,18 @@ import type {
   ContextMemoryState,
   ProviderActivity,
   RunListItem,
+  RuntimeEvent,
   TaskNode,
   WorldSnapshot
 } from "./types";
+
+export function nextRuntimeEventCursor(
+  current: string | undefined,
+  event: RuntimeEvent
+): string | undefined {
+  const durable = event.durable ?? event.type !== "world_frames";
+  return durable ? event.event_id : current;
+}
 
 export function mergeWorldFrames(
   current: WorldSnapshot[],

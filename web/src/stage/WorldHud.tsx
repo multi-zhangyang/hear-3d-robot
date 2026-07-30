@@ -65,9 +65,11 @@ export function WorldHud(props: WorldHudProps): React.JSX.Element {
           {props.firstPerson.available && (
             <div
               className={props.firstPerson.locked ? "first-person-status locked" : "first-person-status"}
-              aria-label="第一人称鼠标锁定"
+              aria-label="第一人称视角交互"
             >
-              {props.firstPerson.locked ? "移动鼠标观察 · ESC 退出" : "单击进入视角"}
+              {props.firstPerson.locked
+                ? "移动鼠标观察 · ESC 退出"
+                : props.firstPerson.touch ? "拖动屏幕观察" : "单击进入视角"}
             </div>
           )}
         </>
