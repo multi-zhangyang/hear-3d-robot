@@ -15,7 +15,10 @@ import {
 import { coordinatorInstructions, workerInstructions } from "./agent-prompts.js";
 import { receiptEvidenceRequirement } from "./evidence-contract.js";
 import type { HarnessRuntimeContext } from "./runtime-context.js";
-import { isTransportInterruption } from "../runtime/transport-recovery.js";
+import {
+  isTransportInterruption,
+  transportRetryPlan
+} from "../runtime/transport-recovery.js";
 
 const provider: ProviderConfig = {
   protocol: "openai_compatible",
@@ -172,7 +175,14 @@ describe("agent tool topology", () => {
     const hierarchy = createAgentHierarchy({
       createModel: () => ({
         getResponse: async () => {
-          throw { statusCode: 503, error: { message: "upstream unavailable" } };
+          throw {
+            statusCode: 503,
+            responseHeaders: {
+              "retry-after": "45",
+              "set-cookie": "must-not-survive-normalization"
+            },
+            error: { message: "upstream unavailable" }
+          };
         },
         getStreamedResponse: () => {
           throw new Error("Streaming is outside this test");
@@ -189,8 +199,14 @@ describe("agent tool topology", () => {
       caught = error;
     }
     expect(caught).toBeInstanceOf(Error);
-    expect(caught).toMatchObject({ name: "ModelTransportError", statusCode: 503 });
+    expect(caught).toMatchObject({
+      name: "ModelTransportError",
+      statusCode: 503,
+      responseHeaders: { "retry-after": "45" }
+    });
+    expect(caught).not.toHaveProperty("responseHeaders.set-cookie");
     expect(isTransportInterruption(caught)).toBe(true);
+    expect(transportRetryPlan(caught, 1).waitMs).toBe(45_000);
   });
 
   it("rethrows nested transport and abort failures before business handling", () => {

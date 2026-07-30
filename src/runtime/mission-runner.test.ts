@@ -139,7 +139,12 @@ describe("initial model transport recovery", () => {
   it("restores the opening Session baseline after bounded retries are exhausted", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-mission-opening-transport-"));
     fakeRunner.behavior = "opening_transport_failure";
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
+    const retryDelays: number[] = [];
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      callback: () => void,
+      milliseconds?: number
+    ) => {
+      retryDelays.push(milliseconds ?? 0);
       queueMicrotask(callback);
       return {} as NodeJS.Timeout;
     }) as typeof setTimeout);
@@ -155,9 +160,25 @@ describe("initial model transport recovery", () => {
       const store = await RunStore.open(runDirectories[0]!);
       const checkpoint = await store.readCheckpoint();
       const session = new FileSession(store.sessionPath(), checkpoint.run_id);
+      const provider = (await store.readJournal("provider"))
+        .map(eventRecord)
+        .filter((entry) => entry?.status === "transport_interrupted");
 
       expect(await store.readAgentState()).toBeUndefined();
       expect(await session.getItems()).toEqual([]);
+      expect(retryDelays).toEqual([2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000]);
+      expect(provider).toHaveLength(8);
+      expect(provider[0]).toMatchObject({
+        recovery_attempt: 1,
+        retry_after_ms: 2_000,
+        exponential_backoff_ms: 2_000,
+        retry_source: "exponential_backoff"
+      });
+      expect(provider.at(-1)).toMatchObject({
+        recovery_attempt: 8,
+        retry_after_ms: 30_000,
+        exponential_backoff_ms: 30_000
+      });
       expect(checkpoint).toMatchObject({
         status: "interrupted",
         error: expect.stringContaining("opening model transport unavailable")

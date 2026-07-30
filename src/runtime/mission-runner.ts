@@ -37,7 +37,8 @@ import { assertGoalSupported } from "./goal-validation.js";
 import { errorMessage } from "./error-message.js";
 import {
   canReplayInitialModelRequest,
-  isTransportInterruption
+  isTransportInterruption,
+  transportRetryPlan
 } from "./transport-recovery.js";
 import {
   assertRunStateMatchesOpenRootDelegations,
@@ -64,11 +65,6 @@ type SdkBranchRotationSource =
   | "checkpoint_not_resumable"
   | "sdk_state_checkpoint_mismatch"
   | "sdk_state_incompatible";
-
-/** Exponential backoff, capped, so a throttled provider is given room to recover. */
-function transportBackoffMs(attempt: number): number {
-  return Math.min(2_000 * 2 ** (attempt - 1), 30_000);
-}
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -497,15 +493,24 @@ async function executeMission(input: {
         }
 
         recoveries += 1;
-        const waitMs = transportBackoffMs(recoveries);
+        const retry = transportRetryPlan(error, recoveries);
         await input.runtime.recordProvider({
           status: "transport_interrupted",
           error: errorMessage(error),
           recovery_attempt: recoveries,
-          retry_after_ms: waitMs,
+          retry_after_ms: retry.waitMs,
+          exponential_backoff_ms: retry.backoffMs,
+          ...(retry.retryAfterMs === null
+            ? { retry_source: "exponential_backoff" }
+            : {
+                server_retry_after_ms: retry.retryAfterMs,
+                retry_source: retry.retryAfterMs > retry.backoffMs
+                  ? "server_retry_after"
+                  : "exponential_backoff"
+              }),
           initial_request_retried: retryingInitialRequest
         });
-        await delay(waitMs, input.signal);
+        await delay(retry.waitMs, input.signal);
         serializedState = persisted;
       }
     }

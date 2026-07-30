@@ -4,7 +4,8 @@ import { describe, expect, it } from "vitest";
 import { RunCheckpointSchema } from "../domain/schema.js";
 import {
   canReplayInitialModelRequest,
-  isTransportInterruption
+  isTransportInterruption,
+  transportRetryPlan
 } from "./transport-recovery.js";
 
 describe("isTransportInterruption", () => {
@@ -155,5 +156,65 @@ describe("isTransportInterruption", () => {
     const compacted = structuredClone(inputJournalChanged);
     compacted.context_memory.total_compactions = 1;
     expect(canReplayInitialModelRequest(checkpoint, compacted)).toBe(false);
+  });
+});
+
+describe("transportRetryPlan", () => {
+  it("uses bounded exponential backoff when the server provides no hint", () => {
+    expect(transportRetryPlan(new Error("offline"), 1)).toEqual({
+      backoffMs: 2_000,
+      retryAfterMs: null,
+      waitMs: 2_000
+    });
+    expect(transportRetryPlan(new Error("offline"), 5)).toEqual({
+      backoffMs: 30_000,
+      retryAfterMs: null,
+      waitMs: 30_000
+    });
+    expect(transportRetryPlan(new Error("offline"), 40).backoffMs).toBe(30_000);
+  });
+
+  it("honors a standard Retry-After delay without shortening local backoff", () => {
+    const longer = Object.assign(new Error("throttled"), {
+      statusCode: 429,
+      responseHeaders: { "Retry-After": "75" }
+    });
+    expect(transportRetryPlan(longer, 1)).toEqual({
+      backoffMs: 2_000,
+      retryAfterMs: 75_000,
+      waitMs: 75_000
+    });
+
+    const shorter = Object.assign(new Error("throttled"), {
+      response: { headers: new Headers({ "retry-after": "1" }) }
+    });
+    expect(transportRetryPlan(shorter, 3)).toEqual({
+      backoffMs: 8_000,
+      retryAfterMs: 1_000,
+      waitMs: 8_000
+    });
+  });
+
+  it("accepts HTTP-date hints, ignores malformed values and caps extreme waits", () => {
+    const now = Date.parse("2026-07-30T16:00:00.000Z");
+    const dated = Object.assign(new Error("maintenance"), {
+      headers: { "retry-after": "Wed, 30 Jul 2026 16:01:30 GMT" }
+    });
+    expect(transportRetryPlan(dated, 1, now).retryAfterMs).toBe(90_000);
+
+    const malformed = Object.assign(new Error("maintenance"), {
+      responseHeaders: { "retry-after": "later" }
+    });
+    expect(transportRetryPlan(malformed, 1, now).retryAfterMs).toBeNull();
+
+    const extreme = Object.assign(new Error("maintenance"), {
+      responseHeaders: { "retry-after": "86400" }
+    });
+    expect(transportRetryPlan(extreme, 1, now).retryAfterMs).toBe(300_000);
+  });
+
+  it("rejects invalid attempt counters", () => {
+    expect(() => transportRetryPlan(new Error("offline"), 0))
+      .toThrow("positive safe integer");
   });
 });

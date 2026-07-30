@@ -36,6 +36,15 @@ const TRANSPORT_ERROR_CODES = new Set([
 
 /** Transient 4xx responses that explicitly permit a later attempt. */
 const RETRYABLE_CLIENT_STATUS_CODES = new Set([408, 409, 425, 429]);
+const INITIAL_TRANSPORT_BACKOFF_MS = 2_000;
+const MAXIMUM_TRANSPORT_BACKOFF_MS = 30_000;
+const MAXIMUM_SERVER_RETRY_AFTER_MS = 5 * 60_000;
+
+export interface TransportRetryPlan {
+  backoffMs: number;
+  retryAfterMs: number | null;
+  waitMs: number;
+}
 
 /**
  * True when the failure is the connection rather than the conversation, so
@@ -63,10 +72,98 @@ export function isTransportInterruption(error: unknown): boolean {
   return false;
 }
 
+/**
+ * Combines bounded exponential backoff with the standard HTTP Retry-After
+ * signal. A server hint may lengthen the wait but can never accelerate the
+ * local backoff, and an extreme hint is capped so the mission remains
+ * interruptible and resumable instead of sleeping inside one process forever.
+ */
+export function transportRetryPlan(
+  error: unknown,
+  attempt: number,
+  now = Date.now()
+): TransportRetryPlan {
+  if (!Number.isSafeInteger(attempt) || attempt < 1) {
+    throw new Error("Transport retry attempt must be a positive safe integer");
+  }
+  if (!Number.isFinite(now)) throw new Error("Transport retry clock must be finite");
+
+  const backoffMs = Math.min(
+    INITIAL_TRANSPORT_BACKOFF_MS * 2 ** Math.min(attempt - 1, 30),
+    MAXIMUM_TRANSPORT_BACKOFF_MS
+  );
+  const retryAfterMs = retryAfterHint(error, now);
+  return {
+    backoffMs,
+    retryAfterMs,
+    waitMs: Math.max(backoffMs, retryAfterMs ?? 0)
+  };
+}
+
 function isRetryableStatus(status: number): boolean {
   // Server-side failures may clear without changing the request. Other 4xx
   // responses describe a request/authentication problem and must terminate.
   return RETRYABLE_CLIENT_STATUS_CODES.has(status) || (status >= 500 && status <= 599);
+}
+
+function retryAfterHint(error: unknown, now: number): number | null {
+  let longest: number | null = null;
+  for (const link of errorChain(error)) {
+    for (const headers of headerContainers(link)) {
+      const value = headerValue(headers, "retry-after");
+      if (value === undefined) continue;
+      const parsed = parseRetryAfter(value, now);
+      if (parsed !== null) longest = Math.max(longest ?? 0, parsed);
+    }
+  }
+  return longest;
+}
+
+function headerContainers(value: unknown): unknown[] {
+  if (value === null || typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  const containers = [record.responseHeaders, record.headers];
+  const response = record.response;
+  if (response !== null && typeof response === "object") {
+    containers.push((response as Record<string, unknown>).headers);
+  }
+  return containers.filter((container) => container !== undefined);
+}
+
+function headerValue(headers: unknown, name: string): string | undefined {
+  if (headers === null || typeof headers !== "object") return undefined;
+  const getter = (headers as { get?: unknown }).get;
+  if (typeof getter === "function") {
+    try {
+      const value = getter.call(headers, name) as unknown;
+      if (typeof value === "string") return value;
+    } catch {
+      return undefined;
+    }
+  }
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== name) continue;
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) {
+      return value.find((entry): entry is string => typeof entry === "string");
+    }
+  }
+  return undefined;
+}
+
+function parseRetryAfter(value: string, now: number): number | null {
+  const normalized = value.trim();
+  if (/^\d+$/.test(normalized)) {
+    const milliseconds = Number(normalized) * 1_000;
+    if (!Number.isSafeInteger(milliseconds)) return MAXIMUM_SERVER_RETRY_AFTER_MS;
+    return Math.min(milliseconds, MAXIMUM_SERVER_RETRY_AFTER_MS);
+  }
+  const timestamp = Date.parse(normalized);
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.min(
+    Math.max(0, timestamp - now),
+    MAXIMUM_SERVER_RETRY_AFTER_MS
+  );
 }
 
 /**

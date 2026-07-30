@@ -5,7 +5,6 @@ import {
   type CallModelInputFilter,
   type FunctionTool,
   type Model,
-  type ModelResponse,
   type ModelSettings,
   type OutputGuardrail,
   type RunContext,
@@ -40,23 +39,23 @@ import {
   evidenceContractGuide
 } from "./evidence-contract.js";
 import {
-  agentIdFromModelPayload,
   agentInvocationMarker,
   currentAgentInvocationId,
   currentAgentInvocationIsRecovery,
   currentAgentInvocationTransportInterruption,
-  recordAgentInvocationTransportInterruption,
   withAgentInvocation
 } from "./agent-scope.js";
 import { HarnessRuntimeContext } from "./runtime-context.js";
 import {
-  modelResponseDisposition,
   providerEventJson,
   sdkEventJson
 } from "./sdk-events.js";
+import { withModelTelemetry } from "./model-telemetry.js";
 
-const MAX_CONSECUTIVE_NO_DECISION_RESPONSES = 4;
-const MAX_ROOT_CONSECUTIVE_NO_DECISION_RESPONSES = 3;
+export {
+  ModelDecisionGuard,
+  ModelDecisionStallError
+} from "./model-telemetry.js";
 
 const CheckerInput = z.object({}).strict();
 const MissionCompletionInput = z.object({
@@ -698,73 +697,6 @@ async function prepareSessionForAgentInvocation(
   return repaired;
 }
 
-function withModelTelemetry(
-  model: Model,
-  runtime: HarnessRuntimeContext,
-  boundAgentId: string
-): Model {
-  const decisionGuard = new ModelDecisionGuard(
-    boundAgentId === runtime.rootAgentId
-      ? MAX_ROOT_CONSECUTIVE_NO_DECISION_RESPONSES
-      : MAX_CONSECUTIVE_NO_DECISION_RESPONSES
-  );
-  const wrapped: Model = {
-    getResponse: async (request) => {
-      const agentId = agentIdFromModelPayload(request, runtime.rootAgentId);
-      assertModelBinding(boundAgentId, agentId);
-      runtime.activeNode(agentId);
-      await runtime.recordModelCallStarted(agentId);
-      try {
-        const response = await model.getResponse(request);
-        decisionGuard.observe(agentId, response.output);
-        return response;
-      } catch (error) {
-        throw preserveModelInterruption(error);
-      }
-    },
-    getStreamedResponse: (request) => claimAndStream(
-      model,
-      runtime,
-      decisionGuard,
-      boundAgentId,
-      request
-    ),
-    ...(model.getRetryAdvice
-      ? { getRetryAdvice: (request) => model.getRetryAdvice!(request) }
-      : {})
-  };
-  return wrapped;
-}
-
-async function* claimAndStream(
-  model: Model,
-  runtime: HarnessRuntimeContext,
-  decisionGuard: ModelDecisionGuard,
-  boundAgentId: string,
-  request: Parameters<Model["getStreamedResponse"]>[0]
-) {
-  const agentId = agentIdFromModelPayload(request, runtime.rootAgentId);
-  assertModelBinding(boundAgentId, agentId);
-  runtime.activeNode(agentId);
-  await runtime.recordModelCallStarted(agentId);
-  try {
-    for await (const event of model.getStreamedResponse(request)) {
-      yield event;
-      if (event.type === "response_done") decisionGuard.observe(agentId, event.response.output);
-    }
-  } catch (error) {
-    throw preserveModelInterruption(error);
-  }
-}
-
-function preserveModelInterruption(error: unknown): Error {
-  const normalized = asError(error);
-  if (isTransportInterruption(normalized)) {
-    recordAgentInvocationTransportInterruption(normalized);
-  }
-  return normalized;
-}
-
 async function restoreInterruptedSession(
   session: Session | undefined,
   baseline: AgentInputItem[] | undefined,
@@ -798,92 +730,6 @@ function atomicSessionReplace(
     replaceItems?: (items: AgentInputItem[]) => Promise<void>;
   }).replaceItems;
   return replaceItems ? (items) => replaceItems.call(session, items) : undefined;
-}
-
-function assertModelBinding(boundAgentId: string, requestAgentId: string): void {
-  if (boundAgentId !== requestAgentId) {
-    throw new Error(
-      `Model binding mismatch: ${boundAgentId} cannot execute ${requestAgentId}'s turn`
-    );
-  }
-}
-
-/**
- * Tool choice is required for every HEAR agent. Some compatible endpoints can
- * nevertheless return reasoning or prose without the required call. The SDK
- * asks again, which is useful once but becomes an unbounded loop if prose keeps
- * resetting the counter. This guard counts every response without a tool
- * decision, never supplies a decision and never swaps models. A failed leaf
- * returns control to its model-run parent, which may delegate fresh recovery;
- * the root fails explicitly if it cannot decide either.
- */
-export class ModelDecisionGuard {
-  readonly #consecutive = new Map<string, number>();
-
-  constructor(
-    readonly maximumConsecutiveResponses = MAX_CONSECUTIVE_NO_DECISION_RESPONSES
-  ) {
-    if (!Number.isInteger(maximumConsecutiveResponses) || maximumConsecutiveResponses < 1) {
-      throw new Error("Model decision threshold must be a positive integer");
-    }
-  }
-
-  observe(agentId: string, output: ModelResponse["output"]): void {
-    const { hasDecision } = modelResponseDisposition(output);
-    if (hasDecision) {
-      this.#consecutive.set(agentId, 0);
-      return;
-    }
-    const consecutive = (this.#consecutive.get(agentId) ?? 0) + 1;
-    this.#consecutive.set(agentId, consecutive);
-    if (consecutive >= this.maximumConsecutiveResponses) {
-      // A fresh Runner turn gets a fresh correction prompt. Reset this local
-      // counter before surfacing the stall so a valid decision on that turn is
-      // not poisoned by the prior blank responses.
-      this.#consecutive.set(agentId, 0);
-      throw new ModelDecisionStallError(
-        agentId,
-        `Configured model returned ${consecutive} consecutive responses `
-        + "without the required tool decision"
-      );
-    }
-  }
-}
-
-export class ModelDecisionStallError extends Error {
-  readonly agentId: string;
-
-  constructor(agentId: string, message: string) {
-    super(message);
-    this.name = "ModelDecisionStallError";
-    this.agentId = agentId;
-  }
-}
-
-/**
- * A transport failure is only as useful as what survives to the journal, and the
- * SDK renders a failed tool with `error.toString()` — so anything thrown that is
- * not an `Error` reaches the run as the string `[object Object]`, erasing the
- * status code and cause that say what actually broke. Normalizing at the one
- * place every model call passes through keeps the detail.
- */
-function asError(error: unknown): Error {
-  if (error instanceof Error) return error;
-  const normalized = new Error(errorMessage(error));
-  normalized.name = "ModelTransportError";
-  if (error !== null && typeof error === "object") {
-    const source = error as Record<string, unknown>;
-    const target = normalized as Error & Record<string, unknown>;
-    for (const key of ["status", "statusCode", "code", "type", "request_id", "requestId"] as const) {
-      const value = source[key];
-      if (typeof value === "string" || typeof value === "number") target[key] = value;
-    }
-    // Preserve only links used by the provider-neutral transport classifier.
-    // Diagnostic serialization still redacts sensitive fields recursively.
-    if (source.cause !== undefined) normalized.cause = source.cause;
-    if (Array.isArray(source.errors)) target.errors = source.errors;
-  }
-  return normalized;
 }
 
 function missionCompletionSubmitted(): OutputGuardrail<"text", HarnessAgentContext> {
