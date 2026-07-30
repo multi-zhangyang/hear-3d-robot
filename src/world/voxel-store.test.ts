@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Terrain } from "../domain/schema.js";
+import type { Terrain, VoxelWorldState } from "../domain/schema.js";
 import { VoxelEditError, VoxelStore } from "./voxel-store.js";
 
 const terrain: Terrain = {
@@ -39,6 +39,108 @@ describe("VoxelStore", () => {
     const restored = new VoxelStore(terrain, store.snapshot(2));
     expect(restored.materialAt({ column: 4, level: 0, row: 5 })).toBeNull();
     expect(restored.revision).toBe(2);
+  });
+
+  it("keeps one authoritative overlay record per coordinate across long edit histories", () => {
+    const store = new VoxelStore(terrain);
+    const coordinate = { column: 4, level: 0, row: 5 };
+    store.setLoadedChunks([{ column: 0, row: 0 }]);
+
+    for (let cycle = 0; cycle < 40; cycle += 1) {
+      store.placeBlock(coordinate, "placed", {
+        commandId: `place_${cycle}`,
+        agentId: "builder"
+      });
+      store.breakBlock(coordinate, {
+        commandId: `break_${cycle}`,
+        agentId: "builder"
+      });
+    }
+
+    const snapshot = store.snapshot(2);
+    expect(snapshot.revision).toBe(80);
+    expect(snapshot.mutations).toEqual([
+      expect.objectContaining({
+        coordinate,
+        before: "placed",
+        after: null,
+        revision: 80,
+        source_command_id: "break_39"
+      })
+    ]);
+    expect(snapshot.inventory.placed).toBe(8);
+
+    const restored = new VoxelStore(terrain, snapshot);
+    expect(restored.materialAt(coordinate)).toBeNull();
+    expect(restored.snapshot(2)).toEqual(snapshot);
+  });
+
+  it("compacts legacy duplicate overlays by highest revision during restore", () => {
+    const coordinate = { column: 4, level: 0, row: 5 };
+    const legacy: VoxelWorldState = {
+      version: 1,
+      revision: 3,
+      chunk_size: 16,
+      load_radius_chunks: 2,
+      loaded_chunks: [{ column: 0, row: 0 }],
+      mutations: [
+        {
+          coordinate,
+          before: null,
+          after: "placed",
+          revision: 1,
+          source_command_id: "place_old",
+          source_agent_id: "builder"
+        },
+        {
+          coordinate,
+          before: "placed",
+          after: null,
+          revision: 2,
+          source_command_id: "break_old",
+          source_agent_id: "builder"
+        },
+        {
+          coordinate,
+          before: null,
+          after: "placed",
+          revision: 3,
+          source_command_id: "place_latest",
+          source_agent_id: "builder"
+        }
+      ],
+      inventory: { grass: 0, dirt: 0, stone: 0, sand: 0, placed: 7 }
+    };
+
+    const restored = new VoxelStore(terrain, legacy);
+    expect(restored.materialAt(coordinate)).toBe("placed");
+    expect(restored.snapshot(2).mutations).toEqual([
+      expect.objectContaining({ revision: 3, source_command_id: "place_latest" })
+    ]);
+  });
+
+  it("rejects a restored overlay newer than its declared world revision", () => {
+    const coordinate = { column: 4, level: 0, row: 5 };
+    const invalid: VoxelWorldState = {
+      version: 1,
+      revision: 1,
+      chunk_size: 16,
+      load_radius_chunks: 2,
+      loaded_chunks: [],
+      mutations: [{
+        coordinate,
+        before: null,
+        after: "placed",
+        revision: 2,
+        source_command_id: "future_edit",
+        source_agent_id: "builder"
+      }],
+      inventory: { grass: 0, dirt: 0, stone: 0, sand: 0, placed: 7 }
+    };
+
+    expect(() => new VoxelStore(terrain, invalid)).toThrow(
+      "Voxel mutation revision 2 exceeds world revision 1"
+    );
   });
 
   it("loads only the chunk neighbourhood around the robot", () => {

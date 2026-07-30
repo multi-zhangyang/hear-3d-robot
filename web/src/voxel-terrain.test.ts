@@ -20,6 +20,34 @@ const WIDE_TERRAIN: TerrainDefinition = {
 };
 
 describe("VoxelTerrain", () => {
+  it("compacts a maximum-sized legacy mutation history without argument overflow", () => {
+    const terrain = new VoxelTerrain(TERRAIN, 17);
+    const mutationCount = 150_000;
+    const mutations = Array.from({ length: mutationCount }, (_, index): VoxelMutation => ({
+      coordinate: { column: 0, level: 0, row: 0 },
+      before: index === 0 ? "grass" : index % 2 === 0 ? "stone" : "dirt",
+      after: index === mutationCount - 1
+        ? "placed"
+        : index % 2 === 0 ? "dirt" : "stone",
+      revision: index + 1,
+      source_command_id: `command-${index + 1}`,
+      source_agent_id: "agent-1"
+    }));
+
+    terrain.update(voxelState(
+      mutationCount,
+      [{ column: 0, row: 0 }],
+      mutations
+    ), "");
+
+    expect(terrain.resolveSelection({
+      kind: "voxel",
+      coordinate: { column: 0, level: 0, row: 0 },
+      material: "placed"
+    })?.selection.material).toBe("placed");
+    expect(chunkMesh(terrain, "terrain-chunk-0:0").count).toBe(64);
+  });
+
   it("does not upload unchanged instance colours on every world frame", () => {
     const terrain = new VoxelTerrain(TERRAIN, 17);
     terrain.update(undefined, "");

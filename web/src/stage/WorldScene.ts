@@ -44,7 +44,8 @@ export class WorldScene {
     this.#bounds = scenario.bounds;
     this.#terrain = scenario.terrain ? new VoxelTerrain(scenario.terrain, scenario.seed) : null;
     this.#terrainHeight = scenario.terrain
-      ? Math.max(0, ...scenario.terrain.heights) * scenario.terrain.block
+      ? maximumFiniteBy(scenario.terrain.heights, (height) => height, 0)
+        * scenario.terrain.block
       : 0;
     scene.add(createFloor(scenario.bounds, scenario.terrain?.block));
     scene.add(this.#root);
@@ -105,13 +106,15 @@ export class WorldScene {
 
   worldBounds(snapshot: WorldSnapshot): THREE.Box3 {
     const box = this.robotBounds();
-    const maximumHeight = Math.max(
-      1.4,
-      this.#terrainHeight,
-      ...snapshot.obstacles.map((obstacle) => obstacle.center.y + obstacle.size.y / 2),
-      ...snapshot.objects
-        .filter((object) => object.enabled)
-        .map((object) => object.position.y + object.size.y / 2)
+    const obstacleHeight = maximumFiniteBy(
+      snapshot.obstacles,
+      (obstacle) => obstacle.center.y + obstacle.size.y / 2,
+      Math.max(1.4, this.#terrainHeight)
+    );
+    const maximumHeight = maximumFiniteBy(
+      snapshot.objects,
+      (object) => object.enabled ? object.position.y + object.size.y / 2 : Number.NaN,
+      obstacleHeight
     );
     box.expandByPoint(new THREE.Vector3(0, 0, 0));
     box.expandByPoint(new THREE.Vector3(this.#bounds.width, maximumHeight, this.#bounds.depth));
@@ -253,6 +256,19 @@ export class WorldScene {
     if (selection.entityType === "obstacle") return this.#obstacles.get(selection.id)?.mesh ?? null;
     return this.#zones.get(selection.id)?.mesh ?? null;
   }
+}
+
+function maximumFiniteBy<T>(
+  entries: Iterable<T>,
+  valueOf: (entry: T) => number,
+  minimum: number
+): number {
+  let maximum = Number.isFinite(minimum) ? minimum : 0;
+  for (const entry of entries) {
+    const value = valueOf(entry);
+    if (Number.isFinite(value) && value > maximum) maximum = value;
+  }
+  return maximum;
 }
 
 function createRobotPickProxy(): THREE.Mesh {

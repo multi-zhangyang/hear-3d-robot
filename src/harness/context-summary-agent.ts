@@ -54,7 +54,6 @@ export interface ContextSummaryUsage {
 export interface ContextSummaryResult {
   summary: ContextCompactionSummary;
   origin: "model" | "authority_projection";
-  fallbackReason?: string;
   usage: ContextSummaryUsage;
 }
 
@@ -65,9 +64,9 @@ export interface ContextSummaryGenerator {
 /**
  * A real Agents SDK model run that turns historical model/tool items into a
  * typed checkpoint. Prose-only failures are retried in fresh bounded turns so
- * one bad branch cannot recursively consume the provider window. If every
- * model attempt fails, the safety projection retains only current authority
- * and receipt-backed evidence; it never selects or performs an action.
+ * one bad branch cannot recursively consume the provider window. Failed model
+ * attempts never become a synthetic durable checkpoint: callers must preserve
+ * the uncompressed Session and resume when a real checkpoint can be produced.
  */
 export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator {
   readonly #runner: Runner;
@@ -101,19 +100,20 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
       acceptedTransactionIds: accepted,
       blockerTransactionIds: blockers
     };
-    const estimatedInputTokens = estimateContextSummaryRequestTokens(boundedRequest);
-    if (estimatedInputTokens > request.maxInputTokens) {
-      throw new Error(
-        `Context compactor request is estimated at ${estimatedInputTokens} input tokens, `
-        + `above its ${request.maxInputTokens}-token hard limit`
-      );
-    }
     const usage: ContextSummaryUsage = {
       requests: 0,
       inputTokens: 0,
       outputTokens: 0,
       totalTokens: 0
     };
+    const estimatedInputTokens = estimateContextSummaryRequestTokens(boundedRequest);
+    if (estimatedInputTokens > request.maxInputTokens) {
+      throw new ContextCompactionInterruption(
+        `Context compactor request is estimated at ${estimatedInputTokens} input tokens, `
+        + `above its ${request.maxInputTokens}-token hard limit; no request was sent`,
+        { usage }
+      );
+    }
     const countedModel = withUsageCounter(this.#model, usage);
     let lastFailure: string | undefined;
 
@@ -126,12 +126,19 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
         accepted,
         blockers
       });
+      const prompt = compactionPrompt(boundedRequest, attempt, lastFailure);
+      const attemptInputTokens = estimateContextSummaryPromptTokens(prompt, accepted, blockers);
+      if (attemptInputTokens > request.maxInputTokens) {
+        lastFailure = `Retry prompt requires an estimated ${attemptInputTokens} input tokens, `
+          + `above its ${request.maxInputTokens}-token hard limit; no oversized request was sent`;
+        break;
+      }
       try {
         // Each attempt starts from the same bounded evidence and no Session.
         // Invalid reasoning from a prior attempt is intentionally not replayed.
         const result = await this.#runner.run(
           agent,
-          compactionPrompt(boundedRequest, attempt, lastFailure),
+          prompt,
           {
             maxTurns: CONTEXT_COMPACTOR_TURNS_PER_ATTEMPT,
             ...(request.signal ? { signal: request.signal } : {})
@@ -158,13 +165,47 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
       }
     }
 
-    return {
-      summary: authorityProjectionSummary(boundedRequest),
-      origin: "authority_projection",
-      fallbackReason: lastFailure ?? "Context Compactor returned no valid checkpoint",
-      usage
-    };
+    throw new ContextCompactionInterruption(
+      lastFailure ?? "Context Compactor returned no valid checkpoint",
+      { usage }
+    );
   }
+}
+
+export class ContextCompactionInterruption extends Error {
+  readonly code = "context_compaction_interrupted";
+  readonly usage: ContextSummaryUsage | undefined;
+
+  constructor(
+    detail: string,
+    options: { cause?: unknown; usage?: ContextSummaryUsage } = {}
+  ) {
+    super(`Context compaction interruption: ${detail}`, {
+      ...(options.cause === undefined ? {} : { cause: options.cause })
+    });
+    this.name = "ContextCompactionInterruption";
+    this.usage = options.usage ? { ...options.usage } : undefined;
+  }
+}
+
+export function isContextCompactionInterruption(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (current === null || (typeof current !== "object" && typeof current !== "function")) {
+      continue;
+    }
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (current instanceof ContextCompactionInterruption) return true;
+    const record = current as Record<string, unknown>;
+    if (record.code === "context_compaction_interrupted"
+      || record.name === "ContextCompactionInterruption") return true;
+    if (record.cause !== undefined) pending.push(record.cause);
+    if (Array.isArray(record.errors)) pending.push(...record.errors);
+  }
+  return false;
 }
 
 function compactorAgent(input: {
@@ -238,15 +279,37 @@ function withUsageCounter(model: Model, usage: ContextSummaryUsage): Model {
   };
 }
 
-/** Estimated input for the first compactor turn, including its dynamic schema. */
+/** Worst-case bounded attempt input, including retry diagnostics and dynamic schema. */
 export function estimateContextSummaryRequestTokens(request: ContextSummaryRequest): number {
   const accepted = [...new Set(request.acceptedTransactionIds)];
   const blockers = [...new Set(request.blockerTransactionIds)];
-  const prompt = compactionPrompt({
+  const boundedRequest = {
     ...request,
     acceptedTransactionIds: accepted,
     blockerTransactionIds: blockers
-  });
+  };
+  const first = estimateContextSummaryPromptTokens(
+    compactionPrompt(boundedRequest),
+    accepted,
+    blockers
+  );
+  const retry = estimateContextSummaryPromptTokens(
+    compactionPrompt(
+      boundedRequest,
+      CONTEXT_COMPACTOR_MAX_ATTEMPTS,
+      "界".repeat(600)
+    ),
+    accepted,
+    blockers
+  );
+  return Math.max(first, retry);
+}
+
+function estimateContextSummaryPromptTokens(
+  prompt: string,
+  accepted: string[],
+  blockers: string[]
+): number {
   const structuralEstimate = estimateModelInputTokens({
     input: [{ role: "user", content: prompt }],
     instructions: COMPACTOR_INSTRUCTIONS
@@ -281,50 +344,46 @@ function compactionPrompt(
 }
 
 /**
- * Last-resort continuity made only from current harness authority and receipt
- * allowlists. It intentionally drops free-form decisions and never suggests a
- * concrete movement, pose, or tool argument.
+ * Rebase model-written memory onto a new world identity without replacing its
+ * durable semantics. Constraints, unfinished goals, and revision-independent
+ * decisions survive. Receipt claims are retained only when the caller proves
+ * them current, while concrete action arguments are discarded because plans,
+ * poses, and coordinates are revision-bound capabilities rather than memory.
  */
-export function authorityProjectionSummary(
-  request: ContextSummaryRequest
-): ContextCompactionSummary {
-  const authority = asRecord(request.authority);
-  const goal = asRecord(authority.goal);
-  const goalState = asRecord(authority.goal_state);
-  const goalSummary = typeof goal.summary === "string"
-    ? goal.summary
-    : "Continue the structured mission";
-  const worldRevision = typeof authority.world_revision === "number"
-    ? authority.world_revision
-    : "unknown";
-  const voxelRevision = typeof authority.voxel_revision === "number"
-    ? authority.voxel_revision
-    : "unknown";
-  const checks = Array.isArray(goalState.checks) ? goalState.checks : [];
-  const unmet = checks.flatMap((value) => {
-    const check = asRecord(value);
-    return check.passed === false && typeof check.name === "string" ? [check.name] : [];
-  });
-  const satisfied = goalState.satisfied === true;
+export function rebaseContextSummary(input: {
+  summary: ContextCompactionSummary;
+  acceptedTransactionIds: string[];
+  blockerTransactionIds: string[];
+}): ContextCompactionSummary {
   return {
-    mission_state: `${satisfied ? "satisfied" : "incomplete"}: ${goalSummary}; `
-      + `world_revision=${worldRevision}; voxel_revision=${voxelRevision}`,
-    constraints: [
-      "Current harness authority, current revisions, and committed receipts override this safety projection.",
-      "Re-observe dynamic geometry before actuation; this projection contains no model-selected action."
-    ],
-    decisions: [],
-    completed: retainedEvidence(request.priorSummary?.completed, request.acceptedTransactionIds),
-    pending: satisfied
-      ? []
-      : unmet.length > 0
-        ? unmet.map((name) => `Unmet structured goal check: ${name}`)
-        : ["The current structured goal remains incomplete."],
-    blockers: retainedEvidence(request.priorSummary?.blockers, request.blockerTransactionIds),
-    next_actions: satisfied
-      ? ["Let the active model verify the current goal through the formal checker."]
-      : ["Let the active model choose the next formal tool from current authority and re-observe before actuation."]
+    mission_state: input.summary.mission_state,
+    constraints: [...input.summary.constraints],
+    decisions: input.summary.decisions.filter((decision) =>
+      !isConcreteRevisionBoundAction(decision, false)
+    ),
+    completed: retainedEvidence(input.summary.completed, input.acceptedTransactionIds),
+    pending: input.summary.pending.filter((item) =>
+      !isConcreteRevisionBoundAction(item, true)
+    ),
+    blockers: retainedEvidence(input.summary.blockers, input.blockerTransactionIds),
+    next_actions: input.summary.next_actions.filter((action) =>
+      !isConcreteRevisionBoundAction(action, true)
+    )
   };
+}
+
+const ACTION_LANGUAGE = /\b(?:call|execute|follow|use|move|navigate|drive|turn|rotate|set|place|break|grasp|pick|drop|reach|inspect|scan|survey|plan)\b|(?:调用|执行|沿用|使用|移动|前往|导航|驾驶|转向|旋转|设置|放置|破坏|抓取|拾取|释放|到达|检查|扫描|规划)/iu;
+const PLAN_OR_ARGUMENT = /\b(?:plan[_\s-]?id|planning[_\s-]?transaction[_\s-]?id|transaction[_\s-]?id|call[_\s-]?id|tool[_\s-]?arguments?|arguments?|target|face[_\s-]?point)\b\s*(?::|=|#|\bis\b)|(?:计划|工具)(?:编号|参数)\s*(?::|=|为)/iu;
+const COORDINATE_TUPLE = /(?:\(|\[)\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*,\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*,\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*(?:\)|\])/u;
+const NAMED_COORDINATE = /(?:\b[xyz]\b\s*[:=]\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+).*){2,}|(?:坐标|位置)\s*(?::|=|为)?\s*(?:\(|\[)?\s*[+-]?\d/iu;
+const TOOL_CALL_ARGUMENTS = /\b[a-z][a-z0-9_]*\s*\(\s*(?:\{|[a-z][a-z0-9_]*\s*(?::|=))/iu;
+
+function isConcreteRevisionBoundAction(value: string, actionField: boolean): boolean {
+  const concrete = PLAN_OR_ARGUMENT.test(value)
+    || COORDINATE_TUPLE.test(value)
+    || NAMED_COORDINATE.test(value)
+    || TOOL_CALL_ARGUMENTS.test(value);
+  return concrete && (actionField || ACTION_LANGUAGE.test(value));
 }
 
 function retainedEvidence(
@@ -338,12 +397,6 @@ function retainedEvidence(
       ? [{ summary: item.summary, transaction_ids: transactionIds }]
       : [];
   });
-}
-
-function asRecord(value: JsonValue | undefined): Record<string, JsonValue> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value
-    : {};
 }
 
 function summarySchema(

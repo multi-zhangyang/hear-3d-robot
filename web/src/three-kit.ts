@@ -111,9 +111,11 @@ export function toVector3(value: { x: number; y: number; z: number }): THREE.Vec
 }
 
 export function disposeObject(root: THREE.Object3D): void {
+  const instancedMeshes = new Set<THREE.InstancedMesh>();
   const geometries = new Set<THREE.BufferGeometry>();
   const materials = new Set<THREE.Material>();
   root.traverse((object) => {
+    if (object instanceof THREE.InstancedMesh) instancedMeshes.add(object);
     if (object instanceof THREE.Mesh || object instanceof THREE.Line) {
       geometries.add(object.geometry);
     } else if (!(object instanceof THREE.Sprite)) {
@@ -123,6 +125,7 @@ export function disposeObject(root: THREE.Object3D): void {
     if (Array.isArray(material)) material.forEach((entry) => materials.add(entry));
     else materials.add(material);
   });
+  instancedMeshes.forEach((mesh) => mesh.dispose());
   geometries.forEach((geometry) => geometry.dispose());
   materials.forEach(disposeMaterial);
 }

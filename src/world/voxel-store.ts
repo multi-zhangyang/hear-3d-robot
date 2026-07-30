@@ -70,7 +70,7 @@ const NEIGHBOURS: ReadonlyArray<readonly [number, number, number]> = [
 export class VoxelStore {
   readonly terrain: Terrain;
   readonly #overlay = new Map<string, VoxelMaterial | null>();
-  readonly #mutations: VoxelMutation[] = [];
+  readonly #mutations = new Map<string, VoxelMutation>();
   readonly #loaded = new Set<string>();
   readonly #inventory: Record<VoxelMaterial, number>;
   #revision = 0;
@@ -88,8 +88,19 @@ export class VoxelStore {
     Object.assign(this.#inventory, restore.inventory);
     for (const mutation of restore.mutations) {
       this.#assertCoordinate(mutation.coordinate);
-      this.#overlay.set(coordinateKey(mutation.coordinate), mutation.after);
-      this.#mutations.push(structuredClone(mutation));
+      if (mutation.revision > restore.revision) {
+        throw new Error(
+          `Voxel mutation revision ${mutation.revision} exceeds world revision ${restore.revision}`
+        );
+      }
+      const key = coordinateKey(mutation.coordinate);
+      const current = this.#mutations.get(key);
+      if (!current || mutation.revision > current.revision) {
+        this.#mutations.set(key, structuredClone(mutation));
+      }
+    }
+    for (const [key, mutation] of this.#mutations) {
+      this.#overlay.set(key, mutation.after);
     }
     for (const chunk of restore.loaded_chunks) {
       if (this.#validChunk(chunk)) this.#loaded.add(chunkKey(chunk));
@@ -428,7 +439,9 @@ export class VoxelStore {
       chunk_size: this.terrain.chunk_size,
       load_radius_chunks: loadRadiusChunks,
       loaded_chunks: this.loadedChunks(),
-      mutations: structuredClone(this.#mutations),
+      mutations: [...this.#mutations.values()]
+        .sort((left, right) => left.revision - right.revision)
+        .map((mutation) => structuredClone(mutation)),
       inventory: this.inventory()
     };
   }
@@ -449,7 +462,7 @@ export class VoxelStore {
       source_agent_id: source.agentId
     };
     this.#overlay.set(coordinateKey(coordinate), after);
-    this.#mutations.push(mutation);
+    this.#mutations.set(coordinateKey(coordinate), mutation);
     return structuredClone(mutation);
   }
 

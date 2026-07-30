@@ -17,7 +17,10 @@ import {
 import { HierarchyProjection } from "../harness/hierarchy-projection.js";
 import { hierarchyNeedsEvidenceContractRotation } from "../harness/evidence-contract.js";
 import { LongRunContextManager } from "../harness/context-compaction.js";
-import { AgentsSdkContextSummaryGenerator } from "../harness/context-summary-agent.js";
+import {
+  AgentsSdkContextSummaryGenerator,
+  isContextCompactionInterruption
+} from "../harness/context-summary-agent.js";
 import {
   createCheckpoint,
   HarnessRuntimeContext,
@@ -383,8 +386,6 @@ async function executeMission(input: {
         }
         if (!isTransportInterruption(error)) throw error;
         const persisted = await input.runtime.store.readAgentState();
-        if (recoveries >= MAX_TRANSPORT_RECOVERIES) throw error;
-
         // The SDK persists a streaming run's input before opening the HTTP
         // response. A brand-new mission can therefore have a durable Session
         // but no RunState when its first request gets no response. Retrying is
@@ -395,13 +396,27 @@ async function executeMission(input: {
         // serialized RunState may resume. The append-only record of the input
         // itself is safe and remains the same logical prefix on the retry.
         const retryingInitialRequest = persisted === undefined;
-        if (retryingInitialRequest) {
-          if (!initialRequestBaseline || !canReplayInitialModelRequest(
+        const initialRequestRemainsReplayable = retryingInitialRequest
+          && initialRequestBaseline !== undefined
+          && canReplayInitialModelRequest(
             initialRequestBaseline.checkpoint,
             input.runtime.checkpoint
-          )) {
-            throw error;
+          );
+
+        // The last bounded attempt also writes its input before failing. There
+        // is no next in-process retry to clean that disposable SDK branch, so
+        // restore it now while the same replay fence still proves that no
+        // authoritative progress or serialized RunState exists. A later
+        // resume can then send exactly one opening mission input.
+        if (recoveries >= MAX_TRANSPORT_RECOVERIES) {
+          if (initialRequestRemainsReplayable) {
+            await session.replaceItems(initialRequestBaseline.sessionItems);
           }
+          throw error;
+        }
+
+        if (retryingInitialRequest) {
+          if (!initialRequestRemainsReplayable) throw error;
           await session.replaceItems(initialRequestBaseline.sessionItems);
         }
 
@@ -436,7 +451,8 @@ async function executeMission(input: {
     }
     const message = errorMessage(error);
     const recoverableInterruption = input.signal?.aborted === true
-      || isTransportInterruption(error);
+      || isTransportInterruption(error)
+      || isContextCompactionInterruption(error);
     await input.runtime.recordProvider({
       status: recoverableInterruption ? "interrupted" : "provider_or_runtime_error",
       error: message

@@ -17,8 +17,9 @@ import type { HarnessRuntimeContext } from "./runtime-context.js";
 import { compactorInputTokenLimit } from "../runtime/context-budget.js";
 import { agentIdFromModelPayload, agentInvocationMarker } from "./agent-scope.js";
 import {
-  authorityProjectionSummary,
+  ContextCompactionInterruption,
   estimateContextSummaryRequestTokens,
+  rebaseContextSummary,
   type ContextSummaryRequest,
   type ContextSummaryGenerator,
   type ContextSummaryResult
@@ -146,7 +147,7 @@ export class LongRunContextManager {
     ));
     const rawUpdate = this.#recordRawDelta(scope, logicalInput);
     const authority = this.#runtime.contextAnchor(node.id);
-    const rebaseUpdate = this.#rebaseSummary(scope, authority);
+    const rebaseUpdate = this.#rebaseSummary(scope);
 
     let filtered = this.#render(logicalModelData, scope, authority);
     scope.active_estimated_tokens = estimateModelInputTokens(filtered) + toolTokens;
@@ -162,7 +163,7 @@ export class LongRunContextManager {
     if (rebaseUpdate !== undefined) {
       await this.#runtime.recordProvider({
         status: "context_checkpoint_rebased",
-        source: "authority_projection",
+        source: "harness_revision_filter",
         scope_id: scope.scope_id,
         agent_id: node.id,
         dropped_stale_transaction_ids: rebaseUpdate.dropped_stale_transaction_ids,
@@ -218,7 +219,7 @@ export class LongRunContextManager {
 
     const hardLimit = this.#config.contextWindowTokens - this.#config.maxOutputTokens;
     if (scope.active_estimated_tokens > hardLimit) {
-      throw new Error(
+      throw new ContextCompactionInterruption(
         `Active context for ${agent.name} is estimated at ${scope.active_estimated_tokens} tokens, `
         + `above the configured ${hardLimit}-token input limit after compaction`
       );
@@ -514,7 +515,9 @@ export class LongRunContextManager {
       this.#config.compactMaxOutputTokens
     );
     if (maxInputTokens <= 0) {
-      throw new Error(`Context compactor has no input budget in the configured model window`);
+      throw new ContextCompactionInterruption(
+        "Context compactor has no input budget in the configured model window"
+      );
     }
     let selected: {
       cut: number;
@@ -556,7 +559,7 @@ export class LongRunContextManager {
       }
     }
     if (!selected) {
-      throw new Error(
+      throw new ContextCompactionInterruption(
         `The next complete context turn for ${node.name} requires an estimated `
         + `${smallestCandidateTokens ?? "unknown"} compactor input tokens, above its `
         + `${maxInputTokens}-token hard limit; no oversized request was sent`
@@ -570,6 +573,7 @@ export class LongRunContextManager {
     await this.#runtime.recordCompactionModelCall(node.id);
 
     let generated: ContextSummaryResult;
+    let reconciledRequests = 1;
     try {
       generated = await this.#generatorFor(node.id).generate(request);
       this.#runtime.signal?.throwIfAborted();
@@ -578,29 +582,41 @@ export class LongRunContextManager {
           node.id,
           generated.usage.requests - 1
         );
+        reconciledRequests = generated.usage.requests;
+      }
+      if (generated.origin !== "model") {
+        throw new ContextCompactionInterruption(
+          "Context Compactor returned a synthetic checkpoint instead of model-written memory",
+          { usage: generated.usage }
+        );
       }
       this.#runtime.assertContextSummaryEvidence(generated.summary);
     } catch (error) {
+      this.#runtime.signal?.throwIfAborted();
+      const usage = compactionFailureUsage(error);
+      if (usage && usage.requests > reconciledRequests) {
+        await this.#runtime.reconcileCompactionModelCalls(
+          node.id,
+          usage.requests - reconciledRequests
+        );
+      }
+      const interruption = error instanceof ContextCompactionInterruption
+        ? error
+        : new ContextCompactionInterruption(
+            error instanceof Error ? error.message : String(error),
+            { cause: error, ...(usage ? { usage } : {}) }
+          );
       await this.#runtime.recordProvider(json({
-        status: "context_compaction_error",
+        status: "context_compaction_interrupted",
         source: "agents_sdk",
         scope_id: scope.scope_id,
         agent_id: node.id,
-        error: error instanceof Error ? error.message : String(error)
+        error: interruption instanceof Error ? interruption.message : String(interruption),
+        recoverable: true,
+        raw_history_preserved: true,
+        session_trimmed: false
       }));
-      throw error;
-    }
-
-    if (generated.origin === "authority_projection") {
-      await this.#runtime.recordProvider(json({
-        status: "context_compaction_fallback",
-        source: "authority_projection",
-        scope_id: scope.scope_id,
-        agent_id: node.id,
-        model_requests: generated.usage.requests,
-        error: generated.fallbackReason ?? "Model compactor returned no valid checkpoint",
-        automatic_actuation: false
-      }));
+      throw interruption;
     }
 
     const completedAt = new Date().toISOString();
@@ -622,7 +638,7 @@ export class LongRunContextManager {
 
     await this.#runtime.recordProvider(json({
       status: "context_compacted",
-      source: generated.origin === "model" ? "agents_sdk" : "authority_projection",
+      source: "agents_sdk",
       scope_id: scope.scope_id,
       agent_id: node.id,
       source_items: sourceItems.length,
@@ -685,7 +701,7 @@ export class LongRunContextManager {
         .join("\n\n")
     };
     const checkpointSource = scope.summary_origin === "authority_projection"
-      ? "The checkpoint below is an authority-only safety projection created after the model compactor failed. It contains no model-selected action."
+      ? "The checkpoint below is a legacy authority projection. It is not model memory and cannot justify compacting any additional history."
       : "The checkpoint below was written by a real model to preserve working continuity. It is not authority.";
     const checkpoint = [
       "LONG-RUN CONTEXT CHECKPOINT",
@@ -706,14 +722,13 @@ export class LongRunContextManager {
   }
 
   /**
-   * A fresh SDK turn must not replay model-selected next actions, and a receipt
-   * from an older world revision must not remain an active blocker. Project the
-   * checkpoint back onto current authority while retaining only current-
-   * revision evidence. This changes no world state and chooses no action.
+   * A fresh SDK turn must not replay revision-bound action arguments, and a
+   * receipt from an older world revision must not remain active evidence. Keep
+   * the model's durable constraints, abstract decisions, and unfinished work;
+   * this filter changes no world state and chooses no replacement action.
    */
   #rebaseSummary(
-    scope: ContextScopeState,
-    authority: JsonValue
+    scope: ContextScopeState
   ): {
     type: "context_checkpoint_rebased";
     scope_id: string;
@@ -749,15 +764,11 @@ export class LongRunContextManager {
       ...(revisionChanged ? ["world_identity_changed"] : []),
       ...(staleIds.length > 0 ? ["stale_receipt_evidence"] : [])
     ];
-    scope.summary = authorityProjectionSummary({
-      priorSummary: scope.summary,
-      sourceItems: [],
-      authority,
+    scope.summary = rebaseContextSummary({
+      summary: scope.summary,
       acceptedTransactionIds: acceptedIds,
-      blockerTransactionIds: currentIds,
-      maxInputTokens: Number.MAX_SAFE_INTEGER
+      blockerTransactionIds: currentIds
     });
-    scope.summary_origin = "authority_projection";
     scope.summary_world_revision = currentWorldRevision;
     scope.summary_voxel_revision = currentVoxelRevision;
     return {
@@ -932,6 +943,25 @@ function summaryTransactionIds(summary: NonNullable<ContextScopeState["summary"]
     ...summary.completed.flatMap((item) => item.transaction_ids),
     ...summary.blockers.flatMap((item) => item.transaction_ids)
   ])];
+}
+
+function compactionFailureUsage(error: unknown): ContextSummaryResult["usage"] | undefined {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (current === null || (typeof current !== "object" && typeof current !== "function")) {
+      continue;
+    }
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (current instanceof ContextCompactionInterruption && current.usage) {
+      return current.usage;
+    }
+    const record = current as Record<string, unknown>;
+    if (record.cause !== undefined) pending.push(record.cause);
+  }
+  return undefined;
 }
 
 function json(value: unknown): JsonValue {

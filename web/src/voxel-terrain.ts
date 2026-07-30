@@ -51,7 +51,8 @@ export class VoxelTerrain {
   readonly #exploredChunkCounts = new Map<string, number>();
   readonly #exploredChunks = new Map<string, ChunkReference>();
   #mutations = new Map<string, VoxelMaterial | null>();
-  #mutationLists = new Map<string, VoxelMutation[]>();
+  #mutationsByChunk = new Map<string, Map<string, VoxelMutation>>();
+  #highestMutationLevelByCell = new Map<number, number>();
   #explorationKey = "";
   #explorationBits: Uint8Array<ArrayBufferLike> = new Uint8Array();
   #stateRevision = -1;
@@ -162,16 +163,33 @@ export class VoxelTerrain {
 
   #indexMutations(mutations: VoxelMutation[]): void {
     this.#mutations = new Map();
-    this.#mutationLists = new Map();
+    this.#mutationsByChunk = new Map();
+    this.#highestMutationLevelByCell = new Map();
+    const latestByCoordinate = new Map<string, VoxelMutation>();
     for (const mutation of mutations) {
-      this.#mutations.set(coordinateKey(mutation.coordinate), mutation.after);
+      const key = coordinateKey(mutation.coordinate);
+      const current = latestByCoordinate.get(key);
+      if (current && current.revision > mutation.revision) continue;
+      latestByCoordinate.set(key, mutation);
+    }
+    for (const [coordinate, mutation] of latestByCoordinate) {
+      this.#mutations.set(coordinate, mutation.after);
+      const cell = mutation.coordinate.row * this.#terrain.columns
+        + mutation.coordinate.column;
+      this.#highestMutationLevelByCell.set(
+        cell,
+        Math.max(
+          this.#highestMutationLevelByCell.get(cell) ?? -1,
+          mutation.coordinate.level
+        )
+      );
       const key = chunkKey({
         column: Math.floor(mutation.coordinate.column / this.#terrain.chunk_size),
         row: Math.floor(mutation.coordinate.row / this.#terrain.chunk_size)
       });
-      const entries = this.#mutationLists.get(key) ?? [];
-      entries.push(mutation);
-      this.#mutationLists.set(key, entries);
+      const entries = this.#mutationsByChunk.get(key) ?? new Map<string, VoxelMutation>();
+      entries.set(coordinate, mutation);
+      this.#mutationsByChunk.set(key, entries);
     }
   }
 
@@ -181,8 +199,9 @@ export class VoxelTerrain {
     explorationDirty: boolean
   ): void {
     const key = chunkKey(reference);
-    const signature = (this.#mutationLists.get(key) ?? [])
-      .map((mutation) => `${coordinateKey(mutation.coordinate)}=${mutation.after ?? "air"}@${mutation.revision}`)
+    const signature = [...(this.#mutationsByChunk.get(key)?.entries() ?? [])]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([coordinate, mutation]) => `${coordinate}=${mutation.after ?? "air"}@${mutation.revision}`)
       .join("|");
     const existing = this.#chunks.get(key);
     if (existing?.mutationSignature === signature) {
@@ -244,21 +263,26 @@ export class VoxelTerrain {
       for (let column = startColumn; column < endColumn; column += 1) {
         const cell = row * this.#terrain.columns + column;
         const baselineHeight = this.#terrain.heights[cell] ?? 0;
-        const mutatedLevels = this.#mutationLists.get(chunkKey(reference))
-          ?.filter((mutation) => mutation.coordinate.column === column
-            && mutation.coordinate.row === row)
-          .map((mutation) => mutation.coordinate.level) ?? [];
-        const highestLevel = Math.max(baselineHeight - 1, ...mutatedLevels);
+        const highestLevel = Math.min(
+          this.#terrain.maximum_height - 1,
+          Math.max(
+            baselineHeight - 1,
+            this.#highestMutationLevelByCell.get(cell) ?? -1
+          )
+        );
         const occupied: Array<{ level: number; material: VoxelMaterial }> = [];
+        let topLevel = -1;
         for (let level = 0; level <= highestLevel; level += 1) {
           const material = this.#materialAt(column, level, row);
-          if (material) occupied.push({ level, material });
+          if (material) {
+            occupied.push({ level, material });
+            topLevel = level;
+          }
         }
         if (occupied.length === 0) {
           instances.push({ cell, level: -1, top: true, material: "ground" });
           continue;
         }
-        const topLevel = Math.max(...occupied.map((block) => block.level));
         for (const block of occupied) {
           instances.push({
             cell,

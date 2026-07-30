@@ -290,6 +290,7 @@ export function createStage(
       scheduleRender();
     },
     dispose: () => {
+      if (disposed) return;
       disposed = true;
       if (animationFrame !== 0) window.cancelAnimationFrame(animationFrame);
       unsubscribeFrames();

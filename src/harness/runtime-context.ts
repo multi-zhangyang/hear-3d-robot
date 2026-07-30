@@ -79,6 +79,7 @@ interface PendingActionCommit {
 }
 
 const FAILED_DELEGATION_DENIAL_LIMIT = 3;
+export const PARTIAL_WORLD_CHECKPOINT_INTERVAL_FRAMES = 15;
 
 /** The capability that consumes each planning capability's output. */
 const PLAN_EXECUTORS: Record<string, string | undefined> = {
@@ -102,6 +103,7 @@ export class HarnessRuntimeContext {
   readonly #spatialMemory: SpatialMemory;
   #checkpoint: RunCheckpoint;
   #lastBroadcastFrame: number;
+  #lastPersistedWorldFrame: number;
   #checkpointWrite: Promise<void> = Promise.resolve();
 
   constructor(input: {
@@ -119,6 +121,7 @@ export class HarnessRuntimeContext {
     this.#hierarchy = input.hierarchy;
     this.#checkpoint = structuredClone(input.checkpoint);
     this.#lastBroadcastFrame = input.checkpoint.world.frame;
+    this.#lastPersistedWorldFrame = input.checkpoint.world.frame;
     this.#eventSink = input.eventSink ?? (() => undefined);
     this.#signal = input.signal;
     this.#capabilities = new Set(this.#checkpoint.capability_catalog);
@@ -1627,13 +1630,21 @@ export class HarnessRuntimeContext {
     if (fresh.length === 0) return;
     const latest = fresh.at(-1)!;
     this.#lastBroadcastFrame = latest.frame;
-    // Preserve partial physical progress for exactly-once recovery without
-    // journaling every rendered frame. The checkpoint is overwritten, not
-    // appended, so the first actuation batch is durable without creating a
-    // replay-sized history.
     this.#checkpoint.world = structuredClone(latest);
     this.#checkpoint.updated_at = new Date().toISOString();
-    await this.#writeCheckpoint();
+    const firstProgressForActiveCommand = Object.values(
+      this.#checkpoint.inflight_actions
+    ).some((action) =>
+      latest.frame > action.world_before_frame
+        && action.world_before_frame >= this.#lastPersistedWorldFrame
+    );
+    if (
+      firstProgressForActiveCommand
+      || latest.frame - this.#lastPersistedWorldFrame
+        >= PARTIAL_WORLD_CHECKPOINT_INTERVAL_FRAMES
+    ) {
+      await this.#writeCheckpoint();
+    }
     await this.broadcast("world_frames", json({
       transaction_id: this.#checkpoint.inflight_action?.transaction_id ?? null,
       transaction_ids: Object.keys(this.#checkpoint.inflight_actions),
@@ -1816,6 +1827,10 @@ export class HarnessRuntimeContext {
     const write = this.#checkpointWrite.then(() => this.#store.writeCheckpoint(checkpoint));
     this.#checkpointWrite = write.catch(() => undefined);
     await write;
+    this.#lastPersistedWorldFrame = Math.max(
+      this.#lastPersistedWorldFrame,
+      checkpoint.world.frame
+    );
   }
 
 }

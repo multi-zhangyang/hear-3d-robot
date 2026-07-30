@@ -19,6 +19,7 @@ import { HierarchyProjection } from "./hierarchy-projection.js";
 import {
   createCheckpoint,
   HarnessRuntimeContext,
+  PARTIAL_WORLD_CHECKPOINT_INTERVAL_FRAMES,
   type RuntimeEvent,
   type RuntimeEventSink
 } from "./runtime-context.js";
@@ -1932,6 +1933,63 @@ describe("HarnessRuntimeContext", () => {
       resumedWorld?.dispose();
       if (!originalWorldDisposed) fixture.world.dispose();
       await rm(fixture.runsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds partial world checkpoint writes without reducing live physics frames", async () => {
+    const events: RuntimeEvent[] = [];
+    const fixture = await createRuntimeFixture(["drive_base"], (event) => {
+      events.push(event);
+    });
+    const originalWrite = fixture.store.writeCheckpoint.bind(fixture.store);
+    const persistedFrames: number[] = [];
+    const write = vi.spyOn(fixture.store, "writeCheckpoint")
+      .mockImplementation(async (checkpoint) => {
+        persistedFrames.push(checkpoint.world.frame);
+        await originalWrite(checkpoint);
+      });
+    try {
+      const before = fixture.runtime.checkpoint.world.frame;
+      const result = outputRecord(await fixture.runtime.invokeSkill(
+        "drive_base",
+        {
+          linear_meters_per_second: 0.2,
+          angular_radians_per_second: 0,
+          duration_seconds: 0.6
+        },
+        "sdk_bounded_partial_checkpoints"
+      ));
+      expect(result).toMatchObject({ accepted: true });
+
+      const terminal = fixture.runtime.checkpoint.world.frame;
+      const partial = [...new Set(persistedFrames)]
+        .filter((frame) => frame > before && frame < terminal);
+      expect(partial[0]).toBe(before + 3);
+      for (let index = 1; index < partial.length; index += 1) {
+        expect(partial[index]! - partial[index - 1]!)
+          .toBeGreaterThanOrEqual(PARTIAL_WORLD_CHECKPOINT_INTERVAL_FRAMES);
+      }
+      expect(partial.length).toBeLessThan(
+        Math.ceil((terminal - before) / 3)
+      );
+      expect((await fixture.store.readCheckpoint()).world.frame).toBe(terminal);
+
+      const streamedFrames = events
+        .filter((event) => event.type === "world_frames")
+        .flatMap((event) => {
+          if (typeof event.data !== "object" || event.data === null || Array.isArray(event.data)) {
+            return [];
+          }
+          return Array.isArray(event.data.frames) ? event.data.frames : [];
+        })
+        .flatMap((frame) => {
+          if (typeof frame !== "object" || frame === null || Array.isArray(frame)) return [];
+          return typeof frame.frame === "number" ? [frame.frame] : [];
+        });
+      expect(new Set(streamedFrames).size).toBe(terminal - before);
+    } finally {
+      write.mockRestore();
+      await disposeFixture(fixture);
     }
   });
 

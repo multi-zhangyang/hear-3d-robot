@@ -303,12 +303,18 @@ async function withLeaseGuard<T>(
       if (!isExists(error)) throw error;
       const existing = await readLeaseSnapshot(guardPath);
       if (!existing) continue;
-      const localHolder = existing.record
-        && sameHostname(existing.record.hostname, guard.hostname);
-      const deadLocalHolder = localHolder && !processExists(existing.record!.pid);
-      const staleUnverifiableHolder = !localHolder
+      const foreignHolder = existing.record
+        && !sameHostname(existing.record.hostname, guard.hostname);
+      if (foreignHolder) {
+        throw new OperatorLeaseError(
+          "Runs directory lease guard is held by another host"
+        );
+      }
+      const deadLocalHolder = existing.record
+        && !processExists(existing.record.pid);
+      const staleMalformedHolder = !existing.record
         && Date.now() - existing.modifiedAt >= INVALID_LEASE_GRACE_MS;
-      if (deadLocalHolder || staleUnverifiableHolder) {
+      if (deadLocalHolder || staleMalformedHolder) {
         await removeLeaseSnapshot(guardPath, existing, guard.token);
         continue;
       }

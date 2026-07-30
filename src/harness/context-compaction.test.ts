@@ -21,6 +21,7 @@ import {
 } from "./context-compaction.js";
 import { receiptEvidenceRequirement } from "./evidence-contract.js";
 import {
+  ContextCompactionInterruption,
   estimateContextSummaryRequestTokens,
   type ContextSummaryGenerator,
   type ContextSummaryRequest,
@@ -70,9 +71,6 @@ class RecordingGenerator implements ContextSummaryGenerator {
         next_actions: ["Observe the current world before actuation."]
       },
       origin: this.#origin,
-      ...(this.#origin === "authority_projection"
-        ? { fallbackReason: "Configured model omitted the checkpoint tool" }
-        : {}),
       usage: { requests: 1, inputTokens: 2400, outputTokens: 120, totalTokens: 2520 }
     };
   }
@@ -413,6 +411,128 @@ describe("long-run context compaction", () => {
     }
   });
 
+  it("isolates a failed sibling compaction and lets that scope recover without touching its peer", async () => {
+    const fixture = await createFixture();
+    try {
+      const spec = (name: string): AgentSpec => ({
+        name,
+        objective: `Maintain isolated recoverable memory for ${name}.`,
+        success_criteria: ["The node retains one independent context checkpoint."],
+        evidence_requirements: [receiptEvidenceRequirement(
+          0,
+          "read_proprioception",
+          { kind: "robot" }
+        )],
+        capabilities: ["read_proprioception"],
+        may_delegate: false,
+        references: []
+      });
+      const first = await fixture.runtime.beginDelegation(
+        null,
+        spec("Recoverable memory worker"),
+        "recoverable_memory_worker"
+      );
+      const second = await fixture.runtime.beginDelegation(
+        null,
+        spec("Independent memory worker"),
+        "independent_memory_worker",
+        fixture.runtime.rootAgentId
+      );
+      const historyFor = (agentId: string, label: string): AgentInputItem[] => {
+        const history = longHistory();
+        history[0] = {
+          role: "user",
+          content: `${agentInvocationMarker(agentId)}\n${label}`
+        };
+        return history;
+      };
+      const firstHistory = historyFor(first.node.id, "FIRST_SCOPE_PRIVATE");
+      const secondHistory = historyFor(second.node.id, "SECOND_SCOPE_PRIVATE");
+      const sessions = new Map([
+        [first.node.id, new FileSession(
+          fixture.store.workerSessionPath(first.node.id),
+          `${fixture.runtime.runId}:${first.node.id}`
+        )],
+        [second.node.id, new FileSession(
+          fixture.store.workerSessionPath(second.node.id),
+          `${fixture.runtime.runId}:${second.node.id}`
+        )]
+      ]);
+      await sessions.get(first.node.id)!.addItems(firstHistory);
+      await sessions.get(second.node.id)!.addItems(secondHistory);
+      let firstUnavailable = true;
+      const successful = new RecordingGenerator();
+      const manager = new LongRunContextManager({
+        runtime: fixture.runtime,
+        provider,
+        sessionForAgent: (agentId) => sessions.get(agentId)!,
+        createGenerator: (agentId) => agentId === first.node.id
+          ? {
+              generate: async (request) => {
+                if (firstUnavailable) {
+                  throw new ContextCompactionInterruption("temporary compactor outage", {
+                    usage: { requests: 2, inputTokens: 400, outputTokens: 0, totalTokens: 400 }
+                  });
+                }
+                return successful.generate(request);
+              }
+            }
+          : new RecordingGenerator()
+      });
+      const workerAgent = new Agent({ name: "Capability Worker", instructions: "Work." });
+
+      await expect(manager.filter({
+        agent: workerAgent,
+        context: { runId: fixture.runtime.runId },
+        modelData: { input: firstHistory, instructions: "Work." }
+      })).rejects.toMatchObject({ code: "context_compaction_interrupted" });
+      await manager.filter({
+        agent: workerAgent,
+        context: { runId: fixture.runtime.runId },
+        modelData: { input: secondHistory, instructions: "Work." }
+      });
+
+      let persisted = await fixture.store.readCheckpoint();
+      expect(persisted.context_memory.scopes[first.node.id]).toMatchObject({
+        raw_item_count: firstHistory.length,
+        compacted_item_count: 0,
+        compaction_count: 0,
+        summary: null
+      });
+      expect(persisted.context_memory.scopes[second.node.id]).toMatchObject({
+        raw_item_count: 0,
+        compacted_item_count: 0,
+        compaction_count: 1,
+        summary_origin: "model"
+      });
+      expect(await sessions.get(first.node.id)!.getItems()).toEqual(firstHistory);
+      expect(await sessions.get(second.node.id)!.getItems()).toEqual([]);
+
+      firstUnavailable = false;
+      await manager.filter({
+        agent: workerAgent,
+        context: { runId: fixture.runtime.runId },
+        modelData: { input: await sessions.get(first.node.id)!.getItems(), instructions: "Work." }
+      });
+
+      persisted = await fixture.store.readCheckpoint();
+      expect(persisted.context_memory.scopes[first.node.id]).toMatchObject({
+        raw_item_count: 0,
+        compacted_item_count: 0,
+        compaction_count: 1,
+        summary_origin: "model"
+      });
+      expect(persisted.context_memory.scopes[second.node.id]).toMatchObject({
+        compaction_count: 1,
+        summary_origin: "model"
+      });
+      expect(await sessions.get(first.node.id)!.getItems()).toEqual([]);
+    } finally {
+      fixture.world.dispose();
+      await rm(fixture.runsDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not commit a compactor result returned after the mission was aborted", async () => {
     const controller = new AbortController();
     const fixture = await createFixture(controller.signal);
@@ -747,7 +867,7 @@ describe("long-run context compaction", () => {
         })
       ]);
       expect(await fixture.store.readJournal("provider")).toEqual([
-        expect.objectContaining({ status: "context_compaction_error" })
+        expect.objectContaining({ status: "context_compaction_interrupted" })
       ]);
     } finally {
       fixture.world.dispose();
@@ -755,42 +875,117 @@ describe("long-run context compaction", () => {
     }
   });
 
-  it("labels an authority-only fallback without treating it as model memory", async () => {
+  it("rejects a synthetic fallback without advancing memory or trimming the Session", async () => {
     const fixture = await createFixture();
     try {
+      const session = new FileSession(
+        fixture.store.sessionPath(),
+        fixture.runtime.runId
+      );
+      const items = longHistory();
+      await session.addItems(items);
       const manager = new LongRunContextManager({
         runtime: fixture.runtime,
         provider,
-        createGenerator: () => new RecordingGenerator(undefined, "authority_projection")
+        createGenerator: () => new RecordingGenerator(undefined, "authority_projection"),
+        sessionForAgent: () => session
       });
-      const items = longHistory();
-      const filtered = await manager.filter({
+
+      await expect(manager.filter({
         agent: new Agent({ name: "Mission Coordinator", instructions: "Coordinate." }),
         context: { runId: fixture.runtime.runId },
         modelData: { input: items, instructions: "Coordinate." }
-      });
+      })).rejects.toMatchObject({ code: "context_compaction_interrupted" });
 
       const persisted = await fixture.store.readCheckpoint();
+      expect(persisted.context_memory.total_compactions).toBe(0);
       expect(persisted.context_memory.scopes[persisted.root_id]).toMatchObject({
-        summary_origin: "authority_projection",
+        summary: null,
+        summary_origin: null,
         compacted_item_count: 0,
-        raw_item_count: 0
+        raw_item_count: items.length,
+        compaction_count: 0
       });
-      expect(filtered.instructions).toContain("authority-only safety projection");
-      expect(await fixture.store.readJournal("provider")).toEqual(expect.arrayContaining([
+      expect(await session.getItems()).toEqual(items);
+      expect(await fixture.store.readJournal("context")).toEqual([
+        expect.objectContaining({ type: "context_history_delta", items })
+      ]);
+      expect(await fixture.store.readJournal("provider")).toEqual([
         expect.objectContaining({
-          status: "context_compaction_fallback",
-          source: "authority_projection",
-          automatic_actuation: false
-        }),
-        expect.objectContaining({
-          status: "context_compacted",
-          source: "authority_projection"
+          status: "context_compaction_interrupted",
+          recoverable: true,
+          raw_history_preserved: true,
+          session_trimmed: false
         })
-      ]));
-      expect((await fixture.store.readJournal("context"))[0]).toMatchObject({
+      ]);
+    } finally {
+      fixture.world.dispose();
+      await rm(fixture.runsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the last model checkpoint and new Session epoch intact when compaction is interrupted", async () => {
+    const fixture = await createFixture();
+    try {
+      const session = new FileSession(
+        fixture.store.sessionPath(),
+        fixture.runtime.runId
+      );
+      const recording = new RecordingGenerator();
+      let generation = 0;
+      const generator: ContextSummaryGenerator = {
+        generate: async (request) => {
+          generation += 1;
+          if (generation > 1) {
+            throw new ContextCompactionInterruption("all bounded attempts were invalid", {
+              usage: { requests: 4, inputTokens: 900, outputTokens: 120, totalTokens: 1020 }
+            });
+          }
+          return recording.generate(request);
+        }
+      };
+      const manager = new LongRunContextManager({
+        runtime: fixture.runtime,
+        provider,
+        createGenerator: () => generator,
+        sessionForAgent: () => session
+      });
+      const first = longHistory();
+      await session.addItems(first);
+      await manager.filter({
+        agent: new Agent({ name: "Mission Coordinator", instructions: "Coordinate." }),
+        context: { runId: fixture.runtime.runId },
+        modelData: { input: first, instructions: "Coordinate." }
+      });
+      const beforeFailure = await fixture.store.readCheckpoint();
+      const priorScope = beforeFailure.context_memory.scopes[beforeFailure.root_id]!;
+      expect(await session.getItems()).toEqual([]);
+
+      const second = longHistory();
+      second[0] = { role: "user", content: "Begin a new raw epoch after the durable checkpoint." };
+      await session.addItems(second);
+      await expect(manager.filter({
+        agent: new Agent({ name: "Mission Coordinator", instructions: "Coordinate." }),
+        context: { runId: fixture.runtime.runId },
+        modelData: { input: second, instructions: "Coordinate." }
+      })).rejects.toMatchObject({ code: "context_compaction_interrupted" });
+
+      const interrupted = await fixture.store.readCheckpoint();
+      expect(interrupted.context_memory.total_compactions).toBe(1);
+      expect(interrupted.context_memory.scopes[interrupted.root_id]).toMatchObject({
+        raw_item_count: second.length,
+        compacted_item_count: 0,
+        compaction_count: 1,
+        summary: priorScope.summary,
+        summary_origin: "model",
+        last_compacted_at: priorScope.last_compacted_at
+      });
+      expect(await session.getItems()).toEqual(second);
+      const records = await fixture.store.readJournal("context") as Array<Record<string, unknown>>;
+      expect(records.filter((record) => record.type === "context_compacted")).toHaveLength(1);
+      expect(records.at(-1)).toMatchObject({
         type: "context_history_delta",
-        items
+        items: second
       });
     } finally {
       fixture.world.dispose();
@@ -831,11 +1026,12 @@ describe("long-run context compaction", () => {
         raw_item_count: 1,
         compacted_item_count: 0,
         compaction_count: 1,
-        summary_origin: "authority_projection",
+        summary_origin: "model",
         summary: {
-          mission_state: expect.stringContaining("satisfied:"),
-          decisions: [],
-          next_actions: ["Let the active model verify the current goal through the formal checker."]
+          mission_state: "The hierarchy is still working on the operator mission.",
+          decisions: ["Continue from current harness authority."],
+          pending: ["Take the next source-backed action."],
+          next_actions: ["Observe the current world before actuation."]
         }
       });
       expect(await fixture.store.readJournal("context")).toEqual(expect.arrayContaining([
@@ -849,7 +1045,129 @@ describe("long-run context compaction", () => {
         expect.objectContaining({
           type: "context_checkpoint_rebased",
           reason: expect.arrayContaining(["fresh_sdk_turn"]),
-          summary: expect.objectContaining({ decisions: [] })
+          summary: expect.objectContaining({
+            decisions: ["Continue from current harness authority."]
+          })
+        })
+      ]));
+    } finally {
+      fixture.world.dispose();
+      await rm(fixture.runsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves durable model memory across a world revision and drops only stale evidence and actions", async () => {
+    const fixture = await createFixture();
+    try {
+      const mover = await fixture.runtime.beginDelegation(null, {
+        name: "Revision mover",
+        objective: "Change the world once so compact memory must be rebased.",
+        success_criteria: ["One base command reaches a terminal receipt."],
+        evidence_requirements: [receiptEvidenceRequirement(
+          0,
+          "drive_base",
+          { kind: "body", channel: "base" }
+        )],
+        capabilities: ["read_proprioception", "drive_base"],
+        may_delegate: false,
+        references: []
+      }, "revision_mover");
+      const observation = JSON.parse(await fixture.runtime.invokeTool(
+        "read_proprioception",
+        {},
+        "memory_before_revision",
+        mover.node.id
+      )) as { transaction_id: string; accepted: boolean };
+      expect(observation.accepted).toBe(true);
+
+      const generator: ContextSummaryGenerator = {
+        generate: async () => ({
+          summary: {
+            mission_state: "Exploration remains unfinished after the first observation.",
+            constraints: ["Keep mapping and motion in separate workers."],
+            decisions: [
+              "Re-observe before any physical execution.",
+              "Execute plan_id=stale-route immediately."
+            ],
+            completed: [{
+              summary: "Initial proprioception was observed.",
+              transaction_ids: [observation.transaction_id]
+            }],
+            pending: [
+              "Explore an unobserved reachable frontier.",
+              "Execute plan_id=stale-pending-route."
+            ],
+            blockers: [{
+              summary: "The prior pose constrained the route.",
+              transaction_ids: [observation.transaction_id]
+            }],
+            next_actions: [
+              "Survey current terrain again.",
+              "Move to x=4, y=0, z=-2.",
+              "Call execute_base_plan({\"plan_id\":\"stale-route\"})."
+            ]
+          },
+          origin: "model",
+          usage: { requests: 1, inputTokens: 200, outputTokens: 100, totalTokens: 300 }
+        })
+      };
+      const manager = new LongRunContextManager({
+        runtime: fixture.runtime,
+        provider,
+        createGenerator: () => generator
+      });
+      const history = longHistory();
+      history[0] = {
+        role: "user",
+        content: `Preserve receipt ${observation.transaction_id} while it is current.`
+      };
+      await manager.filter({
+        agent: new Agent({ name: "Mission Coordinator", instructions: "Coordinate." }),
+        context: { runId: fixture.runtime.runId },
+        modelData: { input: history, instructions: "Coordinate." }
+      });
+
+      const moved = JSON.parse(await fixture.runtime.invokeSkill(
+        "drive_base",
+        {
+          linear_meters_per_second: 0.2,
+          angular_radians_per_second: 0,
+          duration_seconds: 0.2
+        },
+        "advance_world_revision",
+        mover.node.id
+      )) as { accepted: boolean };
+      expect(moved.accepted).toBe(true);
+
+      const continued = await manager.filter({
+        agent: new Agent({ name: "Mission Coordinator", instructions: "Coordinate." }),
+        context: { runId: fixture.runtime.runId },
+        modelData: {
+          input: [{ role: "user", content: "Continue from the changed live world." }],
+          instructions: "Coordinate."
+        }
+      });
+
+      expect(continued.instructions).toContain("Exploration remains unfinished");
+      const persisted = await fixture.store.readCheckpoint();
+      expect(persisted.context_memory.scopes[persisted.root_id]).toMatchObject({
+        summary_origin: "model",
+        summary_world_revision: persisted.world.world_revision,
+        summary: {
+          mission_state: "Exploration remains unfinished after the first observation.",
+          constraints: ["Keep mapping and motion in separate workers."],
+          decisions: ["Re-observe before any physical execution."],
+          completed: [],
+          pending: ["Explore an unobserved reachable frontier."],
+          blockers: [],
+          next_actions: ["Survey current terrain again."]
+        }
+      });
+      expect(await fixture.store.readJournal("context")).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "context_checkpoint_rebased",
+          reason: expect.arrayContaining(["world_identity_changed", "stale_receipt_evidence"]),
+          dropped_stale_transaction_ids: [observation.transaction_id]
         })
       ]));
     } finally {

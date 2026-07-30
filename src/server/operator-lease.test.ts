@@ -85,6 +85,140 @@ describe("Operator runs-directory lease", () => {
     }
   });
 
+  it("never rewrites or removes an aged valid guard held by another host", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-foreign-guard-"));
+    const guardPath = join(runsDir, ".operator.lock.guard");
+    const foreignGuard = {
+      token: randomUUID(),
+      pid: process.pid,
+      hostname: `${hostname()}-foreign`,
+      started_at: "2026-07-30T00:00:00.000Z"
+    };
+    const serialized = `${JSON.stringify(foreignGuard)}\n`;
+    await writeFile(guardPath, serialized, "utf8");
+    const old = new Date("2000-01-01T00:00:00.000Z");
+    await utimes(guardPath, old, old);
+    const before = await stat(guardPath);
+    try {
+      let rejection: unknown;
+      try {
+        await acquireOperatorLease(runsDir, FAST_LEASE);
+      } catch (error) {
+        rejection = error;
+      }
+
+      expect(rejection).toBeInstanceOf(Error);
+      const message = (rejection as Error).message;
+      expect(message).toBe("Runs directory lease guard is held by another host");
+      expect(message).not.toContain(foreignGuard.hostname);
+      expect(message).not.toContain(foreignGuard.token);
+      expect(message).not.toContain(String(foreignGuard.pid));
+      expect(await readFile(guardPath, "utf8")).toBe(serialized);
+      const after = await stat(guardPath);
+      expect({
+        dev: after.dev,
+        ino: after.ino,
+        size: after.size,
+        mtimeMs: after.mtimeMs
+      }).toEqual({
+        dev: before.dev,
+        ino: before.ino,
+        size: before.size,
+        mtimeMs: before.mtimeMs
+      });
+    } finally {
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an expired foreign lease fenced until its foreign guard is released", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-foreign-guard-fence-"));
+    const leasePath = join(runsDir, ".operator.lock");
+    const guardPath = `${leasePath}.guard`;
+    const foreignHostname = `${hostname()}-foreign`;
+    const foreignLease = {
+      version: 2,
+      token: randomUUID(),
+      pid: process.pid,
+      hostname: foreignHostname,
+      started_at: "2026-07-30T00:00:00.000Z",
+      heartbeat_interval_ms: FAST_LEASE.heartbeatIntervalMs,
+      lease_duration_ms: FAST_LEASE.leaseDurationMs
+    };
+    const foreignGuard = {
+      token: randomUUID(),
+      pid: process.pid,
+      hostname: foreignHostname,
+      started_at: "2026-07-30T00:00:00.000Z"
+    };
+    await writeFile(leasePath, `${JSON.stringify(foreignLease)}\n`, "utf8");
+    await writeFile(guardPath, `${JSON.stringify(foreignGuard)}\n`, "utf8");
+    const old = new Date("2000-01-01T00:00:00.000Z");
+    await utimes(leasePath, old, old);
+    await utimes(guardPath, old, old);
+    let contender: Awaited<ReturnType<typeof acquireOperatorLease>> | undefined;
+    try {
+      await expect(acquireOperatorLease(runsDir, FAST_LEASE))
+        .rejects.toThrow("lease guard is held by another host");
+      expect(JSON.parse(await readFile(leasePath, "utf8"))).toMatchObject({
+        token: foreignLease.token,
+        hostname: foreignHostname
+      });
+      expect(JSON.parse(await readFile(guardPath, "utf8"))).toEqual(foreignGuard);
+
+      await rm(guardPath);
+      contender = await acquireOperatorLease(runsDir, FAST_LEASE);
+      expect(JSON.parse(await readFile(leasePath, "utf8"))).not.toMatchObject({
+        token: foreignLease.token
+      });
+      await expect(contender.assertOwned()).resolves.toBeUndefined();
+    } finally {
+      await contender?.release();
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims a valid guard only after its same-host process has ended", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-dead-local-guard-"));
+    const guardPath = join(runsDir, ".operator.lock.guard");
+    const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    const deadPid = child.pid;
+    await once(child, "exit");
+    if (!deadPid) throw new Error("Child process had no pid");
+    await writeFile(guardPath, `${JSON.stringify({
+      token: randomUUID(),
+      pid: deadPid,
+      hostname: hostname(),
+      started_at: "2026-07-30T00:00:00.000Z"
+    })}\n`, "utf8");
+    let lease: Awaited<ReturnType<typeof acquireOperatorLease>> | undefined;
+    try {
+      lease = await acquireOperatorLease(runsDir, FAST_LEASE);
+      await expect(lease.assertOwned()).resolves.toBeUndefined();
+      await expect(stat(guardPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await lease?.release();
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims an aged malformed guard", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-malformed-guard-"));
+    const guardPath = join(runsDir, ".operator.lock.guard");
+    await writeFile(guardPath, "{\"interrupted\":", "utf8");
+    const old = new Date("2000-01-01T00:00:00.000Z");
+    await utimes(guardPath, old, old);
+    let lease: Awaited<ReturnType<typeof acquireOperatorLease>> | undefined;
+    try {
+      lease = await acquireOperatorLease(runsDir, FAST_LEASE);
+      await expect(lease.assertOwned()).resolves.toBeUndefined();
+      await expect(stat(guardPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await lease?.release();
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not retry a guarded mutation whose operation throws EEXIST", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-guard-operation-error-"));
     const owner = await acquireOperatorLease(runsDir, FAST_LEASE);

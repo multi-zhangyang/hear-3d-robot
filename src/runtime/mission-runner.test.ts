@@ -9,18 +9,55 @@ import {
   HarnessRuntimeContext,
   type RuntimeEventSink
 } from "../harness/runtime-context.js";
+import { FileSession } from "../persistence/file-session.js";
 import { listRunDirectories, RunStore } from "../persistence/run-store.js";
 import { startMission } from "./mission-runner.js";
 
 const fakeRunner = vi.hoisted(() => ({
-  finalOutput: "Mission completed from the current world state"
+  finalOutput: "Mission completed from the current world state",
+  behavior: "success" as
+    | "success"
+    | "opening_transport_failure"
+    | "context_compaction_failure",
+  runCalls: 0,
+  sessionSizesBeforeRequest: [] as number[]
 }));
 
 vi.mock("@openai/agents", async (importOriginal) => {
   const original = await importOriginal<typeof import("@openai/agents")>();
 
-  class SuccessfulRunner {
-    async run(): Promise<unknown> {
+  class ConfigurableRunner {
+    async run(
+      _agent: unknown,
+      _input: unknown,
+      options?: {
+        session?: {
+          getItems(): Promise<unknown[]>;
+          addItems(items: Array<{ role: string; content: string }>): Promise<void>;
+        };
+      }
+    ): Promise<unknown> {
+      fakeRunner.runCalls += 1;
+      if (fakeRunner.behavior === "opening_transport_failure") {
+        if (!options?.session) throw new Error("Test Runner requires a Session");
+        fakeRunner.sessionSizesBeforeRequest.push((await options.session.getItems()).length);
+        await options.session.addItems([{
+          role: "user",
+          content: "SDK-persisted opening mission input"
+        }]);
+        throw Object.assign(new Error("opening model transport unavailable"), {
+          status: 503
+        });
+      }
+      if (fakeRunner.behavior === "context_compaction_failure") {
+        throw Object.assign(
+          new Error("Context compaction interruption: checkpoint tool omitted"),
+          {
+            name: "ContextCompactionInterruption",
+            code: "context_compaction_interrupted"
+          }
+        );
+      }
       return {
         completed: Promise.resolve(),
         finalOutput: fakeRunner.finalOutput,
@@ -33,7 +70,7 @@ vi.mock("@openai/agents", async (importOriginal) => {
     }
   }
 
-  return { ...original, Runner: SuccessfulRunner };
+  return { ...original, Runner: ConfigurableRunner };
 });
 
 const TEST_PROVIDER: ProviderConfig = {
@@ -52,6 +89,9 @@ const TEST_PROVIDER: ProviderConfig = {
 const originalSucceed = HarnessRuntimeContext.prototype.succeed;
 
 afterEach(() => {
+  fakeRunner.behavior = "success";
+  fakeRunner.runCalls = 0;
+  fakeRunner.sessionSizesBeforeRequest = [];
   vi.restoreAllMocks();
 });
 
@@ -89,6 +129,67 @@ describe("mission terminal lifecycle persistence", () => {
 
       await expect(runMission(runsDir)).rejects.toThrow("success outbox clear unavailable");
       await expectPersistedSuccessOnly(runsDir);
+    } finally {
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("initial model transport recovery", () => {
+  it("restores the opening Session baseline after bounded retries are exhausted", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-mission-opening-transport-"));
+    fakeRunner.behavior = "opening_transport_failure";
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
+      queueMicrotask(callback);
+      return {} as NodeJS.Timeout;
+    }) as typeof setTimeout);
+
+    try {
+      await expect(runMission(runsDir)).rejects.toThrow("opening model transport unavailable");
+
+      expect(fakeRunner.runCalls).toBe(9);
+      expect(fakeRunner.sessionSizesBeforeRequest).toEqual(Array<number>(9).fill(0));
+
+      const runDirectories = await listRunDirectories(runsDir);
+      expect(runDirectories).toHaveLength(1);
+      const store = await RunStore.open(runDirectories[0]!);
+      const checkpoint = await store.readCheckpoint();
+      const session = new FileSession(store.sessionPath(), checkpoint.run_id);
+
+      expect(await store.readAgentState()).toBeUndefined();
+      expect(await session.getItems()).toEqual([]);
+      expect(checkpoint).toMatchObject({
+        status: "interrupted",
+        error: expect.stringContaining("opening model transport unavailable")
+      });
+    } finally {
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("context compaction recovery", () => {
+  it("persists an unsafe compaction outcome as interrupted instead of failed", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-mission-context-interruption-"));
+    fakeRunner.behavior = "context_compaction_failure";
+    try {
+      await expect(runMission(runsDir)).rejects.toMatchObject({
+        code: "context_compaction_interrupted"
+      });
+
+      const runDirectories = await listRunDirectories(runsDir);
+      expect(runDirectories).toHaveLength(1);
+      const store = await RunStore.open(runDirectories[0]!);
+      const checkpoint = await store.readCheckpoint();
+      const events = await store.readJournal("events");
+
+      expect(checkpoint).toMatchObject({
+        status: "interrupted",
+        error: expect.stringContaining("Context compaction interruption"),
+        final_output: null
+      });
+      expect(events.some((event) => eventRecord(event)?.type === "run_interrupted")).toBe(true);
+      expect(events.some((event) => eventRecord(event)?.type === "run_failed")).toBe(false);
     } finally {
       await rm(runsDir, { recursive: true, force: true });
     }
