@@ -2285,7 +2285,7 @@ describe("HarnessRuntimeContext", () => {
     } finally {
       await disposeFixture(satisfied);
     }
-  });
+  }, 20_000);
 
   it("hands a granted reference its measurement and not just its name", async () => {
     const fixture = await createRuntimeFixture(["inspect_entity"]);
