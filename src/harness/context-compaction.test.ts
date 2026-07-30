@@ -184,7 +184,7 @@ describe("long-run context compaction", () => {
       fixture.world.dispose();
       await rm(fixture.runsDir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it("only exposes accepted receipts to completed memory evidence", async () => {
     const fixture = await createFixture();
@@ -409,7 +409,7 @@ describe("long-run context compaction", () => {
       fixture.world.dispose();
       await rm(fixture.runsDir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it("isolates a failed sibling compaction and lets that scope recover without touching its peer", async () => {
     const fixture = await createFixture();

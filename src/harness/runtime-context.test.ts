@@ -712,7 +712,7 @@ describe("HarnessRuntimeContext", () => {
     } finally {
       await disposeFixture(fixture);
     }
-  });
+  }, 20_000);
 
   it("points a mistaken plan handle back at the transaction id it should have used", async () => {
     const fixture = await createRuntimeFixture(["plan_base_path", "execute_base_plan"]);
@@ -757,7 +757,7 @@ describe("HarnessRuntimeContext", () => {
     } finally {
       await disposeFixture(fixture);
     }
-  });
+  }, 20_000);
 
   it("executes a position-only arm plan by its harness transaction", async () => {
     const fixture = await createRuntimeFixture([

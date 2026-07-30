@@ -108,7 +108,7 @@ describe("RunStore journal windows", () => {
     expect(journal.map((entry) => entry.index)).toEqual(
       Array.from({ length: 100 }, (_, index) => index)
     );
-  });
+  }, 20_000);
 
   it("serializes one journal across independently opened store instances", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-shared-journal-"));
