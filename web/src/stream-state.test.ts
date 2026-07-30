@@ -110,6 +110,10 @@ describe("runtime event cursor", () => {
     };
     expect(nextRuntimeEventCursor("older", { ...event, durable: true })).toBe("committed");
     expect(nextRuntimeEventCursor("older", event)).toBe("committed");
+    expect(nextRuntimeEventCursor("older", {
+      ...event,
+      cursor: `v1:7:${"a".repeat(64)}`
+    })).toBe(`v1:7:${"a".repeat(64)}`);
   });
 });
 

@@ -1,8 +1,7 @@
-import { LockOutlined, RobotOutlined } from "@ant-design/icons";
-import { Alert, Button, Form, Input, Space, Spin, Tag, Typography } from "antd";
 import { useState } from "react";
 import { summarizeFailure } from "./failure-summary";
 import type { RunListItem } from "./types";
+import { UiButton } from "./ui/Button";
 import { runStatusLabel } from "./ui-text";
 
 export function Login(props: {
@@ -13,6 +12,7 @@ export function Login(props: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(props.hasStoredPassword ? "已保存的登录凭据无效" : null);
   const submit = async (): Promise<void> => {
+    if (busy || !value) return;
     setBusy(true);
     setError(null);
     try {
@@ -26,40 +26,33 @@ export function Login(props: {
   return (
     <div className="login-shell">
       <div className="login-panel">
-        <RobotOutlined className="login-mark" />
-        <Typography.Title level={2}>HEAR</Typography.Title>
-        <Form layout="vertical" onFinish={() => void submit()}>
-          <Form.Item
-            label="操作密码"
-            // Form.Item only wires label-to-input when the field is registered
-            // through `name`. This one is controlled by local state, so the
-            // association has to be made explicitly or the password box has no
-            // accessible name at all.
-            htmlFor="operator-password"
-            help={error}
-            {...(error ? { validateStatus: "error" as const } : {})}
-          >
-            <Input.Password
+        <span className="login-mark" aria-hidden="true"><i /><i /><i /></span>
+        <h1>HEAR</h1>
+        <form onSubmit={(event) => {
+          event.preventDefault();
+          void submit();
+        }}>
+          <label htmlFor="operator-password">操作密码</label>
+          <div className={error ? "login-input invalid" : "login-input"}>
+            <span aria-hidden="true">◇</span>
+            <input
+              type="password"
               autoFocus
               id="operator-password"
-              prefix={<LockOutlined />}
               value={value}
               onChange={(event) => setValue(event.target.value)}
             />
-          </Form.Item>
-          <Button block htmlType="submit" type="primary" loading={busy} disabled={!value}>登录</Button>
-        </Form>
+          </div>
+          {error && <p className="login-error" role="alert">{error}</p>}
+          <UiButton block type="submit" tone="primary" busy={busy} disabled={!value}>登录</UiButton>
+        </form>
       </div>
     </div>
   );
 }
 
 export function RunStatus({ status }: { status: RunListItem["status"] }): React.JSX.Element {
-  const color = status === "succeeded" ? "success"
-    : status === "running" || status === "starting" ? "processing"
-      : status === "local_artifact" ? "default"
-        : "error";
-  return <Tag color={color}>{runStatusLabel(status)}</Tag>;
+  return <span className={`run-status run-status-${status}`}><i />{runStatusLabel(status)}</span>;
 }
 
 /**
@@ -78,28 +71,24 @@ export function FailureAlert(props: {
     ? summary.headline
     : "运行发生错误，请查看状态信息后重试。";
   return (
-    <Alert
-      className="failure-alert"
-      type="error"
-      showIcon
-      {...(props.onClose ? { closable: true, onClose: props.onClose } : {})}
-      message={
-        <Space size={8} wrap>
+    <aside className="failure-alert" role="alert">
+      <span className="failure-mark" aria-hidden="true">!</span>
+      <div className="failure-body">
+        <div className="failure-heading">
           <span className="failure-title">{props.title}</span>
           {summary.facts.map((fact) => (
-            <Tag key={fact.label} color="error" bordered={false}>{fact.label} {fact.value}</Tag>
+            <small key={fact.label}>{fact.label} {fact.value}</small>
           ))}
-        </Space>
-      }
-      description={
-        <div className="failure-body">
-          <p className="failure-headline">{headline}</p>
         </div>
-      }
-    />
+        <p className="failure-headline">{headline}</p>
+      </div>
+      {props.onClose && (
+        <button type="button" className="failure-close" aria-label="关闭" onClick={props.onClose}>×</button>
+      )}
+    </aside>
   );
 }
 
 export function CenteredSpin(): React.JSX.Element {
-  return <div className="centered-spin" role="status" aria-label="正在加载"><Spin size="large" /></div>;
+  return <div className="centered-spin" role="status" aria-label="正在加载"><i /><i /><i /></div>;
 }

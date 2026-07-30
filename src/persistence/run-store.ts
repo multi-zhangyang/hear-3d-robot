@@ -20,11 +20,12 @@ import {
 } from "../domain/schema.js";
 import { z } from "zod";
 import {
-  appendIndexedRecords,
+  appendIndexedRecordsBuilt,
   ensureJournalIndex,
   readIndexedTail,
   readIndexedWindow
 } from "./journal-index.js";
+import { runtimeEventCursor } from "./event-cursor.js";
 import { writeTextAtomically } from "./atomic-file.js";
 import {
   runFencedMutation,
@@ -41,6 +42,11 @@ const RunDefinitionSchema = z.object({
   created_at: z.string().datetime()
 });
 const AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const AgentStateEnvelopeSchema = z.object({
+  version: z.literal(1),
+  checkpoint_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  state: z.string().min(1)
+}).strict();
 
 export type RunDefinition = z.infer<typeof RunDefinitionSchema>;
 
@@ -69,6 +75,21 @@ export interface RunDetailsSnapshot {
 
 export interface RunStoreOptions {
   mutationFence?: MutationFence;
+}
+
+export interface AgentStateRecord {
+  state: string;
+  checkpointFingerprint?: string;
+}
+
+export interface DurableRuntimeEventRecord {
+  event_id: string;
+  run_id: string;
+  type: string;
+  at: string;
+  data: JsonValue;
+  durable?: boolean;
+  cursor?: string;
 }
 
 export class RunStore {
@@ -132,6 +153,26 @@ export class RunStore {
     await this.#append(name, values.map((value) => JSON.stringify(value)));
   }
 
+  /**
+   * Persists durable events with cursors derived from their exact JSONL row.
+   * The ordinal is assigned while the append lock is held, so concurrent
+   * writers and index rebuilds cannot make the cursor point at another row.
+   */
+  async appendRuntimeEvents<T extends DurableRuntimeEventRecord>(
+    events: readonly T[]
+  ): Promise<Array<T & { cursor: string }>> {
+    if (events.length === 0) return [];
+    let persisted: Array<T & { cursor: string }> = [];
+    await this.#appendBuilt("events", (startIndex) => {
+      persisted = events.map((event, offset) => ({
+        ...structuredClone(event),
+        cursor: runtimeEventCursor(event.run_id, event.event_id, startIndex + offset)
+      }));
+      return persisted.map((event) => JSON.stringify(event));
+    });
+    return persisted;
+  }
+
   async writeCheckpoint(checkpoint: RunCheckpoint): Promise<void> {
     const parsed = RunCheckpointSchema.parse(checkpoint);
     await this.#runMutation(
@@ -153,16 +194,26 @@ export class RunStore {
     return entries;
   }
 
-  async readJournalPage(name: JournalName, from: number, limit: number): Promise<JournalPage> {
+  async readJournalPage(
+    name: JournalName,
+    from: number,
+    limit: number,
+    maximumBytes?: number
+  ): Promise<JournalPage> {
     if (!Number.isSafeInteger(from) || from < 0) throw new Error("Journal offset must be nonnegative");
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Journal limit must be positive");
+    if (maximumBytes !== undefined
+      && (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1)) {
+      throw new Error("Journal byte limit must be positive");
+    }
 
     await this.#journalWrites.get(name);
     const window = await this.#runMutation(() => readIndexedWindow(
       this.#journalPath(name),
       this.#journalIndexPath(name),
       from,
-      limit
+      limit,
+      maximumBytes
     ));
     return {
       entries: window.lines.map(parseJournalLine),
@@ -219,15 +270,38 @@ export class RunStore {
     await this.#scanJournal(name, visit);
   }
 
-  async writeAgentState(state: string): Promise<void> {
+  async writeAgentState(state: string, checkpointFingerprint?: string): Promise<void> {
+    const persisted = checkpointFingerprint === undefined
+      ? state
+      : JSON.stringify(AgentStateEnvelopeSchema.parse({
+          version: 1,
+          checkpoint_fingerprint: checkpointFingerprint,
+          state
+        }));
     await this.#runMutation(
-      () => atomicText(resolve(this.runDir, "agent-state.json"), state)
+      () => atomicText(resolve(this.runDir, "agent-state.json"), persisted)
     );
   }
 
   async readAgentState(): Promise<string | undefined> {
+    return (await this.readAgentStateRecord())?.state;
+  }
+
+  async readAgentStateRecord(): Promise<AgentStateRecord | undefined> {
     try {
-      return await readFile(resolve(this.runDir, "agent-state.json"), "utf8");
+      const persisted = await readFile(resolve(this.runDir, "agent-state.json"), "utf8");
+      try {
+        const envelope = AgentStateEnvelopeSchema.safeParse(JSON.parse(persisted));
+        if (envelope.success) {
+          return {
+            state: envelope.data.state,
+            checkpointFingerprint: envelope.data.checkpoint_fingerprint
+          };
+        }
+      } catch {
+        // Raw SDK RunState files written before the envelope remain readable.
+      }
+      return { state: persisted };
     } catch (error) {
       if (isMissing(error)) return undefined;
       throw error;
@@ -274,12 +348,19 @@ export class RunStore {
   }
 
   async #append(name: JournalName, records: string[]): Promise<void> {
+    await this.#appendBuilt(name, () => records);
+  }
+
+  async #appendBuilt(
+    name: JournalName,
+    build: (startIndex: number) => readonly string[]
+  ): Promise<void> {
     const previous = this.#journalWrites.get(name) ?? Promise.resolve();
     const write = previous.then(async () => {
-      await this.#runMutation(() => appendIndexedRecords(
+      await this.#runMutation(() => appendIndexedRecordsBuilt(
         this.#journalPath(name),
         this.#journalIndexPath(name),
-        records
+        build
       ));
     });
     this.#journalWrites.set(name, write.catch(() => undefined));

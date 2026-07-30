@@ -1,7 +1,9 @@
+import "antd/dist/reset.css";
 import { DeleteOutlined, PlusOutlined, RocketOutlined } from "@ant-design/icons";
 import {
   Button,
   Checkbox,
+  ConfigProvider,
   Form,
   Input,
   InputNumber,
@@ -9,8 +11,10 @@ import {
   Select,
   Space,
   Tooltip,
-  Typography
+  Typography,
+  theme
 } from "antd";
+import zhCN from "antd/locale/zh_CN";
 import { useEffect, useMemo, useState } from "react";
 import type {
   Bootstrap,
@@ -31,6 +35,38 @@ interface MissionModalProps {
 }
 
 export function MissionModal(props: MissionModalProps): React.JSX.Element {
+  return (
+    <ConfigProvider
+      locale={zhCN}
+      theme={{
+        algorithm: theme.darkAlgorithm,
+        token: {
+          colorPrimary: "#24c8ae",
+          colorInfo: "#8e7be8",
+          colorSuccess: "#24c8ae",
+          colorWarning: "#e6a64b",
+          colorError: "#ef6a6a",
+          colorBgBase: "#101214",
+          colorBgContainer: "#191c1f",
+          colorBgElevated: "#22262a",
+          colorBorder: "#34393e",
+          colorBorderSecondary: "#292d31",
+          colorText: "#f0f1f2",
+          colorTextSecondary: "#a7adb3",
+          colorTextTertiary: "#737a81",
+          borderRadius: 6,
+          wireframe: false,
+          fontFamily: '"Space Grotesk Variable", Inter, ui-sans-serif, system-ui, sans-serif',
+          fontFamilyCode: '"JetBrains Mono Variable", "SFMono-Regular", Consolas, monospace'
+        }
+      }}
+    >
+      <MissionModalContent {...props} />
+    </ConfigProvider>
+  );
+}
+
+function MissionModalContent(props: MissionModalProps): React.JSX.Element {
   const [mission, setMission] = useState("");
   const [scenarioId, setScenarioId] = useState("");
   const [goal, setGoal] = useState<Goal | null>(null);

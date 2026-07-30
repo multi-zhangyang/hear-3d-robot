@@ -49,3 +49,21 @@
   .predicate-add { width: 100%; }
   .predicate-row { padding: 10px; }
 }
+.modal-loading {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(6 9 10 / 66%);
+  backdrop-filter: blur(8px);
+}
+
+.modal-loading .panel-loading {
+  width: 180px;
+  min-height: 110px;
+  border: 1px solid rgb(135 176 159 / 24%);
+  border-radius: 16px;
+  background: #191e1c;
+  box-shadow: 0 22px 54px rgb(0 0 0 / 48%);
+}

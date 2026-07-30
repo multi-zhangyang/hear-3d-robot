@@ -20,9 +20,26 @@ describe("RunStore journal windows", () => {
 
     await store.writeAgentState("serialized-state");
     expect(await store.readAgentState()).toBe("serialized-state");
+    const fingerprint = "a".repeat(64);
+    await store.writeAgentState("enveloped-state", fingerprint);
+    expect(await store.readAgentStateRecord()).toEqual({
+      state: "enveloped-state",
+      checkpointFingerprint: fingerprint
+    });
+    expect(await store.readAgentState()).toBe("enveloped-state");
     await store.clearAgentState();
     expect(await store.readAgentState()).toBeUndefined();
     await store.clearAgentState();
+
+    const persistedEvents = await store.appendRuntimeEvents([
+      runtimeEvent(store.definition.run_id, "cursor-a"),
+      runtimeEvent(store.definition.run_id, "cursor-b")
+    ]);
+    expect(persistedEvents.map((event) => event.cursor)).toEqual([
+      expect.stringMatching(/^v1:0:[a-f0-9]{64}$/),
+      expect.stringMatching(/^v1:1:[a-f0-9]{64}$/)
+    ]);
+    expect(await store.readJournal("events")).toEqual(persistedEvents);
   });
 
   it("isolates and clears one SDK session file per concrete worker", async () => {
@@ -209,3 +226,13 @@ describe("RunStore journal windows", () => {
     expect((await stat(join(store.runDir, "events.offsets"))).size).toBe(2_001 * 8);
   });
 });
+
+function runtimeEvent(runId: string, eventId: string) {
+  return {
+    event_id: eventId,
+    run_id: runId,
+    type: "test_event",
+    at: "2026-07-30T00:00:00.000Z",
+    data: { source: "test" }
+  };
+}

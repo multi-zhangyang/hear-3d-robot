@@ -61,15 +61,16 @@ describe("RunManager event and process lifecycle", () => {
     let writeFinished = false;
     const writing = (async () => {
       await writer.append("provider", record);
-      await writer.append("events", durable as unknown as JsonValue);
+      const [persisted] = await writer.appendRuntimeEvents([durable]);
       writeFinished = true;
+      return persisted!;
     })();
     await Promise.resolve();
     expect(writeFinished).toBe(false);
 
     pause.release();
     const cut = await loading;
-    await writing;
+    const persistedDurable = await writing;
     expect(cut.event_cursor).toBe(baseline.event_cursor);
     expect(cut.provider).not.toContainEqual(record);
 
@@ -80,7 +81,8 @@ describe("RunManager event and process lifecycle", () => {
       (event) => replayed.push(event)
     );
     unsubscribe();
-    expect(replayed.filter((event) => event.event_id === durable.event_id)).toEqual([durable]);
+    expect(replayed.filter((event) => event.event_id === durable.event_id))
+      .toEqual([persistedDurable]);
   });
 
   it("replays one matching event when details sees its domain record first", async () => {
@@ -105,7 +107,7 @@ describe("RunManager event and process lifecycle", () => {
     const cut = await manager.details(runId, { actions: 20, provider: 20, framework: 20 });
     expect(cut.provider).toContainEqual(record);
 
-    await store.append("events", durable as unknown as JsonValue);
+    const [persistedDurable] = await store.appendRuntimeEvents([durable]);
     const replayed: RuntimeEvent[] = [];
     const unsubscribe = await manager.subscribe(
       runId,
@@ -113,7 +115,8 @@ describe("RunManager event and process lifecycle", () => {
       (event) => replayed.push(event)
     );
     unsubscribe();
-    expect(replayed.filter((event) => event.event_id === durable.event_id)).toEqual([durable]);
+    expect(replayed.filter((event) => event.event_id === durable.event_id))
+      .toEqual([persistedDurable]);
   });
 
   it("streams an old cursor suffix without replaying history for a current cursor", async () => {
@@ -162,6 +165,97 @@ describe("RunManager event and process lifecycle", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("locates a versioned cursor in O(1) and replays its suffix across bounded pages", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const appended = Array.from({ length: 1_300 }, (_, index) =>
+      runtimeEvent(runId, `indexed-event-${index}`));
+    const persisted = await store.appendRuntimeEvents(appended);
+    const manager = new RunManager({ runsDir, catalog });
+    const scan = vi.spyOn(RunStore.prototype, "scanJournal")
+      .mockRejectedValue(new Error("full journal scan is forbidden"));
+    const pages = vi.spyOn(RunStore.prototype, "readJournalPage");
+    const received: RuntimeEvent[] = [];
+    try {
+      const stop = await manager.subscribe(
+        runId,
+        persisted[100]!.cursor,
+        (event) => received.push(event)
+      );
+      stop();
+      expect(received.map((event) => event.event_id)).toEqual(
+        persisted.slice(101).map((event) => event.event_id)
+      );
+      expect(scan).not.toHaveBeenCalled();
+      expect(pages.mock.calls.length).toBeGreaterThan(1);
+      expect(pages.mock.calls.every((call) => call[2] <= 64)).toBe(true);
+      expect(pages.mock.calls.every((call) => call[3] === 512 * 1024)).toBe(true);
+    } finally {
+      pages.mockRestore();
+      scan.mockRestore();
+    }
+  });
+
+  it("distinguishes duplicate event IDs with versioned cursors", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const [first, second] = await store.appendRuntimeEvents([
+      runtimeEvent(runId, "reused-event-id"),
+      runtimeEvent(runId, "reused-event-id")
+    ]);
+    const manager = new RunManager({ runsDir, catalog });
+    const received: RuntimeEvent[] = [];
+
+    const stop = await manager.subscribe(
+      runId,
+      first!.cursor,
+      (event) => received.push(event)
+    );
+    stop();
+
+    expect(received).toEqual([second]);
+    expect(first!.cursor).not.toBe(second!.cursor);
+  });
+
+  it("rejects duplicate legacy IDs and malformed reserved cursors before stream readiness", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    await store.appendRuntimeEvents([
+      runtimeEvent(runId, "ambiguous-legacy-id"),
+      runtimeEvent(runId, "ambiguous-legacy-id")
+    ]);
+    const manager = new RunManager({ runsDir, catalog });
+
+    for (const cursor of [
+      "ambiguous-legacy-id",
+      "v1:not-an-index:broken",
+      `v1:0:${"0".repeat(64)}`
+    ]) {
+      const ready = vi.fn();
+      await expect(manager.subscribe(runId, cursor, () => undefined, undefined, ready))
+        .rejects.toThrow(/(?:Ambiguous|Malformed|Unknown) .*event cursor/i);
+      expect(ready).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects an unknown cursor before declaring the stream ready", async () => {
+    const { runsDir, runId } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const manager = new RunManager({ runsDir, catalog });
+    const ready = vi.fn();
+    const received: RuntimeEvent[] = [];
+
+    await expect(manager.subscribe(
+      runId,
+      "unknown-event-cursor",
+      (event) => received.push(event),
+      undefined,
+      ready
+    )).rejects.toThrow(/Unknown event cursor/);
+    expect(ready).not.toHaveBeenCalled();
+    expect(received).toEqual([]);
+  });
+
   it("marks process-orphaned runs interrupted and leaves them resumable", async () => {
     const { runsDir, store } = await copiedFixture();
     const catalog = await loadRuntimeCatalog();
@@ -208,18 +302,16 @@ describe("RunManager event and process lifecycle", () => {
     const catalog = await loadRuntimeCatalog();
     const checkpoint = await store.readCheckpoint();
     await store.writeCheckpoint({ ...checkpoint, status: "running", error: null });
-    const originalAppend = RunStore.prototype.append;
+    const originalAppend = RunStore.prototype.appendRuntimeEvents;
     let rejected = false;
-    const append = vi.spyOn(RunStore.prototype, "append").mockImplementation(async function (
-      name,
-      value
+    const append = vi.spyOn(RunStore.prototype, "appendRuntimeEvents").mockImplementation(async function (
+      events
     ) {
-      if (!rejected && name === "events"
-        && (value as Record<string, unknown>).type === "run_interrupted") {
+      if (!rejected && events.some((event) => event.type === "run_interrupted")) {
         rejected = true;
         throw new Error("event journal unavailable");
       }
-      await originalAppend.call(this, name, value);
+      return originalAppend.call(this, events);
     });
     try {
       const manager = new RunManager({ runsDir, catalog });
@@ -267,6 +359,27 @@ describe("RunManager event and process lifecycle", () => {
     expect(deliveredBeforeDisconnect).toBe(1);
   });
 
+  it("replays one durable event larger than the replay byte budget", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const manager = new RunManager({ runsDir, catalog });
+    const baseline = await manager.details(runId, { actions: 1, provider: 1, framework: 1 });
+    const [oversized] = await store.appendRuntimeEvents([{
+      ...runtimeEvent(runId, "oversized-durable-event"),
+      data: { payload: "x".repeat(1024 * 1024) }
+    }]);
+    const received: RuntimeEvent[] = [];
+
+    const stop = await manager.subscribe(
+      runId,
+      baseline.event_cursor!,
+      (event) => received.push(event)
+    );
+    stop();
+
+    expect(received).toEqual([oversized]);
+  });
+
   it("orders live events after a paused journal backfill without losing either source", async () => {
     const { runsDir, runId, store } = await copiedFixture();
     const catalog = await loadRuntimeCatalog();
@@ -291,15 +404,12 @@ describe("RunManager event and process lifecycle", () => {
     await expect(starting).resolves.toBe(runId);
 
     const live = runtimeEvent(runId, "live-during-backfill");
+    const originalScan = RunStore.prototype.scanJournal;
     const scan = vi.spyOn(RunStore.prototype, "scanJournal").mockImplementationOnce(
-      async (_name, visit) => {
-        for (const [index, event] of entries.entries()) {
-          await visit(event, index);
-          if (index === cursorIndex + 1) {
-            emit?.(entries[cursorIndex + 2]!);
-            emit?.(live);
-          }
-        }
+      async function (name, visit) {
+        await originalScan.call(this, name, visit);
+        emit?.(entries[cursorIndex + 2]!);
+        emit?.(live);
       }
     );
     const received: RuntimeEvent[] = [];
@@ -348,24 +458,25 @@ describe("RunManager event and process lifecycle", () => {
     emit(runtimeEvent(runId, "mission-created"));
     await starting;
 
+    const originalScan = RunStore.prototype.scanJournal;
     const scan = vi.spyOn(RunStore.prototype, "scanJournal").mockImplementationOnce(
-      async (_name, visit) => {
-        for (const [index, event] of entries.entries()) {
-          await visit(event, index);
-          if (index === cursorIndex) {
-            for (let liveIndex = 0; liveIndex < 300; liveIndex += 1) {
-              emit?.(runtimeEvent(runId, `live-overflow-${liveIndex}`));
-            }
-          }
+      async function (name, visit) {
+        await originalScan.call(this, name, visit);
+        for (let liveIndex = 0; liveIndex < 300; liveIndex += 1) {
+          emit?.(runtimeEvent(runId, `live-overflow-${liveIndex}`));
         }
       }
     );
+    const ready = vi.fn();
     try {
       await expect(manager.subscribe(
         runId,
         entries[cursorIndex]!.event_id,
-        async () => Promise.resolve()
+        async () => Promise.resolve(),
+        undefined,
+        ready
       )).rejects.toThrow(/fell behind during journal backfill/);
+      expect(ready).not.toHaveBeenCalled();
     } finally {
       scan.mockRestore();
       finishMission({ runId, runDir: store.runDir, output: "done" });
@@ -374,7 +485,7 @@ describe("RunManager event and process lifecycle", () => {
     }
   });
 
-  it("bounds live-event bytes while a journal cursor is being replayed", async () => {
+  it("allows one oversized live event while a journal cursor is being replayed", async () => {
     const { runsDir, runId, store } = await copiedFixture();
     const catalog = await loadRuntimeCatalog();
     const entries = await store.readJournal("events") as unknown as RuntimeEvent[];
@@ -397,27 +508,81 @@ describe("RunManager event and process lifecycle", () => {
     emit(runtimeEvent(runId, "mission-created"));
     await starting;
 
+    const originalScan = RunStore.prototype.scanJournal;
     const scan = vi.spyOn(RunStore.prototype, "scanJournal").mockImplementationOnce(
-      async (_name, visit) => {
-        for (const [index, event] of entries.entries()) {
-          await visit(event, index);
-          if (index === cursorIndex) {
-            emit?.({
-              ...runtimeEvent(runId, "oversized-live-frame"),
-              type: "world_frames",
-              durable: false,
-              data: { frames: [], payload: "x".repeat(1024 * 1024) }
-            });
-          }
-        }
+      async function (name, visit) {
+        await originalScan.call(this, name, visit);
+        emit?.({
+          ...runtimeEvent(runId, "oversized-live-frame"),
+          type: "world_frames",
+          durable: false,
+          data: { frames: [], payload: "x".repeat(1024 * 1024) }
+        });
       }
     );
+    const received: RuntimeEvent[] = [];
+    try {
+      const stop = await manager.subscribe(
+        runId,
+        entries[cursorIndex]!.event_id,
+        (event) => received.push(event)
+      );
+      stop();
+      expect(received.at(-1)?.event_id).toBe("oversized-live-frame");
+    } finally {
+      scan.mockRestore();
+      finishMission({ runId, runDir: store.runDir, output: "done" });
+      await manager.drain();
+      missionRunner.startMission.mockReset();
+    }
+  });
+
+  it("disconnects when another live event follows an oversized backfill buffer entry", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const entries = await store.readJournal("events") as unknown as RuntimeEvent[];
+    const cursorIndex = entries.length - 3;
+    let emit: RuntimeEventSink | undefined;
+    let finishMission!: (value: { runId: string; runDir: string; output: string }) => void;
+    missionRunner.startMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
+      emit = input.eventSink;
+      return new Promise((resolveMission) => {
+        finishMission = resolveMission;
+      });
+    });
+    const manager = new RunManager({ runsDir, catalog, provider: TEST_PROVIDER });
+    const starting = manager.start({
+      mission: store.definition.mission,
+      scenarioId: store.definition.scenario_id,
+      goal: store.definition.goal
+    });
+    if (!emit) throw new Error("Mission event sink was not installed");
+    emit(runtimeEvent(runId, "mission-created"));
+    await starting;
+
+    const originalScan = RunStore.prototype.scanJournal;
+    const scan = vi.spyOn(RunStore.prototype, "scanJournal").mockImplementationOnce(
+      async function (name, visit) {
+        await originalScan.call(this, name, visit);
+        emit?.({
+          ...runtimeEvent(runId, "oversized-live-frame"),
+          type: "world_frames",
+          durable: false,
+          data: { frames: [], payload: "x".repeat(1024 * 1024) }
+        });
+        emit?.(runtimeEvent(runId, "event-after-oversized-frame"));
+      }
+    );
+    const ready = vi.fn();
     try {
       await expect(manager.subscribe(
         runId,
         entries[cursorIndex]!.event_id,
-        async () => Promise.resolve()
+        () => undefined,
+        undefined,
+        ready
       )).rejects.toThrow(/fell behind during journal backfill/);
+      expect(ready).not.toHaveBeenCalled();
     } finally {
       scan.mockRestore();
       finishMission({ runId, runDir: store.runDir, output: "done" });

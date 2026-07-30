@@ -39,6 +39,11 @@ import {
   canReplayInitialModelRequest,
   isTransportInterruption
 } from "./transport-recovery.js";
+import {
+  assertRunStateMatchesOpenRootDelegations,
+  hasOpenRootDelegations,
+  sdkRecoveryCheckpointFingerprint
+} from "./sdk-recovery.js";
 
 setTracingDisabled(true);
 
@@ -49,6 +54,16 @@ setTracingDisabled(true);
  */
 const MAX_TRANSPORT_RECOVERIES = 8;
 const MAX_MODEL_DECISION_RECOVERIES = 3;
+const SDK_STATE_LOSS_REASON =
+  "Unfinished node closed because its SDK RunState call ownership was unavailable";
+
+type SdkBranchRotationSource =
+  | "operator_requested"
+  | "evidence_contract_upgrade"
+  | "sdk_state_missing"
+  | "checkpoint_not_resumable"
+  | "sdk_state_checkpoint_mismatch"
+  | "sdk_state_incompatible";
 
 /** Exponential backoff, capped, so a throttled provider is given room to recover. */
 function transportBackoffMs(attempt: number): number {
@@ -171,16 +186,32 @@ export async function resumeMission(input: {
       checkpoint.active_agent_id,
       checkpoint.active_agent_ids
     );
-    const agentState = await store.readAgentState();
+    const agentStateRecord = await store.readAgentStateRecord();
+    const agentState = agentStateRecord?.state;
     const evidenceContractUpgrade = hierarchyNeedsEvidenceContractRotation(
       restoredNodes,
       checkpoint.root_id
     );
-    const freshContext = input.freshContext === true || evidenceContractUpgrade;
-    const resumeSerializedState = !freshContext
-      && agentState !== undefined
-      && (checkpoint.status === "running" || checkpoint.status === "interrupted");
-    if (!resumeSerializedState) hierarchy.reactivateRoot();
+    const checkpointCanResumeState = checkpoint.status === "running"
+      || checkpoint.status === "interrupted";
+    const stateCheckpointMismatch = agentStateRecord?.checkpointFingerprint !== undefined
+      && agentStateRecord.checkpointFingerprint
+        !== sdkRecoveryCheckpointFingerprint(checkpoint);
+    const freshContextSource: SdkBranchRotationSource | undefined = input.freshContext === true
+      ? "operator_requested"
+      : evidenceContractUpgrade
+        ? "evidence_contract_upgrade"
+        : agentState === undefined
+          ? "sdk_state_missing"
+          : !checkpointCanResumeState
+            ? "checkpoint_not_resumable"
+            : undefined;
+    const resumeSerializedState = freshContextSource === undefined && agentState !== undefined;
+    if (!resumeSerializedState) {
+      const stateUnavailable = freshContextSource === "sdk_state_missing"
+        || freshContextSource === "checkpoint_not_resumable";
+      hierarchy.reactivateRoot(stateUnavailable ? SDK_STATE_LOSS_REASON : undefined);
+    }
     const runtime = new HarnessRuntimeContext({
       store,
       goal: store.definition.goal,
@@ -199,15 +230,11 @@ export async function resumeMission(input: {
       runtime,
       provider: input.provider,
       resumed: true,
-      freshContext,
-      ...(freshContext
-        ? {
-            freshContextSource: input.freshContext === true
-              ? "operator_requested" as const
-              : "evidence_contract_upgrade" as const
-          }
-        : {}),
+      ...(freshContextSource ? { freshContextSource } : {}),
       ...(resumeSerializedState ? { serializedState: agentState } : {}),
+      ...(resumeSerializedState && stateCheckpointMismatch
+        ? { serializedStateCheckpointMismatch: true }
+        : {}),
       ...(input.signal ? { signal: input.signal } : {})
     });
   } finally {
@@ -219,9 +246,9 @@ async function executeMission(input: {
   runtime: HarnessRuntimeContext;
   provider: ProviderConfig;
   resumed: boolean;
-  freshContext?: boolean;
-  freshContextSource?: "operator_requested" | "evidence_contract_upgrade";
+  freshContextSource?: SdkBranchRotationSource;
   serializedState?: string;
+  serializedStateCheckpointMismatch?: boolean;
   signal?: AbortSignal;
 }): Promise<MissionRunResult> {
   const sessions = new Map<string, FileSession>();
@@ -268,22 +295,57 @@ async function executeMission(input: {
   });
   const session = sessionForAgent(input.runtime.rootAgentId);
   const runContext = new RunContext<HarnessAgentContext>({ runId: input.runtime.runId });
+  const validateSerializedState = async (
+    state: string,
+    checkpointMismatch: boolean
+  ): Promise<void> => {
+    const restored = await RunState.fromStringWithContext(
+      hierarchy.root,
+      state,
+      runContext,
+      { contextStrategy: "replace" }
+    );
+    assertRunStateMatchesOpenRootDelegations(
+      input.runtime.checkpoint,
+      restored.toJSON()
+    );
+    if (checkpointMismatch && !hasOpenRootDelegations(input.runtime.checkpoint)) {
+      throw new Error("SDK RunState checkpoint fingerprint is stale without an open delegation");
+    }
+  };
 
   try {
-    if (input.freshContext) {
+    let serializedState = input.serializedState;
+    const serializedStateCheckpointMismatch =
+      input.serializedStateCheckpointMismatch === true;
+    let branchRotationSource = input.freshContextSource;
+    let branchRotationError: string | undefined;
+    if (serializedState) {
+      try {
+        await validateSerializedState(serializedState, serializedStateCheckpointMismatch);
+      } catch (error) {
+        branchRotationSource = serializedStateCheckpointMismatch
+          ? "sdk_state_checkpoint_mismatch"
+          : "sdk_state_incompatible";
+        branchRotationError = errorMessage(error);
+        serializedState = undefined;
+      }
+    }
+    if (branchRotationSource) {
       contextManager.startFreshSdkTurn(input.runtime.rootAgentId);
-      await Promise.all([
-        session.clearSession(),
-        input.runtime.store.clearWorkerSessions(),
-        input.runtime.store.clearAgentState()
-      ]);
+      await clearSdkBranch(input.runtime.store, session);
+      if (branchRotationSource === "sdk_state_incompatible"
+        || branchRotationSource === "sdk_state_checkpoint_mismatch") {
+        await input.runtime.reactivateRootAfterSdkStateLoss(SDK_STATE_LOSS_REASON);
+      }
     }
     await input.runtime.start(input.resumed);
-    if (input.freshContext) {
+    if (branchRotationSource) {
       await input.runtime.recordProvider({
         status: "context_branch_rotated",
-        source: input.freshContextSource ?? "operator_requested",
-        cleared: ["sdk_run_state", "sdk_session"],
+        source: branchRotationSource,
+        ...(branchRotationError ? { error: branchRotationError } : {}),
+        cleared: ["sdk_run_state", "root_sdk_session", "worker_sdk_sessions"],
         preserved: ["world_checkpoint", "action_receipts", "context_journal", "compact_memory", "spatial_memory"],
         automatic_actuation: false
       }, input.runtime.rootAgentId);
@@ -293,7 +355,6 @@ async function executeMission(input: {
       ...providerIdentity(input.provider)
     });
 
-    let serializedState = input.serializedState;
     const initialRequestBaseline = !input.resumed && serializedState === undefined
       ? {
           checkpoint: input.runtime.checkpoint,
@@ -336,7 +397,10 @@ async function executeMission(input: {
         }
         await stream.completed;
         await contextManager.compactSessionHistories(sessionForAgent);
-        await input.runtime.store.writeAgentState(stream.state.toString());
+        await input.runtime.store.writeAgentState(
+          stream.state.toString(),
+          sdkRecoveryCheckpointFingerprint(input.runtime.checkpoint)
+        );
         // An aborted SDK stream can resolve `completed` without a final model
         // item. Preserve the process-signal reason instead of reading an
         // unavailable finalOutput and overwriting the checkpoint with a
@@ -365,6 +429,7 @@ async function executeMission(input: {
           // that short-term branch while retaining the append-only context
           // journal, compact checkpoint, receipts and authoritative world.
           contextManager.startFreshSdkTurn(input.runtime.rootAgentId);
+          await input.runtime.store.clearAgentState();
           await session.clearSession();
           await input.runtime.recordProvider({
             status: "model_decision_recovery",
@@ -385,7 +450,18 @@ async function executeMission(input: {
           continue;
         }
         if (!isTransportInterruption(error)) throw error;
-        const persisted = await input.runtime.store.readAgentState();
+        const persistedRecord = await input.runtime.store.readAgentStateRecord();
+        const persistedCheckpointMismatch = persistedRecord?.checkpointFingerprint !== undefined
+          && persistedRecord.checkpointFingerprint
+            !== sdkRecoveryCheckpointFingerprint(input.runtime.checkpoint);
+        let persisted = persistedRecord?.state;
+        if (persisted) {
+          try {
+            await validateSerializedState(persisted, persistedCheckpointMismatch);
+          } catch {
+            persisted = undefined;
+          }
+        }
         // The SDK persists a streaming run's input before opening the HTTP
         // response. A brand-new mission can therefore have a durable Session
         // but no RunState when its first request gets no response. Retrying is
@@ -476,7 +552,10 @@ async function persistStreamEvent(
   const frameworkEvent = sdkEventJson(event);
   const providerEvent = providerEventJson(event);
   if (!frameworkEvent && !providerEvent) return;
-  await runtime.store.writeAgentState(stream.state.toString());
+  await runtime.store.writeAgentState(
+    stream.state.toString(),
+    sdkRecoveryCheckpointFingerprint(runtime.checkpoint)
+  );
   if (frameworkEvent) {
     await runtime.recordFramework(
       runtime.frameworkScope(runtime.rootAgentId),
@@ -485,6 +564,16 @@ async function persistStreamEvent(
     );
   }
   if (providerEvent) await runtime.recordProvider(providerEvent, runtime.rootAgentId);
+}
+
+async function clearSdkBranch(store: RunStore, rootSession: FileSession): Promise<void> {
+  // The RunState file is the recovery pointer. Remove it first so a process
+  // exit during Session cleanup can only re-enter this idempotent rotation.
+  await store.clearAgentState();
+  await Promise.all([
+    rootSession.clearSession(),
+    store.clearWorkerSessions()
+  ]);
 }
 
 function missionInput(runtime: HarnessRuntimeContext, mission: string, resumed: boolean): string {

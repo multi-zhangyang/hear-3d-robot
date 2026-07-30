@@ -10,7 +10,7 @@ export default defineConfig({
   // slower on a cold shared CI runner than on a warm development machine.
   // Keep every rendering assertion, but give the full production WebGL path a
   // realistic ceiling instead of turning runner contention into a false fail.
-  timeout: 90_000,
+  timeout: 120_000,
   expect: { timeout: 12_000 },
   fullyParallel: false,
   workers: 1,

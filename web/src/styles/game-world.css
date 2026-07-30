@@ -23,6 +23,43 @@
   min-height: 0;
 }
 
+.stage-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background:
+    radial-gradient(circle at 50% 44%, rgb(46 104 80 / 22%), transparent 30%),
+    linear-gradient(180deg, #111815, #080b0d);
+}
+
+.stage-loading i,
+.panel-loading i {
+  width: 10px;
+  height: 10px;
+  border: 1px solid rgb(130 222 182 / 42%);
+  background: rgb(72 156 120 / 34%);
+  box-shadow: 0 0 18px rgb(72 190 143 / 18%);
+  animation: world-loading-pulse 1.1s ease-in-out infinite alternate;
+}
+
+.stage-loading i:nth-child(2),
+.panel-loading i:nth-child(2) { animation-delay: 160ms; }
+.stage-loading i:nth-child(3),
+.panel-loading i:nth-child(3) { animation-delay: 320ms; }
+
+@keyframes world-loading-pulse {
+  to { opacity: 0.32; transform: translateY(-5px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stage-loading i,
+  .panel-loading i { animation: none; }
+}
+
 .game-card {
   border: 1px solid rgb(150 174 164 / 26%);
   border-radius: 14px;

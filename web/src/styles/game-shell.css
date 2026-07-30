@@ -77,13 +77,57 @@
   gap: 10px;
 }
 
-.operator-toolbar > .ant-space:first-child {
+.run-context {
+  display: flex;
   min-width: 0;
   flex: 1;
+  align-items: center;
+  gap: 10px;
 }
 
 .run-select {
   width: min(470px, 42vw);
+  height: 36px;
+  min-width: 0;
+  padding: 0 34px 0 11px;
+  border: 1px solid rgb(145 164 157 / 26%);
+  border-radius: 9px;
+  color: #e7ece9;
+  background-color: #202624;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.run-select:hover { border-color: rgb(123 212 174 / 46%); }
+.run-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid rgb(146 166 158 / 20%);
+  border-radius: 999px;
+  color: #aeb8b4;
+  background: rgb(255 255 255 / 3%);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.run-status i { width: 6px; height: 6px; border-radius: 50%; background: #737d79; }
+.run-status-running,
+.run-status-starting,
+.run-status-succeeded { color: #8bdeb9; }
+.run-status-running i,
+.run-status-starting i,
+.run-status-succeeded i { background: #69daa9; box-shadow: 0 0 8px rgb(87 214 161 / 50%); }
+.run-status-failed,
+.run-status-interrupted { color: #ef9a9a; }
+.run-status-failed i,
+.run-status-interrupted i { background: #e66f6f; }
+
+.mission-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .system-controls {
@@ -142,7 +186,42 @@
   min-height: 0;
 }
 
-.game-content > .ant-alert {
+.panel-loading {
+  display: flex;
+  min-height: 280px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.deferred-failure {
+  display: grid;
+  min-height: 260px;
+  place-content: center;
+  justify-items: center;
+  gap: 12px;
+  color: #e9b0b0;
+  font-size: 12px;
+}
+
+.deferred-failure button {
+  padding: 7px 12px;
+  border: 1px solid rgb(231 116 116 / 38%);
+  border-radius: 8px;
+  color: #f0cece;
+  background: rgb(116 43 43 / 22%);
+  cursor: pointer;
+}
+
+.deferred-failure.modal {
+  position: fixed;
+  z-index: 1001;
+  inset: 0;
+  background: rgb(6 9 10 / 78%);
+  backdrop-filter: blur(8px);
+}
+
+.game-content > .failure-alert {
   position: absolute;
   z-index: 65;
   top: 10px;
@@ -151,11 +230,28 @@
   transform: translateX(-50%);
 }
 
-.game-content > .ant-empty,
+.game-content > .empty-state,
 .game-content > .centered-spin {
   display: grid;
   height: 100%;
   place-content: center;
+}
+
+.operator-notice {
+  position: fixed;
+  z-index: 160;
+  top: 76px;
+  left: 50%;
+  width: min(560px, calc(100% - 28px));
+  padding: 11px 14px;
+  border: 1px solid rgb(239 106 106 / 36%);
+  border-radius: 11px;
+  color: #f3d8d8;
+  background: rgb(60 27 28 / 96%);
+  box-shadow: 0 14px 34px rgb(0 0 0 / 38%);
+  transform: translateX(-50%);
+  text-align: center;
+  font-size: 12px;
 }
 
 .game-hotbar {
@@ -253,9 +349,7 @@
   .game-brand small { display: none; }
   .operator-toolbar { align-items: center; flex-direction: row; }
   .operator-toolbar > .run-context { width: auto; min-width: 0; flex: 1; flex-wrap: nowrap; }
-  .run-context > .ant-space-item { min-width: 0; }
-  .run-context > .ant-space-item:first-child { flex: 1; }
-  .run-context > .ant-space-item:nth-child(n + 2) { display: none; }
+  .run-context > .run-status { display: none; }
   .operator-toolbar > .mission-actions { width: auto; flex: 0 0 auto; justify-content: flex-end; }
   .run-select { width: 100%; }
   .game-main { height: auto; min-height: 0; }

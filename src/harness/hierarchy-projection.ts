@@ -340,12 +340,14 @@ export class HierarchyProjection {
     this.#focusId = null;
   }
 
-  reactivateRoot(): void {
+  reactivateRoot(
+    unfinishedReason = "Unfinished node closed before coordinator restart"
+  ): void {
     const now = new Date().toISOString();
     for (const node of Object.values(this.#nodes)) {
       if (node.id === this.rootId || !isUnfinished(node)) continue;
       node.status = "failed";
-      node.last_result = { error: "Unfinished node closed before coordinator restart" };
+      node.last_result = { error: unfinishedReason };
       node.updated_at = now;
     }
     const root = this.get(this.rootId);

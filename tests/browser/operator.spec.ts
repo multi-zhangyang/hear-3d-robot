@@ -10,6 +10,7 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
   await page.goto("/");
   const passwordInput = page.getByLabel("操作密码");
   if (await passwordInput.isVisible().catch(() => false)) {
+    expect(await loadedDeferredChunks(page)).toEqual([]);
     await passwordInput.fill(process.env.HEAR_E2E_PASSWORD ?? "hear-e2e-local");
     await page.getByRole("button", { name: /登\s*录/ }).click();
   }
@@ -50,6 +51,13 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
     const element = document.querySelector("canvas.three-canvas");
     return element instanceof HTMLCanvasElement && element.width > 200 && element.height > 200;
   });
+  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
+    expect.stringMatching(/create-stage/),
+    expect.stringMatching(/three~/)
+  ]));
+  expect(await loadedDeferredChunks(page)).not.toEqual(expect.arrayContaining([
+    expect.stringMatching(/AgentFlowView|ActivityView|RobotTrailView|MissionModal/)
+  ]));
 
   const stageMode = missionMode === "实时任务" ? "实时机器人世界" : "机器人任务回顾";
   await expect(page.locator(`section[aria-label="${stageMode}"]`)).toBeVisible();
@@ -111,17 +119,27 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
   await expect(page.getByRole("region", { name: "智能体流面板" })).toBeVisible();
   await expect(page.getByLabel("实时层级智能体流")).toBeVisible();
   await expect(page.getByLabel("智能体执行流")).toBeVisible();
+  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
+    expect.stringMatching(/AgentFlowView/)
+  ]));
   await expect(canvas).toBeVisible();
   if (testInfo.project.name === "desktop") await captureReadmeScreenshot(page, "hierarchy.png");
   await page.keyboard.press("Escape");
   await expect(page.getByRole("region", { name: "智能体流面板" })).toHaveCount(0);
   await page.keyboard.press("3");
   await expect(page.getByRole("region", { name: "行动历程面板" })).toBeVisible();
+  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
+    expect.stringMatching(/RobotTrailView/)
+  ]));
+  await expect(page.getByLabel("机器人行动历程")).toBeVisible();
   if (testInfo.project.name === "desktop") await captureReadmeScreenshot(page, "actions.png");
   await page.keyboard.press("Escape");
   await page.keyboard.press("4");
   await expect(page.getByRole("region", { name: "智能体输出面板" })).toBeVisible();
   await expect(page.getByLabel("模型输出")).toBeVisible();
+  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
+    expect.stringMatching(/ActivityView/)
+  ]));
   await expect(page.getByLabel(/\d+ 次模型调用/)).toBeVisible();
   if (missionMode === "任务回顾") {
     await expect(page.getByLabel("模型流状态")).toContainText("模型已响应");
@@ -130,70 +148,44 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
   await page.keyboard.press("Escape");
   await expect(hotbar.getByRole("button", { name: "世界" })).toHaveAttribute("aria-current", "page");
 
-  // Trigger one authoritative render, then read its WebGL buffer before the
-  // browser compositor clears it. Chromium's screenshot compositor can race a
-  // large SwiftShader canvas; readPixels tests the renderer itself directly.
-  const painted = await canvas.evaluate((element) => new Promise<{
-    colors: number;
-    opaque: number;
+  await page.getByRole("button", { name: "适配相机范围", exact: true }).click();
+  const webgl = await canvas.evaluate((element): {
+    available: boolean;
     contextLost: boolean;
     error: number | null;
-  }>((resolvePainted) => {
+  } => {
     if (!(element instanceof HTMLCanvasElement)) {
-      resolvePainted({ colors: 0, opaque: 0, contextLost: true, error: null });
-      return;
+      return { available: false, contextLost: true, error: null };
     }
-    const fit = document.querySelector<HTMLButtonElement>(
-      'button[aria-label="适配相机范围"]'
-    );
-    if (!fit) {
-      resolvePainted({ colors: 0, opaque: 0, contextLost: false, error: null });
-      return;
-    }
-    fit.addEventListener("click", () => {
-      window.requestAnimationFrame(() => {
-        const context = element.getContext("webgl2") ?? element.getContext("webgl");
-        if (!context) {
-          resolvePainted({ colors: 0, opaque: 0, contextLost: true, error: null });
-          return;
-        }
-        context.finish();
-        const bandHeight = Math.min(96, element.height);
-        const bandY = Math.max(0, Math.floor((element.height - bandHeight) / 2));
-        const pixels = new Uint8Array(element.width * bandHeight * 4);
-        context.readPixels(
-          0,
-          bandY,
-          element.width,
-          bandHeight,
-          context.RGBA,
-          context.UNSIGNED_BYTE,
-          pixels
-        );
-        const error = context.getError();
-        const colors = new Set<string>();
-        let opaque = 0;
-        const pixelCount = element.width * bandHeight;
-        const stride = Math.max(1, Math.floor(pixelCount / 12_000));
-        for (let pixel = 0; pixel < pixelCount; pixel += stride) {
-          const offset = pixel * 4;
-          if ((pixels[offset + 3] ?? 0) > 0) opaque += 1;
-          colors.add(`${pixels[offset]},${pixels[offset + 1]},${pixels[offset + 2]}`);
-        }
-        resolvePainted({
-          colors: colors.size,
-          opaque,
-          contextLost: context.isContextLost(),
-          error: error === context.NO_ERROR ? null : error
-        });
-      });
-    }, { once: true });
-    fit.click();
-  }));
-  expect(painted.contextLost).toBe(false);
-  expect(painted.error).toBeNull();
-  expect(painted.opaque).toBeGreaterThan(100);
-  expect(painted.colors).toBeGreaterThan(8);
+    const context = element.getContext("webgl2") ?? element.getContext("webgl");
+    if (!context) return { available: false, contextLost: true, error: null };
+    const error = context.getError();
+    return {
+      available: true,
+      contextLost: context.isContextLost(),
+      error: error === context.NO_ERROR ? null : error
+    };
+  });
+  expect(webgl.available).toBe(true);
+  expect(webgl.contextLost).toBe(false);
+  expect(webgl.error).toBeNull();
+  await expect(page.locator(".webgl-error")).toHaveCount(0);
+
+  const canvasBox = await canvas.boundingBox();
+  expect(canvasBox).not.toBeNull();
+  const renderedPng = await canvas.screenshot({
+    animations: "disabled",
+    style: ".world-hud { visibility: hidden !important; }"
+  });
+  const solidPng = await captureSolidReference(
+    page,
+    canvasBox!.width,
+    canvasBox!.height
+  );
+  expect(
+    renderedPng.byteLength,
+    `3D canvas PNG should be more complex than a solid frame (${renderedPng.byteLength} vs ${solidPng.byteLength} bytes)`
+  ).toBeGreaterThan(solidPng.byteLength * 2);
 
   const viewport = await page.evaluate(() => ({
     clientWidth: document.documentElement.clientWidth,
@@ -209,6 +201,38 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
     fullPage: true
   });
 });
+
+async function loadedDeferredChunks(page: Page): Promise<string[]> {
+  return page.evaluate(() => performance.getEntriesByType("resource")
+    .map((entry) => new URL(entry.name).pathname.split("/").at(-1) ?? "")
+    .filter((name) => /three~|create-stage|AgentFlowView|ActivityView|RobotTrailView|MissionModal/.test(name)));
+}
+
+async function captureSolidReference(page: Page, width: number, height: number): Promise<Buffer> {
+  await page.evaluate(({ referenceWidth, referenceHeight }) => {
+    document.querySelector("[data-e2e-solid-reference]")?.remove();
+    const reference = document.createElement("div");
+    reference.dataset.e2eSolidReference = "true";
+    reference.setAttribute("aria-hidden", "true");
+    Object.assign(reference.style, {
+      position: "fixed",
+      left: "0",
+      top: "0",
+      width: `${referenceWidth}px`,
+      height: `${referenceHeight}px`,
+      background: "#111821",
+      zIndex: "2147483647",
+      pointerEvents: "none"
+    });
+    document.body.append(reference);
+  }, { referenceWidth: width, referenceHeight: height });
+  const reference = page.locator("[data-e2e-solid-reference]");
+  try {
+    return await reference.screenshot({ animations: "disabled" });
+  } finally {
+    await reference.evaluate((element) => element.remove()).catch(() => undefined);
+  }
+}
 
 async function captureReadmeScreenshot(page: Page, name: string): Promise<void> {
   if (!UPDATE_README_SCREENSHOTS) return;

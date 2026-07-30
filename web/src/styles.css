@@ -31,12 +31,73 @@ body {
   min-height: 100vh;
   overflow-x: hidden;
   background: var(--void);
+  font-family: "Space Grotesk Variable", Inter, ui-sans-serif, system-ui, sans-serif;
 }
 
 button,
 input,
 textarea,
-select { letter-spacing: 0; }
+select {
+  font: inherit;
+  letter-spacing: 0;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid rgb(80 220 181 / 62%);
+  outline-offset: 2px;
+}
+
+.ui-button {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 6px 14px;
+  border: 1px solid rgb(144 166 157 / 28%);
+  border-radius: 9px;
+  color: #e6ece9;
+  background: linear-gradient(180deg, #2a3030, #202524);
+  box-shadow: 0 6px 14px rgb(0 0 0 / 16%), inset 0 1px rgb(255 255 255 / 4%);
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.ui-button:hover:not(:disabled) {
+  border-color: rgb(131 218 179 / 54%);
+  background: linear-gradient(180deg, #333c39, #252c2a);
+  transform: translateY(-1px);
+}
+
+.ui-button:active:not(:disabled) { transform: translateY(0); }
+.ui-button:disabled { cursor: not-allowed; filter: saturate(0.55); opacity: 0.48; }
+.ui-button-primary {
+  border-color: rgb(87 211 162 / 68%);
+  color: #f5fff9;
+  background: linear-gradient(145deg, #347c5d, #286048);
+}
+.ui-button-primary:hover:not(:disabled) { background: linear-gradient(145deg, #3d8d6b, #2d6b50); }
+.ui-button-danger {
+  border-color: rgb(224 103 103 / 42%);
+  color: #ffc2c2;
+  background: rgb(125 45 45 / 24%);
+}
+.ui-button-block { width: 100%; }
+.ui-button > b { font-size: 16px; line-height: 0; }
+.ui-button-spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid currentcolor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: ui-spin 700ms linear infinite;
+}
+
+@keyframes ui-spin { to { transform: rotate(360deg); } }
 
 .three-canvas {
   display: block;
@@ -57,14 +118,69 @@ select { letter-spacing: 0; }
   text-align: center;
 }
 
-.failure-alert .failure-title { font-weight: 600; }
+.failure-alert {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid rgb(239 106 106 / 34%);
+  border-radius: 12px;
+  color: #f5dddd;
+  background: rgb(55 25 26 / 94%);
+  box-shadow: 0 14px 34px rgb(0 0 0 / 32%);
+  backdrop-filter: blur(14px);
+}
+.failure-mark {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 7px;
+  color: #1b0d0d;
+  background: #ef7777;
+  font-weight: 800;
+}
+.failure-alert .failure-title { font-weight: 650; }
+.failure-heading { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.failure-heading small {
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #f2b3b3;
+  background: rgb(239 106 106 / 13%);
+  font: 9px/1.5 "JetBrains Mono Variable", monospace;
+}
 .failure-headline { margin: 0; color: var(--text); }
+.failure-body { display: grid; gap: 3px; }
+.failure-close {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  color: #d7aaaa;
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+}
 
 .centered-spin {
-  display: grid;
+  display: flex;
   min-height: 320px;
-  place-items: center;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
 }
+
+.centered-spin i {
+  width: 10px;
+  height: 10px;
+  border: 1px solid rgb(133 229 187 / 44%);
+  background: rgb(54 146 108 / 46%);
+  animation: ui-loading 900ms ease-in-out infinite alternate;
+}
+.centered-spin i:nth-child(2) { animation-delay: 130ms; }
+.centered-spin i:nth-child(3) { animation-delay: 260ms; }
+@keyframes ui-loading { to { opacity: 0.3; transform: translateY(-4px); } }
 
 .login-shell {
   display: grid;
@@ -76,14 +192,79 @@ select { letter-spacing: 0; }
 
 .login-panel {
   width: min(100%, 380px);
-  padding: 32px;
+  padding: 34px;
   border: 1px solid var(--line);
+  border-radius: 18px;
   background: var(--surface-raised);
   box-shadow: 0 24px 60px rgb(0 0 0 / 55%);
 }
 
-.login-mark { color: var(--cyan); font-size: 34px; }
-.login-panel h2 { margin: 10px 0 24px; }
+.login-mark {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid rgb(106 226 178 / 58%);
+  border-radius: 13px;
+  background: rgb(43 112 82 / 32%);
+}
+.login-mark i { background: #79d9b0; box-shadow: 0 0 12px rgb(74 207 153 / 32%); }
+.login-panel h1 { margin: 12px 0 26px; font-size: 25px; letter-spacing: 0.16em; }
+.login-panel form { display: grid; gap: 9px; }
+.login-panel label { color: var(--text-dim); font-size: 12px; }
+.login-input {
+  display: flex;
+  height: 42px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #141719;
+}
+.login-input:focus-within { border-color: rgb(92 216 169 / 64%); }
+.login-input.invalid { border-color: rgb(239 106 106 / 64%); }
+.login-input > span { color: #67c9a2; }
+.login-input input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--text); background: transparent; }
+.login-error { margin: 0 0 4px; color: #ef8b8b; font-size: 11px; }
+
+.result-state,
+.empty-state {
+  display: grid;
+  min-height: 100dvh;
+  padding: 28px;
+  place-content: center;
+  justify-items: center;
+  color: var(--text);
+  background: radial-gradient(circle at 50% 42%, rgb(45 129 96 / 13%), transparent 30%), #080b0d;
+  text-align: center;
+}
+.result-state > span {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  place-items: center;
+  border: 1px solid rgb(239 106 106 / 46%);
+  border-radius: 14px;
+  color: #ef8a8a;
+  background: rgb(107 35 35 / 22%);
+  font-size: 23px;
+  font-weight: 700;
+}
+.result-state h1 { margin: 16px 0 3px; font-size: 22px; }
+.result-state p,
+.empty-state p { margin: 0 0 18px; color: var(--text-dim); font-size: 13px; }
+.empty-state { min-height: 100%; }
+.empty-state > span { display: flex; gap: 4px; margin-bottom: 14px; }
+.empty-state > span i { width: 14px; height: 14px; border: 1px solid #537265; background: #243d33; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-button,
+  .ui-button-spinner,
+  .centered-spin i { animation: none; transition: none; }
+}
 
 @media (max-width: 560px) {
   .three-canvas { touch-action: pan-y; }

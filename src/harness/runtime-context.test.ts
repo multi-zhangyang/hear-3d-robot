@@ -263,6 +263,8 @@ describe("HarnessRuntimeContext", () => {
       expect(framework?.runtime_event_id).toBe(frameworkEvent?.event_id);
       expect(providerEvent?.durable).toBe(true);
       expect(frameworkEvent?.durable).toBe(true);
+      expect(providerEvent?.cursor).toMatch(/^v1:\d+:[a-f0-9]{64}$/);
+      expect(frameworkEvent?.cursor).toMatch(/^v1:\d+:[a-f0-9]{64}$/);
     } finally {
       await disposeFixture(fixture);
     }
@@ -271,12 +273,12 @@ describe("HarnessRuntimeContext", () => {
   it("recovers a started lifecycle event after its first journal append fails", async () => {
     const fixture = await createUnstartedRuntimeFixture();
     let resumedWorld: RapierWorld | undefined;
-    const originalAppend = fixture.store.append.bind(fixture.store);
-    const append = vi.spyOn(fixture.store, "append").mockImplementation(async (name, value) => {
-      if (name === "events" && objectRecord(value)?.type === "run_started") {
+    const originalAppend = fixture.store.appendRuntimeEvents.bind(fixture.store);
+    const append = vi.spyOn(fixture.store, "appendRuntimeEvents").mockImplementation(async (events) => {
+      if (events.some((event) => event.type === "run_started")) {
         throw new Error("event journal unavailable");
       }
-      await originalAppend(name, value);
+      return originalAppend(events);
     });
     try {
       await expect(fixture.runtime.start()).rejects.toThrow("event journal unavailable");
@@ -352,12 +354,12 @@ describe("HarnessRuntimeContext", () => {
   it("recovers an interrupted lifecycle event before resuming a terminal checkpoint", async () => {
     const fixture = await createRuntimeFixture(["set_head_target"]);
     let resumedWorld: RapierWorld | undefined;
-    const originalAppend = fixture.store.append.bind(fixture.store);
-    const append = vi.spyOn(fixture.store, "append").mockImplementation(async (name, value) => {
-      if (name === "events" && objectRecord(value)?.type === "run_interrupted") {
+    const originalAppend = fixture.store.appendRuntimeEvents.bind(fixture.store);
+    const append = vi.spyOn(fixture.store, "appendRuntimeEvents").mockImplementation(async (events) => {
+      if (events.some((event) => event.type === "run_interrupted")) {
         throw new Error("terminal event journal unavailable");
       }
-      await originalAppend(name, value);
+      return originalAppend(events);
     });
     try {
       await expect(fixture.runtime.interrupt("operator stopped"))

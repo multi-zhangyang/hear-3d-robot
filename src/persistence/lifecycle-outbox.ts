@@ -54,7 +54,7 @@ export async function reconcileLifecycleOutbox(input: {
     if (!eventId) return;
     const expected = expectedById.get(eventId);
     if (!expected) return;
-    if (!isDeepStrictEqual(entry, expected)) {
+    if (!matchesLifecycleEvent(entry, expected)) {
       throw new Error(`Lifecycle event ${eventId} conflicts with the event journal`);
     }
     published.add(eventId);
@@ -62,9 +62,9 @@ export async function reconcileLifecycleOutbox(input: {
 
   for (const event of pending) {
     if (published.has(event.event_id)) continue;
-    await input.store.append("events", event as unknown as JsonValue);
+    const [persisted] = await input.store.appendRuntimeEvents([event]);
     published.add(event.event_id);
-    await input.eventSink?.(structuredClone(event));
+    await input.eventSink?.(structuredClone(persisted!));
   }
 
   const previous = input.checkpoint.pending_lifecycle_events;
@@ -82,4 +82,10 @@ export async function reconcileLifecycleOutbox(input: {
 function eventIdentifier(value: JsonValue): string | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   return typeof value.event_id === "string" ? value.event_id : undefined;
+}
+
+function matchesLifecycleEvent(value: JsonValue, expected: RunLifecycleEvent): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const { cursor: _cursor, ...event } = value;
+  return isDeepStrictEqual(event, expected);
 }

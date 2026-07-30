@@ -1,18 +1,4 @@
-import {
-  PlusOutlined,
-  StopOutlined
-} from "@ant-design/icons";
-import {
-  Button,
-  ConfigProvider,
-  Empty,
-  Result,
-  Select,
-  Space,
-  message,
-  theme
-} from "antd";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
   getBootstrap,
@@ -25,10 +11,6 @@ import {
   stopRun,
   subscribeToRun
 } from "./api";
-import { ActivityView } from "./flow/ActivityView";
-import { AgentFlowView } from "./flow/AgentFlowView";
-import { RobotTrailView } from "./flow/RobotTrailView";
-import { MissionModal } from "./MissionModal";
 import { MissionWorkspace } from "./MissionWorkspace";
 import { GameShell, type ModelConnectionState, type Workspace } from "./game/GameShell";
 import { OverlayPanel } from "./game/OverlayPanel";
@@ -55,13 +37,36 @@ import type {
   StreamState,
   WorldSnapshot
 } from "./types";
+import { UiButton } from "./ui/Button";
+import { DeferredBoundary } from "./ui/DeferredBoundary";
 import { runOptionLabel, runStatusLabel } from "./ui-text";
 
 const FRAMEWORK_HISTORY_LIMIT = 300;
 const PROVIDER_HISTORY_LIMIT = 400;
 const ACTION_HISTORY_LIMIT = 500;
+
+interface LoadRunOptions {
+  preserveStream?: boolean;
+}
+
+const loadMissionModal = () => import("./MissionModal");
+const warmMissionModal = (): void => {
+  void loadMissionModal().catch(() => undefined);
+};
+const MissionModal = lazy(() => loadMissionModal().then((module) => ({
+  default: module.MissionModal
+})));
+const ActivityView = lazy(() => import("./flow/ActivityView").then((module) => ({
+  default: module.ActivityView
+})));
+const AgentFlowView = lazy(() => import("./flow/AgentFlowView").then((module) => ({
+  default: module.AgentFlowView
+})));
+const RobotTrailView = lazy(() => import("./flow/RobotTrailView").then((module) => ({
+  default: module.RobotTrailView
+})));
+
 export function App(): React.JSX.Element {
-  const [api, contextHolder] = message.useMessage();
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
   const [runs, setRuns] = useState<RunListItem[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -79,6 +84,7 @@ export function App(): React.JSX.Element {
   const [submitting, setSubmitting] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const selectedRunRef = useRef<string | null>(null);
   const eventCursorRef = useRef<{ runId: string; eventId?: string } | null>(null);
   const loadGenerationRef = useRef(0);
@@ -86,14 +92,29 @@ export function App(): React.JSX.Element {
   const frameBufferRef = useRef<AuthoritativeFrameBuffer | null>(null);
   frameBufferRef.current ??= new AuthoritativeFrameBuffer();
   const frameBuffer = frameBufferRef.current;
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showError = useCallback((value: string): void => {
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    setNotice(value);
+    noticeTimerRef.current = setTimeout(() => {
+      noticeTimerRef.current = null;
+      setNotice(null);
+    }, 4_500);
+  }, []);
 
   useEffect(() => {
     selectedRunRef.current = selectedRunId;
   }, [selectedRunId]);
 
-  const loadRun = useCallback(async (runId: string): Promise<boolean> => {
-    const generation = loadGenerationRef.current + 1;
-    loadGenerationRef.current = generation;
+  const loadRun = useCallback(async (
+    runId: string,
+    options: LoadRunOptions = {}
+  ): Promise<RunDetails | null> => {
+    const generation = options.preserveStream
+      ? loadGenerationRef.current
+      : loadGenerationRef.current + 1;
+    if (!options.preserveStream) loadGenerationRef.current = generation;
     loadAbortRef.current?.abort();
     const controller = new AbortController();
     loadAbortRef.current = controller;
@@ -101,7 +122,7 @@ export function App(): React.JSX.Element {
       && loadGenerationRef.current === generation
       && selectedRunRef.current === runId;
 
-    setLoading(true);
+    if (!options.preserveStream) setLoading(true);
     try {
       const nextDetails = await getRun(runId, {
         signal: controller.signal,
@@ -109,7 +130,7 @@ export function App(): React.JSX.Element {
         providerLimit: PROVIDER_HISTORY_LIMIT,
         frameworkLimit: FRAMEWORK_HISTORY_LIMIT
       });
-      if (!isCurrent()) return false;
+      if (!isCurrent()) return null;
 
       setDetails(nextDetails);
       eventCursorRef.current = {
@@ -119,18 +140,25 @@ export function App(): React.JSX.Element {
       frameBuffer.reset(nextDetails.checkpoint.world);
       setFramework(nextDetails.framework);
       setProviderActivity(latestProviderActivity(nextDetails.provider));
-      setStreamEpoch((current) => current + 1);
+      setRuns((current) => updateRunListStatus(
+        current,
+        runId,
+        nextDetails.checkpoint.status,
+        nextDetails.checkpoint.error,
+        nextDetails.checkpoint.updated_at
+      ));
+      if (!options.preserveStream) setStreamEpoch((current) => current + 1);
       if (nextDetails.checkpoint.status !== "starting" && nextDetails.checkpoint.status !== "running") {
         setStoppingRunId((current) => current === runId ? null : current);
       }
-      return true;
+      return nextDetails;
     } catch (error) {
-      if (!isCurrent() || isAbortError(error)) return false;
+      if (!isCurrent() || isAbortError(error)) return null;
       throw error;
     } finally {
       if (loadGenerationRef.current === generation) {
         if (loadAbortRef.current === controller) loadAbortRef.current = null;
-        setLoading(false);
+        if (!options.preserveStream) setLoading(false);
       }
     }
   }, [frameBuffer]);
@@ -178,6 +206,7 @@ export function App(): React.JSX.Element {
   useEffect(() => () => {
     loadGenerationRef.current += 1;
     loadAbortRef.current?.abort();
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
   }, []);
 
   const appendWorldFrames = useCallback((incoming: WorldSnapshot[]): void => {
@@ -255,6 +284,10 @@ export function App(): React.JSX.Element {
   }, [appendWorldFrames, frameBuffer]);
 
   useEffect(() => {
+    if (authRequired) {
+      setStreamState("inactive");
+      return;
+    }
     if (!selectedRunId || details?.definition.run_id !== selectedRunId) {
       setStreamState("inactive");
       return;
@@ -279,17 +312,32 @@ export function App(): React.JSX.Element {
       (event) => {
         if (acceptsStreamUpdate()) handleRuntimeEvent(runId, event);
       },
-      () => {
-        if (acceptsStreamUpdate()) setStreamError("实时事件流连接已断开");
+      (error) => {
+        if (!acceptsStreamUpdate()) return;
+        if (error instanceof ApiError && error.status === 401) {
+          setPassword("");
+          setAuthRequired(true);
+          return;
+        }
+        setStreamError("实时事件流连接已断开");
       },
       (state) => {
         if (!acceptsStreamUpdate()) return;
         setStreamState(state);
         if (state === "connected") setStreamError(null);
       },
-      cursor
+      cursor,
+      async () => {
+        const refreshed = await loadRun(runId, { preserveStream: true });
+        if (!refreshed) throw new Error("运行已切换，停止恢复旧事件流");
+        return {
+          cursor: refreshed.event_cursor,
+          active: refreshed.checkpoint.status === "starting"
+            || refreshed.checkpoint.status === "running"
+        };
+      }
     );
-  }, [details?.checkpoint.status, details?.definition.run_id, handleRuntimeEvent, selectedRunId, streamEpoch]);
+  }, [authRequired, details?.checkpoint.status, details?.definition.run_id, handleRuntimeEvent, loadRun, selectedRunId, streamEpoch]);
 
   const selectRun = async (runId: string): Promise<void> => {
     selectedRunRef.current = runId;
@@ -302,7 +350,7 @@ export function App(): React.JSX.Element {
       await loadRun(runId);
     } catch {
       if (selectedRunRef.current === runId) {
-        api.error("无法加载所选运行记录，请稍后重试。");
+        showError("无法加载所选运行记录，请稍后重试。");
       }
     }
   };
@@ -319,7 +367,7 @@ export function App(): React.JSX.Element {
       setWorkspace("world");
       await refreshRuns(runId);
     } catch {
-      api.error("任务启动失败，请检查模型配置和任务条件。");
+      showError("任务启动失败，请检查模型配置和任务条件。");
     } finally {
       setSubmitting(false);
     }
@@ -364,7 +412,7 @@ export function App(): React.JSX.Element {
         previousError,
         details.checkpoint.updated_at
       ));
-      api.error("任务恢复失败，请查看运行状态后重试。");
+      showError("任务恢复失败，请查看运行状态后重试。");
     } finally {
       setResuming(false);
     }
@@ -377,7 +425,7 @@ export function App(): React.JSX.Element {
       await stopRun(selectedRunId);
     } catch {
       setStoppingRunId(null);
-      api.error("停止任务失败，请稍后重试。");
+      showError("停止任务失败，请稍后重试。");
     }
   };
 
@@ -402,12 +450,14 @@ export function App(): React.JSX.Element {
     );
   }
   if (fatalError || !bootstrap) {
-    return <Result
-      status="error"
-      title="操作服务不可用"
-      subTitle="无法连接操作服务，请确认服务已启动并检查网络配置。"
-      extra={<Button onClick={() => void initialize()}>重试</Button>}
-    />;
+    return (
+      <section className="result-state" role="alert">
+        <span aria-hidden="true">!</span>
+        <h1>操作服务不可用</h1>
+        <p>无法连接操作服务，请确认服务已启动并检查网络配置。</p>
+        <UiButton onClick={() => void initialize()}>重试</UiButton>
+      </section>
+    );
   }
 
   const selectedRun = runs.find((run) => run.run_id === selectedRunId);
@@ -420,34 +470,7 @@ export function App(): React.JSX.Element {
     selectedIsActive
   );
   return (
-    <ConfigProvider
-      theme={{
-        // Neutral graphite keeps the hierarchy and telemetry legible; channel
-        // colours are reserved for actual robot control state.
-        algorithm: theme.darkAlgorithm,
-        token: {
-          colorPrimary: "#24c8ae",
-          colorInfo: "#8e7be8",
-          colorSuccess: "#24c8ae",
-          colorWarning: "#e6a64b",
-          colorError: "#ef6a6a",
-          colorBgBase: "#101214",
-          colorBgContainer: "#191c1f",
-          colorBgElevated: "#22262a",
-          colorBorder: "#34393e",
-          colorBorderSecondary: "#292d31",
-          colorText: "#f0f1f2",
-          colorTextSecondary: "#a7adb3",
-          colorTextTertiary: "#737a81",
-          borderRadius: 6,
-          wireframe: false,
-          fontFamily: '"Space Grotesk Variable", Inter, ui-sans-serif, system-ui, sans-serif',
-          fontFamilyCode: '"JetBrains Mono Variable", "SFMono-Regular", Consolas, monospace'
-        },
-        components: { Tabs: { cardBg: "#22262a" } }
-      }}
-    >
-      <GameShell
+    <GameShell
         workspace={workspace}
         onWorkspace={setWorkspace}
         modelState={modelState}
@@ -460,57 +483,63 @@ export function App(): React.JSX.Element {
           : null}
         toolbar={(
           <div className="operator-toolbar">
-            <Space size={10} wrap className="run-context">
-              <Select<string>
+            <div className="run-context">
+              <select
                 className="run-select"
-                value={selectedRunId}
+                value={selectedRunId ?? ""}
                 aria-label="选择运行记录"
-                placeholder="选择运行记录"
-                onChange={(value) => {
+                onChange={(event) => {
+                  const value = event.target.value;
                   if (value) void selectRun(value);
                 }}
-                options={runs.map((run) => ({
-                  value: run.run_id,
-                  label: runOptionLabel(run),
-                  disabled: run.status === "local_artifact"
-                }))}
-              />
+              >
+                <option value="" disabled>选择运行记录</option>
+                {runs.map((run) => (
+                  <option
+                    key={run.run_id}
+                    value={run.run_id}
+                    disabled={run.status === "local_artifact"}
+                  >
+                    {runOptionLabel(run)}
+                  </option>
+                ))}
+              </select>
               {selectedRun && <RunStatus status={selectedRun.status} />}
-            </Space>
-            <Space className="mission-actions">
+            </div>
+            <div className="mission-actions">
               {details && selectedIsActive && (
-                <Button
-                  danger
-                  icon={<StopOutlined />}
-                  loading={stoppingRunId === selectedRunId}
+                <UiButton
+                  tone="danger"
+                  busy={stoppingRunId === selectedRunId}
                   disabled={resuming || submitting || (stoppingRunId !== null && stoppingRunId !== selectedRunId)}
                   onClick={() => void stopSelected()}
                 >
                   停止
-                </Button>
+                </UiButton>
               )}
               {details && ["failed", "interrupted"].includes(details.checkpoint.status) && (
-                <Button
-                  loading={resuming}
+                <UiButton
+                  busy={resuming}
                   disabled={missionControlsBusy || activeRun !== undefined}
                   onClick={() => void resumeSelected()}
                 >
                   继续运行
-                </Button>
+                </UiButton>
               )}
-              <Button
-                type="primary"
-                icon={<PlusOutlined />}
+              <UiButton
+                tone="primary"
                 disabled={missionControlsBusy || activeRun !== undefined || !bootstrap.provider.configured}
+                onFocus={warmMissionModal}
+                onPointerEnter={warmMissionModal}
                 onClick={() => setMissionOpen(true)}
               >
-                新建任务
-              </Button>
-            </Space>
+                <b aria-hidden="true">＋</b>新建任务
+              </UiButton>
+            </div>
           </div>
         )}
       >
-        {contextHolder}
+        {notice && <div className="operator-notice" role="alert">{notice}</div>}
         <div className="game-content">
 
           {!bootstrap.provider.configured && !loading && !details && (
@@ -524,19 +553,19 @@ export function App(): React.JSX.Element {
           )}
 
           {loading ? <CenteredSpin /> : !details ? (
-            <Empty
-              image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description="尚未选择运行记录"
-            >
-              <Button
-                type="primary"
-                icon={<PlusOutlined />}
+            <section className="empty-state">
+              <span aria-hidden="true"><i /><i /><i /></span>
+              <p>尚未选择运行记录</p>
+              <UiButton
+                tone="primary"
                 disabled={missionControlsBusy || activeRun !== undefined || !bootstrap.provider.configured}
+                onFocus={warmMissionModal}
+                onPointerEnter={warmMissionModal}
                 onClick={() => setMissionOpen(true)}
               >
-                新建任务
-              </Button>
-            </Empty>
+                <b aria-hidden="true">＋</b>新建任务
+              </UiButton>
+            </section>
           ) : (
             <WorkspaceView
               workspace={workspace}
@@ -548,15 +577,20 @@ export function App(): React.JSX.Element {
             />
           )}
         </div>
-        <MissionModal
-          open={missionOpen}
-          scenarios={bootstrap.scenarios}
-          submitting={submitting}
-          onCancel={() => setMissionOpen(false)}
-          onSubmit={createMission}
-        />
-      </GameShell>
-    </ConfigProvider>
+        {missionOpen && (
+          <DeferredBoundary resetKey="mission-open" modal>
+            <Suspense fallback={<ModalLoading />}>
+              <MissionModal
+                open
+                scenarios={bootstrap.scenarios}
+                submitting={submitting}
+                onCancel={() => setMissionOpen(false)}
+                onSubmit={createMission}
+              />
+            </Suspense>
+          </DeferredBoundary>
+        )}
+    </GameShell>
   );
 }
 
@@ -607,9 +641,29 @@ function WorkspaceView(props: {
       {world}
       {panel && (
         <OverlayPanel title={panel.title} onClose={props.onClose}>
-          {panel.body}
+          <DeferredBoundary resetKey={`${props.details.definition.run_id}:${props.workspace}`}>
+            <Suspense fallback={<PanelLoading />}>
+              {panel.body}
+            </Suspense>
+          </DeferredBoundary>
         </OverlayPanel>
       )}
+    </div>
+  );
+}
+
+function PanelLoading(): React.JSX.Element {
+  return (
+    <div className="panel-loading" role="status" aria-label="正在加载视图">
+      <i /><i /><i />
+    </div>
+  );
+}
+
+function ModalLoading(): React.JSX.Element {
+  return (
+    <div className="modal-loading" role="status" aria-label="正在加载任务表单">
+      <PanelLoading />
     </div>
   );
 }

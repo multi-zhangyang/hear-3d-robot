@@ -23,13 +23,14 @@ export default defineConfig({
           // No maxSize: these packages have circular imports between their own
           // modules, and slicing a group into size-capped fragments emits them
           // in an order where a module is called before its definition has been
-          // evaluated. The built console then dies on load with "s is not a
-          // function" while the dev server, which does not split, works fine.
+          // evaluated. The production application then fails on load with
+          // "s is not a function" while the dev server works normally.
           groups: [
             {
               name: "three",
               test: /node_modules[\\/]three[\\/]/,
-              priority: 30
+              priority: 30,
+              entriesAware: true
             },
             {
               name: "react",
@@ -39,12 +40,14 @@ export default defineConfig({
             {
               name: "antd",
               test: /node_modules[\\/](?:antd|@ant-design|@rc-component|rc-[^\\/]+)[\\/]/,
-              priority: 20
+              priority: 20,
+              entriesAware: true
             },
             {
               name: "vendor",
               test: /node_modules[\\/]/,
-              priority: 1
+              priority: 1,
+              entriesAware: true
             }
           ]
         }

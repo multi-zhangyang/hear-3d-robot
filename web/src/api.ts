@@ -6,9 +6,11 @@ import type {
   RuntimeEvent,
   StreamState
 } from "./types";
+import { eventStreamFailureDecision } from "./event-stream-recovery";
 import { nextRuntimeEventCursor } from "./stream-state";
 
-let password = sessionStorage.getItem("hear.password") ?? "";
+const PASSWORD_STORAGE_KEY = "hear.password";
+let password = readStoredPassword();
 
 export class ApiError extends Error {
   readonly status: number;
@@ -19,14 +21,52 @@ export class ApiError extends Error {
   }
 }
 
+export interface RefreshedRunCursor {
+  cursor: string | null;
+  active: boolean;
+}
+
 export function setPassword(value: string): void {
   password = value;
-  if (value) sessionStorage.setItem("hear.password", value);
-  else sessionStorage.removeItem("hear.password");
+  if (value) writeStoredPassword(value);
+  else deleteStoredPassword();
+}
+
+function writeStoredPassword(value: string): void {
+  try {
+    sessionPasswordStorage()?.setItem(PASSWORD_STORAGE_KEY, value);
+  } catch {
+    // Authentication still works for this tab when browser storage is denied
+    // or full; the module-level value remains authoritative for requests.
+  }
+}
+
+function deleteStoredPassword(): void {
+  try {
+    sessionPasswordStorage()?.removeItem(PASSWORD_STORAGE_KEY);
+  } catch {
+    // The in-memory password was already cleared.
+  }
 }
 
 export function hasPassword(): boolean {
   return password.length > 0;
+}
+
+function readStoredPassword(): string {
+  try {
+    return sessionPasswordStorage()?.getItem(PASSWORD_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function sessionPasswordStorage(): Storage | undefined {
+  try {
+    return globalThis.sessionStorage;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function getBootstrap(): Promise<Bootstrap> {
@@ -110,10 +150,19 @@ export function subscribeToRun(
   onEvent: (event: RuntimeEvent) => void,
   onError: (error: Error) => void,
   onState?: (state: StreamState) => void,
-  after?: string
+  after?: string,
+  refreshCursor?: () => Promise<RefreshedRunCursor>
 ): () => void {
   const controller = new AbortController();
-  void consumeEventLoop(runId, controller.signal, onEvent, onError, onState, after);
+  void consumeEventLoop(
+    runId,
+    controller.signal,
+    onEvent,
+    onError,
+    onState,
+    after,
+    refreshCursor
+  );
   return () => {
     controller.abort();
     onState?.("inactive");
@@ -126,9 +175,15 @@ async function consumeEventLoop(
   onEvent: (event: RuntimeEvent) => void,
   onError: (error: Error) => void,
   onState: ((state: StreamState) => void) | undefined,
-  initialCursor: string | undefined
+  initialCursor: string | undefined,
+  refreshCursor: (() => Promise<RefreshedRunCursor>) | undefined
 ): Promise<void> {
   let cursor = initialCursor;
+  if (cursor === undefined && refreshCursor) {
+    const refreshed = await refreshEventCursor(signal, refreshCursor, onError, onState);
+    if (refreshed === null) return;
+    cursor = refreshed;
+  }
   while (!signal.aborted) {
     try {
       onState?.("connecting");
@@ -146,13 +201,48 @@ async function consumeEventLoop(
     } catch (error) {
       if (signal.aborted) return;
       const cause = error instanceof Error ? error : new Error(String(error));
+      const decision = eventStreamFailureDecision(cause);
+      if (decision === "refresh_snapshot") {
+        if (!refreshCursor) {
+          onState?.("disconnected");
+          onError(cause);
+          return;
+        }
+        const refreshed = await refreshEventCursor(signal, refreshCursor, onError, onState);
+        if (refreshed === null) return;
+        cursor = refreshed;
+        continue;
+      }
       onState?.("disconnected");
       onError(cause);
-      if (cause instanceof ApiError && cause.status < 500) return;
-      if (cause instanceof SyntaxError) return;
+      if (decision === "stop") return;
       await abortableDelay(800, signal);
     }
   }
+}
+
+async function refreshEventCursor(
+  signal: AbortSignal,
+  refreshCursor: () => Promise<RefreshedRunCursor>,
+  onError: (error: Error) => void,
+  onState: ((state: StreamState) => void) | undefined
+): Promise<string | null> {
+  while (!signal.aborted) {
+    try {
+      onState?.("connecting");
+      const refreshed = await refreshCursor();
+      if (signal.aborted || !refreshed.active) return null;
+      if (refreshed.cursor) return refreshed.cursor;
+    } catch (error) {
+      if (signal.aborted) return null;
+      const cause = error instanceof Error ? error : new Error(String(error));
+      onState?.("disconnected");
+      onError(cause);
+      if (eventStreamFailureDecision(cause) === "stop") return null;
+    }
+    await abortableDelay(800, signal);
+  }
+  return null;
 }
 
 async function consumeEvents(
@@ -179,16 +269,39 @@ async function consumeEvents(
     const { done, value } = await reader.read();
     if (done) return;
     buffer += decoder.decode(value, { stream: true });
+    buffer = buffer.replace(/\r\n/g, "\n");
     const records = buffer.split("\n\n");
     buffer = records.pop() ?? "";
     for (const record of records) {
-      const data = record.split("\n")
+      const lines = record.split("\n");
+      const streamCursor = lines
+        .filter((line) => line.startsWith("id:"))
+        .map((line) => line.slice(3).replace(/^ /, ""))
+        .at(-1);
+      const data = lines
         .filter((line) => line.startsWith("data: "))
         .map((line) => line.slice(6))
         .join("\n");
       if (!data) continue;
       const parsed = JSON.parse(data) as RuntimeEvent | { run_id: string };
-      if ("event_id" in parsed) onEvent(parsed);
+      if (!("event_id" in parsed)) continue;
+      if (parsed.cursor !== undefined && (
+        typeof parsed.cursor !== "string"
+        || parsed.cursor.length === 0
+        || /[\r\n\0]/.test(parsed.cursor)
+      )) {
+        throw new SyntaxError("Runtime event contains an invalid cursor");
+      }
+      if (streamCursor !== undefined) {
+        if (streamCursor.length === 0 || /[\r\n\0]/.test(streamCursor)) {
+          throw new SyntaxError("Runtime event contains an invalid SSE id");
+        }
+        if (parsed.cursor !== undefined && parsed.cursor !== streamCursor) {
+          throw new SyntaxError("Runtime event cursor does not match its SSE id");
+        }
+        parsed.cursor = streamCursor;
+      }
+      onEvent(parsed);
     }
   }
 }
@@ -200,10 +313,10 @@ async function abortableDelay(milliseconds: number, signal: AbortSignal): Promis
       return;
     }
     const onAbort = (): void => {
-      window.clearTimeout(timer);
+      globalThis.clearTimeout(timer);
       resolve();
     };
-    const timer = window.setTimeout(() => {
+    const timer = globalThis.setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
       resolve();
     }, milliseconds);

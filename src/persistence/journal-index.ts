@@ -64,8 +64,22 @@ export async function appendIndexedRecords(
   indexPath: string,
   records: readonly string[]
 ): Promise<JournalIndexState> {
+  return appendIndexedRecordsBuilt(dataPath, indexPath, () => records);
+}
+
+/**
+ * Builds records only after the journal's current count is locked. This lets a
+ * caller persist an ordinal-derived cursor in the same operation that assigns
+ * the ordinal; calculating it with a later tail read would race another writer.
+ */
+export async function appendIndexedRecordsBuilt(
+  dataPath: string,
+  indexPath: string,
+  build: (startIndex: number) => readonly string[]
+): Promise<JournalIndexState> {
   return withJournalOperation(dataPath, indexPath, async () => {
     const state = await ensureJournalIndexUnlocked(dataPath, indexPath);
+    const records = build(state.count);
     if (records.length === 0) return state;
     if (state.dataByteLength !== state.completeByteLength) {
       await truncate(dataPath, state.completeByteLength);
@@ -108,20 +122,40 @@ export async function readIndexedWindow(
   dataPath: string,
   indexPath: string,
   from: number,
-  limit: number
+  limit: number,
+  maximumBytes?: number
 ): Promise<JournalWindow> {
   return withJournalOperation(dataPath, indexPath, async () => {
+    if (maximumBytes !== undefined
+      && (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1)) {
+      throw new Error("Journal byte limit must be a positive safe integer");
+    }
     const state = await ensureJournalIndexUnlocked(dataPath, indexPath);
     if (from >= state.count) return { lines: [], next: null, total: state.count };
-    const endIndex = Math.min(state.count, from + limit);
+    const requestedEnd = Math.min(state.count, from + limit);
     const offsets = await readOffsets(
       indexPath,
       from,
-      endIndex - from + (endIndex < state.count ? 1 : 0)
+      requestedEnd - from + (requestedEnd < state.count ? 1 : 0)
     );
     const startByte = offsets[0]!;
+    let endIndex = requestedEnd;
+    if (maximumBytes !== undefined) {
+      endIndex = from + 1;
+      for (let candidate = from + 1; candidate <= requestedEnd; candidate += 1) {
+        const candidateEndByte = candidate < state.count
+          ? offsets[candidate - from]!
+          : state.completeByteLength;
+        // One oversized record must still make progress. The caller already
+        // needs that record in order to deliver or inspect it; the byte budget
+        // prevents several large records from being materialized together.
+        if (candidate > from + 1 && candidateEndByte - startByte > maximumBytes) break;
+        endIndex = candidate;
+        if (candidateEndByte - startByte > maximumBytes) break;
+      }
+    }
     const endByte = endIndex < state.count
-      ? offsets.at(-1)!
+      ? offsets[endIndex - from]!
       : state.completeByteLength;
     const text = await readRange(dataPath, startByte, endByte);
     return {

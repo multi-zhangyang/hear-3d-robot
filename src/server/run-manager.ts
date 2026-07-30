@@ -13,6 +13,11 @@ import {
   resolveRunDirectory,
   RunStore
 } from "../persistence/run-store.js";
+import {
+  parseRuntimeEventCursor,
+  runtimeEventCursor,
+  runtimeEventCursorMatches
+} from "../persistence/event-cursor.js";
 import { resumeMission, startMission } from "../runtime/mission-runner.js";
 
 export interface RunListItem {
@@ -29,6 +34,8 @@ type Subscriber = (event: RuntimeEvent) => void | Promise<void>;
 
 const MAX_BUFFERED_LIVE_EVENTS_DURING_BACKFILL = 256;
 const MAX_BUFFERED_LIVE_BYTES_DURING_BACKFILL = 1024 * 1024;
+const EVENT_REPLAY_PAGE_SIZE = 64;
+const EVENT_REPLAY_PAGE_MAX_BYTES = 512 * 1024;
 
 export class RunManager {
   readonly #runsDir: string;
@@ -163,8 +170,8 @@ export class RunManager {
     onReady: () => void | Promise<void> = () => undefined
   ): Promise<() => void> {
     const buffered: RuntimeEvent[] = [];
-    const bufferedIds = new Set<string>();
-    const replayedBufferedIds = new Set<string>();
+    const bufferedKeys = new Set<string>();
+    const replayedBufferedKeys = new Set<string>();
     let bufferedBytes = 0;
     let backfilling = true;
     let backfillFailure: Error | undefined;
@@ -172,16 +179,32 @@ export class RunManager {
       signal?.throwIfAborted();
       if (backfillFailure) throw backfillFailure;
     };
+    const declareReady = async (): Promise<void> => {
+      throwIfUnavailable();
+      await onReady();
+      throwIfUnavailable();
+    };
     const deliver = async (
       event: RuntimeEvent,
       source: "journal" | "buffered" | "live"
     ): Promise<void> => {
       throwIfUnavailable();
-      if (source === "journal" && bufferedIds.has(event.event_id)) {
-        replayedBufferedIds.add(event.event_id);
+      const key = runtimeEventDedupeKey(event);
+      if (source === "journal") {
+        if (bufferedKeys.has(key)) replayedBufferedKeys.add(key);
+        // Older in-process emitters did not carry the durable row cursor. Keep
+        // their exact replay deduplication without collapsing current events
+        // that intentionally reuse an event_id but have distinct cursors.
+        for (const bufferedEvent of buffered) {
+          if (bufferedEvent.cursor === undefined && bufferedEvent.event_id === event.event_id) {
+            replayedBufferedKeys.add(runtimeEventDedupeKey(bufferedEvent));
+          }
+        }
       } else if (
         source === "buffered"
-        && (event.event_id === after || replayedBufferedIds.has(event.event_id))
+        && (event.cursor === after
+          || (event.cursor === undefined && event.event_id === after)
+          || replayedBufferedKeys.has(key))
       ) {
         return;
       }
@@ -190,11 +213,13 @@ export class RunManager {
     };
     const unsubscribe = this.#addSubscriber(runId, (event) => {
       if (!backfilling) return deliver(event, "live");
-      if (bufferedIds.has(event.event_id)) return;
+      const key = runtimeEventDedupeKey(event);
+      if (bufferedKeys.has(key)) return;
       const bytes = Buffer.byteLength(JSON.stringify(event));
       if (
         buffered.length >= MAX_BUFFERED_LIVE_EVENTS_DURING_BACKFILL
-        || bytes > MAX_BUFFERED_LIVE_BYTES_DURING_BACKFILL - bufferedBytes
+        || (buffered.length > 0
+          && bytes > MAX_BUFFERED_LIVE_BYTES_DURING_BACKFILL - bufferedBytes)
       ) {
         backfillFailure ??= new Error(
           `Event stream for run ${runId} fell behind during journal backfill`
@@ -202,7 +227,7 @@ export class RunManager {
         throw backfillFailure;
       }
       buffered.push(event);
-      bufferedIds.add(event.event_id);
+      bufferedKeys.add(key);
       bufferedBytes += bytes;
     });
 
@@ -213,13 +238,12 @@ export class RunManager {
           runId,
           after,
           (event) => deliver(event, "journal"),
-          onReady,
+          declareReady,
           signal
         );
       } else {
         await RunStore.open(resolveRunDirectory(this.#runsDir, runId), this.#storeOptions());
-        throwIfUnavailable();
-        await onReady();
+        await declareReady();
       }
       let bufferedIndex = 0;
       while (bufferedIndex < buffered.length) {
@@ -230,8 +254,8 @@ export class RunManager {
       backfilling = false;
       buffered.length = 0;
       bufferedBytes = 0;
-      bufferedIds.clear();
-      replayedBufferedIds.clear();
+      bufferedKeys.clear();
+      replayedBufferedKeys.clear();
       return unsubscribe;
     } catch (error) {
       unsubscribe();
@@ -305,7 +329,7 @@ export class RunManager {
     const cursorEntry = snapshot.events.entries.at(-1);
     const eventCursor = cursorEntry === undefined
       ? null
-      : runtimeEvent(cursorEntry, runId).event_id;
+      : runtimeEventAt(cursorEntry, runId, snapshot.events.total - 1).cursor!;
     return {
       definition: store.definition,
       checkpoint: snapshot.checkpoint,
@@ -329,11 +353,7 @@ export class RunManager {
     return store.readJournalPage(name, from, limit);
   }
 
-  /**
-   * Replays only the missing suffix. The normal details -> SSE path passes the
-   * current last event, which is answered from the journal offset index without
-   * scanning history. Older cursors use a constant-memory stream.
-   */
+  /** Replays the suffix after an exact durable journal row. */
   async #backfillRuntimeEvents(
     runId: string,
     after: string,
@@ -346,27 +366,78 @@ export class RunManager {
       resolveRunDirectory(this.#runsDir, runId),
       this.#storeOptions()
     );
-    const tail = await store.readJournalTail("events", 1);
-    const latest = tail.entries.at(-1);
-    if (latest && runtimeEvent(latest, runId).event_id === after) {
-      signal?.throwIfAborted();
-      await onReady();
-      return;
+    const parsed = parseRuntimeEventCursor(after);
+    if (parsed.kind === "invalid") {
+      throw new EventCursorError(`Malformed event cursor for run ${runId}`);
     }
 
-    let found = false;
-    await store.scanJournal("events", async (entry) => {
-      signal?.throwIfAborted();
-      const event = runtimeEvent(entry, runId);
-      if (!found) {
-        found = event.event_id === after;
-        if (found) await onReady();
-        return;
+    let cursorIndex: number;
+    let replayEnd: number;
+    if (parsed.kind === "versioned") {
+      const page = await store.readJournalPage(
+        "events",
+        parsed.index,
+        1,
+        EVENT_REPLAY_PAGE_MAX_BYTES
+      );
+      const entry = page.entries[0];
+      if (entry === undefined) {
+        throw new EventCursorError(`Unknown event cursor for run ${runId}`);
       }
-      await deliver(event);
-    });
-    if (!found) {
-      throw new EventCursorError(`Unknown event cursor for run ${runId}`);
+      const event = runtimeEventAt(entry, runId, parsed.index);
+      if (!runtimeEventCursorMatches(parsed, runId, event.event_id)) {
+        throw new EventCursorError(`Unknown event cursor for run ${runId}`);
+      }
+      cursorIndex = parsed.index;
+      replayEnd = page.total;
+    } else {
+      let match: number | undefined;
+      let matches = 0;
+      await store.scanJournal("events", (entry, index) => {
+        signal?.throwIfAborted();
+        if (runtimeEvent(entry, runId).event_id !== after) return;
+        matches += 1;
+        match ??= index;
+      });
+      if (matches === 0 || match === undefined) {
+        throw new EventCursorError(`Unknown event cursor for run ${runId}`);
+      }
+      if (matches > 1) {
+        throw new EventCursorError(`Ambiguous legacy event cursor for run ${runId}`);
+      }
+      const page = await store.readJournalPage(
+        "events",
+        match,
+        1,
+        EVENT_REPLAY_PAGE_MAX_BYTES
+      );
+      const entry = page.entries[0];
+      if (entry === undefined || runtimeEventAt(entry, runId, match).event_id !== after) {
+        throw new EventCursorError(`Unknown event cursor for run ${runId}`);
+      }
+      cursorIndex = match;
+      replayEnd = page.total;
+    }
+
+    signal?.throwIfAborted();
+    await onReady();
+    for (let from = cursorIndex + 1; from < replayEnd;) {
+      signal?.throwIfAborted();
+      const limit = Math.min(EVENT_REPLAY_PAGE_SIZE, replayEnd - from);
+      const page = await store.readJournalPage(
+        "events",
+        from,
+        limit,
+        EVENT_REPLAY_PAGE_MAX_BYTES
+      );
+      if (page.entries.length === 0 || page.total < replayEnd) {
+        throw new Error(`Event journal for run ${runId} changed during replay`);
+      }
+      for (const [offset, entry] of page.entries.entries()) {
+        signal?.throwIfAborted();
+        await deliver(runtimeEventAt(entry, runId, from + offset));
+      }
+      from += page.entries.length;
     }
   }
 
@@ -515,9 +586,30 @@ function runtimeEvent(value: JsonValue, runId: string): RuntimeEvent {
     || eventRunId !== runId
     || typeof type !== "string" || type.length === 0 || /[\r\n\0]/.test(type)
     || typeof at !== "string"
+    || ("cursor" in value && (typeof value.cursor !== "string" || value.cursor.length === 0))
     || !("data" in value)
   ) {
     throw new Error(`Run ${runId} contains an invalid runtime event`);
   }
   return value as unknown as RuntimeEvent;
+}
+
+function runtimeEventAt(
+  value: JsonValue,
+  runId: string,
+  index: number
+): RuntimeEvent & { cursor: string } {
+  const event = runtimeEvent(value, runId);
+  if (event.durable === false) {
+    throw new Error(`Run ${runId} contains a non-durable event in its journal`);
+  }
+  const cursor = runtimeEventCursor(runId, event.event_id, index);
+  if (event.cursor !== undefined && event.cursor !== cursor) {
+    throw new Error(`Run ${runId} contains an invalid runtime event cursor`);
+  }
+  return event.cursor === cursor ? event as RuntimeEvent & { cursor: string } : { ...event, cursor };
+}
+
+function runtimeEventDedupeKey(event: RuntimeEvent): string {
+  return event.cursor ?? `event:${event.event_id}`;
 }

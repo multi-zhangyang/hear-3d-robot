@@ -63,6 +63,7 @@ export interface RuntimeEvent {
   at: string;
   data: JsonValue;
   durable?: boolean;
+  cursor?: string;
 }
 
 export type RuntimeEventSink = (event: RuntimeEvent) => void | Promise<void>;
@@ -375,6 +376,18 @@ export class HarnessRuntimeContext {
       nodes: this.#checkpoint.nodes,
       world: this.#checkpoint.world
     }));
+  }
+
+  async reactivateRootAfterSdkStateLoss(reason: string): Promise<void> {
+    this.#hierarchy.reactivateRoot(reason);
+    await this.#persistHierarchy();
+    await this.#store.append("hierarchy", json({
+      type: "sdk_recovery_branch_closed",
+      reason,
+      root_id: this.#hierarchy.rootId,
+      at: new Date().toISOString()
+    }));
+    await this.#emitHierarchyChanged();
   }
 
   async beginDelegation(
@@ -907,8 +920,8 @@ export class HarnessRuntimeContext {
       data: structuredClone(data),
       durable: true
     };
-    await this.#store.append("events", event as unknown as JsonValue);
-    await this.#eventSink(event);
+    const [persisted] = await this.#store.appendRuntimeEvents([event]);
+    await this.#eventSink(persisted!);
   }
 
   /** High-frequency telemetry is live-only; durable state is the checkpoint. */
@@ -1761,8 +1774,8 @@ export class HarnessRuntimeContext {
         missingEvents.push(reconciledRuntimeEvent(this.#checkpoint.run_id, type, receipt));
       }
     }
-    await this.#store.appendMany("events", missingEvents as unknown as JsonValue[]);
-    for (const event of missingEvents) await this.#eventSink(event);
+    const persistedEvents = await this.#store.appendRuntimeEvents(missingEvents);
+    for (const event of persistedEvents) await this.#eventSink(event);
   }
 
   async #recoverInflightActions(): Promise<void> {

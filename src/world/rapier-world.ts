@@ -30,13 +30,11 @@ import {
   clamp,
   finiteQuaternion,
   finiteVector,
-  inverseQuaternion,
   moveTowards,
   normalizeAngle,
   planarDistance,
   quaternion,
   quaternionYaw,
-  rotateVector,
   sameVector,
   scale,
   subtract,
@@ -45,15 +43,11 @@ import {
   yawRotation
 } from "./geometry.js";
 import {
-  collisionCandidates,
   collisionKey,
   collisionSetJson,
   collisionTransitionAllowed,
   colliderData,
   colliderIdentity,
-  linkPairKey,
-  uniqueCollisions,
-  type CollisionCandidate,
   type CollisionIssue
 } from "./collision.js";
 import {
@@ -110,6 +104,8 @@ import {
   snapshotArmPlan,
   type StoredArmPlan
 } from "./arm-plan.js";
+import { EntityVisibility } from "./entity-visibility.js";
+import { ArticulatedCollisionQuery } from "./articulated-collision-query.js";
 
 type Collider = InstanceType<typeof RAPIER.Collider>;
 type ContactManifold = InstanceType<typeof RAPIER.TempContactManifold>;
@@ -178,20 +174,6 @@ const MAX_AFFORDANCE_EVENTS = 32;
  * limit. Tighter costs only a fraction of a simulated second of rotation.
  */
 const FACING_LATERAL_TOLERANCE = POSITION_TOLERANCE / 2;
-const ADJACENT_COLLISION_SEGMENTS = new Set([
-  linkPairKey("base", "torso"),
-  linkPairKey("torso", "sensor_head"),
-  linkPairKey("torso", "upper_arm"),
-  linkPairKey("upper_arm", "forearm"),
-  linkPairKey("forearm", "wrist"),
-  linkPairKey("wrist", "left_finger"),
-  linkPairKey("wrist", "right_finger"),
-  linkPairKey("left_finger", "right_finger"),
-  linkPairKey("wrist", "attached_payload"),
-  linkPairKey("left_finger", "attached_payload"),
-  linkPairKey("right_finger", "attached_payload")
-]);
-
 let rapierInitialization: Promise<void> | undefined;
 
 export class RapierWorld {
@@ -208,6 +190,8 @@ export class RapierWorld {
   readonly #voxelStore: VoxelStore | null;
   readonly #voxelChunks: VoxelChunkPhysics | null;
   readonly #voxelInteraction: VoxelInteraction | null;
+  readonly #entityVisibility: EntityVisibility;
+  readonly #articulatedCollisions: ArticulatedCollisionQuery;
   readonly #navigationPlans = new PlanRegistry<StoredNavigationPlan>();
   readonly #armPlans = new PlanRegistry<StoredArmPlan>();
   readonly #begunCommands = new Set<string>();
@@ -314,6 +298,18 @@ export class RapierWorld {
     this.#leftFingerCollider = scene.leftFingerCollider;
     this.#rightFingerCollider = scene.rightFingerCollider;
     this.#objects = scene.objects;
+    this.#entityVisibility = new EntityVisibility({
+      world: this.#world,
+      linkBodies: this.#linkBodies,
+      maximumRange: this.#scenario.visibility_radius
+    });
+    this.#articulatedCollisions = new ArticulatedCollisionQuery({
+      world: this.#world,
+      objects: this.#objects,
+      attachment: this.#attachment,
+      currentBase: () => vector(this.#robot.translation()),
+      currentYaw: () => this.#yaw
+    });
     this.#voxelStore = voxelStore;
     this.#voxelChunks = voxelStore ? new VoxelChunkPhysics(this.#world, voxelStore, 2) : null;
     this.#voxelInteraction = voxelStore
@@ -510,7 +506,7 @@ export class RapierWorld {
         locked: object.locked,
         container_id: object.config.container_id ?? null,
         enabled: object.body.isEnabled(),
-        visible: this.#isVisible(object)
+        visible: this.#entityVisibility.isVisible(object)
       })),
       zones: structuredClone(this.#scenario.zones),
       obstacles: structuredClone(this.#scenario.obstacles),
@@ -770,7 +766,12 @@ export class RapierWorld {
   inspectEntity(entityId: string): CommandResult {
     const object = this.#objects.get(entityId);
     if (object) {
-      if (!this.#isVisible(object)) return denied("entity_not_visible", this.#visibilityFailure(object));
+      if (!this.#entityVisibility.isVisible(object)) {
+        return denied(
+          "entity_not_visible",
+          this.#entityVisibility.failure(object, this.#yaw)
+        );
+      }
       const snapshot = this.snapshot().objects.find((candidate) => candidate.id === entityId);
       if (!snapshot) return denied("unknown_entity", this.#unknownEntity(entityId));
       return accepted("entity_state", {
@@ -1125,7 +1126,7 @@ export class RapierWorld {
       face,
       start: vector(this.#robot.translation()),
       yaw: this.#yaw,
-      collisionsAt: (position, yaw) => this.#robotCollisionIssues(position, yaw, joints)
+      collisionsAt: (position, yaw) => this.#articulatedCollisions.robot(position, yaw, joints)
     });
   }
 
@@ -1425,9 +1426,9 @@ export class RapierWorld {
     }
     const trajectory = this.#planArmTrajectory(result.joints);
     if (!("waypoints" in trajectory)) {
-      const collisions = this.#armCollisionIssues({ ...this.#joints, ...result.joints }, true);
+      const collisions = this.#articulatedCollisions.arm({ ...this.#joints, ...result.joints }, true);
       const endpointBlocked = !collisionTransitionAllowed(
-        this.#armCollisionIssues(this.#joints, true),
+        this.#articulatedCollisions.arm(this.#joints, true),
         collisions
       );
       return denied(endpointBlocked ? "ik_trajectory_endpoint_blocked" : "ik_trajectory_blocked", {
@@ -1484,7 +1485,7 @@ export class RapierWorld {
     const targetState: RobotJointState = { ...this.#joints, ...normalizedTargets };
     const trajectory = this.#planArmTrajectory(targetState);
     if (!("waypoints" in trajectory)) {
-      const endpointCollisions = this.#armCollisionIssues(targetState, true);
+      const endpointCollisions = this.#articulatedCollisions.arm(targetState, true);
       return denied("joint_trajectory_blocked", {
         targets: normalizedTargets as unknown as JsonValue,
         planner: trajectory,
@@ -1663,7 +1664,7 @@ export class RapierWorld {
   }
 
   #planArmTrajectory(target: ArmJointTargets): ReturnType<typeof planArmTrajectory> {
-    const baseline = this.#armCollisionIssues(this.#joints, true);
+    const baseline = this.#articulatedCollisions.arm(this.#joints, true);
     return planArmTrajectory({
       start: {
         shoulder: this.#joints.shoulder,
@@ -1678,7 +1679,7 @@ export class RapierWorld {
       },
       isPoseValid: (pose) => collisionTransitionAllowed(
         baseline,
-        this.#armCollisionIssues({ ...this.#joints, ...pose }, true)
+        this.#articulatedCollisions.arm({ ...this.#joints, ...pose }, true)
       )
     });
   }
@@ -1766,7 +1767,7 @@ export class RapierWorld {
         } satisfies ArmTrajectory
       : this.#planArmTrajectory(targetState);
     if (!("waypoints" in planned)) {
-      const endpointCollisions = this.#armCollisionIssues(targetState, true);
+      const endpointCollisions = this.#articulatedCollisions.arm(targetState, true);
       return denied("joint_motion_blocked", {
         targets: normalizedTargets as unknown as JsonValue,
         planner: planned,
@@ -1819,8 +1820,11 @@ export class RapierWorld {
             + (waypointState[joint] - this.#joints[joint]) * fraction;
           this.#jointVelocities[joint] = (next[joint] - this.#joints[joint]) / this.#world.timestep;
         }
-        const collisions = this.#armCollisionIssues(next, true);
-        if (!collisionTransitionAllowed(this.#armCollisionIssues(this.#joints, true), collisions)) {
+        const collisions = this.#articulatedCollisions.arm(next, true);
+        if (!collisionTransitionAllowed(
+          this.#articulatedCollisions.arm(this.#joints, true),
+          collisions
+        )) {
           this.#zeroJointVelocities(["shoulder", "elbow", "wrist"]);
           await this.#advance(command.id, "blocked");
           command.signal?.throwIfAborted();
@@ -1921,8 +1925,11 @@ export class RapierWorld {
         head_yaw: moveTowards(previousYaw, yaw, yawVelocity * this.#world.timestep),
         head_pitch: moveTowards(previousPitch, pitch, pitchVelocity * this.#world.timestep)
       };
-      const collisions = this.#headCollisionIssues(next);
-      if (!collisionTransitionAllowed(this.#headCollisionIssues(this.#joints), collisions)) {
+      const collisions = this.#articulatedCollisions.head(next);
+      if (!collisionTransitionAllowed(
+        this.#articulatedCollisions.head(this.#joints),
+        collisions
+      )) {
         this.#zeroJointVelocities(["head_yaw", "head_pitch"]);
         this.#jointTargets.head_yaw = this.#joints.head_yaw;
         this.#jointTargets.head_pitch = this.#joints.head_pitch;
@@ -1999,8 +2006,11 @@ export class RapierWorld {
         ...this.#joints,
         gripper_aperture: moveTowards(previous, aperture, velocity * this.#world.timestep)
       };
-      const collisions = this.#gripperCollisionIssues(next);
-      if (!collisionTransitionAllowed(this.#gripperCollisionIssues(this.#joints), collisions)) {
+      const collisions = this.#articulatedCollisions.gripper(next);
+      if (!collisionTransitionAllowed(
+        this.#articulatedCollisions.gripper(this.#joints),
+        collisions
+      )) {
         this.#gripperDirection = 0;
         this.#jointVelocities.gripper_aperture = 0;
         this.#jointTargets.gripper_aperture = this.#joints.gripper_aperture;
@@ -2261,9 +2271,9 @@ export class RapierWorld {
       z: current.z + Math.cos(midpointYaw) * linear * dt
     };
     if (!this.#insideBounds(next)) return { code: "target_out_of_bounds", target: next };
-    const collisions = this.#robotCollisionIssues(next, nextYaw);
+    const collisions = this.#articulatedCollisions.robot(next, nextYaw, this.#joints);
     if (!collisionTransitionAllowed(
-      this.#robotCollisionIssues(vector(current), this.#yaw),
+      this.#articulatedCollisions.robot(vector(current), this.#yaw, this.#joints),
       collisions
     )) return { collisions: collisionSetJson(collisions) };
 
@@ -2339,211 +2349,6 @@ export class RapierWorld {
       body.setNextKinematicTranslation(transform.position);
       body.setNextKinematicRotation(transform.rotation);
     }
-  }
-
-  #robotCollisionIssues(
-    base: Vec3,
-    yaw: number,
-    joints: RobotJointState = this.#joints
-  ): CollisionIssue[] {
-    return this.#rigCollisionIssues(
-      joints,
-      base,
-      yaw,
-      new Set([
-        "base",
-        "torso",
-        "sensor_head",
-        "upper_arm",
-        "forearm",
-        "wrist",
-        "left_finger",
-        "right_finger",
-        "attached_payload"
-      ]),
-      false
-    );
-  }
-
-  #armCollisionIssues(
-    joints: RobotJointState,
-    allowPortableContacts: boolean,
-    baseOverride?: Vec3,
-    yawOverride?: number
-  ): CollisionIssue[] {
-    const base = baseOverride ?? vector(this.#robot.translation());
-    const yaw = yawOverride ?? this.#yaw;
-    return this.#rigCollisionIssues(
-      joints,
-      base,
-      yaw,
-      new Set([
-        "upper_arm",
-        "forearm",
-        "wrist",
-        "left_finger",
-        "right_finger",
-        "attached_payload"
-      ]),
-      allowPortableContacts
-    );
-  }
-
-  #headCollisionIssues(joints: RobotJointState): CollisionIssue[] {
-    return this.#rigCollisionIssues(
-      joints,
-      vector(this.#robot.translation()),
-      this.#yaw,
-      new Set(["sensor_head"]),
-      false
-    );
-  }
-
-  #gripperCollisionIssues(joints: RobotJointState): CollisionIssue[] {
-    return this.#rigCollisionIssues(
-      joints,
-      vector(this.#robot.translation()),
-      this.#yaw,
-      new Set(["left_finger", "right_finger"]),
-      true
-    );
-  }
-
-  #rigCollisionIssues(
-    joints: RobotJointState,
-    base: Vec3,
-    yaw: number,
-    movedSegments: ReadonlySet<string>,
-    allowPortableFingerContacts: boolean
-  ): CollisionIssue[] {
-    const candidates = this.#collisionCandidates(
-      joints,
-      base,
-      yaw,
-      allowPortableFingerContacts
-    );
-    const issues: CollisionIssue[] = [];
-    if (this.#attachment.attached && !candidates.some((candidate) => candidate.segment === "attached_payload")) {
-      issues.push({
-        segment: "attached_payload",
-        code: "attached_object_missing",
-        collider_kind: "state",
-        collider_id: null,
-        penetration_depth: null
-      });
-    }
-
-    for (const candidate of candidates) {
-      if (!movedSegments.has(candidate.segment)) continue;
-      issues.push(...this.#intersections(candidate, this.#attachment.objectId ?? undefined));
-    }
-
-    for (let leftIndex = 0; leftIndex < candidates.length; leftIndex += 1) {
-      const left = candidates[leftIndex]!;
-      for (let rightIndex = leftIndex + 1; rightIndex < candidates.length; rightIndex += 1) {
-        const right = candidates[rightIndex]!;
-        const leftMoved = movedSegments.has(left.segment);
-        const rightMoved = movedSegments.has(right.segment);
-        if ((!leftMoved && !rightMoved)
-          || ADJACENT_COLLISION_SEGMENTS.has(linkPairKey(left.segment, right.segment))) continue;
-        if (!left.shape.intersectsShape(
-          left.transform.position,
-          left.transform.rotation,
-          right.shape,
-          right.transform.position,
-          right.transform.rotation
-        )) continue;
-        const contact = left.shape.contactShape(
-          left.transform.position,
-          left.transform.rotation,
-          right.shape,
-          right.transform.position,
-          right.transform.rotation,
-          0
-        );
-        const primary = leftMoved ? left : right;
-        const other = primary === left ? right : left;
-        issues.push({
-          segment: primary.segment,
-          collider_kind: "robot",
-          collider_id: other.segment,
-          penetration_depth: contact && Number.isFinite(contact.distance)
-            ? Math.max(0, -contact.distance)
-            : null
-        });
-      }
-    }
-    return uniqueCollisions(issues);
-  }
-
-  #collisionCandidates(
-    joints: RobotJointState,
-    base: Vec3,
-    yaw: number,
-    allowPortableFingerContacts: boolean
-  ): CollisionCandidate[] {
-    const attached = this.#attachment.objectId
-      ? this.#objects.get(this.#attachment.objectId)
-      : undefined;
-    const attachmentPosition = this.#attachment.anchorPosition;
-    const attachmentRotation = this.#attachment.anchorRotation;
-    return collisionCandidates({
-      joints,
-      base,
-      yaw,
-      allowPortableFingerContacts,
-      payload: attached && attachmentPosition && attachmentRotation
-        ? {
-          size: attached.config.size,
-          anchorPosition: attachmentPosition,
-          anchorRotation: attachmentRotation
-        }
-        : undefined
-    });
-  }
-
-  #intersections(
-    candidate: CollisionCandidate,
-    ignoreObjectId?: string
-  ): CollisionIssue[] {
-    const collisions: CollisionIssue[] = [];
-    this.#world.intersectionsWithShape(
-      candidate.transform.position,
-      candidate.transform.rotation,
-      candidate.shape,
-      (collider: Collider) => {
-        const data = colliderData(collider);
-        const contact = collider.contactShape(
-          candidate.shape,
-          candidate.transform.position,
-          candidate.transform.rotation,
-          0
-        );
-        collisions.push({
-          segment: candidate.segment,
-          collider_kind: data.kind ?? "unknown",
-          collider_id: colliderIdentity(data),
-          penetration_depth: contact && Number.isFinite(contact.distance)
-            ? Math.max(0, -contact.distance)
-            : null
-        });
-        return true;
-      },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      (collider: Collider) => {
-        const data = colliderData(collider);
-        if (data?.kind === "robot") return false;
-        if (data?.kind === "object" && data.id === ignoreObjectId) return false;
-        if (candidate.allowPortableContacts && data?.kind === "object" && data.id) {
-          return this.#objects.get(data.id)?.config.portable !== true;
-        }
-        return true;
-      }
-    );
-    return collisions;
   }
 
   #refreshContacts(): void {
@@ -2741,96 +2546,6 @@ export class RapierWorld {
   }
 
   /**
-   * A bare "not visible" tells an agent nothing it can act on, so it retries
-   * the same look and is denied again. Visibility fails for four distinct
-   * reasons and each has a different remedy, so the denial names which gate
-   * closed and — when the fix is aiming the head — the yaw and pitch that
-   * would open it. Those come from the same transform `#isVisible` uses, so
-   * the numbers are the world's own, not an estimate.
-   */
-  #visibilityFailure(object: SimObject): JsonValue {
-    const entityId = object.config.id;
-    if (!object.body.isEnabled()) {
-      return {
-        entity_id: entityId,
-        reason: "not_simulated",
-        recovery: `${entityId} is not an active body in this scenario, so no sensing will ever `
-          + "reveal it. Use sense_scene to see what does exist and work with those entities."
-      };
-    }
-    const head = this.#linkBodies.get("sensor_head");
-    if (!head) return { entity_id: entityId, reason: "sensor_head_missing" };
-    const origin = vector(head.translation());
-    const target = vector(object.body.translation());
-    const delta = subtract(target, origin);
-    const distance = vectorLength(delta);
-    if (distance > this.#scenario.visibility_radius) {
-      return {
-        entity_id: entityId,
-        reason: "out_of_range",
-        distance: Number(distance.toFixed(3)),
-        visibility_radius: this.#scenario.visibility_radius,
-        recovery: `${entityId} is ${distance.toFixed(2)}m away but the sensor only reaches `
-          + `${this.#scenario.visibility_radius}m. Aiming the head will not help. Move the base `
-          + "closer first with plan_base_path and execute_base_plan, then inspect again."
-      };
-    }
-    // The head is a child of the base, so the yaw that centres the object is
-    // measured in the base frame, which is exactly what set_head_target takes.
-    const bodyRelative = rotateVector(inverseQuaternion(yawRotation(this.#yaw)), delta);
-    const yaw = clamp(
-      Math.atan2(bodyRelative.x, bodyRelative.z),
-      ROBOT_SPEC.joints.head_yaw.minimum,
-      ROBOT_SPEC.joints.head_yaw.maximum
-    );
-    const pitch = clamp(
-      Math.atan2(bodyRelative.y, Math.hypot(bodyRelative.x, bodyRelative.z)),
-      ROBOT_SPEC.joints.head_pitch.minimum,
-      ROBOT_SPEC.joints.head_pitch.maximum
-    );
-    const localDirection = rotateVector(
-      inverseQuaternion(quaternion(head.rotation())),
-      scale(delta, 1 / Math.max(distance, 1e-6))
-    );
-    const offAxis = Math.abs(Math.atan2(localDirection.x, localDirection.z))
-        > ROBOT_SPEC.sensorHead.horizontalFieldOfView / 2
-      || Math.abs(Math.atan2(localDirection.y, Math.hypot(localDirection.x, localDirection.z)))
-        > ROBOT_SPEC.sensorHead.verticalFieldOfView / 2;
-    if (offAxis) {
-      return {
-        entity_id: entityId,
-        reason: "outside_field_of_view",
-        distance: Number(distance.toFixed(3)),
-        recovery: `${entityId} is in range but outside the sensor cone. Call set_head_target with `
-          + `yaw=${yaw.toFixed(3)} and pitch=${pitch.toFixed(3)} to aim at it, then inspect again.`
-      };
-    }
-    const hit = this.#world.castRay(
-      new RAPIER.Ray(origin, scale(delta, 1 / Math.max(distance, 1e-6))),
-      distance + 0.02,
-      true,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      (collider: Collider) => {
-        const data = colliderData(collider);
-        return data.kind !== "robot" && data.kind !== "ground";
-      }
-    );
-    const blocker = hit ? colliderIdentity(colliderData(hit.collider)) : null;
-    return {
-      entity_id: entityId,
-      reason: "occluded",
-      occluded_by: blocker,
-      distance: Number(distance.toFixed(3)),
-      recovery: `${entityId} is in range and in view, but ${blocker ?? "another body"} `
-        + "blocks the line of sight. Aiming the head will not clear it. Move the base to a "
-        + "different side with plan_base_path and execute_base_plan, then inspect again."
-    };
-  }
-
-  /**
    * Marks every terrain column the sensor can currently see.
    *
    * Run once per committed command rather than once per physics step: the head
@@ -2873,38 +2588,6 @@ export class RapierWorld {
     for (const index of visible) {
       this.#explored.mark(index);
     }
-  }
-
-  #isVisible(object: SimObject): boolean {
-    if (!object.body.isEnabled()) return false;
-    const head = this.#linkBodies.get("sensor_head");
-    if (!head) return false;
-    const origin = vector(head.translation());
-    const target = vector(object.body.translation());
-    const delta = subtract(target, origin);
-    const distance = vectorLength(delta);
-    if (distance <= 0.001 || distance > this.#scenario.visibility_radius) return false;
-    const localDirection = rotateVector(inverseQuaternion(quaternion(head.rotation())), scale(delta, 1 / distance));
-    const horizontal = Math.atan2(localDirection.x, localDirection.z);
-    const vertical = Math.atan2(localDirection.y, Math.hypot(localDirection.x, localDirection.z));
-    if (Math.abs(horizontal) > ROBOT_SPEC.sensorHead.horizontalFieldOfView / 2
-      || Math.abs(vertical) > ROBOT_SPEC.sensorHead.verticalFieldOfView / 2) {
-      return false;
-    }
-    const hit = this.#world.castRay(
-      new RAPIER.Ray(origin, scale(delta, 1 / distance)),
-      distance + 0.02,
-      true,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      (collider: Collider) => {
-        const data = collider.parent()?.userData as { kind?: string } | undefined;
-        return data?.kind !== "robot" && data?.kind !== "ground";
-      }
-    );
-    return hit?.collider === object.collider;
   }
 
   #restore(snapshot: WorldSnapshot): void {

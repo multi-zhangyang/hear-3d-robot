@@ -128,6 +128,39 @@ describe("journal offset index repair", () => {
     }
   });
 
+  it("bounds a window by UTF-8 bytes while still returning one oversized record", async () => {
+    const fixture = await createFixture();
+    try {
+      const firstBytes = Buffer.byteLength(`${RECORDS[0]}\n`);
+      const secondBytes = Buffer.byteLength(`${RECORDS[1]}\n`);
+
+      await expect(readIndexedWindow(
+        fixture.dataPath,
+        fixture.indexPath,
+        0,
+        RECORDS.length,
+        firstBytes + secondBytes - 1
+      )).resolves.toEqual({
+        lines: [RECORDS[0]],
+        next: 1,
+        total: RECORDS.length
+      });
+      await expect(readIndexedWindow(
+        fixture.dataPath,
+        fixture.indexPath,
+        1,
+        RECORDS.length,
+        secondBytes - 1
+      )).resolves.toEqual({
+        lines: [RECORDS[1]],
+        next: 2,
+        total: RECORDS.length
+      });
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
   it("reuses verified fingerprints until an external middle-offset edit", async () => {
     const fixture = await createFixture();
     const streamSpy = vi.mocked(createReadStream);

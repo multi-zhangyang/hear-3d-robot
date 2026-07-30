@@ -174,6 +174,9 @@ export async function createOperatorServer(input: {
     const headerAfter = EventCursor.optional().parse(
       stringHeader(request.headers["last-event-id"])
     );
+    if (query.after !== undefined && headerAfter !== undefined && query.after !== headerAfter) {
+      return reply.code(400).send({ error: "Conflicting event cursors" });
+    }
     const after = query.after ?? headerAfter;
     let writeEvent: ((event: RuntimeEvent) => Promise<void>) | undefined;
     let writer: EventStreamWriter | undefined;
@@ -329,7 +332,14 @@ function sameSecret(left: string, right: string): boolean {
 }
 
 export function runtimeEventRecord(event: RuntimeEvent): string {
-  const cursor = event.durable === false ? "" : `id: ${event.event_id}\n`;
+  let cursor = "";
+  if (event.durable !== false) {
+    const value = event.cursor ?? event.event_id;
+    if (typeof value !== "string" || value.length === 0 || /[\r\n\0]/.test(value)) {
+      throw new Error("Invalid runtime event cursor");
+    }
+    cursor = `id: ${value}\n`;
+  }
   return `${cursor}event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
@@ -393,7 +403,7 @@ export class EventStreamWriter {
     const bytes = Buffer.byteLength(record);
     if (
       this.#pending.length >= this.#maxPendingRecords
-      || bytes > this.#maxPendingBytes - this.#pendingBytes
+      || (this.#pending.length > 0 && bytes > this.#maxPendingBytes - this.#pendingBytes)
     ) {
       const error = new Error("Event stream client is too slow");
       this.#fail(error);

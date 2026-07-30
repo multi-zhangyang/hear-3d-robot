@@ -13,6 +13,7 @@ export function nextRuntimeEventCursor(
   current: string | undefined,
   event: RuntimeEvent
 ): string | undefined {
+  if (event.cursor) return event.cursor;
   const durable = event.durable ?? event.type !== "world_frames";
   return durable ? event.event_id : current;
 }

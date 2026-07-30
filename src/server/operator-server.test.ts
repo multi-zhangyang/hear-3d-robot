@@ -28,12 +28,13 @@ describe("Operator API", () => {
       type: "action_committed",
       at: "2026-07-30T00:00:01.000Z",
       data: {},
-      durable: true
+      durable: true,
+      cursor: `v1:4:${"a".repeat(64)}`
     });
 
     expect(live).not.toContain("id: live-frame");
     expect(live).toContain("event: world_frames");
-    expect(durable).toContain("id: committed");
+    expect(durable).toContain(`id: v1:4:${"a".repeat(64)}`);
   });
 
   it("protects runtime data and exposes the current hierarchy contract", async () => {
@@ -142,7 +143,7 @@ describe("Operator API", () => {
       expect(details.actions.length).toBeLessThanOrEqual(3);
       expect(details.provider.length).toBeLessThanOrEqual(4);
       expect(details.framework).toHaveLength(2);
-      expect(details.event_cursor).toEqual(expect.any(String));
+      expect(details.event_cursor).toMatch(/^v1:\d+:[a-f0-9]{64}$/);
 
       const unknownCursor = await app.inject({
         method: "GET",
@@ -150,6 +151,21 @@ describe("Operator API", () => {
       });
       expect(unknownCursor.statusCode).toBe(409);
       expect(unknownCursor.json().error).toMatch(/Unknown event cursor/);
+
+      const malformedVersionedCursor = await app.inject({
+        method: "GET",
+        url: "/api/runs/20000101T000000Z_fetch_red_block_00000000/events?after=v1:not-an-index:broken"
+      });
+      expect(malformedVersionedCursor.statusCode).toBe(409);
+      expect(malformedVersionedCursor.json().error).toMatch(/Malformed event cursor/);
+
+      const conflictingCursors = await app.inject({
+        method: "GET",
+        url: `/api/runs/20000101T000000Z_fetch_red_block_00000000/events?after=${encodeURIComponent(details.event_cursor)}`,
+        headers: { "last-event-id": "different-cursor" }
+      });
+      expect(conflictingCursors.statusCode).toBe(400);
+      expect(conflictingCursors.json()).toEqual({ error: "Conflicting event cursors" });
 
       for (const invalidCursor of ["", "x".repeat(257), "cursor\r\nforged", "cursor\0tail"]) {
         const invalidHeader = await app.inject({
@@ -295,6 +311,30 @@ describe("Operator API", () => {
     expect(failures).toHaveLength(1);
     expect(failures[0]?.message).toMatch(/too slow/);
     expect(stalledTarget.records).toEqual(["one\n\n"]);
+  });
+
+  it("allows one oversized record but rejects queue growth behind it", async () => {
+    const target = new ControlledEventStreamTarget([false, false]);
+    const failures: Error[] = [];
+    const writer = new EventStreamWriter(target, (error) => failures.push(error), {
+      maxPendingRecords: 4,
+      maxPendingBytes: 8,
+      drainTimeoutMs: 1_000
+    });
+    const oversized = writer.write("oversized record\n\n");
+    expect(target.records).toEqual(["oversized record\n\n"]);
+
+    target.emit("drain");
+    await expect(oversized).resolves.toBeUndefined();
+    expect(failures).toEqual([]);
+
+    const blocked = writer.write("another oversized record\n\n");
+    const overflow = writer.write("queued\n\n");
+    await expect(Promise.allSettled([blocked, overflow])).resolves.toEqual([
+      expect.objectContaining({ status: "rejected" }),
+      expect.objectContaining({ status: "rejected" })
+    ]);
+    expect(failures).toHaveLength(1);
   });
 
   it("fails a backpressured stream when drain never arrives", async () => {
