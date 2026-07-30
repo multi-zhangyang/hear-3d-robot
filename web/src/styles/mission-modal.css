@@ -1,0 +1,51 @@
+.predicate-heading,
+.predicate-row-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.predicate-heading { margin-bottom: 10px; }
+.predicate-add { width: 190px; flex: 0 0 auto; }
+
+.predicate-list {
+  display: grid;
+  max-height: min(44vh, 480px);
+  gap: 8px;
+  padding-inline-end: 4px;
+  overflow: auto;
+}
+
+.predicate-row {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface-raised);
+}
+
+.predicate-row-heading { margin-bottom: 10px; }
+.predicate-row-heading > .ant-select { min-width: 0; flex: 1; }
+
+.predicate-fields,
+.predicate-fields .ant-space-compact,
+.predicate-fields > .ant-select,
+.predicate-fields > .ant-input-number,
+.predicate-fields > .ant-space-item,
+.predicate-fields > .ant-space-item > .ant-select,
+.predicate-fields > .ant-space-item > .ant-input-number,
+.predicate-fields > .ant-space-item > .ant-space-compact {
+  width: 100%;
+}
+
+.predicate-fields .ant-space-compact > .ant-select,
+.predicate-fields .ant-space-compact > .ant-input-number {
+  min-width: 0;
+  flex: 1;
+}
+
+@media (max-width: 560px) {
+  .predicate-heading { align-items: stretch; flex-direction: column; }
+  .predicate-add { width: 100%; }
+  .predicate-row { padding: 10px; }
+}

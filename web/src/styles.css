@@ -1,0 +1,91 @@
+:root {
+  --void: #101214;
+  --surface: #191c1f;
+  --surface-raised: #22262a;
+  --surface-hover: #292e32;
+  --line: #34393e;
+  --line-soft: #292d31;
+  --text: #f0f1f2;
+  --text-dim: #a7adb3;
+  --text-faint: #737a81;
+  --cyan: #24c8ae;
+  --danger: #ef6a6a;
+  color: var(--text);
+  background: var(--void);
+  color-scheme: dark;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 320px;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-height: 100vh;
+  overflow-x: hidden;
+  background: var(--void);
+}
+
+button,
+input,
+textarea,
+select { letter-spacing: 0; }
+
+.three-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+.webgl-error {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  padding: 24px;
+  place-items: center;
+  color: var(--danger);
+  background: var(--void);
+  text-align: center;
+}
+
+.failure-alert .failure-title { font-weight: 600; }
+.failure-headline { margin: 0; color: var(--text); }
+
+.centered-spin {
+  display: grid;
+  min-height: 320px;
+  place-items: center;
+}
+
+.login-shell {
+  display: grid;
+  min-height: 100vh;
+  padding: 24px;
+  place-items: center;
+  background: radial-gradient(circle at 50% 0%, rgb(53 224 196 / 10%), transparent 55%), var(--void);
+}
+
+.login-panel {
+  width: min(100%, 380px);
+  padding: 32px;
+  border: 1px solid var(--line);
+  background: var(--surface-raised);
+  box-shadow: 0 24px 60px rgb(0 0 0 / 55%);
+}
+
+.login-mark { color: var(--cyan); font-size: 34px; }
+.login-panel h2 { margin: 10px 0 24px; }
+
+@media (max-width: 560px) {
+  .three-canvas { touch-action: pan-y; }
+  .provider-status { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+}

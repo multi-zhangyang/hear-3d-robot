@@ -1,0 +1,277 @@
+import { appendFile, cp, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { loadRuntimeCatalog, type ProviderConfig } from "../config/load.js";
+import type { RuntimeEvent, RuntimeEventSink } from "../harness/runtime-context.js";
+import { RunStore } from "../persistence/run-store.js";
+import { RunManager } from "./run-manager.js";
+
+const missionRunner = vi.hoisted(() => ({
+  startMission: vi.fn(),
+  resumeMission: vi.fn()
+}));
+
+vi.mock("../runtime/mission-runner.js", () => missionRunner);
+
+const FIXTURE = resolve(
+  process.cwd(),
+  "tests/fixtures/runs/20000101T000000Z_fetch_red_block_00000000"
+);
+const TEST_PROVIDER: ProviderConfig = {
+  protocol: "openai_compatible",
+  baseUrl: "https://example.test/v1",
+  model: "test-model",
+  apiKey: "test-key",
+  temperature: 0,
+  maxOutputTokens: 512,
+  contextWindowTokens: 8192,
+  compactTriggerTokens: 2048,
+  compactRecentModelTurns: 2,
+  compactMaxOutputTokens: 512
+};
+
+describe("RunManager event and process lifecycle", () => {
+  it("streams an old cursor suffix without replaying history for a current cursor", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const manager = new RunManager({ runsDir, catalog });
+    const entries = await store.readJournal("events") as unknown as RuntimeEvent[];
+    expect(entries.length).toBeGreaterThan(2);
+
+    const fromCurrent: RuntimeEvent[] = [];
+    const stopCurrent = await manager.subscribe(
+      runId,
+      entries.at(-1)!.event_id,
+      (event) => fromCurrent.push(event)
+    );
+    stopCurrent();
+    expect(fromCurrent).toEqual([]);
+
+    const fromOlder: RuntimeEvent[] = [];
+    const deliveryOrder: string[] = [];
+    const cursorIndex = entries.length - 3;
+    const stopOlder = await manager.subscribe(
+      runId,
+      entries[cursorIndex]!.event_id,
+      (event) => {
+        fromOlder.push(event);
+        deliveryOrder.push(event.event_id);
+      },
+      undefined,
+      () => deliveryOrder.push("ready")
+    );
+    stopOlder();
+    expect(fromOlder.map((event) => event.event_id)).toEqual(
+      entries.slice(cursorIndex + 1).map((event) => event.event_id)
+    );
+    expect(deliveryOrder).toEqual([
+      "ready",
+      ...entries.slice(cursorIndex + 1).map((event) => event.event_id)
+    ]);
+
+    const noReplay: RuntimeEvent[] = [];
+    const stopLive = await manager.subscribe(runId, undefined, (event) => noReplay.push(event));
+    stopLive();
+    expect(noReplay).toEqual([]);
+    await expect(manager.subscribe("missing_run", undefined, () => undefined))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("marks process-orphaned runs interrupted and leaves them resumable", async () => {
+    const { runsDir, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const checkpoint = await store.readCheckpoint();
+    expect(checkpoint.active_agent_ids).toEqual([]);
+    expect(checkpoint.inflight_actions).toEqual({});
+    expect(checkpoint.spatial_memory).toEqual([]);
+    expect(Object.values(checkpoint.nodes).every(
+      (node) => Array.isArray(node.evidence_requirements)
+    )).toBe(true);
+    await store.writeCheckpoint({ ...checkpoint, status: "running", error: null });
+
+    const manager = new RunManager({ runsDir, catalog });
+    await expect(manager.recoverOrphanedRuns()).resolves.toBe(1);
+    await expect(manager.recoverOrphanedRuns()).resolves.toBe(0);
+
+    const recovered = await store.readCheckpoint();
+    expect(recovered.status).toBe("interrupted");
+    expect(recovered.error).toMatch(/previous operator process/);
+    expect((await store.readJournalTail("events", 1)).entries[0]).toMatchObject({
+      type: "run_interrupted",
+      data: { recovered_on_operator_start: true }
+    });
+  });
+
+  it("does not hide a valid orphaned checkpoint write failure", async () => {
+    const { runsDir, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const checkpoint = await store.readCheckpoint();
+    await store.writeCheckpoint({ ...checkpoint, status: "running", error: null });
+    const write = vi.spyOn(RunStore.prototype, "writeCheckpoint")
+      .mockRejectedValueOnce(new Error("checkpoint storage unavailable"));
+    try {
+      const manager = new RunManager({ runsDir, catalog });
+      await expect(manager.recoverOrphanedRuns())
+        .rejects.toThrow("checkpoint storage unavailable");
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it("backfills only complete crash-safe events and cancels a disconnected replay", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const manager = new RunManager({ runsDir, catalog });
+    const entries = await store.readJournal("events") as unknown as RuntimeEvent[];
+    await appendFile(join(store.runDir, "events.jsonl"), '{"event_id":"interrupted"');
+
+    const replayed: RuntimeEvent[] = [];
+    const stop = await manager.subscribe(
+      runId,
+      entries.at(-3)!.event_id,
+      (event) => replayed.push(event)
+    );
+    stop();
+    expect(replayed.map((event) => event.event_id)).toEqual(
+      entries.slice(-2).map((event) => event.event_id)
+    );
+
+    const disconnected = new AbortController();
+    let deliveredBeforeDisconnect = 0;
+    await expect(manager.subscribe(runId, entries[0]!.event_id, () => {
+      deliveredBeforeDisconnect += 1;
+      disconnected.abort(new Error("client disconnected"));
+    }, disconnected.signal)).rejects.toThrow("client disconnected");
+    expect(deliveredBeforeDisconnect).toBe(1);
+  });
+
+  it("orders live events after a paused journal backfill without losing either source", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const entries = await store.readJournal("events") as unknown as RuntimeEvent[];
+    const cursorIndex = entries.length - 3;
+    let emit: RuntimeEventSink | undefined;
+    let finishMission!: (value: { runId: string; runDir: string; output: string }) => void;
+    missionRunner.startMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
+      emit = input.eventSink;
+      return new Promise((resolveMission) => {
+        finishMission = resolveMission;
+      });
+    });
+    const manager = new RunManager({ runsDir, catalog, provider: TEST_PROVIDER });
+    const starting = manager.start({
+      mission: store.definition.mission,
+      scenarioId: store.definition.scenario_id,
+      goal: store.definition.goal
+    });
+    if (!emit) throw new Error("Mission event sink was not installed");
+    emit(runtimeEvent(runId, "mission-created"));
+    await expect(starting).resolves.toBe(runId);
+
+    const live = runtimeEvent(runId, "live-during-backfill");
+    const scan = vi.spyOn(RunStore.prototype, "scanJournal").mockImplementationOnce(
+      async (_name, visit) => {
+        for (const [index, event] of entries.entries()) {
+          await visit(event, index);
+          if (index === cursorIndex + 1) {
+            emit?.(entries[cursorIndex + 2]!);
+            emit?.(live);
+          }
+        }
+      }
+    );
+    const received: RuntimeEvent[] = [];
+    try {
+      const stop = await manager.subscribe(
+        runId,
+        entries[cursorIndex]!.event_id,
+        async (event) => {
+          await Promise.resolve();
+          received.push(event);
+        }
+      );
+      stop();
+      expect(received.map((event) => event.event_id)).toEqual([
+        ...entries.slice(cursorIndex + 1).map((event) => event.event_id),
+        live.event_id
+      ]);
+    } finally {
+      scan.mockRestore();
+      finishMission({ runId, runDir: store.runDir, output: "done" });
+      await manager.drain();
+      missionRunner.startMission.mockReset();
+    }
+  });
+
+  it("fails a replay whose bounded live-event buffer is overrun", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const entries = await store.readJournal("events") as unknown as RuntimeEvent[];
+    const cursorIndex = entries.length - 3;
+    let emit: RuntimeEventSink | undefined;
+    let finishMission!: (value: { runId: string; runDir: string; output: string }) => void;
+    missionRunner.startMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
+      emit = input.eventSink;
+      return new Promise((resolveMission) => {
+        finishMission = resolveMission;
+      });
+    });
+    const manager = new RunManager({ runsDir, catalog, provider: TEST_PROVIDER });
+    const starting = manager.start({
+      mission: store.definition.mission,
+      scenarioId: store.definition.scenario_id,
+      goal: store.definition.goal
+    });
+    if (!emit) throw new Error("Mission event sink was not installed");
+    emit(runtimeEvent(runId, "mission-created"));
+    await starting;
+
+    const scan = vi.spyOn(RunStore.prototype, "scanJournal").mockImplementationOnce(
+      async (_name, visit) => {
+        for (const [index, event] of entries.entries()) {
+          await visit(event, index);
+          if (index === cursorIndex) {
+            for (let liveIndex = 0; liveIndex < 300; liveIndex += 1) {
+              emit?.(runtimeEvent(runId, `live-overflow-${liveIndex}`));
+            }
+          }
+        }
+      }
+    );
+    try {
+      await expect(manager.subscribe(
+        runId,
+        entries[cursorIndex]!.event_id,
+        async () => Promise.resolve()
+      )).rejects.toThrow(/fell behind during journal backfill/);
+    } finally {
+      scan.mockRestore();
+      finishMission({ runId, runDir: store.runDir, output: "done" });
+      await manager.drain();
+      missionRunner.startMission.mockReset();
+    }
+  });
+});
+
+async function copiedFixture(): Promise<{
+  runsDir: string;
+  runId: string;
+  store: RunStore;
+}> {
+  const runsDir = await mkdtemp(join(tmpdir(), "hear-manager-"));
+  const runId = basename(FIXTURE);
+  const destination = join(runsDir, runId);
+  await cp(FIXTURE, destination, { recursive: true });
+  return { runsDir, runId, store: await RunStore.open(destination) };
+}
+
+function runtimeEvent(runId: string, eventId: string): RuntimeEvent {
+  return {
+    event_id: eventId,
+    run_id: runId,
+    type: "test_event",
+    at: "2026-07-30T00:00:00.000Z",
+    data: { source: "test" }
+  };
+}

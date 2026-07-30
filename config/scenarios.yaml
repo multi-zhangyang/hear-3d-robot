@@ -1,0 +1,268 @@
+scenarios:
+  voxel_expanse:
+    kind: generated
+    title: Voxel expanse
+    generate:
+      terrain:
+        size: 80
+        cell: 1
+        block: 0.9
+        relief: 3
+        density: 0.26
+      visibility_radius: 7
+      objects:
+        - id: red_block
+          kind: block
+          color: "#d84a4a"
+          size: { x: 0.5, y: 0.5, z: 0.5 }
+          portable: true
+        - id: blue_block
+          kind: block
+          color: "#3f6fd8"
+          size: { x: 0.5, y: 0.5, z: 0.5 }
+          portable: true
+      zones:
+        - id: green_zone
+          color: "#3d9b68"
+          size: { x: 1.8, y: 0.02, z: 1.8 }
+      default_goal:
+        summary: Red block rests inside the green zone and is no longer attached to the robot.
+        predicates:
+          - type: object_in_zone
+            object_id: red_block
+            zone_id: green_zone
+            expected: true
+            tolerance: 0.05
+          - type: object_attached
+            object_id: red_block
+            expected: false
+
+  voxel_highlands:
+    kind: generated
+    title: Voxel highlands
+    generate:
+      terrain:
+        size: 96
+        cell: 1
+        block: 0.9
+        relief: 4
+        density: 0.34
+      visibility_radius: 8
+      objects:
+        - id: red_block
+          kind: block
+          color: "#d84a4a"
+          size: { x: 0.5, y: 0.5, z: 0.5 }
+          portable: true
+        - id: amber_block
+          kind: block
+          color: "#d89a3f"
+          size: { x: 0.45, y: 0.45, z: 0.45 }
+          portable: true
+        - id: blue_block
+          kind: block
+          color: "#3f6fd8"
+          size: { x: 0.5, y: 0.5, z: 0.5 }
+          portable: true
+      zones:
+        - id: green_zone
+          color: "#3d9b68"
+          size: { x: 1.8, y: 0.02, z: 1.8 }
+      default_goal:
+        summary: Red block rests inside the green zone and is no longer attached to the robot.
+        predicates:
+          - type: object_in_zone
+            object_id: red_block
+            zone_id: green_zone
+            expected: true
+            tolerance: 0.05
+          - type: object_attached
+            object_id: red_block
+            expected: false
+
+  voxel_survey:
+    kind: generated
+    title: Voxel survey
+    generate:
+      terrain:
+        size: 80
+        cell: 1
+        block: 0.9
+        relief: 3
+        density: 0.3
+      visibility_radius: 8
+      objects: []
+      zones:
+        - id: arrival_zone
+          color: "#4b83c3"
+          size: { x: 1.5, y: 0.02, z: 1.5 }
+      default_goal:
+        summary: Robot autonomously maps at least five percent of the unknown terrain.
+        predicates:
+          - type: terrain_explored
+            minimum_fraction: 0.05
+
+  voxel_realm:
+    kind: generated
+    title: Voxel realm
+    generate:
+      terrain:
+        size: 192
+        cell: 1
+        block: 0.9
+        chunk_size: 16
+        maximum_height: 24
+        relief: 5
+        density: 0.31
+      visibility_radius: 9
+      objects:
+        - id: red_block
+          kind: block
+          color: "#d84a4a"
+          size: { x: 0.5, y: 0.5, z: 0.5 }
+          portable: true
+        - id: amber_block
+          kind: block
+          color: "#d89a3f"
+          size: { x: 0.45, y: 0.45, z: 0.45 }
+          portable: true
+      zones:
+        - id: green_zone
+          color: "#3d9b68"
+          size: { x: 1.8, y: 0.02, z: 1.8 }
+      default_goal:
+        summary: Robot autonomously maps at least one percent of the large unknown world.
+        predicates:
+          - type: terrain_explored
+            minimum_fraction: 0.01
+
+  open_navigation:
+    kind: authored
+    title: Open navigation
+    scenario:
+      title: Open navigation
+      bounds: { width: 12, depth: 10 }
+      visibility_radius: 6
+      robot: { x: 1, z: 1, yaw: 0 }
+      obstacles:
+        - id: center_column
+          center: { x: 6, y: 1, z: 5 }
+          size: { x: 1.2, y: 2, z: 1.2 }
+      objects: []
+      zones:
+        - id: arrival_zone
+          color: "#4b83c3"
+          center: { x: 10, y: 0.01, z: 8 }
+          size: { x: 1.5, y: 0.02, z: 1.5 }
+      default_goal:
+        summary: Robot reaches the arrival coordinate.
+        predicates:
+          - type: robot_at
+            target: { x: 10, y: 0, z: 8 }
+            tolerance: 0.3
+
+  fetch_red_block:
+    kind: authored
+    title: Fetch red block
+    scenario:
+      title: Fetch red block
+      bounds: { width: 8, depth: 8 }
+      visibility_radius: 4
+      robot: { x: 0.8, z: 0.8, yaw: 0 }
+      obstacles:
+        - id: barrier_a
+          center: { x: 3, y: 0.6, z: 2.5 }
+          size: { x: 0.8, y: 1.2, z: 2.4 }
+      objects:
+        - id: red_block
+          kind: block
+          color: "#d84a4a"
+          position: { x: 2, y: 0.25, z: 1.5 }
+          size: { x: 0.5, y: 0.5, z: 0.5 }
+          portable: true
+        - id: blue_block
+          kind: block
+          color: "#3f6fd8"
+          position: { x: 1, y: 0.25, z: 5 }
+          size: { x: 0.5, y: 0.5, z: 0.5 }
+          portable: true
+      zones:
+        - id: green_zone
+          color: "#3d9b68"
+          center: { x: 6.5, y: 0.01, z: 6.5 }
+          size: { x: 1.8, y: 0.02, z: 1.8 }
+      default_goal:
+        summary: Red block rests inside the green zone and is no longer attached to the robot.
+        predicates:
+          - type: object_in_zone
+            object_id: red_block
+            zone_id: green_zone
+            expected: true
+            tolerance: 0.05
+          - type: object_attached
+            object_id: red_block
+            expected: false
+
+  locked_container:
+    kind: authored
+    title: Locked container
+    scenario:
+      title: Locked container
+      bounds: { width: 9, depth: 7 }
+      visibility_radius: 5
+      robot: { x: 0.8, z: 0.8, yaw: 0 }
+      obstacles:
+        - id: divider
+          center: { x: 3.5, y: 0.7, z: 3.3 }
+          size: { x: 0.7, y: 1.4, z: 2.5 }
+      objects:
+        - id: brass_key
+          kind: key
+          color: "#cda349"
+          position: { x: 1.5, y: 0.12, z: 2 }
+          size: { x: 0.45, y: 0.12, z: 0.18 }
+          portable: true
+        - id: locked_box
+          kind: container
+          color: "#68717d"
+          position: { x: 6, y: 0.45, z: 1.5 }
+          size: { x: 1.2, y: 0.9, z: 1 }
+          portable: false
+          locked: true
+          key_id: brass_key
+        - id: red_block
+          kind: block
+          color: "#d84a4a"
+          position: { x: 5.3, y: 0.25, z: 2.35 }
+          size: { x: 0.5, y: 0.5, z: 0.5 }
+          portable: true
+      zones:
+        - id: green_zone
+          color: "#3d9b68"
+          center: { x: 7.5, y: 0.01, z: 5.5 }
+          size: { x: 1.8, y: 0.02, z: 1.8 }
+      affordances:
+        - id: locked_box_key_socket
+          type: keyed_lock
+          container_id: locked_box
+          key_id: brass_key
+          socket:
+            center: { x: 0, y: 0, z: 0.58 }
+            half_extents: { x: 0.24, y: 0.24, z: 0.16 }
+            insertion_axis: { x: 0, y: 0, z: 1 }
+            maximum_axis_angle: 0.4
+      default_goal:
+        summary: Locked box is unlocked and the red block rests unattached inside the green zone.
+        predicates:
+          - type: object_property
+            object_id: locked_box
+            property: locked
+            expected: false
+          - type: object_in_zone
+            object_id: red_block
+            zone_id: green_zone
+            expected: true
+            tolerance: 0.05
+          - type: object_attached
+            object_id: red_block
+            expected: false

@@ -1,0 +1,14 @@
+.env
+node_modules/
+dist/
+web/dist/
+coverage/
+playwright-report/
+test-results/
+.e2e-runs/
+*.log
+*.tsbuildinfo
+*.offsets
+.DS_Store
+runs/*
+!runs/.gitkeep
