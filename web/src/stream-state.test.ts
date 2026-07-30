@@ -11,6 +11,7 @@ import {
   nextRuntimeEventCursor,
   taskNodesFrom,
   updateRunListStatus,
+  upsertRuntimeJournalEntry,
   upsertAction,
   worldSnapshotsFrom
 } from "./stream-state";
@@ -134,6 +135,28 @@ describe("appendRecent", () => {
 
   it("grows until the limit", () => {
     expect(appendRecent([1], 2, 3)).toEqual([1, 2]);
+  });
+});
+
+describe("runtime journal merge", () => {
+  it("merges a details-tail record and its later SSE event exactly once", () => {
+    const fromDetails = {
+      status: "contacted",
+      runtime_event_id: "event-1",
+      at: "2026-07-30T00:00:00.000Z"
+    };
+    const fromStream = structuredClone(fromDetails);
+    const merged = upsertRuntimeJournalEntry([fromDetails], fromStream, 10);
+
+    expect(merged).toEqual([fromStream]);
+    expect(merged).toHaveLength(1);
+  });
+
+  it("keeps distinct records bounded and preserves legacy append semantics", () => {
+    const current = [{ runtime_event_id: "event-1" }];
+    expect(upsertRuntimeJournalEntry(current, { runtime_event_id: "event-2" }, 2))
+      .toEqual([{ runtime_event_id: "event-1" }, { runtime_event_id: "event-2" }]);
+    expect(upsertRuntimeJournalEntry(["legacy"], "legacy", 2)).toEqual(["legacy", "legacy"]);
   });
 });
 

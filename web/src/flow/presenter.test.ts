@@ -2,6 +2,22 @@ import { describe, expect, it } from "vitest";
 import { presentFramework } from "./presenter";
 
 describe("agent timeline presenter", () => {
+  it("derives stable keys from the durable runtime event identity", () => {
+    const entry = {
+      runtime_event_id: "framework-event-1",
+      at: "2026-07-30T00:00:00.000Z",
+      event: {
+        type: "run_item_stream_event",
+        name: "message_output_created",
+        item: { rawItem: { content: [{ type: "output_text", text: "继续探索。" }] } }
+      }
+    };
+
+    expect(presentFramework([entry])[0]?.id).toBe("message-framework-event-1");
+    expect(presentFramework([{ ignored: true }, entry])[0]?.id)
+      .toBe("message-framework-event-1");
+  });
+
   it("presents model messages, tool results, usage, and active-agent transitions", () => {
     const at = "2026-07-30T00:00:00.000Z";
     const entries = [

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Terrain, VoxelWorldState } from "../domain/schema.js";
 import { VoxelEditError, VoxelStore } from "./voxel-store.js";
 
@@ -154,6 +154,61 @@ describe("VoxelStore", () => {
     ]);
     store.setLoadedChunks(desired);
     expect(store.isLoaded({ column: 20, level: 0, row: 20 })).toBe(true);
+  });
+
+  it("maintains the projected column height incrementally across edits and restore", () => {
+    const store = new VoxelStore(terrain);
+    store.setLoadedChunks([{ column: 0, row: 0 }]);
+    for (let level = 0; level < 3; level += 1) {
+      store.placeBlock(
+        { column: 4, level, row: 5 },
+        "placed",
+        { commandId: `place_${level}`, agentId: "builder" }
+      );
+    }
+    expect(store.heightAt(4, 5)).toBe(3);
+    expect(store.projectedTerrain().heights[5 * terrain.columns + 4]).toBe(3);
+
+    store.breakBlock(
+      { column: 4, level: 2, row: 5 },
+      { commandId: "break_top", agentId: "builder" }
+    );
+    expect(store.heightAt(4, 5)).toBe(2);
+
+    const restored = new VoxelStore(terrain, store.snapshot(2));
+    expect(restored.heightAt(4, 5)).toBe(2);
+    expect(restored.projectedTerrain().heights).toEqual(store.projectedTerrain().heights);
+  });
+
+  it("projects a large terrain without rescanning every vertical voxel", () => {
+    const large: Terrain = {
+      ...terrain,
+      columns: 384,
+      rows: 384,
+      maximum_height: 64,
+      heights: new Array<number>(384 * 384).fill(24)
+    };
+    const store = new VoxelStore(large);
+    const reads = vi.spyOn(store, "materialAt");
+
+    const projected = store.projectedTerrain();
+
+    expect(projected.heights).toHaveLength(384 * 384);
+    expect(projected.heights[projected.heights.length - 1]).toBe(24);
+    expect(reads).not.toHaveBeenCalled();
+  });
+
+  it("caps legacy authored heights at the authoritative vertical voxel bound", () => {
+    const bounded: Terrain = {
+      ...terrain,
+      maximum_height: 4,
+      heights: terrain.heights.map((height, index) => index === 0 ? 12 : height)
+    };
+    const store = new VoxelStore(bounded);
+
+    expect(store.heightAt(0, 0)).toBe(4);
+    expect(store.projectedTerrain().heights[0]).toBe(4);
+    expect(store.materialAt({ column: 0, level: 4, row: 0 })).toBeNull();
   });
 
   it("rejects unsupported construction and edits in unloaded chunks", () => {

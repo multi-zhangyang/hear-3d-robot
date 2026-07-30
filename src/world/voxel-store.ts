@@ -73,11 +73,19 @@ export class VoxelStore {
   readonly #mutations = new Map<string, VoxelMutation>();
   readonly #loaded = new Set<string>();
   readonly #inventory: Record<VoxelMaterial, number>;
+  readonly #columnHeights: number[];
   #revision = 0;
 
   constructor(terrain: Terrain, restore?: VoxelWorldState | null) {
     this.terrain = terrain;
     this.#inventory = { ...EMPTY_INVENTORY };
+    // Authored worlds created before maximum_height was introduced may carry
+    // a taller height-field value. materialAt() has always exposed only levels
+    // inside that vertical bound, so keep the indexed projection identical to
+    // the authoritative voxel volume instead of leaking the raw legacy value.
+    this.#columnHeights = terrain.heights.map((height) =>
+      Math.min(height, terrain.maximum_height)
+    );
     if (!restore) return;
     if (restore.chunk_size !== terrain.chunk_size) {
       throw new Error(
@@ -99,8 +107,16 @@ export class VoxelStore {
         this.#mutations.set(key, structuredClone(mutation));
       }
     }
+    const changedColumns = new Set<number>();
     for (const [key, mutation] of this.#mutations) {
       this.#overlay.set(key, mutation.after);
+      changedColumns.add(
+        mutation.coordinate.row * this.terrain.columns + mutation.coordinate.column
+      );
+    }
+    for (const cell of changedColumns) {
+      const column = cell % this.terrain.columns;
+      this.#refreshColumnHeight(column, (cell - column) / this.terrain.columns);
     }
     for (const chunk of restore.loaded_chunks) {
       if (this.#validChunk(chunk)) this.#loaded.add(chunkKey(chunk));
@@ -149,24 +165,17 @@ export class VoxelStore {
   }
 
   heightAt(column: number, row: number): number {
-    if (column < 0 || row < 0 || column >= this.terrain.columns || row >= this.terrain.rows) {
+    if (!Number.isInteger(column) || !Number.isInteger(row)
+      || column < 0 || row < 0
+      || column >= this.terrain.columns || row >= this.terrain.rows) {
       return 0;
     }
-    for (let level = this.terrain.maximum_height - 1; level >= 0; level -= 1) {
-      if (this.materialAt({ column, level, row })) return level + 1;
-    }
-    return 0;
+    return this.#columnHeights[row * this.terrain.columns + column] ?? 0;
   }
 
   /** Height projection used only for local frontier candidates and compact maps. */
   projectedTerrain(): Terrain {
-    const heights = new Array<number>(this.terrain.columns * this.terrain.rows);
-    for (let row = 0; row < this.terrain.rows; row += 1) {
-      for (let column = 0; column < this.terrain.columns; column += 1) {
-        heights[row * this.terrain.columns + column] = this.heightAt(column, row);
-      }
-    }
-    return { ...this.terrain, heights };
+    return { ...this.terrain, heights: [...this.#columnHeights] };
   }
 
   chunkAt(coordinate: Pick<VoxelCoordinate, "column" | "row">): VoxelChunkReference {
@@ -209,8 +218,12 @@ export class VoxelStore {
   }
 
   loadedRegion(): VoxelChunkRegion {
-    const chunks = this.loadedChunks();
-    if (chunks.length === 0) {
+    return this.regionForChunks(this.loadedChunks());
+  }
+
+  regionForChunks(chunks: readonly VoxelChunkReference[]): VoxelChunkRegion {
+    const valid = chunks.filter((chunk) => this.#validChunk(chunk));
+    if (valid.length === 0) {
       return {
         minimum: { x: 0, y: 0, z: 0 },
         maximum: {
@@ -221,10 +234,16 @@ export class VoxelStore {
       };
     }
     const chunkMetres = this.terrain.chunk_size * this.terrain.cell;
-    const minimumColumn = Math.min(...chunks.map((chunk) => chunk.column));
-    const maximumColumn = Math.max(...chunks.map((chunk) => chunk.column));
-    const minimumRow = Math.min(...chunks.map((chunk) => chunk.row));
-    const maximumRow = Math.max(...chunks.map((chunk) => chunk.row));
+    let minimumColumn = Number.POSITIVE_INFINITY;
+    let maximumColumn = Number.NEGATIVE_INFINITY;
+    let minimumRow = Number.POSITIVE_INFINITY;
+    let maximumRow = Number.NEGATIVE_INFINITY;
+    for (const chunk of valid) {
+      minimumColumn = Math.min(minimumColumn, chunk.column);
+      maximumColumn = Math.max(maximumColumn, chunk.column);
+      minimumRow = Math.min(minimumRow, chunk.row);
+      maximumRow = Math.max(maximumRow, chunk.row);
+    }
     return {
       minimum: {
         x: Math.max(0, minimumColumn * chunkMetres),
@@ -463,7 +482,19 @@ export class VoxelStore {
     };
     this.#overlay.set(coordinateKey(coordinate), after);
     this.#mutations.set(coordinateKey(coordinate), mutation);
+    this.#refreshColumnHeight(coordinate.column, coordinate.row);
     return structuredClone(mutation);
+  }
+
+  #refreshColumnHeight(column: number, row: number): void {
+    const cell = row * this.terrain.columns + column;
+    for (let level = this.terrain.maximum_height - 1; level >= 0; level -= 1) {
+      if (this.materialAt({ column, level, row })) {
+        this.#columnHeights[cell] = level + 1;
+        return;
+      }
+    }
+    this.#columnHeights[cell] = 0;
   }
 
   #verticalRuns(column: number, row: number): Array<readonly [number, number]> {

@@ -2,7 +2,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 const NODE_MARKER = "HEAR_AGENT_INVOCATION_V1";
 const NODE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const invocationScope = new AsyncLocalStorage<string>();
+
+interface AgentInvocationScope {
+  agentId: string;
+  parent: AgentInvocationScope | undefined;
+  recovering: boolean;
+  transportInterruption: Error | undefined;
+}
+
+const invocationScope = new AsyncLocalStorage<AgentInvocationScope>();
 
 export function agentInvocationMarker(agentId: string): string {
   if (!NODE_ID_PATTERN.test(agentId)) throw new Error("Invalid hierarchy node identifier");
@@ -10,15 +18,47 @@ export function agentInvocationMarker(agentId: string): string {
 }
 
 export function currentAgentInvocationId(): string | undefined {
-  return invocationScope.getStore();
+  return invocationScope.getStore()?.agentId;
+}
+
+export function currentAgentInvocationIsRecovery(): boolean {
+  return invocationScope.getStore()?.recovering === true;
+}
+
+/**
+ * Preserve a model transport failure before Agent.asTool's default function
+ * error handler converts it to model-visible text. Every nested invocation has
+ * a distinct scope; copying the first failure into its direct ancestor chain
+ * lets a supervisor's asTool boundary recover the same original Error without
+ * exposing it to an unrelated parallel sibling.
+ */
+export function recordAgentInvocationTransportInterruption(error: Error): boolean {
+  let scope = invocationScope.getStore();
+  if (!scope) return false;
+  while (scope) {
+    scope.transportInterruption ??= error;
+    scope = scope.parent;
+  }
+  return true;
+}
+
+export function currentAgentInvocationTransportInterruption(): Error | undefined {
+  return invocationScope.getStore()?.transportInterruption;
 }
 
 export function withAgentInvocation<T>(
   agentId: string,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  recovering = false
 ): Promise<T> {
   if (!NODE_ID_PATTERN.test(agentId)) throw new Error("Invalid hierarchy node identifier");
-  return invocationScope.run(agentId, operation);
+  const scope: AgentInvocationScope = {
+    agentId,
+    parent: invocationScope.getStore(),
+    recovering,
+    transportInterruption: undefined
+  };
+  return invocationScope.run(scope, operation);
 }
 
 /**
@@ -49,8 +89,11 @@ function findMarker(value: unknown): string | undefined {
     }
     if (!current || typeof current !== "object" || visited.has(current)) continue;
     visited.add(current);
-    if (Array.isArray(current)) stack.push(...current);
-    else stack.push(...Object.values(current));
+    if (Array.isArray(current)) {
+      for (const item of current) stack.push(item);
+    } else {
+      for (const value of Object.values(current)) stack.push(value);
+    }
   }
   return found;
 }

@@ -63,6 +63,32 @@ describe("VoxelTerrain", () => {
     expect(mesh.instanceColor.version).toBe(firstVersion);
   });
 
+  it("does not revisit rendered chunks when terrain authority is unchanged", () => {
+    const terrain = new VoxelTerrain(WIDE_TERRAIN, 17);
+    const state = voxelState(0, [{ column: 0, row: 0 }, { column: 1, row: 0 }]);
+    terrain.update(state, "");
+    const chunks = [
+      chunkMesh(terrain, "terrain-chunk-0:0"),
+      chunkMesh(terrain, "terrain-chunk-1:0")
+    ];
+    let physicalStateWrites = 0;
+    for (const chunk of chunks) {
+      let value = chunk.userData.loaded_in_physics;
+      Object.defineProperty(chunk.userData, "loaded_in_physics", {
+        configurable: true,
+        get: () => value,
+        set: (next) => {
+          physicalStateWrites += 1;
+          value = next;
+        }
+      });
+    }
+
+    terrain.update(structuredClone(state), "");
+
+    expect(physicalStateWrites).toBe(0);
+  });
+
   it("refreshes only the chunk containing a changed exploration bit", () => {
     const terrain = new VoxelTerrain(WIDE_TERRAIN, 17);
     const loaded = [{ column: 0, row: 0 }, { column: 1, row: 0 }];

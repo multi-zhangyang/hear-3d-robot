@@ -39,7 +39,7 @@ export class FileSession implements Session {
   async addItems(items: AgentInputItem[]): Promise<void> {
     await this.#mutate(async () => {
       const data = await this.#read();
-      data.items.push(...structuredClone(items));
+      data.items = data.items.concat(structuredClone(items));
       await this.#write(data);
     });
   }

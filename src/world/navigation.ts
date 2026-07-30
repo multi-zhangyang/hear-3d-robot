@@ -145,7 +145,7 @@ export class NavigationMesh {
       maximum: { x: scenario.bounds.width, z: scenario.bounds.depth }
     };
     const geometry = worldGeometry(scenario, solids, region);
-    const maximumGeometryHeight = worldGeometryHeight(scenario, solids);
+    const maximumGeometryHeight = worldGeometryHeight(scenario, solids, region);
     const generated = recastGeneratorsApi.generateTileCache(
       geometry.positions,
       geometry.indices,
@@ -178,7 +178,13 @@ export class NavigationMesh {
     if (!generated.success) {
       throw new Error(`Navigation mesh generation failed: ${generated.error}`);
     }
-    return new NavigationMesh(generated.navMesh, generated.tileCache);
+    try {
+      return new NavigationMesh(generated.navMesh, generated.tileCache);
+    } catch (error) {
+      generated.tileCache.destroy();
+      generated.navMesh.destroy();
+      throw error;
+    }
   }
 
   private constructor(navMesh: RecastNavMesh, tileCache: RecastTileCache) {
@@ -395,8 +401,10 @@ function worldGeometry(
     { x: region.maximum.x, y: 0, z: region.maximum.z },
     { x: region.maximum.x, y: 0, z: region.minimum.z }
   );
-  for (const obstacle of solids.filter((box) => overlapsRegion(box, region))) {
-    appendBox(geometry, obstacle.center, obstacle.size);
+  for (const obstacle of solids) {
+    if (overlapsRegion(obstacle, region)) {
+      appendBox(geometry, obstacle.center, obstacle.size);
+    }
   }
   for (const object of scenario.objects) {
     if (!object.portable && overlapsRegion({ center: object.position, size: object.size }, region)) {
@@ -422,14 +430,23 @@ function deindexGeometry(geometry: Geometry): Geometry {
   return expanded;
 }
 
-function worldGeometryHeight(scenario: Scenario, solids: TerrainBox[]): number {
-  return Math.max(
-    0,
-    ...solids.map((obstacle) => obstacle.center.y + obstacle.size.y / 2),
-    ...scenario.objects
-      .filter((object) => !object.portable)
-      .map((object) => object.position.y + object.size.y / 2)
-  );
+function worldGeometryHeight(
+  scenario: Scenario,
+  solids: TerrainBox[],
+  region: NavigationBuildScope["region"]
+): number {
+  let maximum = 0;
+  for (const obstacle of solids) {
+    if (overlapsRegion(obstacle, region)) {
+      maximum = Math.max(maximum, obstacle.center.y + obstacle.size.y / 2);
+    }
+  }
+  for (const object of scenario.objects) {
+    if (!object.portable && overlapsRegion({ center: object.position, size: object.size }, region)) {
+      maximum = Math.max(maximum, object.position.y + object.size.y / 2);
+    }
+  }
+  return maximum;
 }
 
 function overlapsRegion(

@@ -49,6 +49,195 @@ describe("HierarchyProjection", () => {
     expect(restored.activeIds).toEqual([rootId]);
   });
 
+  it("keeps different siblings from one concurrent model turn while rejecting a duplicate grant", () => {
+    const hierarchy = HierarchyProjection.create(
+      "Run independent observations",
+      ["sense_scene", "read_proprioception", "query_contacts"]
+    );
+    const batch = new Set(["scene_call", "body_call", "duplicate_call"]);
+    const sceneSpec = spec({ name: "Scene", capabilities: ["sense_scene"] });
+    const bodySpec = spec({ name: "Body", capabilities: ["read_proprioception"] });
+
+    const scene = hierarchy.enterChild(null, sceneSpec, "scene_call", undefined, batch).node;
+    const body = hierarchy.enterChild(null, bodySpec, "body_call", undefined, batch).node;
+
+    expect(scene.id).not.toBe(body.id);
+    expect(hierarchy.children(hierarchy.rootId)).toHaveLength(2);
+    expect(() => hierarchy.enterChild(
+      null,
+      sceneSpec,
+      "duplicate_call",
+      undefined,
+      batch
+    )).toThrow("duplicates open hierarchy node");
+  });
+
+  it("rebinds an interrupted exact grant to a fresh model call id without orphaning the node", () => {
+    const hierarchy = HierarchyProjection.create(
+      "Resume one nested observation",
+      ["sense_scene", "read_proprioception"]
+    );
+    const childSpec = spec({ name: "Observer", capabilities: ["sense_scene"] });
+    const original = hierarchy.enterChild(
+      null,
+      childSpec,
+      "lost_call",
+      undefined,
+      new Set(["lost_call"])
+    ).node;
+
+    const resumed = hierarchy.enterChild(
+      null,
+      childSpec,
+      "retry_call",
+      undefined,
+      new Set(["retry_call"])
+    );
+
+    expect(resumed).toMatchObject({ created: false, node: { id: original.id } });
+    expect(resumed.node.source_call_id).toBe("retry_call");
+    expect(hierarchy.children(hierarchy.rootId)).toHaveLength(1);
+
+    const completedOutput = JSON.stringify({
+      status: "completed",
+      summary: "Observed current scene",
+      world_revision: 0
+    });
+    hierarchy.completeChild(original.id, completedOutput);
+    const cached = hierarchy.enterChild(
+      null,
+      childSpec,
+      "later_call",
+      undefined,
+      new Set(["later_call"]),
+      { recovering: true },
+      0
+    );
+    expect(cached).toMatchObject({
+      created: false,
+      cached_output: completedOutput,
+      node: { id: original.id }
+    });
+    expect(hierarchy.children(hierarchy.rootId)).toHaveLength(1);
+  });
+
+  it("does not reuse a completed exact grant outside an explicit recovery turn", () => {
+    const hierarchy = HierarchyProjection.create(
+      "Observe the changing world twice",
+      ["sense_scene", "read_proprioception"]
+    );
+    const childSpec = spec({ name: "Observer", capabilities: ["sense_scene"] });
+    const first = hierarchy.enterChild(null, childSpec, "first_call").node;
+    hierarchy.completeChild(first.id, JSON.stringify({ world_revision: 0 }));
+
+    const second = hierarchy.enterChild(
+      null,
+      childSpec,
+      "second_call",
+      undefined,
+      new Set(["second_call"]),
+      { recovering: false },
+      0
+    );
+
+    expect(second.created).toBe(true);
+    expect(second.node.id).not.toBe(first.id);
+    expect(hierarchy.children(hierarchy.rootId)).toHaveLength(2);
+  });
+
+  it("keeps recovery sticky when the active sibling is rebound before the completed sibling", () => {
+    const hierarchy = HierarchyProjection.create(
+      "Recover one completed and one active sibling",
+      ["sense_scene", "read_proprioception", "query_contacts"]
+    );
+    const completedSpec = spec({ name: "Scene", capabilities: ["sense_scene"] });
+    const activeSpec = spec({ name: "Body", capabilities: ["read_proprioception"] });
+    const originalBatch = new Set(["scene_lost", "body_lost"]);
+    const completed = hierarchy.enterChild(
+      null,
+      completedSpec,
+      "scene_lost",
+      undefined,
+      originalBatch
+    ).node;
+    const active = hierarchy.enterChild(
+      null,
+      activeSpec,
+      "body_lost",
+      undefined,
+      originalBatch
+    ).node;
+    const completedOutput = JSON.stringify({
+      status: "completed",
+      summary: "Observed the current scene",
+      world_revision: 0
+    });
+    hierarchy.completeChild(completed.id, completedOutput);
+
+    const restored = new HierarchyProjection(
+      hierarchy.snapshot(),
+      hierarchy.rootId,
+      hierarchy.activeId,
+      hierarchy.activeIds
+    );
+    const recoveryBatch = new Set(["body_retry", "scene_retry"]);
+    const recoveryState = { recovering: false };
+    const resumedActive = restored.enterChild(
+      null,
+      activeSpec,
+      "body_retry",
+      undefined,
+      recoveryBatch,
+      recoveryState,
+      0
+    );
+    expect(resumedActive).toMatchObject({
+      created: false,
+      node: { id: active.id, source_call_id: "body_retry", status: "active" }
+    });
+    expect(recoveryState.recovering).toBe(true);
+
+    const reusedCompleted = restored.enterChild(
+      null,
+      completedSpec,
+      "scene_retry",
+      undefined,
+      recoveryBatch,
+      recoveryState,
+      0
+    );
+    expect(reusedCompleted).toMatchObject({
+      created: false,
+      cached_output: completedOutput,
+      node: { id: completed.id, status: "completed" }
+    });
+    expect(restored.children(restored.rootId).map((node) => node.id))
+      .toEqual([completed.id, active.id]);
+  });
+
+  it("blocks unrelated work while an interrupted turn still owns an unfinished child", () => {
+    const hierarchy = HierarchyProjection.create(
+      "Resume before changing work",
+      ["sense_scene", "read_proprioception", "query_contacts"]
+    );
+    hierarchy.enterChild(
+      null,
+      spec({ name: "Scene", capabilities: ["sense_scene"] }),
+      "lost_call",
+      undefined,
+      new Set(["lost_call"])
+    );
+
+    expect(() => hierarchy.enterChild(
+      null,
+      spec({ name: "Contacts", capabilities: ["query_contacts"] }),
+      "retry_with_different_work",
+      undefined,
+      new Set(["retry_with_different_work"])
+    )).toThrow("unfinished delegation(s) from an interrupted model turn");
+    expect(hierarchy.children(hierarchy.rootId)).toHaveLength(1);
+  });
+
   it("records recursive parent-child execution and returns control after completion", () => {
     const hierarchy = HierarchyProjection.create(
       "Complete the requested world state",

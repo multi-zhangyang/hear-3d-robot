@@ -5,6 +5,7 @@ import type {
   JsonValue,
   TaskNode
 } from "../domain/schema.js";
+import type { DelegationRecoveryState } from "./delegation-drain.js";
 
 export interface DelegationEntry {
   node: TaskNode;
@@ -107,34 +108,78 @@ export class HierarchyProjection {
     parentSpec: AgentSpec | null,
     spec: AgentSpec,
     sourceCallId: string,
-    parentId?: string
+    parentId?: string,
+    concurrentSourceCallIds?: ReadonlySet<string>,
+    recoveryState?: DelegationRecoveryState,
+    currentWorldRevision?: number
   ): DelegationEntry {
     const parent = this.#parentFor(parentSpec, parentId);
-    const existing = this.children(parent.id).find(
+    const children = this.children(parent.id);
+    const existing = children.find(
       (candidate) => candidate.source_call_id === sourceCallId
     );
     if (existing) {
       if (!matchesSpec(existing, spec)) {
         throw new Error(`Delegation call ${sourceCallId} was reused with a different agent specification`);
       }
-      if (existing.status === "completed") {
-        this.#refreshParent(parent);
-        return {
-          node: structuredClone(existing),
-          created: false,
-          cached_output: completedOutput(existing)
-        };
-      }
-      if (existing.status === "failed" || existing.status === "blocked") {
-        throw new Error(`Delegation call ${sourceCallId} already ended as ${existing.status}`);
-      }
-      const now = new Date().toISOString();
-      parent.status = "waiting";
-      parent.updated_at = now;
-      this.#activeIds.delete(parent.id);
-      if (existing.status === "active") this.#activeIds.add(existing.id);
-      this.#focus(existing.status === "active" ? existing.id : undefined);
-      return { node: structuredClone(existing), created: false };
+      return this.#reuseChild(parent, existing);
+    }
+
+    const abandoned = concurrentSourceCallIds
+      ? children.filter((candidate) =>
+          isUnfinished(candidate)
+          && (!candidate.source_call_id
+            || !concurrentSourceCallIds.has(candidate.source_call_id))
+        )
+      : [];
+    if (abandoned.length > 0 && recoveryState) recoveryState.recovering = true;
+    const recovering = recoveryState?.recovering === true || abandoned.length > 0;
+    const concurrentDuplicate = children.find((candidate) =>
+      isUnfinished(candidate)
+      && matchesSpec(candidate, spec)
+      && candidate.source_call_id !== undefined
+      && concurrentSourceCallIds?.has(candidate.source_call_id)
+    );
+    if (concurrentDuplicate) {
+      throw new Error(
+        `Concurrent delegation duplicates open hierarchy node ${concurrentDuplicate.id}`
+      );
+    }
+
+    // A nested SDK run that loses its transport cannot serialize the model
+    // response containing the child's original call id. Its hierarchy node is
+    // nevertheless authoritative and must be resumed, not duplicated, when
+    // the model recreates the exact same grant with a fresh call id.
+    const matchingOpen = recovering
+      ? children.find((candidate) => isUnfinished(candidate) && matchesSpec(candidate, spec))
+      : undefined;
+    if (matchingOpen) {
+      matchingOpen.source_call_id = sourceCallId;
+      matchingOpen.updated_at = new Date().toISOString();
+      return this.#reuseChild(parent, matchingOpen);
+    }
+    const matchingCompleted = recovering && currentWorldRevision !== undefined
+      ? children.find((candidate) =>
+          candidate.status === "completed"
+          && matchesSpec(candidate, spec)
+          && completedAtWorldRevision(candidate, currentWorldRevision)
+        )
+      : undefined;
+    if (matchingCompleted) {
+      this.#refreshParent(parent);
+      return {
+        node: structuredClone(matchingCompleted),
+        created: false,
+        cached_output: completedOutput(matchingCompleted)
+      };
+    }
+
+    if (abandoned.length > 0) {
+      throw new Error(
+        `Hierarchy parent ${parent.id} has unfinished delegation(s) from an interrupted model `
+        + `turn: ${abandoned.map((candidate) => `${candidate.id}:${candidate.name}`).join(", ")}. `
+        + "Reissue an exact child specification from CURRENT HARNESS AUTHORITY before creating different work."
+      );
     }
 
     if (parent.status !== "active" && parent.status !== "waiting") {
@@ -186,6 +231,29 @@ export class HierarchyProjection {
     this.#activeIds.add(child.id);
     this.#focus(child.id);
     return { node: structuredClone(child), created: true };
+  }
+
+  #reuseChild(parent: TaskNode, child: TaskNode): DelegationEntry {
+    if (child.status === "completed") {
+      this.#refreshParent(parent);
+      return {
+        node: structuredClone(child),
+        created: false,
+        cached_output: completedOutput(child)
+      };
+    }
+    if (child.status === "failed" || child.status === "blocked") {
+      throw new Error(
+        `Delegation call ${child.source_call_id ?? child.id} already ended as ${child.status}`
+      );
+    }
+    const now = new Date().toISOString();
+    parent.status = "waiting";
+    parent.updated_at = now;
+    this.#activeIds.delete(parent.id);
+    if (child.status === "active") this.#activeIds.add(child.id);
+    this.#focus(child.status === "active" ? child.id : undefined);
+    return { node: structuredClone(child), created: false };
   }
 
   completeChild(childId: string, output: string): void {
@@ -458,6 +526,19 @@ function completedOutput(node: TaskNode): string {
     if (typeof output === "string" && output.trim() !== "") return output;
   }
   throw new Error(`Completed hierarchy node ${node.id} has no output`);
+}
+
+function completedAtWorldRevision(node: TaskNode, worldRevision: number): boolean {
+  try {
+    const parsed = JSON.parse(completedOutput(node)) as unknown;
+    return typeof parsed === "object"
+      && parsed !== null
+      && !Array.isArray(parsed)
+      && "world_revision" in parsed
+      && parsed.world_revision === worldRevision;
+  } catch {
+    return false;
+  }
 }
 
 function descendants(nodes: Record<string, TaskNode>, parent: TaskNode): TaskNode[] {

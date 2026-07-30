@@ -97,9 +97,26 @@ describe("reduceRunDetails", () => {
     expect(next.provider).toHaveLength(1);
   });
 
+  it("does not duplicate provider activity already present in the details snapshot", () => {
+    const record = {
+      status: "contacted",
+      runtime_event_id: "provider-event-1",
+      at: "2026-07-26T12:00:05.000Z"
+    };
+    const current = { ...details(), provider: [record] };
+    const next = reduce(current, event("provider_event", structuredClone(record)));
+    expect(next.provider).toEqual([record]);
+  });
+
   it("advances the world from the latest frame in the event", () => {
     const next = reduce(details(), event("world_frames", {}), { worlds: [frame(4), frame(9)] });
     expect(next.checkpoint.world.frame).toBe(9);
+  });
+
+  it("never rolls a newer snapshot back when an older durable world arrives", () => {
+    const current = details({ world: frame(12) });
+    const next = reduce(current, event("action_committed", {}), { worlds: [frame(8)] });
+    expect(next.checkpoint.world.frame).toBe(12);
   });
 
   it("counts a committed action once even when the receipt is delivered twice", () => {

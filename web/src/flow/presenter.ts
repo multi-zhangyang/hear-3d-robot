@@ -87,11 +87,12 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
       ?? "智能体";
     const agent = agentNameLabel(rawAgent);
     const at = stringOf(outer?.at) ?? new Date(0).toISOString();
+    const recordId = stringOf(outer?.runtime_event_id) ?? `${index}-${at}`;
 
     if (event?.type === "agent_updated_stream_event") {
       const activeAgent = agentNameLabel(stringOf(event.agent) ?? rawAgent);
       moments.push({
-        id: `agent-${index}-${at}`,
+        id: `agent-${recordId}`,
         at,
         agent: activeAgent,
         title: "接管当前执行流",
@@ -106,7 +107,7 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
       if (data?.type !== "response_done") return;
       const usage = record(data.usage);
       moments.push({
-        id: `usage-${index}-${at}`,
+        id: `usage-${recordId}`,
         at,
         agent,
         title: "模型调用已完成",
@@ -126,7 +127,7 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
       const name = stringOf(raw?.name);
       if (!name) return;
       moments.push({
-        id: `decision-${index}-${at}`,
+        id: `decision-${recordId}`,
         at,
         agent,
         title: `发起${actionLabel(name)}`,
@@ -141,7 +142,7 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
       const detail = modelOutputLabel(text);
       if (!detail) return;
       moments.push({
-        id: `message-${index}-${at}`,
+        id: `message-${recordId}`,
         at,
         agent,
         title: "模型输出",
@@ -155,7 +156,7 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
       const name = stringOf(raw?.name) ?? "tool";
       const result = toolResult(name, raw, item);
       moments.push({
-        id: `result-${index}-${at}`,
+        id: `result-${recordId}`,
         at,
         agent,
         title: `${actionLabel(name)}回执`,

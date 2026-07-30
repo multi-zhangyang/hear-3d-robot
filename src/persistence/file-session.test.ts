@@ -62,6 +62,25 @@ describe("FileSession", () => {
     }
   });
 
+  it("persists a large SDK history without expanding it into call arguments", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hear-bulk-session-"));
+    const path = join(directory, "sessions", "agent_bulk.json");
+    try {
+      const session = new FileSession(path, "run_bulk");
+      const history: AgentInputItem[] = Array.from({ length: 150_000 }, (_, index) => ({
+        role: "user",
+        content: `turn-${index}`
+      }));
+
+      await session.addItems(history);
+
+      expect(await session.getItems(2)).toEqual(history.slice(-2));
+      expect(await new FileSession(path, "run_bulk").getItems(1)).toEqual(history.slice(-1));
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("invalidates its cache when a durability error follows a published rename", async () => {
     const directory = await mkdtemp(join(tmpdir(), "hear-session-cache-failure-"));
     const path = join(directory, "session.json");

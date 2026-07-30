@@ -11,13 +11,13 @@
 import type { ActionReceipt, RunDetails, RuntimeEvent, WorldSnapshot } from "./types";
 import {
   actionReceiptFrom,
-  appendRecent,
   asRecord,
   checkerFrom,
   completeRootNode,
   contextMemoryFrom,
   failOpenNodes,
   taskNodesFrom,
+  upsertRuntimeJournalEntry,
   upsertAction
 } from "./stream-state";
 
@@ -53,12 +53,20 @@ export function reduceRunDetails(input: ReducerInput): RunDetails {
     // Provider activity is an append-only journal, so a replayed event is
     // harmless, but a historical one must not overwrite newer status.
     if (input.historical) return details;
-    return { ...details, provider: appendRecent(details.provider, event.data, input.limits.provider) };
+    return {
+      ...details,
+      provider: upsertRuntimeJournalEntry(details.provider, event.data, input.limits.provider)
+    };
   }
   if (input.historical) return details;
 
   let next = details;
-  const latestWorld = input.worlds.at(-1);
+  const candidateWorld = input.worlds.at(-1);
+  const latestWorld = candidateWorld
+    && candidateWorld.frame >= next.checkpoint.world.frame
+    && candidateWorld.simulated_time >= next.checkpoint.world.simulated_time
+    ? candidateWorld
+    : undefined;
   if (latestWorld) {
     next = {
       ...next,

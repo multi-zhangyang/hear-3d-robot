@@ -36,6 +36,7 @@ import {
   withoutVoxelDynamicAffordances
 } from "../world/voxel-affordance.js";
 import { DenialLedger } from "./denial-ledger.js";
+import type { DelegationRecoveryState } from "./delegation-drain.js";
 import {
   assertEvidenceRequirementsJointlySatisfiable,
   assertReceiptRequirementDefinition,
@@ -380,7 +381,9 @@ export class HarnessRuntimeContext {
     parentSpec: AgentSpec | null,
     childSpec: AgentSpec,
     sourceCallId: string,
-    parentId?: string
+    parentId?: string,
+    concurrentSourceCallIds?: ReadonlySet<string>,
+    recoveryState?: DelegationRecoveryState
   ): Promise<DelegationEntry> {
     const normalizedParent = parentSpec === null ? null : this.#normalizeSpec(parentSpec);
     const normalizedChild = this.#normalizeSpec(childSpec);
@@ -404,7 +407,10 @@ export class HarnessRuntimeContext {
       normalizedParent,
       normalizedChild,
       sourceCallId,
-      parentId
+      parentId,
+      concurrentSourceCallIds,
+      recoveryState,
+      this.#checkpoint.world.world_revision
     );
     await this.#persistHierarchy();
     await this.#store.append("hierarchy", json({
@@ -892,9 +898,9 @@ export class HarnessRuntimeContext {
     await this.#commitLifecycle("run_interrupted", () => ({ reason }));
   }
 
-  async emit(type: string, data: JsonValue): Promise<void> {
+  async emit(type: string, data: JsonValue, eventId = randomUUID()): Promise<void> {
     const event: RuntimeEvent = {
-      event_id: randomUUID(),
+      event_id: eventId,
       run_id: this.#checkpoint.run_id,
       type,
       at: new Date().toISOString(),
@@ -919,25 +925,29 @@ export class HarnessRuntimeContext {
 
   async recordFramework(scope: string, event: JsonValue, agentId?: string): Promise<void> {
     const agent = agentId ? this.#hierarchy.get(agentId) : undefined;
+    const runtimeEventId = randomUUID();
     const record = json({
       scope,
       ...(agent ? { agent_id: agent.id, agent_name: agent.name } : {}),
       event,
-      at: new Date().toISOString()
+      at: new Date().toISOString(),
+      runtime_event_id: runtimeEventId
     });
     await this.#store.append("framework", record);
-    await this.emit("framework_event", record);
+    await this.emit("framework_event", record, runtimeEventId);
   }
 
   async recordProvider(event: JsonValue, agentId?: string): Promise<void> {
     const agent = agentId ? this.#hierarchy.get(agentId) : undefined;
+    const runtimeEventId = randomUUID();
     const record = json({
       ...asObject(event),
       ...(agent ? { agent_id: agent.id, agent_name: agent.name } : {}),
-      at: new Date().toISOString()
+      at: new Date().toISOString(),
+      runtime_event_id: runtimeEventId
     });
     await this.#store.append("provider", record);
-    await this.emit("provider_event", record);
+    await this.emit("provider_event", record, runtimeEventId);
   }
 
   async #commit(

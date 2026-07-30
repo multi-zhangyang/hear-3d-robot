@@ -270,7 +270,9 @@ export class LongRunContextManager {
         this.#recoveredInputs.delete(scope.scope_id);
         return physical;
       }
-      recovered.logical.push(...structuredClone(physical.slice(recovered.physical.length)));
+      recovered.logical = recovered.logical.concat(
+        structuredClone(physical.slice(recovered.physical.length))
+      );
       recovered.physical = structuredClone(physical);
       return structuredClone(recovered.logical);
     }

@@ -1,6 +1,7 @@
 import {
   Agent,
   tool,
+  type AgentInputItem,
   type CallModelInputFilter,
   type FunctionTool,
   type Model,
@@ -31,6 +32,10 @@ import { errorMessage } from "../runtime/error-message.js";
 import { isTransportInterruption } from "../runtime/transport-recovery.js";
 import { coordinatorInstructions, workerInstructions } from "./agent-prompts.js";
 import {
+  DelegationDrainRegistry,
+  type DelegationDrainHandle
+} from "./delegation-drain.js";
+import {
   assertEvidenceRequirementsJointlySatisfiable,
   evidenceContractGuide
 } from "./evidence-contract.js";
@@ -38,6 +43,9 @@ import {
   agentIdFromModelPayload,
   agentInvocationMarker,
   currentAgentInvocationId,
+  currentAgentInvocationIsRecovery,
+  currentAgentInvocationTransportInterruption,
+  recordAgentInvocationTransportInterruption,
   withAgentInvocation
 } from "./agent-scope.js";
 import { HarnessRuntimeContext } from "./runtime-context.js";
@@ -398,6 +406,7 @@ function delegationTool(
   callModelInputFilter: CallModelInputFilter | undefined,
   createSession: ((agentId: string) => Session) | undefined
 ): FunctionTool<HarnessAgentContext, typeof DelegationSpecSchema> {
+  const drainRegistry = new DelegationDrainRegistry();
   const description = [
     "Create a capability-scoped child agent and wait for its real model run to return.",
     "A supervisory model may emit several delegate_agent calls in one response for independent children; the Agents SDK runs them concurrently up to the configured tool limit, while the harness arbitrates disjoint body-channel leases.",
@@ -419,6 +428,10 @@ function delegationTool(
     description,
     parameters: DelegationSpecSchema,
     strict: true,
+    // Agent.asTool currently turns nested runner failures into ordinary text.
+    // Once the invocation bridge restores the original transport Error, this
+    // outer SDK tool must allow it to reach the mission recovery boundary.
+    errorFunction: null,
     isEnabled: ({ runContext }) => {
       requireRuntime(runContext, runtime);
       if (runtime.checkerSatisfiedCurrentWorld()) return false;
@@ -428,38 +441,72 @@ function delegationTool(
     execute: async (childInput, context, details) => {
       if (!context) throw new Error("Agent runtime context is required for delegation");
       const activeRuntime = requireRuntime(context, runtime);
-      const parent = invocationFromContext(context, activeRuntime);
-      const parentSpec = parent.spec;
-      const callId = details?.toolCall?.callId;
-      if (!callId) throw new Error("SDK did not provide a call ID for delegate_agent");
-      const childSpec: AgentSpec = {
-        ...childInput,
-        references: activeRuntime.acceptedActionReferences(
-          childInput.references.map((reference) => reference.transaction_id)
-        )
-      };
-      const entry = await activeRuntime.beginDelegation(
-        parentSpec,
-        childSpec,
-        callId,
-        parent.nodeId
-      );
-      if (entry.cached_output !== undefined) return entry.cached_output;
-
+      let childSpec: AgentSpec | undefined;
+      let entry: Awaited<ReturnType<HarnessRuntimeContext["beginDelegation"]>> | undefined;
+      let drain: DelegationDrainHandle | undefined;
       try {
+        const parent = invocationFromContext(context, activeRuntime);
+        const callId = details?.toolCall?.callId;
+        if (!callId) throw new Error("SDK did not provide a call ID for delegate_agent");
+        drain = drainRegistry.register(
+          parent.nodeId,
+          callId,
+          currentAgentInvocationIsRecovery()
+        );
+        childSpec = {
+          ...childInput,
+          references: activeRuntime.acceptedActionReferences(
+            childInput.references.map((reference) => reference.transaction_id)
+          )
+        };
+        entry = await activeRuntime.beginDelegation(
+          parent.spec,
+          childSpec,
+          callId,
+          parent.nodeId,
+          drain.sourceCallIds,
+          drain.recoveryState
+        );
+        if (entry.cached_output !== undefined) return entry.cached_output;
+
+        const childNodeId = entry.node.id;
+        const session = createSession?.(childNodeId);
+        const invocationInput = agentInvocationInput(childNodeId, childSpec, activeRuntime);
+        const sessionBaseline = session
+          ? await prepareSessionForAgentInvocation(session, invocationInput)
+          : undefined;
         const nativeAgentTool = delegatedAgentTool(
-          createWorker(entry.node.id, childSpec),
+          createWorker(childNodeId, childSpec),
           runtime,
           description,
           callModelInputFilter,
-          createSession?.(entry.node.id),
+          session,
           childSpec.may_delegate ? 4 : 1
         );
-        const result = await withAgentInvocation(entry.node.id, () => nativeAgentTool.invoke(
-            context,
-            JSON.stringify({ node_id: entry.node.id, spec: childSpec }),
-            details
-          ));
+        const result = await withAgentInvocation(childNodeId, async () => {
+          let value: unknown;
+          try {
+            value = await nativeAgentTool.invoke(
+              context,
+              JSON.stringify({ node_id: childNodeId, spec: childSpec }),
+              details
+            );
+          } catch (error) {
+            const interruption = currentAgentInvocationTransportInterruption();
+            if (interruption) {
+              await restoreInterruptedSession(session, sessionBaseline, interruption);
+              throw interruption;
+            }
+            if (activeRuntime.signal?.aborted) {
+              await restoreInterruptedSession(session, sessionBaseline, error);
+            }
+            throw error;
+          }
+          const interruption = currentAgentInvocationTransportInterruption();
+          if (!interruption) return value;
+          await restoreInterruptedSession(session, sessionBaseline, interruption);
+          throw interruption;
+        }, !entry.created);
         const output = typeof result === "string" ? result : JSON.stringify(result);
         const parsedOutcome = WorkerOutcomeSchema.safeParse(
           typeof output === "string" ? safeJson(output) : undefined
@@ -504,7 +551,21 @@ function delegationTool(
         await activeRuntime.completeChild(entry.node.id, completedOutput);
         return completedOutput;
       } catch (error) {
-        rethrowDelegationInterruption(error, activeRuntime.signal);
+        try {
+          rethrowDelegationInterruption(error, activeRuntime.signal);
+        } catch (interruption) {
+          await drain?.settleAndDrain();
+          throw interruption;
+        }
+        if (!entry || !childSpec) {
+          return JSON.stringify({
+            accepted: false,
+            code: "delegation_rejected",
+            ...activeRuntime.worldIdentity(),
+            error: errorMessage(error),
+            automatic_actuation: false
+          });
+        }
         await activeRuntime.failChild(entry.node.id, errorMessage(error));
         return JSON.stringify({
           accepted: false,
@@ -516,6 +577,8 @@ function delegationTool(
           automatic_actuation: false,
           recovery: "Delegate a fresh model-run node from current world evidence. For movement, re-survey and select a different reachable frontier; no programmatic action was substituted."
         });
+      } finally {
+        drain?.settle();
       }
     }
   });
@@ -541,12 +604,7 @@ function delegatedAgentTool(
     toolName: DELEGATE_TOOL_NAME,
     toolDescription: description,
     parameters: AgentInvocationSchema,
-    inputBuilder: ({ params }) => [
-      agentInvocationMarker(params.node_id),
-      `Agent invocation: ${JSON.stringify(params)}`,
-      `Agent specification: ${JSON.stringify(params.spec)}`,
-      `Mission goal: ${JSON.stringify(runtime.goal())}`
-    ].join("\n"),
+    inputBuilder: ({ params }) => agentInvocationInput(params.node_id, params.spec, runtime),
     includeInputSchema: true,
     runConfig: {
       tracingDisabled: true,
@@ -598,6 +656,48 @@ function delegatedAgentTool(
   });
 }
 
+export function agentInvocationInput(
+  nodeId: string,
+  spec: AgentSpec,
+  runtime: Pick<HarnessRuntimeContext, "goal">
+): string {
+  const normalizedSpec = AgentSpecSchema.parse(spec);
+  const params = { node_id: nodeId, spec: normalizedSpec };
+  return [
+    agentInvocationMarker(nodeId),
+    `Agent invocation: ${JSON.stringify(params)}`,
+    `Agent specification: ${JSON.stringify(normalizedSpec)}`,
+    `Mission goal: ${JSON.stringify(runtime.goal())}`
+  ].join("\n");
+}
+
+async function prepareSessionForAgentInvocation(
+  session: Session,
+  invocationInput: string
+): Promise<AgentInputItem[]> {
+  const items = await session.getItems();
+  const danglingOpeningInput: AgentInputItem = {
+    type: "message",
+    role: "user",
+    content: invocationInput
+  };
+  if (!isDeepStrictEqual(items.at(-1), danglingOpeningInput)) return items;
+
+  const baseline = items.slice(0, -1);
+  const replaceItems = atomicSessionReplace(session);
+  if (!replaceItems) {
+    throw new Error(
+      "Agent Session ends with an interrupted invocation input and cannot be repaired atomically"
+    );
+  }
+  await replaceItems(baseline);
+  const repaired = await session.getItems();
+  if (!isDeepStrictEqual(repaired, baseline)) {
+    throw new Error("Agent Session did not preserve the repaired invocation baseline");
+  }
+  return repaired;
+}
+
 function withModelTelemetry(
   model: Model,
   runtime: HarnessRuntimeContext,
@@ -619,7 +719,7 @@ function withModelTelemetry(
         decisionGuard.observe(agentId, response.output);
         return response;
       } catch (error) {
-        throw asError(error);
+        throw preserveModelInterruption(error);
       }
     },
     getStreamedResponse: (request) => claimAndStream(
@@ -653,8 +753,51 @@ async function* claimAndStream(
       if (event.type === "response_done") decisionGuard.observe(agentId, event.response.output);
     }
   } catch (error) {
-    throw asError(error);
+    throw preserveModelInterruption(error);
   }
+}
+
+function preserveModelInterruption(error: unknown): Error {
+  const normalized = asError(error);
+  if (isTransportInterruption(normalized)) {
+    recordAgentInvocationTransportInterruption(normalized);
+  }
+  return normalized;
+}
+
+async function restoreInterruptedSession(
+  session: Session | undefined,
+  baseline: AgentInputItem[] | undefined,
+  interruption: unknown
+): Promise<void> {
+  if (!session || !baseline) return;
+  try {
+    const current = await session.getItems();
+    if (isDeepStrictEqual(current, baseline)) return;
+    const replaceItems = atomicSessionReplace(session);
+    if (!replaceItems) {
+      throw new Error("Agent Session cannot be restored atomically after an interrupted model request");
+    }
+    await replaceItems(baseline);
+    const restored = await session.getItems();
+    if (!isDeepStrictEqual(restored, baseline)) {
+      throw new Error("Agent Session did not preserve the restored invocation baseline");
+    }
+  } catch (restoreError) {
+    throw new AggregateError(
+      [interruption, restoreError],
+      "Agent Session could not be restored after an interrupted model request"
+    );
+  }
+}
+
+function atomicSessionReplace(
+  session: Session
+): ((items: AgentInputItem[]) => Promise<void>) | undefined {
+  const replaceItems = (session as Session & {
+    replaceItems?: (items: AgentInputItem[]) => Promise<void>;
+  }).replaceItems;
+  return replaceItems ? (items) => replaceItems.call(session, items) : undefined;
 }
 
 function assertModelBinding(boundAgentId: string, requestAgentId: string): void {

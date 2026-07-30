@@ -72,6 +72,30 @@ export function appendRecent<T>(current: T[], entry: T, limit: number): T[] {
   return [...current.slice(current.length - limit + 1), entry];
 }
 
+/**
+ * Merges a journal tail with its SSE suffix. New provider/framework records
+ * persist the durable event id alongside the domain record, so a snapshot cut
+ * taken between those two appends cannot make the same activity appear twice.
+ * Legacy records have no identity and retain their original append behaviour.
+ */
+export function upsertRuntimeJournalEntry<T>(current: T[], entry: T, limit: number): T[] {
+  const id = runtimeJournalEntryId(entry);
+  if (id === null) return appendRecent(current, entry, limit);
+  const index = current.findIndex((candidate) => runtimeJournalEntryId(candidate) === id);
+  if (index < 0) return appendRecent(current, entry, limit);
+  if (current[index] === entry) return current;
+  const next = [...current];
+  next[index] = entry;
+  return next;
+}
+
+export function runtimeJournalEntryId(value: unknown): string | null {
+  const record = asRecord(value);
+  return typeof record?.runtime_event_id === "string" && record.runtime_event_id.length > 0
+    ? record.runtime_event_id
+    : null;
+}
+
 export function updateRunListStatus(
   runs: RunListItem[],
   runId: string,

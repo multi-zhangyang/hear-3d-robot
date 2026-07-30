@@ -248,6 +248,26 @@ async function resumedRuntime(
 }
 
 describe("HarnessRuntimeContext", () => {
+  it("shares one stable identity between telemetry journals and durable SSE events", async () => {
+    const delivered: RuntimeEvent[] = [];
+    const fixture = await createUnstartedRuntimeFixture((event) => delivered.push(event));
+    try {
+      await fixture.runtime.recordProvider({ status: "contacted" });
+      await fixture.runtime.recordFramework("agent:root", { type: "response_done" });
+
+      const provider = objectRecord((await fixture.store.readJournal("provider"))[0]);
+      const framework = objectRecord((await fixture.store.readJournal("framework"))[0]);
+      const providerEvent = delivered.find((event) => event.type === "provider_event");
+      const frameworkEvent = delivered.find((event) => event.type === "framework_event");
+      expect(provider?.runtime_event_id).toBe(providerEvent?.event_id);
+      expect(framework?.runtime_event_id).toBe(frameworkEvent?.event_id);
+      expect(providerEvent?.durable).toBe(true);
+      expect(frameworkEvent?.durable).toBe(true);
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
   it("recovers a started lifecycle event after its first journal append fails", async () => {
     const fixture = await createUnstartedRuntimeFixture();
     let resumedWorld: RapierWorld | undefined;

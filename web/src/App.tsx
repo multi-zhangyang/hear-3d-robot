@@ -36,12 +36,12 @@ import { CenteredSpin, FailureAlert, Login, RunStatus } from "./Shell";
 import { reduceRunDetails } from "./run-details-reducer";
 import { AuthoritativeFrameBuffer } from "./stage/authoritative-frame-buffer";
 import {
-  appendRecent,
   asRecord,
   isAbortError,
   latestProviderActivity,
   nextRuntimeEventCursor,
   providerActivityFrom,
+  upsertRuntimeJournalEntry,
   updateRunListStatus,
   worldSnapshotsFrom
 } from "./stream-state";
@@ -81,7 +81,6 @@ export function App(): React.JSX.Element {
   const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
   const selectedRunRef = useRef<string | null>(null);
   const eventCursorRef = useRef<{ runId: string; eventId?: string } | null>(null);
-  const eventFloorRef = useRef<{ runId: string; at: string } | null>(null);
   const loadGenerationRef = useRef(0);
   const loadAbortRef = useRef<AbortController | null>(null);
   const frameBufferRef = useRef<AuthoritativeFrameBuffer | null>(null);
@@ -117,7 +116,6 @@ export function App(): React.JSX.Element {
         runId,
         ...(nextDetails.event_cursor ? { eventId: nextDetails.event_cursor } : {})
       };
-      eventFloorRef.current = { runId, at: nextDetails.checkpoint.updated_at };
       frameBuffer.reset(nextDetails.checkpoint.world);
       setFramework(nextDetails.framework);
       setProviderActivity(latestProviderActivity(nextDetails.provider));
@@ -147,7 +145,6 @@ export function App(): React.JSX.Element {
     if (candidate) {
       if (selectedRunRef.current !== candidate) {
         eventCursorRef.current = null;
-        eventFloorRef.current = null;
         setDetails(null);
         setFramework([]);
         setProviderActivity(null);
@@ -198,26 +195,25 @@ export function App(): React.JSX.Element {
       runId,
       ...(nextCursor === undefined ? {} : { eventId: nextCursor })
     };
-    const floor = eventFloorRef.current;
-    // Events at or before the snapshot the details were loaded from are already
-    // reflected in that snapshot; replaying them would double-count steps.
-    const historical = floor?.runId === runId && event.at <= floor.at;
-
     if (event.type === "framework_event") {
-      setFramework((current) => appendRecent(current, event.data, FRAMEWORK_HISTORY_LIMIT));
+      setFramework((current) => upsertRuntimeJournalEntry(
+        current,
+        event.data,
+        FRAMEWORK_HISTORY_LIMIT
+      ));
     }
 
-    if (event.type === "provider_event" && !historical) {
+    if (event.type === "provider_event") {
       const activity = providerActivityFrom(event.data);
       if (activity) setProviderActivity(activity);
     }
 
-    const worlds = historical ? [] : worldSnapshotsFrom(event.data);
+    const worlds = worldSnapshotsFrom(event.data);
     if (worlds.length > 0) appendWorldFrames(worlds);
     const terminalEvent = event.type === "run_succeeded"
       || event.type === "run_failed"
       || event.type === "run_interrupted";
-    const reducerWorlds = !historical && terminalEvent && worlds.length === 0 && frameBuffer.latest
+    const reducerWorlds = terminalEvent && worlds.length === 0 && frameBuffer.latest
       ? [frameBuffer.latest]
       : worlds;
 
@@ -231,12 +227,11 @@ export function App(): React.JSX.Element {
         details: current,
         event,
         worlds: reducerWorlds,
-        historical,
+        historical: false,
         limits: { actions: ACTION_HISTORY_LIMIT, provider: PROVIDER_HISTORY_LIMIT }
       }));
     }
 
-    if (historical) return;
     // The run list is a sibling of the details, not part of them, so terminal
     // transitions still have to be mirrored onto it here.
     if (event.type === "run_started" || event.type === "run_resumed") {
@@ -299,7 +294,6 @@ export function App(): React.JSX.Element {
   const selectRun = async (runId: string): Promise<void> => {
     selectedRunRef.current = runId;
     eventCursorRef.current = null;
-    eventFloorRef.current = null;
     setDetails(null);
     setFramework([]);
     setProviderActivity(null);

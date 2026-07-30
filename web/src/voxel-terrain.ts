@@ -55,7 +55,8 @@ export class VoxelTerrain {
   #highestMutationLevelByCell = new Map<number, number>();
   #explorationKey = "";
   #explorationBits: Uint8Array<ArrayBufferLike> = new Uint8Array();
-  #stateRevision = -1;
+  #stateRevision: number | null | undefined;
+  #loadedChunksKey: string | undefined;
 
   constructor(terrain: TerrainDefinition, worldSeed: number) {
     this.root.name = "voxel-terrain";
@@ -77,9 +78,19 @@ export class VoxelTerrain {
   }
 
   update(state: VoxelWorldState | null | undefined, encodedExploration: string): void {
+    const nextRevision = state?.revision ?? null;
+    const nextLoadedChunksKey = state
+      ? state.loaded_chunks.map(chunkKey).sort().join("|")
+      : "legacy";
+    if (
+      this.#stateRevision === nextRevision
+      && this.#loadedChunksKey === nextLoadedChunksKey
+      && this.#explorationKey === encodedExploration
+    ) {
+      return;
+    }
     const dirtyExplorationChunks = this.#updateExploration(encodedExploration);
     if (state && state.revision !== this.#stateRevision) {
-      this.#stateRevision = state.revision;
       this.#indexMutations(state.mutations);
     }
 
@@ -108,6 +119,8 @@ export class VoxelTerrain {
         dirtyExplorationChunks.has(chunkKey(reference))
       );
     }
+    this.#stateRevision = nextRevision;
+    this.#loadedChunksKey = nextLoadedChunksKey;
   }
 
   resolveIntersection(

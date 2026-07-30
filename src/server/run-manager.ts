@@ -295,28 +295,23 @@ export class RunManager {
       resolveRunDirectory(this.#runsDir, runId),
       this.#storeOptions()
     );
-    // Read the journal high-water mark first, then the checkpoint. If a live
-    // event lands between those reads, the checkpoint is at least as new and
-    // the SSE subscription safely re-delivers the event after this cursor.
-    // This avoids replaying an arbitrarily large events journal just to render
-    // the current operator view.
-    const [actionsPage, providerPage, frameworkPage, eventPage] = await Promise.all([
-      store.readJournalTail("actions", limits.actions),
-      store.readJournalTail("provider", limits.provider),
-      store.readJournalTail("framework", limits.framework),
-      store.readJournalTail("events", 1)
-    ]);
-    const checkpoint = await store.readCheckpoint();
-    const cursorEntry = eventPage.entries.at(-1);
+    // One fenced cut is essential here. Independent parallel tail reads can see
+    // an event after its matching action/provider/framework tail was sampled;
+    // publishing that event as the cursor would then make SSE skip the missing
+    // domain record forever. RunStore samples every durable surface while all
+    // writers are excluded, and current telemetry carries a stable identity for
+    // the inverse (domain-ahead-of-event) cut so the browser can deduplicate it.
+    const snapshot = await store.readDetailsSnapshot(limits);
+    const cursorEntry = snapshot.events.entries.at(-1);
     const eventCursor = cursorEntry === undefined
       ? null
       : runtimeEvent(cursorEntry, runId).event_id;
     return {
       definition: store.definition,
-      checkpoint,
-      actions: actionsPage.entries,
-      provider: providerPage.entries,
-      framework: frameworkPage.entries,
+      checkpoint: snapshot.checkpoint,
+      actions: snapshot.actions.entries,
+      provider: snapshot.provider.entries,
+      framework: snapshot.framework.entries,
       event_cursor: eventCursor
     };
   }

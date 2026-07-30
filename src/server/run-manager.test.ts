@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { loadRuntimeCatalog, type ProviderConfig } from "../config/load.js";
+import type { JsonValue } from "../domain/schema.js";
 import type { RuntimeEvent, RuntimeEventSink } from "../harness/runtime-context.js";
+import type { MutationFence } from "../persistence/mutation-fence.js";
 import { RunStore } from "../persistence/run-store.js";
 import { RunManager } from "./run-manager.js";
 
@@ -32,6 +34,88 @@ const TEST_PROVIDER: ProviderConfig = {
 };
 
 describe("RunManager event and process lifecycle", () => {
+  it("takes one fenced details cut so a matching journal record cannot be skipped by its cursor", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const fence = new PausableMutationFence();
+    const manager = new RunManager({ runsDir, catalog, mutationFence: fence });
+    const writer = await RunStore.open(store.runDir, { mutationFence: fence });
+    const baseline = await manager.details(runId, { actions: 20, provider: 20, framework: 20 });
+    const pause = fence.pauseNext();
+    const loading = manager.details(runId, { actions: 20, provider: 20, framework: 20 });
+    await pause.entered;
+
+    const record = {
+      status: "contacted",
+      at: "2026-07-30T12:00:00.000Z",
+      runtime_event_id: "interleaved-provider-event"
+    };
+    const durable = {
+      event_id: record.runtime_event_id,
+      run_id: runId,
+      type: "provider_event",
+      at: record.at,
+      data: record,
+      durable: true
+    } satisfies RuntimeEvent;
+    let writeFinished = false;
+    const writing = (async () => {
+      await writer.append("provider", record);
+      await writer.append("events", durable as unknown as JsonValue);
+      writeFinished = true;
+    })();
+    await Promise.resolve();
+    expect(writeFinished).toBe(false);
+
+    pause.release();
+    const cut = await loading;
+    await writing;
+    expect(cut.event_cursor).toBe(baseline.event_cursor);
+    expect(cut.provider).not.toContainEqual(record);
+
+    const replayed: RuntimeEvent[] = [];
+    const unsubscribe = await manager.subscribe(
+      runId,
+      cut.event_cursor ?? undefined,
+      (event) => replayed.push(event)
+    );
+    unsubscribe();
+    expect(replayed.filter((event) => event.event_id === durable.event_id)).toEqual([durable]);
+  });
+
+  it("replays one matching event when details sees its domain record first", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const manager = new RunManager({ runsDir, catalog });
+    const record = {
+      status: "contacted",
+      at: "2026-07-30T12:00:00.000Z",
+      runtime_event_id: "domain-ahead-provider-event"
+    };
+    const durable = {
+      event_id: record.runtime_event_id,
+      run_id: runId,
+      type: "provider_event",
+      at: record.at,
+      data: record,
+      durable: true
+    } satisfies RuntimeEvent;
+
+    await store.append("provider", record);
+    const cut = await manager.details(runId, { actions: 20, provider: 20, framework: 20 });
+    expect(cut.provider).toContainEqual(record);
+
+    await store.append("events", durable as unknown as JsonValue);
+    const replayed: RuntimeEvent[] = [];
+    const unsubscribe = await manager.subscribe(
+      runId,
+      cut.event_cursor ?? undefined,
+      (event) => replayed.push(event)
+    );
+    unsubscribe();
+    expect(replayed.filter((event) => event.event_id === durable.event_id)).toEqual([durable]);
+  });
+
   it("streams an old cursor suffix without replaying history for a current cursor", async () => {
     const { runsDir, runId, store } = await copiedFixture();
     const catalog = await loadRuntimeCatalog();
@@ -363,4 +447,43 @@ function runtimeEvent(runId: string, eventId: string): RuntimeEvent {
     at: "2026-07-30T00:00:00.000Z",
     data: { source: "test" }
   };
+}
+
+class PausableMutationFence implements MutationFence {
+  #tail: Promise<void> = Promise.resolve();
+  #nextPause: {
+    enter: () => void;
+    release: Promise<void>;
+  } | undefined;
+
+  pauseNext(): { entered: Promise<void>; release: () => void } {
+    if (this.#nextPause) throw new Error("A mutation fence pause is already armed");
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    this.#nextPause = { enter: entered.resolve, release: release.promise };
+    return { entered: entered.promise, release: release.resolve };
+  }
+
+  runMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const pause = this.#nextPause;
+    this.#nextPause = undefined;
+    const execute = async (): Promise<T> => {
+      if (pause) {
+        pause.enter();
+        await pause.release;
+      }
+      return operation();
+    };
+    const result = this.#tail.then(execute, execute);
+    this.#tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+}
+
+function deferredSignal(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }

@@ -59,6 +59,14 @@ export interface JournalPage {
   total: number;
 }
 
+export interface RunDetailsSnapshot {
+  checkpoint: RunCheckpoint;
+  actions: JournalPage;
+  provider: JournalPage;
+  framework: JournalPage;
+  events: JournalPage;
+}
+
 export interface RunStoreOptions {
   mutationFence?: MutationFence;
 }
@@ -167,16 +175,41 @@ export class RunStore {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Journal limit must be positive");
 
     await this.#journalWrites.get(name);
-    const window = await this.#runMutation(() => readIndexedTail(
-      this.#journalPath(name),
-      this.#journalIndexPath(name),
-      limit
-    ));
-    return {
-      entries: window.lines.map(parseJournalLine),
-      next: null,
-      total: window.total
-    };
+    return this.#runMutation(() => this.#readJournalTail(name, limit));
+  }
+
+  /**
+   * Captures the operator's checkpoint and durable journal tails under one
+   * runs-directory mutation fence. Runtime writers always persist a domain
+   * record before its matching durable event, so an event visible in this cut
+   * can never point past an omitted action/provider/framework record.
+   *
+   * A domain record may be visible just before its event is appended. Current
+   * records carry the same stable runtime_event_id as that later event, allowing
+   * the browser to merge the details response and SSE suffix exactly once.
+   */
+  async readDetailsSnapshot(limits: {
+    actions: number;
+    provider: number;
+    framework: number;
+  }): Promise<RunDetailsSnapshot> {
+    for (const limit of [limits.actions, limits.provider, limits.framework]) {
+      if (!Number.isSafeInteger(limit) || limit < 1) {
+        throw new Error("Journal limit must be positive");
+      }
+    }
+    const journals = ["actions", "provider", "framework", "events"] as const;
+    await Promise.all(journals.map((name) => this.#journalWrites.get(name)));
+    return this.#runMutation(async () => {
+      const [actions, provider, framework, events, checkpoint] = await Promise.all([
+        this.#readJournalTail("actions", limits.actions),
+        this.#readJournalTail("provider", limits.provider),
+        this.#readJournalTail("framework", limits.framework),
+        this.#readJournalTail("events", 1),
+        this.#readCheckpoint()
+      ]);
+      return { checkpoint, actions, provider, framework, events };
+    });
   }
 
   async scanJournal(
@@ -251,6 +284,25 @@ export class RunStore {
     });
     this.#journalWrites.set(name, write.catch(() => undefined));
     await write;
+  }
+
+  async #readCheckpoint(): Promise<RunCheckpoint> {
+    return RunCheckpointSchema.parse(
+      JSON.parse(await readFile(resolve(this.runDir, "checkpoint.json"), "utf8"))
+    );
+  }
+
+  async #readJournalTail(name: JournalName, limit: number): Promise<JournalPage> {
+    const window = await readIndexedTail(
+      this.#journalPath(name),
+      this.#journalIndexPath(name),
+      limit
+    );
+    return {
+      entries: window.lines.map(parseJournalLine),
+      next: null,
+      total: window.total
+    };
   }
 
   #journalPath(name: JournalName): string {

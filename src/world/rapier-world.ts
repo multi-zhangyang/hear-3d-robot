@@ -77,7 +77,10 @@ import {
   type RobotJointName,
   type RobotJointState
 } from "./robot-model.js";
-import { VoxelChunkPhysics } from "./voxel-chunk-physics.js";
+import {
+  VoxelChunkPhysics,
+  type ChunkResidentRegion
+} from "./voxel-chunk-physics.js";
 import { VoxelEditError, VoxelStore } from "./voxel-store.js";
 import { VoxelInteraction } from "./voxel-interaction.js";
 import {
@@ -321,7 +324,10 @@ export class RapierWorld {
           visibilityRadius: this.#scenario.visibility_radius
         })
       : null;
-    this.#voxelChunks?.synchronize({ x: scenario.robot.x, z: scenario.robot.z });
+    this.#voxelChunks?.synchronize(
+      { x: scenario.robot.x, z: scenario.robot.z },
+      this.#dynamicVoxelResidents()
+    );
     this.#navigationVoxelSignature = this.#voxelNavigationSignature();
 
     // The rig is built at the base pose with a straight chain, so pose it by
@@ -341,7 +347,10 @@ export class RapierWorld {
 
   async #synchronizeVoxelRuntime(): Promise<void> {
     if (!this.#voxelStore || !this.#voxelChunks) return;
-    this.#voxelChunks.synchronize(this.#robot.translation());
+    this.#voxelChunks.synchronize(
+      this.#robot.translation(),
+      this.#dynamicVoxelResidents()
+    );
     const signature = this.#voxelNavigationSignature();
     if (signature === this.#navigationVoxelSignature) return;
     const next = await NavigationMesh.create(this.#scenario, {
@@ -356,9 +365,46 @@ export class RapierWorld {
 
   #voxelNavigationSignature(): string {
     if (!this.#voxelStore) return "";
-    return `${this.#voxelStore.revision}|${this.#voxelStore.loadedChunks()
+    return `${this.#voxelStore.revision}|${this.#voxelChunks?.navigationChunks()
       .map((chunk) => `${chunk.column}:${chunk.row}`)
-      .join(",")}`;
+      .join(",") ?? ""}`;
+  }
+
+  /**
+   * Keeps real dynamic entities and the terrain they can touch in the same
+   * Rapier residency set. The navigation window intentionally remains owned by
+   * the robot: these swept bounds must not turn one distant payload into a
+   * world-spanning Recast rebuild.
+   */
+  #dynamicVoxelResidents(): ChunkResidentRegion[] {
+    if (!this.#voxelStore) return [];
+    const timestep = this.#world.timestep;
+    const skin = Math.max(0.02, this.#voxelStore.terrain.cell * 0.02);
+    return [...this.#objects.values()].flatMap((object) => {
+      if (!object.config.portable || !object.body.isEnabled()) return [];
+      const position = object.body.translation();
+      const velocity = object.body.linvel();
+      // A bounding sphere covers every yaw/pitch/roll of a carried or released
+      // box. Sweeping it through the next frame prevents a chunk-boundary step
+      // from dropping the collider beneath a moving payload.
+      const radius = Math.hypot(
+        object.config.size.x,
+        object.config.size.y,
+        object.config.size.z
+      ) / 2 + skin;
+      const nextX = position.x + velocity.x * timestep;
+      const nextZ = position.z + velocity.z * timestep;
+      return [{
+        minimum: {
+          x: Math.min(position.x, nextX) - radius,
+          z: Math.min(position.z, nextZ) - radius
+        },
+        maximum: {
+          x: Math.max(position.x, nextX) + radius,
+          z: Math.max(position.z, nextZ) + radius
+        }
+      }];
+    });
   }
 
   setFrameSink(sink: WorldFrameSink | null): void {
@@ -2096,7 +2142,10 @@ export class RapierWorld {
 
   async #stepCommands(commandIds: string[]): Promise<void> {
     this.#syncRig(false);
-    this.#voxelChunks?.synchronize(this.#robot.translation());
+    this.#voxelChunks?.synchronize(
+      this.#robot.translation(),
+      this.#dynamicVoxelResidents()
+    );
     this.#world.step();
     this.#pendingBasePosition = null;
     this.#frame += 1;

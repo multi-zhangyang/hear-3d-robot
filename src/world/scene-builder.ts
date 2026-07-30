@@ -162,7 +162,13 @@ function buildObjects(world: World, scenario: Scenario): Map<string, SimObject> 
     // it decides the body type: fixed scenery versus a dynamic body the
     // gripper can constrain. Damping keeps a released object from skating.
     const descriptor = object.portable
-      ? RAPIER.RigidBodyDesc.dynamic().setLinearDamping(0.8).setAngularDamping(0.9)
+      ? RAPIER.RigidBodyDesc.dynamic()
+          .setLinearDamping(0.8)
+          .setAngularDamping(0.9)
+          // A released payload may fall from the top of a voxel column. Hard
+          // CCD keeps the small rounded body from tunnelling through a thin
+          // floor or platform during the high-speed part of that real fall.
+          .setCcdEnabled(true)
       : RAPIER.RigidBodyDesc.fixed();
     const body = world.createRigidBody(
       descriptor

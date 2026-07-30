@@ -151,6 +151,16 @@ describe("Operator API", () => {
       expect(unknownCursor.statusCode).toBe(409);
       expect(unknownCursor.json().error).toMatch(/Unknown event cursor/);
 
+      for (const invalidCursor of ["", "x".repeat(257), "cursor\r\nforged", "cursor\0tail"]) {
+        const invalidHeader = await app.inject({
+          method: "GET",
+          url: "/api/runs/20000101T000000Z_fetch_red_block_00000000/events",
+          headers: { "last-event-id": invalidCursor }
+        });
+        expect(invalidHeader.statusCode).toBe(400);
+        expect(invalidHeader.json().error).toBe("Invalid request");
+      }
+
       const missingRun = await app.inject({
         method: "GET",
         url: "/api/runs/missing_run/events"

@@ -36,8 +36,9 @@ const DetailsQuery = z.object({
   provider: z.coerce.number().int().min(1).max(5000).default(400),
   framework: z.coerce.number().int().min(1).max(5000).default(300)
 });
+const EventCursor = z.string().min(1).max(256).regex(/^[^\r\n\0]+$/);
 const EventsQuery = z.object({
-  after: z.string().min(1).max(256).regex(/^[^\r\n\0]+$/).optional()
+  after: EventCursor.optional()
 });
 const JournalQuery = z.object({
   name: z.enum(["events", "provider", "framework", "actions", "hierarchy", "checker"]),
@@ -170,7 +171,10 @@ export async function createOperatorServer(input: {
   app.get("/api/runs/:runId/events", async (request, reply) => {
     const { runId } = RunParams.parse(request.params);
     const query = EventsQuery.parse(request.query);
-    const after = query.after ?? stringHeader(request.headers["last-event-id"]);
+    const headerAfter = EventCursor.optional().parse(
+      stringHeader(request.headers["last-event-id"])
+    );
+    const after = query.after ?? headerAfter;
     let writeEvent: ((event: RuntimeEvent) => Promise<void>) | undefined;
     let writer: EventStreamWriter | undefined;
     let unsubscribe = (): void => undefined;
