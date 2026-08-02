@@ -36,7 +36,8 @@ import {
 } from "./delegation-drain.js";
 import {
   assertEvidenceRequirementsJointlySatisfiable,
-  evidenceContractGuide
+  evidenceContractGuide,
+  receiptEvidenceRequirement
 } from "./evidence-contract.js";
 import {
   agentInvocationMarker,
@@ -50,6 +51,7 @@ import {
   providerEventJson,
   sdkEventJson
 } from "./sdk-events.js";
+import { invalidToolInputResult } from "./tool-input-recovery.js";
 import { withModelTelemetry } from "./model-telemetry.js";
 
 export {
@@ -413,6 +415,11 @@ function delegationTool(
   createSession: ((agentId: string) => Session) | undefined
 ): FunctionTool<HarnessAgentContext, typeof DelegationSpecSchema> {
   const drainRegistry = new DelegationDrainRegistry();
+  const frontierEvidence = receiptEvidenceRequirement(
+    0,
+    "navigate_frontier",
+    { kind: "body", channel: "base" }
+  );
   const description = [
     "Create a capability-scoped child agent and wait for its real model run to return.",
     "A supervisory model may emit several delegate_agent calls in one response for independent children; the Agents SDK runs them concurrently up to the configured tool limit, while the harness arbitrates disjoint body-channel leases.",
@@ -420,7 +427,7 @@ function delegationTool(
     "The child may create further children only when may_delegate is true.",
     "Provide one evidence_requirements entry for each zero-based success criterion. Use goal_predicate for owned final-state predicates; use receipt for an exact action/effect/target/freshness contract. references may be omitted when there is no prior receipt to grant.",
     "Capabilities are operations available during the child's process, not separate completion criteria. A planning receipt consumed by execute_base_plan or execute_joint_plan is verified from the terminal execution receipt's planning_transaction_id, so never declare the plan and its matching execution as separate terminal requirements.",
-    "For exploration, pair survey_terrain with navigate_frontier. The model chooses choice_id and calls the physical skill; the harness verifies the survey provenance and never chooses or substitutes a frontier.",
+    `For one frontier movement, normally grant the same may_delegate=false leaf both survey_terrain and navigate_frontier, with exactly one success criterion and this terminal evidence contract: ${JSON.stringify(frontierEvidence)}. That leaf surveys first, then its model chooses choice_id and calls the physical skill. Do not split observation and navigation across children unless the survey child has completed and its exact survey_terrain transaction_id is included in the navigation child's references. The harness verifies provenance and never chooses or substitutes a frontier.`,
     "The child receives only the listed formal capabilities and accepted action receipts explicitly granted through references; its capability list must be a strict subset of the active parent's list.",
     "goal_predicate_indexes are zero-based indexes into Mission goal.predicates. A supervisor must own at least one and complete_assignment is rejected until every owned predicate passes in the live world. A bounded observation or planning leaf that cannot actuate its final state must use [].",
     "An unmet voxel_at owner must retain the break_voxel and/or place_voxel authority required by the current-to-target material transition. An observation-only voxel leaf must use goal_predicate_indexes: [].",
@@ -435,10 +442,10 @@ function delegationTool(
     description,
     parameters: DelegationSpecSchema,
     strict: true,
-    // Agent.asTool currently turns nested runner failures into ordinary text.
-    // Once the invocation bridge restores the original transport Error, this
-    // outer SDK tool must allow it to reach the mission recovery boundary.
-    errorFunction: null,
+    // Invalid model arguments return to the SDK's native correction loop
+    // without invoking the hierarchy. Every real execution or transport error
+    // is rethrown so the mission recovery boundary keeps owning it.
+    errorFunction: (_context, error) => invalidToolInputResult(error, DELEGATE_TOOL_NAME),
     isEnabled: ({ runContext }) => {
       requireRuntime(runContext, runtime);
       if (runtime.checkerSatisfiedCurrentWorld()) return false;

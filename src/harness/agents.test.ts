@@ -1,5 +1,5 @@
 import { RunContext, type Model } from "@openai/agents";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ProviderConfig } from "../config/load.js";
 import type { AgentSpec } from "../domain/schema.js";
 import {
@@ -155,6 +155,9 @@ describe("agent tool topology", () => {
       hierarchy.root.tools.map((entry) => [entry.name, entry])
     );
     expect(await rootTools.delegate_agent?.isEnabled(runContext, hierarchy.root)).toBe(true);
+    expect(rootTools.delegate_agent?.description).toContain(JSON.stringify(
+      receiptEvidenceRequirement(0, "navigate_frontier", { kind: "body", channel: "base" })
+    ));
     expect(await rootTools.check_mission?.isEnabled(runContext, hierarchy.root)).toBe(true);
     expect(await rootTools.complete_mission?.isEnabled(runContext, hierarchy.root)).toBe(false);
 
@@ -162,6 +165,49 @@ describe("agent tool topology", () => {
     expect(await rootTools.delegate_agent?.isEnabled(runContext, hierarchy.root)).toBe(false);
     expect(await rootTools.check_mission?.isEnabled(runContext, hierarchy.root)).toBe(false);
     expect(await rootTools.complete_mission?.isEnabled(runContext, hierarchy.root)).toBe(true);
+  });
+
+  it("returns malformed delegation arguments to the model without creating a node", async () => {
+    const beginDelegation = vi.fn();
+    const runtime = {
+      runId: "run_invalid_delegation",
+      rootAgentId: "root_agent",
+      signal: undefined,
+      goal: () => ({ summary: "Test goal", predicates: [] }),
+      referencedReceipts: () => [],
+      checkerSatisfiedCurrentWorld: () => false,
+      canDelegate: () => true,
+      beginDelegation
+    } as unknown as HarnessRuntimeContext;
+    const hierarchy = createAgentHierarchy({
+      createModel: () => ({
+        getResponse: async () => { throw new Error("Model calls are outside this test"); },
+        getStreamedResponse: () => { throw new Error("Model calls are outside this test"); }
+      }) as unknown as Model,
+      provider,
+      runtime
+    });
+    const delegation = hierarchy.root.tools.find((entry) => entry.name === "delegate_agent");
+    if (!delegation || delegation.type !== "function") {
+      throw new Error("Root delegation tool is unavailable");
+    }
+
+    const output = await delegation.invoke(
+      new RunContext({ runId: runtime.runId }),
+      JSON.stringify({ name: "Incomplete delegation" })
+    );
+
+    const rejected = JSON.parse(String(output)) as Record<string, unknown>;
+    expect(rejected).toMatchObject({
+      accepted: false,
+      code: "invalid_tool_input",
+      tool: "delegate_agent",
+      automatic_actuation: false
+    });
+    expect(rejected.validation_issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "objective" })
+    ]));
+    expect(beginDelegation).not.toHaveBeenCalled();
   });
 
   it("preserves retry metadata from non-Error model rejections", async () => {

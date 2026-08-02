@@ -46,6 +46,10 @@ import {
 } from "./evidence-contract.js";
 import { resolveFrontierNavigation } from "./frontier-navigation.js";
 import {
+  frontierCycleActionEnabled,
+  frontierCycleState
+} from "./frontier-cycle.js";
+import {
   goalMemoryContextRecords,
   goalRelevantSpatialMemory
 } from "./goal-memory.js";
@@ -215,6 +219,11 @@ export class HarnessRuntimeContext {
       worldRevision: world.world_revision,
       voxelRevision: world.voxels?.revision ?? null
     });
+    const frontierCycle = frontierCycleState({
+      agent: node,
+      receipts: Object.values(this.#checkpoint.committed_actions),
+      currentWorldRevision: world.world_revision
+    });
     return json({
       mission: this.#store.definition.mission,
       goal: this.#goal,
@@ -249,7 +258,8 @@ export class HarnessRuntimeContext {
             records: goalMemoryContext
           },
       recent_receipts: recentReceipts,
-      pending_plan_receipts: pendingPlans.length === 0 ? null : pendingPlans
+      pending_plan_receipts: pendingPlans.length === 0 ? null : pendingPlans,
+      frontier_cycle: frontierCycle
     });
   }
 
@@ -338,9 +348,16 @@ export class HarnessRuntimeContext {
 
   isCapabilityEnabled(name: string, agentId?: string): boolean {
     const active = agentId ? this.#hierarchy.get(agentId) : this.#hierarchy.active();
+    const worldRevision = this.#world.snapshot().world_revision;
+    const frontierCycle = frontierCycleState({
+      agent: active,
+      receipts: Object.values(this.#checkpoint.committed_actions),
+      currentWorldRevision: worldRevision
+    });
     return !active.may_delegate
       && this.#capabilities.has(name)
       && active.capabilities.includes(name)
+      && frontierCycleActionEnabled(name, frontierCycle)
       && requiredPlanHandoff({
         receipts: Object.values(this.#checkpoint.committed_actions),
         agentId: active.id,
@@ -2009,11 +2026,12 @@ function assertSameActionTransaction(
 
 function actionOutput(receipt: ActionReceipt): string {
   return JSON.stringify({
+    transaction_id: receipt.transaction_id,
     accepted: receipt.accepted,
     code: receipt.code,
-    detail: receipt.detail,
-    transaction_id: receipt.transaction_id,
-    world_frame: receipt.world_after_frame
+    world_frame: receipt.world_after_frame,
+    world_revision: receipt.world_revision,
+    detail: receipt.detail
   });
 }
 

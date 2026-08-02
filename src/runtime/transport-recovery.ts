@@ -82,7 +82,9 @@ export class ConsecutiveTransportRecovery {
  */
 export function isTransportInterruption(error: unknown): boolean {
   for (const link of errorChain(error)) {
-    const status = numberField(link, "statusCode") ?? numberField(link, "status");
+    const status = numberField(link, "statusCode")
+      ?? numberField(link, "status")
+      ?? normalizedTransportCode(link);
     if (status !== undefined) {
       if (isRetryableStatus(status)) return true;
       if (status >= 400 && status <= 499) return false;
@@ -99,6 +101,16 @@ export function isTransportInterruption(error: unknown): boolean {
     }
   }
   return false;
+}
+
+function normalizedTransportCode(value: unknown): number | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.name !== "ModelTransportError") return undefined;
+  const code = numberField(value, "code");
+  return code !== undefined && Number.isInteger(code) && code >= 100 && code <= 599
+    ? code
+    : undefined;
 }
 
 /**

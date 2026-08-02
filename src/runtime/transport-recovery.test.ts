@@ -38,6 +38,16 @@ describe("isTransportInterruption", () => {
     expect(isTransportInterruption({
       error: { statusCode: 503, message: "nested compatible-provider failure" }
     })).toBe(true);
+    expect(isTransportInterruption(Object.assign(new Error("gateway timeout"), {
+      name: "ModelTransportError",
+      code: 504
+    }))).toBe(true);
+  });
+
+  it("does not reinterpret an arbitrary numeric business code as HTTP status", () => {
+    expect(isTransportInterruption(Object.assign(new Error("domain failure"), {
+      code: 503
+    }))).toBe(false);
   });
 
   it.each([

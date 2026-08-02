@@ -1225,6 +1225,8 @@ describe("HarnessRuntimeContext", () => {
       19
     );
     try {
+      expect(fixture.runtime.isCapabilityEnabled("survey_terrain", fixture.activeId)).toBe(true);
+      expect(fixture.runtime.isCapabilityEnabled("navigate_frontier", fixture.activeId)).toBe(false);
       const surveyed = outputRecord(await fixture.runtime.invokeTool(
         "survey_terrain",
         { radius_cells: 12 },
@@ -1239,6 +1241,18 @@ describe("HarnessRuntimeContext", () => {
       const choiceId = selected?.choice_id;
       if (typeof choiceId !== "string") throw new Error("Frontier has no choice_id");
       const surveyTransaction = `${fixture.activeId}:sdk_atomic_frontier_survey`;
+      expect(fixture.runtime.isCapabilityEnabled("survey_terrain", fixture.activeId)).toBe(false);
+      expect(fixture.runtime.isCapabilityEnabled("navigate_frontier", fixture.activeId)).toBe(true);
+      expect(fixture.runtime.contextAnchor(fixture.activeId)).toMatchObject({
+        frontier_cycle: {
+          phase: "choice_required",
+          enabled_action: "navigate_frontier",
+          current_survey_transaction_id: surveyTransaction,
+          available_choice_ids: expect.arrayContaining([choiceId]),
+          decision_owner: "model",
+          automatic_actuation: false
+        }
+      });
 
       const moved = outputRecord(await fixture.runtime.invokeSkill(
         "navigate_frontier",
@@ -1252,6 +1266,7 @@ describe("HarnessRuntimeContext", () => {
       expect(moved).toMatchObject({
         accepted: true,
         code: "base_plan_completed",
+        world_revision: 1,
         detail: {
           survey_transaction_id: surveyTransaction,
           choice_id: choiceId,
@@ -1259,6 +1274,8 @@ describe("HarnessRuntimeContext", () => {
           selected_face_point: point(selected.face_point)
         }
       });
+      expect(fixture.runtime.isCapabilityEnabled("survey_terrain", fixture.activeId)).toBe(true);
+      expect(fixture.runtime.isCapabilityEnabled("navigate_frontier", fixture.activeId)).toBe(false);
 
       const movementTransaction = `${fixture.activeId}:sdk_atomic_frontier_move`;
       expect(fixture.runtime.assertChildEvidence(

@@ -19,7 +19,7 @@ const FrontierChoiceSchema = z.object({
   face_point: Vec3Schema
 }).passthrough();
 
-const TerrainSurveyDetailSchema = z.object({
+export const TerrainSurveyDetailSchema = z.object({
   frontier: z.array(FrontierChoiceSchema)
 }).passthrough();
 
