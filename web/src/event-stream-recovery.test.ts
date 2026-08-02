@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { eventStreamFailureDecision } from "./event-stream-recovery";
+import {
+  eventStreamFailureDecision,
+  eventStreamRetryDelay
+} from "./event-stream-recovery";
 
 describe("event stream recovery", () => {
   it("refreshes the authoritative snapshot when a durable cursor is no longer known", () => {
@@ -13,5 +16,11 @@ describe("event stream recovery", () => {
     expect(eventStreamFailureDecision(Object.assign(new Error("Not found"), { status: 404 })))
       .toBe("stop");
     expect(eventStreamFailureDecision(new SyntaxError("Invalid event"))).toBe("stop");
+  });
+
+  it("backs off repeated disconnects without allowing an unbounded wait", () => {
+    expect([1, 2, 3, 4, 5, 20].map(eventStreamRetryDelay))
+      .toEqual([800, 1_600, 3_200, 6_400, 12_800, 15_000]);
+    expect(() => eventStreamRetryDelay(0)).toThrow("positive safe integer");
   });
 });

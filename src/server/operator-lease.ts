@@ -140,7 +140,7 @@ export async function acquireOperatorLease(
   });
 }
 
-export class OperatorLeaseError extends Error {}
+class OperatorLeaseError extends Error {}
 
 export class OperatorLeaseLostError extends Error {
   readonly statusCode = 503;

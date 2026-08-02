@@ -39,37 +39,37 @@ export interface VoxelWorldState {
   inventory: Record<VoxelMaterial, number>;
 }
 
-export interface CommandFocus {
+interface CommandFocus {
   position: Vec3;
   kind?: string;
   id?: string;
   label?: string;
 }
 
-export interface RobotContactState {
+interface RobotContactState {
   left_object_id: string | null;
   right_object_id: string | null;
   left_force: number;
   right_force: number;
 }
 
-export interface RobotAttachmentState {
+interface RobotAttachmentState {
   object_id: string;
   constraint_id: string;
   source_command_id: string;
 }
 
-export interface WheelOdometry {
+interface WheelOdometry {
   position: number;
   velocity: number;
 }
 
-export interface RobotOdometryState {
+interface RobotOdometryState {
   left_wheel: WheelOdometry;
   right_wheel: WheelOdometry;
 }
 
-export interface RobotJointState {
+interface RobotJointState {
   position: number;
   velocity: number;
   target: number;
@@ -100,7 +100,7 @@ export interface RobotLinkState {
   angular_velocity: Vec3;
 }
 
-export interface NavigationState {
+interface NavigationState {
   plan_id: string | null;
   status: "idle" | "planned" | "executing" | "completed" | "blocked" | "stopped";
   target: Vec3 | null;
@@ -112,7 +112,7 @@ export interface NavigationState {
   actual_path: Vec3[];
 }
 
-export interface GripperState {
+interface GripperState {
   aperture: number;
   target_aperture: number;
   maximum_force: number;
@@ -197,7 +197,7 @@ export interface WorldSnapshot {
   affordance_events: AffordanceEvent[];
 }
 
-export interface AffordanceEvent {
+interface AffordanceEvent {
   frame: number;
   affordance_id: string | null;
   code: string;
@@ -274,7 +274,7 @@ export interface ActionReceipt {
   }>;
 }
 
-export interface ContextCompactionSummary {
+interface ContextCompactionSummary {
   mission_state: string;
   constraints: string[];
   decisions: string[];
@@ -284,7 +284,7 @@ export interface ContextCompactionSummary {
   next_actions: string[];
 }
 
-export interface ContextScopeState {
+interface ContextScopeState {
   scope_id: string;
   agent_id: string;
   agent_name: string;

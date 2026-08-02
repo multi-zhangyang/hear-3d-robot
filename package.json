@@ -28,12 +28,13 @@
     "dev:web": "vite --config web/vite.config.ts",
     "start": "node dist/cli.js operator",
     "hear": "tsx src/cli.ts",
+    "check:dead": "knip",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:production": "pnpm run build && node tests/production-smoke.mjs",
     "test:browser": "pnpm run build:web && playwright test",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit && tsc -p tsconfig.browser.json --noEmit",
-    "check": "pnpm run typecheck && pnpm run test && pnpm run test:production"
+    "check": "pnpm run check:dead && pnpm run typecheck && pnpm run test && pnpm run test:production"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.102",
@@ -44,13 +45,13 @@
     "@fastify/static": "^10.1.2",
     "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "@fontsource-variable/space-grotesk": "^5.3.0",
-    "@openai/agents": "^0.14.1",
-    "@openai/agents-extensions": "^0.14.1",
+    "@openai/agents": "^0.14.2",
+    "@openai/agents-extensions": "^0.14.2",
     "ai": "^6.0.235",
     "antd": "^5.29.3",
     "closed-chain-ik": "^0.0.3",
     "dotenv": "^17.4.2",
-    "fastify": "^5.10.0",
+    "fastify": "^5.11.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "recast-navigation": "^0.43.1",
@@ -59,15 +60,16 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@playwright/test": "^1.62.0",
-    "@types/node": "^24.10.0",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
-    "@types/three": "^0.185.0",
-    "@vitejs/plugin-react": "^6.0.1",
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@types/three": "^0.185.3",
+    "@vitejs/plugin-react": "^6.0.5",
+    "knip": "^6.31.0",
     "tsx": "^4.23.1",
     "typescript": "^7.0.2",
-    "vite": "^8.1.5",
+    "vite": "^8.2.0",
     "vitest": "^4.1.10"
   }
 }

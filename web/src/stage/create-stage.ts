@@ -1,10 +1,11 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { addEnvironment, disposeObject } from "../three-kit";
+import { disposeObject } from "../three-kit";
 import type { ScenarioDefinition, Vec3, WorldSnapshot } from "../types";
 import type { AuthoritativeFrameBuffer } from "./authoritative-frame-buffer";
 import { fitRobot, fitSensor, fitWorld, focusKey } from "./camera";
 import { renderPixelRatio } from "./render-quality";
+import { createRenderBackend } from "./render-backend";
 import { addStudioLighting, STAGE_VOID } from "./scene-primitives";
 import { StageInteraction } from "./stage-interaction";
 import type { StageCallbacks, StageController } from "./stage-types";
@@ -16,34 +17,19 @@ import {
   VoxelSurfaceHeightField
 } from "./chase-camera-clearance";
 
-export function createStage(
+export async function createStage(
   host: HTMLDivElement,
   scenario: ScenarioDefinition,
   initialFrame: WorldSnapshot,
   frameBuffer: AuthoritativeFrameBuffer,
   initiallyLive: boolean,
-  callbacks: StageCallbacks
-): StageController {
+  callbacks: StageCallbacks,
+  signal?: AbortSignal
+): Promise<StageController> {
+  signal?.throwIfAborted();
   const bounds = scenario.bounds;
   const worldExtent = Math.max(bounds.width, bounds.depth);
-  if (!window.WebGL2RenderingContext && !window.WebGLRenderingContext) {
-    throw new Error("This browser does not expose a WebGL context");
-  }
   if (!frameBuffer.latest) frameBuffer.reset(initialFrame);
-
-  const renderer = new THREE.WebGLRenderer({
-    antialias: true,
-    alpha: false,
-    preserveDrawingBuffer: false,
-    powerPreference: "high-performance"
-  });
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.15;
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFShadowMap;
-  renderer.setClearColor(STAGE_VOID, 1);
-  renderer.domElement.className = "three-canvas";
 
   let contextLost = false;
   let reportedError: string | null = null;
@@ -52,6 +38,19 @@ export function createStage(
     reportedError = message;
     callbacks.onError(message);
   };
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(STAGE_VOID);
+  const runtime = await createRenderBackend(scene, {
+    onDeviceLost: (message) => {
+      contextLost = true;
+      reportError(message);
+    },
+    onError: reportError
+  }, signal);
+  signal?.throwIfAborted();
+  const { renderer, environment } = runtime;
+  renderer.setClearColor(STAGE_VOID, 1);
+  renderer.domElement.className = "three-canvas";
   const handleContextLost = (event: Event): void => {
     event.preventDefault();
     contextLost = true;
@@ -66,8 +65,6 @@ export function createStage(
   renderer.domElement.addEventListener("webglcontextrestored", handleContextRestored);
   host.appendChild(renderer.domElement);
 
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(STAGE_VOID);
   const robotFogNear = Math.max(12, worldExtent * 0.38);
   const robotFog = new THREE.Fog(STAGE_VOID, robotFogNear, Math.max(robotFogNear + 22, worldExtent * 1.65));
   const worldFog = new THREE.Fog(
@@ -76,7 +73,6 @@ export function createStage(
     Math.max(84, worldExtent * 6)
   );
   scene.fog = robotFog;
-  const environment = addEnvironment(scene, renderer);
 
   const camera = new THREE.PerspectiveCamera(38, 1, 0.05, Math.max(120, worldExtent * 5));
   const controls = new OrbitControls(camera, renderer.domElement);

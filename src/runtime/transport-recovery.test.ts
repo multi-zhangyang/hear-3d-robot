@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { RunCheckpointSchema } from "../domain/schema.js";
 import {
   canReplayInitialModelRequest,
+  ConsecutiveTransportRecovery,
   isTransportInterruption,
   transportRetryPlan
 } from "./transport-recovery.js";
@@ -215,6 +216,27 @@ describe("transportRetryPlan", () => {
 
   it("rejects invalid attempt counters", () => {
     expect(() => transportRetryPlan(new Error("offline"), 0))
+      .toThrow("positive safe integer");
+  });
+});
+
+describe("ConsecutiveTransportRecovery", () => {
+  it("bounds one outage and opens a fresh window after a completed response", () => {
+    const recovery = new ConsecutiveTransportRecovery(3);
+
+    expect(recovery.nextAttempt()).toBe(1);
+    expect(recovery.nextAttempt()).toBe(2);
+    expect(recovery.responseCompleted()).toBe(2);
+    expect(recovery.responseCompleted()).toBe(0);
+    expect(recovery.nextAttempt()).toBe(1);
+    expect(recovery.nextAttempt()).toBe(2);
+    expect(recovery.nextAttempt()).toBe(3);
+    expect(recovery.nextAttempt()).toBeNull();
+  });
+
+  it("rejects invalid recovery limits", () => {
+    expect(() => new ConsecutiveTransportRecovery(0)).toThrow("positive safe integer");
+    expect(() => new ConsecutiveTransportRecovery(Number.POSITIVE_INFINITY))
       .toThrow("positive safe integer");
   });
 });

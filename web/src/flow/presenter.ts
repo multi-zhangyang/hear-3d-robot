@@ -8,7 +8,7 @@ import {
   resultCodeLabel
 } from "../ui-text";
 
-export type FeedTone = "active" | "success" | "warning" | "neutral";
+type FeedTone = "active" | "success" | "warning" | "neutral";
 export type ActionCategory = "sense" | "plan" | "move" | "verify";
 
 export interface PresentedAction {

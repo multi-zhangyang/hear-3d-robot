@@ -4,9 +4,9 @@ import { ROBOT_SPEC } from "./robot-model.js";
 /** Below this radius the configured one-sided elbow and wrist limits make
  * many otherwise nearby points part of a tight folded workspace. It is a
  * planning comfort boundary, not a claim that every closer point is invalid. */
-export const ARM_PREFERRED_MINIMUM_REACH = 0.75;
-export const ARM_MOTION_PLANE_TOLERANCE = 0.025;
-export const ARM_MAXIMUM_REACH = ROBOT_SPEC.arm.upperLength
+const ARM_PREFERRED_MINIMUM_REACH = 0.75;
+const ARM_MOTION_PLANE_TOLERANCE = 0.025;
+const ARM_MAXIMUM_REACH = ROBOT_SPEC.arm.upperLength
   + ROBOT_SPEC.arm.forearmLength
   + ROBOT_SPEC.arm.wristLength;
 

@@ -1,7 +1,7 @@
 import type { Vec3 } from "../domain/schema.js";
 import { clamp, normalizeAngle, planarDistance } from "./geometry.js";
 
-export type BaseLinearSign = -1 | 1;
+type BaseLinearSign = -1 | 1;
 
 export interface BaseTargetControlInput {
   current: Vec3;

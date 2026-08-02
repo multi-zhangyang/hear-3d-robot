@@ -168,6 +168,7 @@ export function createAgentHierarchy(input: {
   provider: ProviderConfig;
   runtime: HarnessRuntimeContext;
   callModelInputFilter?: CallModelInputFilter;
+  onModelResponseCompleted?: (agentId: string) => void | Promise<void>;
 }): AgentHierarchy {
   const modelSettings: ModelSettings = {
     temperature: input.provider.temperature,
@@ -197,7 +198,12 @@ export function createAgentHierarchy(input: {
     const worker = new Agent<HarnessAgentContext>({
       name: spec.name,
       instructions: workerInstructions(spec, input.runtime),
-      model: withModelTelemetry(input.createModel(), input.runtime, nodeId),
+      model: withModelTelemetry(
+        input.createModel(),
+        input.runtime,
+        nodeId,
+        input.onModelResponseCompleted
+      ),
       modelSettings,
       tools: actionTools(input.runtime, true),
       resetToolChoice: false,
@@ -235,7 +241,8 @@ export function createAgentHierarchy(input: {
     model: withModelTelemetry(
       input.createModel(),
       input.runtime,
-      input.runtime.rootAgentId
+      input.runtime.rootAgentId,
+      input.onModelResponseCompleted
     ),
     modelSettings,
     tools: [delegate, checkerTool(input.runtime), missionCompletionTool(input.runtime)],

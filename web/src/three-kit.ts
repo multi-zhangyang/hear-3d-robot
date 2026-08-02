@@ -1,24 +1,4 @@
 import * as THREE from "three";
-import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
-
-/**
- * A metal surface shows almost nothing but its reflection, so a MeshStandardMaterial
- * with high metalness renders near black when the scene has no environment — the
- * directional lights contribute a specular dot and nothing else. The rig's alloy
- * bearings, rails and wheel rims are exactly that material, so without this they
- * read as holes. Generating the map in-process keeps it working offline and in CI.
- */
-export function addEnvironment(scene: THREE.Scene, renderer: THREE.WebGLRenderer): THREE.Texture {
-  const generator = new THREE.PMREMGenerator(renderer);
-  const environment = generator.fromScene(new RoomEnvironment(), 0.04).texture;
-  scene.environment = environment;
-  // Low enough that it only lifts the metals out of black: at full strength it
-  // also floods the white shells and flattens the emissive accents, which are
-  // the parts that carry state.
-  scene.environmentIntensity = 0.22;
-  generator.dispose();
-  return environment;
-}
 
 /**
  * Three ships only a hard-edged BoxGeometry, and hard edges are what make a rig

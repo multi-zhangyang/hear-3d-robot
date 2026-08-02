@@ -209,6 +209,48 @@ describe("agent tool topology", () => {
     expect(transportRetryPlan(caught, 1).waitMs).toBe(45_000);
   });
 
+  it("reports a completed response from the concrete hierarchy node", async () => {
+    const completed: string[] = [];
+    const runtime = {
+      runId: "run_transport_window",
+      rootAgentId: "root_agent",
+      signal: undefined,
+      activeNode: () => ({ id: "root_agent" }),
+      recordModelCallStarted: async () => undefined
+    } as unknown as HarnessRuntimeContext;
+    const hierarchy = createAgentHierarchy({
+      createModel: () => ({
+        getResponse: async () => ({
+          output: [{ type: "function_call" }],
+          usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 }
+        }),
+        getStreamedResponse: () => (async function* () {
+          yield {
+            type: "response_done",
+            response: {
+              output: [{ type: "function_call" }],
+              usage: { inputTokens: 11, outputTokens: 3, totalTokens: 14 }
+            }
+          };
+        })()
+      }) as unknown as Model,
+      provider,
+      runtime,
+      onModelResponseCompleted: (agentId) => {
+        completed.push(agentId);
+      }
+    });
+
+    await hierarchy.root.model.getResponse({ input: [] } as never);
+    const completionStateAtYield: string[][] = [];
+    for await (const _event of hierarchy.root.model.getStreamedResponse({ input: [] } as never)) {
+      completionStateAtYield.push([...completed]);
+    }
+
+    expect(completed).toEqual(["root_agent", "root_agent"]);
+    expect(completionStateAtYield).toEqual([["root_agent", "root_agent"]]);
+  });
+
   it("rethrows nested transport and abort failures before business handling", () => {
     const unavailable = Object.assign(new Error("upstream unavailable"), { status: 503 });
     expect(() => rethrowDelegationInterruption(unavailable)).toThrow(unavailable);

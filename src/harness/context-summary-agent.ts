@@ -73,15 +73,18 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
   readonly #model: Model;
   readonly #temperature: number;
   readonly #maxOutputTokens: number;
+  readonly #onModelResponseCompleted: (() => void | Promise<void>) | undefined;
 
   constructor(input: {
     model: Model;
     temperature: number;
     maxOutputTokens: number;
+    onModelResponseCompleted?: () => void | Promise<void>;
   }) {
     this.#model = input.model;
     this.#temperature = input.temperature;
     this.#maxOutputTokens = input.maxOutputTokens;
+    this.#onModelResponseCompleted = input.onModelResponseCompleted;
     this.#runner = new Runner({
       tracingDisabled: true,
       traceIncludeSensitiveData: false,
@@ -114,7 +117,11 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
         { usage }
       );
     }
-    const countedModel = withUsageCounter(this.#model, usage);
+    const countedModel = withUsageCounter(
+      this.#model,
+      usage,
+      this.#onModelResponseCompleted
+    );
     let lastFailure: string | undefined;
 
     for (let attempt = 1; attempt <= CONTEXT_COMPACTOR_MAX_ATTEMPTS; attempt += 1) {
@@ -250,7 +257,11 @@ function compactorAgent(input: {
   });
 }
 
-function withUsageCounter(model: Model, usage: ContextSummaryUsage): Model {
+function withUsageCounter(
+  model: Model,
+  usage: ContextSummaryUsage,
+  onModelResponseCompleted?: () => void | Promise<void>
+): Model {
   const addUsage = (value: { inputTokens: number; outputTokens: number; totalTokens: number }) => {
     usage.inputTokens += value.inputTokens;
     usage.outputTokens += value.outputTokens;
@@ -261,6 +272,7 @@ function withUsageCounter(model: Model, usage: ContextSummaryUsage): Model {
       usage.requests += 1;
       const response = await model.getResponse(request);
       addUsage(response.usage);
+      await onModelResponseCompleted?.();
       return response;
     },
     getStreamedResponse: (request) => {
@@ -268,7 +280,10 @@ function withUsageCounter(model: Model, usage: ContextSummaryUsage): Model {
       const stream = model.getStreamedResponse(request);
       return (async function* () {
         for await (const event of stream) {
-          if (event.type === "response_done") addUsage(event.response.usage);
+          if (event.type === "response_done") {
+            addUsage(event.response.usage);
+            await onModelResponseCompleted?.();
+          }
           yield event;
         }
       })();

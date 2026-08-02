@@ -15,7 +15,6 @@ import { RapierWorld } from "../world/rapier-world.js";
 import { capabilityCatalog } from "./agents.js";
 import { agentInvocationMarker } from "./agent-scope.js";
 import {
-  estimateToolTokens,
   LongRunContextManager,
   sequencePrefixIndex
 } from "./context-compaction.js";
@@ -29,6 +28,7 @@ import {
 } from "./context-summary-agent.js";
 import { HierarchyProjection } from "./hierarchy-projection.js";
 import { createCheckpoint, HarnessRuntimeContext } from "./runtime-context.js";
+import { estimateToolTokens } from "./token-budget.js";
 
 const provider: ProviderConfig = {
   protocol: "openai_compatible",

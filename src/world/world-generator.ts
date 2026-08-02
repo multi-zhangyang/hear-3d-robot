@@ -131,7 +131,7 @@ export function materializeScenario(
  * already stuck. Sampling around the neutral stance instead varies where the
  * arm starts without varying whether the arm is legal.
  */
-export function startingJoints(seed: number): RobotJointState {
+function startingJoints(seed: number): RobotJointState {
   const random = createRandom(deriveSeed(seed, "joints"));
   const around = (joint: keyof typeof ROBOT_SPEC.joints, span: number): number => {
     const limit = ROBOT_SPEC.joints[joint];

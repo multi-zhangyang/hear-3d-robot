@@ -31,7 +31,7 @@ export function estimateToolTokens(tools: readonly BudgetedTool[]): number {
   }), 0);
 }
 
-export function estimateTextTokens(value: string): number {
+function estimateTextTokens(value: string): number {
   if (value.length === 0) return 0;
   // Provider-neutral and deliberately conservative: English/JSON normally
   // average nearer four bytes per token, while CJK stays close to this bound.

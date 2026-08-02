@@ -90,7 +90,7 @@ export function upsertRuntimeJournalEntry<T>(current: T[], entry: T, limit: numb
   return next;
 }
 
-export function runtimeJournalEntryId(value: unknown): string | null {
+function runtimeJournalEntryId(value: unknown): string | null {
   const record = asRecord(value);
   return typeof record?.runtime_event_id === "string" && record.runtime_event_id.length > 0
     ? record.runtime_event_id

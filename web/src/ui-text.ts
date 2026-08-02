@@ -307,7 +307,7 @@ export function entityLabel(id: string): string {
   return /[\u3400-\u9fff]/.test(id) ? id : "场景实体";
 }
 
-export function propertyLabel(value: "locked" | "enabled"): string {
+function propertyLabel(value: "locked" | "enabled"): string {
   return value === "locked" ? "锁定" : "启用";
 }
 

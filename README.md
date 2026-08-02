@@ -11,6 +11,7 @@ HEAR 是一个运行在虚拟 3D 体素世界中的模型驱动具身智能体�
 - 基于 OpenAI Agents SDK 的层级智能体编排
 - 每个具体智能体拥有独立的模型上下文与持久会话
 - 通过身体通道租约并行控制移动底盘、传感头、机械臂与夹爪
+- 使用 Three.js WebGPURenderer，优先启用 WebGPU 并自动兼容 WebGL2
 - 使用 Rapier 进行关节机器人仿真与碰撞处理
 - 使用 Recast 动态生成导航网格并规划路径
 - 支持位置与姿态逆运动学，以及经过碰撞检查的机械臂轨迹
@@ -24,7 +25,7 @@ HEAR 是一个运行在虚拟 3D 体素世界中的模型驱动具身智能体�
 
 ```text
 浏览器
-  └─ 操作界面 · Three.js · SSE
+  └─ 操作界面 · Three.js WebGPU/WebGL2 · SSE
        └─ Fastify 运行时
             ├─ OpenAI Agents SDK
             │    ├─ 任务协调智能体
@@ -103,7 +104,7 @@ HEAR 将短期上下文与持久状态分开管理：
 | 操作系统 | Linux、macOS 或 Windows |
 | Node.js | 22.13.0 或更高版本 |
 | 包管理器 | 通过 Corepack 使用 pnpm 11 |
-| 浏览器 | 支持 WebGL 的现代浏览器 |
+| 浏览器 | 支持 WebGPU 或 WebGL2 的现代浏览器 |
 | 模型 API | 支持流式响应与工具调用 |
 
 GitHub Actions 会在 Linux、macOS 和 Windows 上执行构建与测试。
@@ -245,7 +246,7 @@ pnpm test:browser
 pnpm audit --prod
 ```
 
-`pnpm check` 会执行服务端和前端类型检查、单元与集成测试以及生产构建。`pnpm test:browser` 会构建 Web 应用，并运行桌面端和移动端 Playwright 测试。
+`pnpm check` 会执行无用代码扫描、服务端和前端类型检查、单元与集成测试以及生产构建。`pnpm test:browser` 会构建 Web 应用，并运行桌面端和移动端 Playwright 测试。
 
 ## 项目结构
 

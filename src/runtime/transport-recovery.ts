@@ -47,6 +47,35 @@ export interface TransportRetryPlan {
 }
 
 /**
+ * Limits one uninterrupted outage instead of the lifetime of a mission. Any
+ * completed model response proves that transport is available again and opens
+ * a fresh recovery window for a later, independent outage.
+ */
+export class ConsecutiveTransportRecovery {
+  readonly maximumAttempts: number;
+  #attempts = 0;
+
+  constructor(maximumAttempts: number) {
+    if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1) {
+      throw new Error("Maximum transport recovery attempts must be a positive safe integer");
+    }
+    this.maximumAttempts = maximumAttempts;
+  }
+
+  nextAttempt(): number | null {
+    if (this.#attempts >= this.maximumAttempts) return null;
+    this.#attempts += 1;
+    return this.#attempts;
+  }
+
+  responseCompleted(): number {
+    const recoveredAttempts = this.#attempts;
+    this.#attempts = 0;
+    return recoveredAttempts;
+  }
+}
+
+/**
  * True when the failure is the connection rather than the conversation, so
  * resuming the mission from its persisted state is a real continuation and not
  * a retry of something that will fail identically.

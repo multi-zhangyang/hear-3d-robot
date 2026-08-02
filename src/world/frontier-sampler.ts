@@ -9,7 +9,7 @@ const CARDINAL_NEIGHBOURS: ReadonlyArray<readonly [number, number]> = [
   [0, -1]
 ];
 
-export interface FrontierCandidate {
+interface FrontierCandidate {
   key: string;
   choiceId: string;
   target: Vec3;

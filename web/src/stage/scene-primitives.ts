@@ -3,7 +3,7 @@ import type { Vec3 } from "../types";
 import { SHADOW_MAP_SIZE } from "./render-quality";
 
 export const STAGE_VOID = 0x080b11;
-export const STAGE_FLOOR = 0x121722;
+const STAGE_FLOOR = 0x121722;
 
 export function addStudioLighting(scene: THREE.Scene, bounds: { width: number; depth: number }): void {
   const worldExtent = Math.max(bounds.width, bounds.depth);

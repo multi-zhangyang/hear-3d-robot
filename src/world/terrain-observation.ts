@@ -10,7 +10,7 @@ interface QuaternionLike {
   w: number;
 }
 
-export interface WalkableProjection {
+interface WalkableProjection {
   requested: Vec3;
   point: Vec3;
 }
@@ -28,7 +28,7 @@ export interface TerrainSurveyInput {
   projectWalkable: (candidates: readonly Vec3[]) => WalkableProjection[];
 }
 
-export interface TerrainFrontierChoice {
+interface TerrainFrontierChoice {
   choice_id: string;
   target: Vec3;
   face_point: Vec3;

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   z.union([
     z.string(),
     z.number(),
@@ -34,12 +34,12 @@ export const QuaternionSchema = z.object({
   w: z.number().finite()
 });
 
-export const Size3Schema = Vec3Schema.refine(
+const Size3Schema = Vec3Schema.refine(
   ({ x, y, z: depth }) => x > 0 && y > 0 && depth > 0,
   "size components must be positive"
 );
 
-export const GoalPredicateSchema = z.discriminatedUnion("type", [
+const GoalPredicateSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("robot_at"),
     target: Vec3Schema,
@@ -96,7 +96,7 @@ export const GoalSchema = z.object({
 
 export type Goal = z.infer<typeof GoalSchema>;
 
-export const ScenarioObjectSchema = z.object({
+const ScenarioObjectSchema = z.object({
   id: z.string().min(1),
   kind: z.string().trim().min(1),
   color: z.string().min(1),
@@ -108,14 +108,14 @@ export const ScenarioObjectSchema = z.object({
   container_id: z.string().min(1).optional()
 });
 
-export const ScenarioZoneSchema = z.object({
+const ScenarioZoneSchema = z.object({
   id: z.string().min(1),
   color: z.string().min(1),
   center: Vec3Schema,
   size: Size3Schema
 });
 
-export const ScenarioAffordanceSchema = z.discriminatedUnion("type", [
+const ScenarioAffordanceSchema = z.discriminatedUnion("type", [
   z.object({
     id: z.string().trim().min(1),
     type: z.literal("keyed_lock"),
@@ -133,7 +133,7 @@ export const ScenarioAffordanceSchema = z.discriminatedUnion("type", [
   }).strict()
 ]);
 
-export const RobotJointsSchema = z.object({
+const RobotJointsSchema = z.object({
   head_yaw: z.number().finite(),
   head_pitch: z.number().finite(),
   shoulder: z.number().finite(),
@@ -150,7 +150,7 @@ export const RobotJointsSchema = z.object({
  * enough to keep in the run definition whole. The merged box decomposition the
  * physics world and navmesh need is derived from it.
  */
-export const TerrainSchema = z.object({
+const TerrainSchema = z.object({
   cell: z.number().finite().positive(),
   columns: z.number().int().positive(),
   rows: z.number().int().positive(),
@@ -175,7 +175,7 @@ export const VoxelCoordinateSchema = z.object({
 }).strict();
 export type VoxelCoordinate = z.infer<typeof VoxelCoordinateSchema>;
 
-export const VoxelMutationSchema = z.object({
+const VoxelMutationSchema = z.object({
   coordinate: VoxelCoordinateSchema,
   before: VoxelMaterialSchema.nullable(),
   after: VoxelMaterialSchema.nullable(),
@@ -185,12 +185,12 @@ export const VoxelMutationSchema = z.object({
 }).strict();
 export type VoxelMutation = z.infer<typeof VoxelMutationSchema>;
 
-export const VoxelChunkReferenceSchema = z.object({
+const VoxelChunkReferenceSchema = z.object({
   column: z.number().int().nonnegative(),
   row: z.number().int().nonnegative()
 }).strict();
 
-export const VoxelWorldStateSchema = z.object({
+const VoxelWorldStateSchema = z.object({
   version: z.literal(1),
   revision: z.number().int().nonnegative(),
   chunk_size: z.number().int().min(8).max(32),
@@ -201,7 +201,7 @@ export const VoxelWorldStateSchema = z.object({
 }).strict();
 export type VoxelWorldState = z.infer<typeof VoxelWorldStateSchema>;
 
-export const RobotStartSchema = z.object({
+const RobotStartSchema = z.object({
   x: z.number().finite(),
   z: z.number().finite(),
   yaw: z.number().finite(),
@@ -248,7 +248,7 @@ export const ScenarioSchema = z.object({
 export type Scenario = z.infer<typeof ScenarioSchema>;
 
 /** The shape of the voxel field a generated template asks for. */
-export const TerrainShapeSchema = z.object({
+const TerrainShapeSchema = z.object({
   size: z.number().int().min(8).max(384),
   cell: z.number().finite().positive(),
   block: z.number().finite().positive(),
@@ -265,7 +265,7 @@ export const TerrainShapeSchema = z.object({
  * says what kind of world to build and lets the seed decide where everything
  * sits, so selecting it twice gives two different worlds.
  */
-export const ScenarioTemplateSchema = z.discriminatedUnion("kind", [
+const ScenarioTemplateSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("authored"),
     title: z.string().min(1),
@@ -292,10 +292,10 @@ export const ScenarioCatalogSchema = z.object({
   scenarios: z.record(z.string(), ScenarioTemplateSchema)
 });
 
-export const BodyChannelSchema = z.enum(["base", "head", "arm", "gripper"]);
+const BodyChannelSchema = z.enum(["base", "head", "arm", "gripper"]);
 export type BodyChannel = z.infer<typeof BodyChannelSchema>;
 
-export const EvidenceEffectSchema = z.enum([
+const EvidenceEffectSchema = z.enum([
   "observation",
   "memory",
   "plan",
@@ -304,10 +304,10 @@ export const EvidenceEffectSchema = z.enum([
 ]);
 export type EvidenceEffect = z.infer<typeof EvidenceEffectSchema>;
 
-export const EvidenceFreshnessSchema = z.enum(["current_world", "historical_record"]);
+const EvidenceFreshnessSchema = z.enum(["current_world", "historical_record"]);
 export type EvidenceFreshness = z.infer<typeof EvidenceFreshnessSchema>;
 
-export const EvidenceTargetSchema = z.discriminatedUnion("kind", [
+const EvidenceTargetSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("world") }).strict(),
   z.object({ kind: z.literal("robot") }).strict(),
   z.object({ kind: z.literal("terrain") }).strict(),
@@ -318,7 +318,7 @@ export const EvidenceTargetSchema = z.discriminatedUnion("kind", [
 ]);
 export type EvidenceTarget = z.infer<typeof EvidenceTargetSchema>;
 
-export const EvidenceRequirementSchema = z.discriminatedUnion("kind", [
+const EvidenceRequirementSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("receipt"),
     criterion_index: z.number().int().nonnegative(),
@@ -335,7 +335,7 @@ export const EvidenceRequirementSchema = z.discriminatedUnion("kind", [
 ]);
 export type EvidenceRequirement = z.infer<typeof EvidenceRequirementSchema>;
 
-export const AgentReferenceSchema = z.object({
+const AgentReferenceSchema = z.object({
   name: z.string().trim().min(1),
   transaction_id: z.string().trim().min(1)
 }).strict();
@@ -358,7 +358,7 @@ export const AgentSpecSchema = z.object({
 
 export type AgentSpec = z.infer<typeof AgentSpecSchema>;
 
-export const AgentStatusSchema = z.enum([
+const AgentStatusSchema = z.enum([
   "ready",
   "active",
   "waiting",
@@ -367,7 +367,7 @@ export const AgentStatusSchema = z.enum([
   "failed"
 ]);
 
-export const TaskNodeSchema = z.object({
+const TaskNodeSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   parent_id: z.string().min(1).nullable(),
@@ -418,7 +418,7 @@ const CommandStateSchema = z.object({
   focus: JsonValueSchema.optional()
 }).strict();
 
-export const WorldObjectStateSchema = z.object({
+const WorldObjectStateSchema = z.object({
   id: z.string(),
   kind: z.string(),
   color: z.string(),
@@ -565,7 +565,7 @@ export const WorldSnapshotSchema = z.object({
 
 export type WorldSnapshot = z.infer<typeof WorldSnapshotSchema>;
 
-export const CheckerResultSchema = z.object({
+const CheckerResultSchema = z.object({
   success: z.boolean(),
   goal: GoalSchema,
   world_frame: z.number().int().nonnegative(),
@@ -580,7 +580,7 @@ export const CheckerResultSchema = z.object({
 
 export type CheckerResult = z.infer<typeof CheckerResultSchema>;
 
-export const ActionReceiptSchema = z.object({
+const ActionReceiptSchema = z.object({
   transaction_id: z.string().min(1),
   agent_id: z.string().min(1),
   agent_name: z.string().min(1),
@@ -620,7 +620,7 @@ export const SpatialMemoryKindSchema = z.enum([
 ]);
 export type SpatialMemoryKind = z.infer<typeof SpatialMemoryKindSchema>;
 
-export const SpatialMemoryRecordSchema = z.object({
+const SpatialMemoryRecordSchema = z.object({
   id: z.string().min(1),
   world_id: z.string().min(1),
   kind: SpatialMemoryKindSchema,
@@ -663,7 +663,7 @@ export const ContextCompactionSummarySchema = z.object({
 }).strict();
 export type ContextCompactionSummary = z.infer<typeof ContextCompactionSummarySchema>;
 
-export const ContextScopeStateSchema = z.object({
+const ContextScopeStateSchema = z.object({
   scope_id: z.string().min(1),
   agent_id: z.string().min(1),
   agent_name: z.string().min(1),
@@ -709,7 +709,7 @@ export const EmptyContextMemoryState: ContextMemoryState = {
   scopes: {}
 };
 
-export const InflightActionSchema = z.object({
+const InflightActionSchema = z.object({
   transaction_id: z.string().min(1),
   agent_id: z.string().min(1),
   agent_name: z.string().min(1),
@@ -722,7 +722,7 @@ export const InflightActionSchema = z.object({
   started_at: z.string().datetime()
 }).strict();
 
-export const RunStatusSchema = z.enum([
+const RunStatusSchema = z.enum([
   "starting",
   "running",
   "succeeded",
@@ -730,7 +730,7 @@ export const RunStatusSchema = z.enum([
   "interrupted"
 ]);
 
-export const RunLifecycleEventTypeSchema = z.enum([
+const RunLifecycleEventTypeSchema = z.enum([
   "run_started",
   "run_resumed",
   "run_succeeded",
@@ -739,7 +739,7 @@ export const RunLifecycleEventTypeSchema = z.enum([
 ]);
 export type RunLifecycleEventType = z.infer<typeof RunLifecycleEventTypeSchema>;
 
-export const RunLifecycleEventSchema = z.object({
+const RunLifecycleEventSchema = z.object({
   event_id: z.string().min(1),
   run_id: z.string().min(1),
   type: RunLifecycleEventTypeSchema,

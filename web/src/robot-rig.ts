@@ -66,7 +66,7 @@ const PALETTE = {
  * command leases decides both the tag colour in the UI and which part of the
  * robot lights up, so a receipt can be traced to a moving part by colour alone.
  */
-export const CHANNEL_COLOR: Record<string, number> = {
+const CHANNEL_COLOR: Record<string, number> = {
   base: PALETTE.cyan,
   head: PALETTE.violet,
   arm: PALETTE.amber,
@@ -607,7 +607,7 @@ function createSensorFrustum(): THREE.LineSegments {
   return guide;
 }
 
-export function applyLinkTransform(
+function applyLinkTransform(
   object: THREE.Object3D,
   links: WorldSnapshot["robot"]["links"],
   linkId: string

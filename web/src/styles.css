@@ -106,7 +106,7 @@ textarea:focus-visible {
   touch-action: none;
 }
 
-.webgl-error {
+.graphics-error {
   position: absolute;
   inset: 0;
   z-index: 20;

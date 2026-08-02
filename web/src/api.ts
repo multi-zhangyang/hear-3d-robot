@@ -6,7 +6,10 @@ import type {
   RuntimeEvent,
   StreamState
 } from "./types";
-import { eventStreamFailureDecision } from "./event-stream-recovery";
+import {
+  eventStreamFailureDecision,
+  eventStreamRetryDelay
+} from "./event-stream-recovery";
 import { nextRuntimeEventCursor } from "./stream-state";
 
 const PASSWORD_STORAGE_KEY = "hear.password";
@@ -179,6 +182,7 @@ async function consumeEventLoop(
   refreshCursor: (() => Promise<RefreshedRunCursor>) | undefined
 ): Promise<void> {
   let cursor = initialCursor;
+  let retryAttempt = 0;
   if (cursor === undefined && refreshCursor) {
     const refreshed = await refreshEventCursor(signal, refreshCursor, onError, onState);
     if (refreshed === null) return;
@@ -191,6 +195,7 @@ async function consumeEventLoop(
         runId,
         signal,
         (event) => {
+          retryAttempt = 0;
           cursor = nextRuntimeEventCursor(cursor, event);
           onEvent(event);
         },
@@ -216,7 +221,8 @@ async function consumeEventLoop(
       onState?.("disconnected");
       onError(cause);
       if (decision === "stop") return;
-      await abortableDelay(800, signal);
+      retryAttempt += 1;
+      await abortableDelay(eventStreamRetryDelay(retryAttempt), signal);
     }
   }
 }
@@ -227,6 +233,7 @@ async function refreshEventCursor(
   onError: (error: Error) => void,
   onState: ((state: StreamState) => void) | undefined
 ): Promise<string | null> {
+  let retryAttempt = 0;
   while (!signal.aborted) {
     try {
       onState?.("connecting");
@@ -240,7 +247,8 @@ async function refreshEventCursor(
       onError(cause);
       if (eventStreamFailureDecision(cause) === "stop") return null;
     }
-    await abortableDelay(800, signal);
+    retryAttempt += 1;
+    await abortableDelay(eventStreamRetryDelay(retryAttempt), signal);
   }
   return null;
 }

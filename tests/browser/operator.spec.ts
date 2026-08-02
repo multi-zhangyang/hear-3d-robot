@@ -149,27 +149,39 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
   await expect(hotbar.getByRole("button", { name: "世界" })).toHaveAttribute("aria-current", "page");
 
   await page.getByRole("button", { name: "适配相机范围", exact: true }).click();
-  const webgl = await canvas.evaluate((element): {
+  const graphics = await canvas.evaluate((element): {
+    backend: string | null;
     available: boolean;
     contextLost: boolean;
     error: number | null;
   } => {
     if (!(element instanceof HTMLCanvasElement)) {
-      return { available: false, contextLost: true, error: null };
+      return { backend: null, available: false, contextLost: true, error: null };
+    }
+    const backend = element.dataset.renderBackend ?? null;
+    if (backend === "webgpu") {
+      return {
+        backend,
+        available: "gpu" in navigator,
+        contextLost: false,
+        error: null
+      };
     }
     const context = element.getContext("webgl2") ?? element.getContext("webgl");
-    if (!context) return { available: false, contextLost: true, error: null };
+    if (!context) return { backend, available: false, contextLost: true, error: null };
     const error = context.getError();
     return {
+      backend,
       available: true,
       contextLost: context.isContextLost(),
       error: error === context.NO_ERROR ? null : error
     };
   });
-  expect(webgl.available).toBe(true);
-  expect(webgl.contextLost).toBe(false);
-  expect(webgl.error).toBeNull();
-  await expect(page.locator(".webgl-error")).toHaveCount(0);
+  expect(["webgpu", "webgl2"]).toContain(graphics.backend);
+  expect(graphics.available).toBe(true);
+  expect(graphics.contextLost).toBe(false);
+  expect(graphics.error).toBeNull();
+  await expect(page.locator(".graphics-error")).toHaveCount(0);
 
   const canvasBox = await canvas.boundingBox();
   expect(canvasBox).not.toBeNull();

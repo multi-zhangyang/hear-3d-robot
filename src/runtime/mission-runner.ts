@@ -37,6 +37,7 @@ import { assertGoalSupported } from "./goal-validation.js";
 import { errorMessage } from "./error-message.js";
 import {
   canReplayInitialModelRequest,
+  ConsecutiveTransportRecovery,
   isTransportInterruption,
   transportRetryPlan
 } from "./transport-recovery.js";
@@ -247,6 +248,16 @@ async function executeMission(input: {
   serializedStateCheckpointMismatch?: boolean;
   signal?: AbortSignal;
 }): Promise<MissionRunResult> {
+  const transportRecovery = new ConsecutiveTransportRecovery(MAX_TRANSPORT_RECOVERIES);
+  const onModelResponseCompleted = async (agentId: string): Promise<void> => {
+    const recoveredAttempts = transportRecovery.responseCompleted();
+    if (recoveredAttempts === 0) return;
+    await input.runtime.recordProvider({
+      status: "transport_recovered",
+      consecutive_interruptions: recoveredAttempts,
+      recovery_window_reset: true
+    }, agentId);
+  };
   const sessions = new Map<string, FileSession>();
   const sessionForAgent = (agentId: string): FileSession => {
     const existing = sessions.get(agentId);
@@ -267,10 +278,11 @@ async function executeMission(input: {
     runtime: input.runtime,
     provider: input.provider,
     sessionForAgent,
-    createGenerator: () => new AgentsSdkContextSummaryGenerator({
+    createGenerator: (agentId) => new AgentsSdkContextSummaryGenerator({
       model: createConfiguredModel(input.provider),
       temperature: input.provider.temperature,
-      maxOutputTokens: input.provider.compactMaxOutputTokens
+      maxOutputTokens: input.provider.compactMaxOutputTokens,
+      onModelResponseCompleted: () => onModelResponseCompleted(agentId)
     })
   });
   const hierarchy = createAgentHierarchy({
@@ -278,7 +290,8 @@ async function executeMission(input: {
     createSession: sessionForAgent,
     provider: input.provider,
     runtime: input.runtime,
-    callModelInputFilter: contextManager.filter
+    callModelInputFilter: contextManager.filter,
+    onModelResponseCompleted
   });
   const runner = new Runner({
     tracingDisabled: true,
@@ -357,7 +370,6 @@ async function executeMission(input: {
           sessionItems: await session.getItems()
         }
       : undefined;
-    let recoveries = 0;
     let decisionRecoveries = 0;
     let decisionRecoveryPrompt: string | undefined;
     // A mission outlives any single HTTP connection, so a dropped socket is a
@@ -480,7 +492,8 @@ async function executeMission(input: {
         // restore it now while the same replay fence still proves that no
         // authoritative progress or serialized RunState exists. A later
         // resume can then send exactly one opening mission input.
-        if (recoveries >= MAX_TRANSPORT_RECOVERIES) {
+        const recoveryAttempt = transportRecovery.nextAttempt();
+        if (recoveryAttempt === null) {
           if (initialRequestRemainsReplayable) {
             await session.replaceItems(initialRequestBaseline.sessionItems);
           }
@@ -492,12 +505,11 @@ async function executeMission(input: {
           await session.replaceItems(initialRequestBaseline.sessionItems);
         }
 
-        recoveries += 1;
-        const retry = transportRetryPlan(error, recoveries);
+        const retry = transportRetryPlan(error, recoveryAttempt);
         await input.runtime.recordProvider({
           status: "transport_interrupted",
           error: errorMessage(error),
-          recovery_attempt: recoveries,
+          recovery_attempt: recoveryAttempt,
           retry_after_ms: retry.waitMs,
           exponential_backoff_ms: retry.backoffMs,
           ...(retry.retryAfterMs === null

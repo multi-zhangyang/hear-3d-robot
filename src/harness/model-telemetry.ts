@@ -20,7 +20,8 @@ const MAX_ROOT_CONSECUTIVE_NO_DECISION_RESPONSES = 3;
 export function withModelTelemetry(
   model: Model,
   runtime: HarnessRuntimeContext,
-  boundAgentId: string
+  boundAgentId: string,
+  onModelResponseCompleted?: (agentId: string) => void | Promise<void>
 ): Model {
   const decisionGuard = new ModelDecisionGuard(
     boundAgentId === runtime.rootAgentId
@@ -35,6 +36,7 @@ export function withModelTelemetry(
       await runtime.recordModelCallStarted(agentId);
       try {
         const response = await model.getResponse(request);
+        await onModelResponseCompleted?.(agentId);
         decisionGuard.observe(agentId, response.output);
         return response;
       } catch (error) {
@@ -46,7 +48,8 @@ export function withModelTelemetry(
       runtime,
       decisionGuard,
       boundAgentId,
-      request
+      request,
+      onModelResponseCompleted
     ),
     ...(model.getRetryAdvice
       ? { getRetryAdvice: (request) => model.getRetryAdvice!(request) }
@@ -59,7 +62,8 @@ async function* claimAndStream(
   runtime: HarnessRuntimeContext,
   decisionGuard: ModelDecisionGuard,
   boundAgentId: string,
-  request: Parameters<Model["getStreamedResponse"]>[0]
+  request: Parameters<Model["getStreamedResponse"]>[0],
+  onModelResponseCompleted?: (agentId: string) => void | Promise<void>
 ) {
   const agentId = agentIdFromModelPayload(request, runtime.rootAgentId);
   assertModelBinding(boundAgentId, agentId);
@@ -67,8 +71,11 @@ async function* claimAndStream(
   await runtime.recordModelCallStarted(agentId);
   try {
     for await (const event of model.getStreamedResponse(request)) {
+      if (event.type === "response_done") {
+        await onModelResponseCompleted?.(agentId);
+        decisionGuard.observe(agentId, event.response.output);
+      }
       yield event;
-      if (event.type === "response_done") decisionGuard.observe(agentId, event.response.output);
     }
   } catch (error) {
     throw preserveModelInterruption(error);

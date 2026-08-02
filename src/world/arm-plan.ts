@@ -11,12 +11,12 @@ interface ArmPlanBase {
   waypoints: ArmPose[];
 }
 
-export interface EndEffectorArmPlan extends ArmPlanBase {
+interface EndEffectorArmPlan extends ArmPlanBase {
   kind: "end_effector";
   target: EndEffectorTarget;
 }
 
-export interface JointTargetArmPlan extends ArmPlanBase {
+interface JointTargetArmPlan extends ArmPlanBase {
   kind: "joint_targets";
   target: null;
 }

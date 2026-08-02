@@ -22,7 +22,7 @@ function RobotStageComponent({
   live
 }: RobotStageProps): React.JSX.Element {
   const [cameraMode, setCameraMode] = useState<CameraMode>("robot");
-  const [stageFailure, setStageFailure] = useState<"load" | "webgl" | null>(null);
+  const [stageFailure, setStageFailure] = useState<"load" | "render" | null>(null);
   const [selection, setSelection] = useState<WorldSelection | null>(null);
   const [firstPerson, setFirstPerson] = useState<FirstPersonStatus>({
     available: false,
@@ -44,23 +44,31 @@ function RobotStageComponent({
     const container = stageRef.current;
     let disposed = false;
     let controller: StageController | null = null;
+    const initialization = new AbortController();
     setStageLoading(true);
     setStageFailure(null);
 
     void import("./stage/create-stage")
-      .then(({ createStage }) => {
+      .then(async ({ createStage }) => {
         if (disposed) return;
-        controller = createStage(
+        controller = await createStage(
           container,
           scenario,
           initialFrame,
           frameBuffer,
           liveRef.current,
           {
-            onError: () => setStageFailure("webgl"),
-            onSelection: setSelection,
-            onFirstPersonStatus: setFirstPerson
-          }
+            onError: (message) => {
+              if (!disposed) setStageFailure(message ? "render" : null);
+            },
+            onSelection: (value) => {
+              if (!disposed) setSelection(value);
+            },
+            onFirstPersonStatus: (value) => {
+              if (!disposed) setFirstPerson(value);
+            }
+          },
+          initialization.signal
         );
         if (disposed) {
           controller.dispose();
@@ -78,6 +86,7 @@ function RobotStageComponent({
 
     return () => {
       disposed = true;
+      initialization.abort();
       controller?.dispose();
       if (sceneRef.current === controller) sceneRef.current = null;
     };
@@ -91,10 +100,10 @@ function RobotStageComponent({
       <div className="three-stage" ref={stageRef}>
         {stageLoading && <div className="stage-loading" role="status" aria-label="正在加载三维世界"><i /><i /><i /></div>}
         {stageFailure && (
-          <div className="webgl-error" role="alert">
+          <div className="graphics-error" role="alert">
             {stageFailure === "load"
               ? "3D 场景加载失败，请刷新后重试。"
-              : "3D 场景不可用，请检查浏览器的 WebGL 支持。"}
+              : "3D 场景不可用，请检查浏览器图形加速。"}
           </div>
         )}
         <WorldHud
