@@ -83,7 +83,10 @@ export function assertGoalCapabilityContract(
  * or gripper interaction), while locomotion predicates require a base actuator.
  */
 function predicateActuatorAlternatives(type: Goal["predicates"][number]["type"]): string[] {
-  if (type === "robot_at" || type === "robot_in_zone" || type === "terrain_explored") {
+  if (type === "terrain_explored") {
+    return ["navigate_frontier", "execute_base_plan", "drive_base"];
+  }
+  if (type === "robot_at" || type === "robot_in_zone") {
     return ["execute_base_plan", "drive_base"];
   }
   if (type === "object_attached") return ["set_gripper_target"];

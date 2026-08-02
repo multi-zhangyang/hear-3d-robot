@@ -22,6 +22,7 @@ describe("中文界面文案", () => {
     expect(resultCodeLabel("base_path_collision")).toBe("底盘路线存在碰撞");
     expect(resultCodeLabel("unknown_arm_plan")).toBe("机械臂规划不存在");
     expect(resultCodeLabel("spatial_memory_context_unavailable")).toBe("当前智能体无可用空间记忆上下文");
+    expect(resultCodeLabel("stale_survey_revision")).toBe("地形勘察对应的世界版本已失效");
     expect(resultCodeLabel("future_runtime_code")).toBe("未识别的运行回执");
   });
 

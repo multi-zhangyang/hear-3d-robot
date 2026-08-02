@@ -274,6 +274,7 @@ function actionDetail(action: ActionReceipt): string {
   }
   const target = pointText(input?.target);
   if (action.name === "plan_base_path" && target) return `已请求规划前往 ${target} 的可通行路线。`;
+  if (action.name === "navigate_frontier") return "机器人已前往模型选择的探索边界。";
   if (action.name === "execute_base_plan") return "机器人已沿路线移动。";
   if (action.name === "survey_terrain") {
     const sampling = record(detail?.movement_sampling);

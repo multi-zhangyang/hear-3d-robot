@@ -83,6 +83,14 @@ export const ToolInputs = {
 export type ToolName = keyof typeof ToolInputs;
 
 const SkillInputs = {
+  navigate_frontier: z.object({
+    survey_transaction_id: z.string().trim().min(1),
+    survey_world_revision: z.number().int().nonnegative(),
+    choice_id: z.string().trim().min(1),
+    target: Vec3Schema,
+    face_point: Vec3Schema,
+    options: MotionOptionsSchema.optional()
+  }).strict(),
   execute_base_plan: z.object({
     plan_id: z.string().trim().min(1),
     options: MotionOptionsSchema.optional()
@@ -119,6 +127,11 @@ const SkillInputs = {
 
 export const AgentSkillInputs = {
   ...SkillInputs,
+  navigate_frontier: z.object({
+    survey_transaction_id: z.string().trim().min(1),
+    choice_id: z.string().trim().min(1),
+    options: MotionOptionsSchema.optional()
+  }).strict(),
   execute_base_plan: z.object({
     planning_transaction_id: z.string().trim().min(1),
     options: MotionOptionsSchema.optional()
@@ -134,7 +147,7 @@ export type SkillName = keyof typeof SkillInputs;
 export const ToolDescriptions: Record<ToolName, string> = {
   read_proprioception: "Read the current base pose, authoritative joint positions, limits and targets, link transforms, wheel odometry, gripper state, contacts, and attachment. The reading only changes when a body command changes the world, so calling it repeatedly without acting in between returns the identical snapshot and is refused as a repeated action.",
   sense_scene: "Read entities currently visible to the articulated sensor and the known static world geometry. In a world larger than the sensor range this reports only what is in view right now, which early in a run is often nothing; use survey_terrain to decide where to go looking.",
-  survey_terrain: "Read the voxel terrain around the base as a local height map of everything the robot has actually seen so far, plus a motion-entropy-ordered set of reachable frontier choices. Every choice contains a choice_id, target, face_point, travel distance, turn amount and information gain ready for model selection and plan_base_path. The ordering varies independently between new runs, but the harness never selects or executes a choice. Rows are text, one character per cell: '.' walkable floor, '1'-'9' a solid column that many blocks high, '?' not yet seen, '#' outside the world. Optional radius_cells sets how far the local map extends, defaulting to 12.",
+  survey_terrain: "Read the voxel terrain around the base as a local height map of everything the robot has actually seen so far, plus a motion-entropy-ordered set of reachable frontier choices. Every choice contains a choice_id, target, face_point, travel distance, turn amount and information gain ready for model selection. For exploration, pass the survey transaction and selected choice_id to navigate_frontier; use plan_base_path for other observed world-space targets. The ordering varies independently between new runs, but the harness never selects or executes a choice. Rows are text, one character per cell: '.' walkable floor, '1'-'9' a solid column that many blocks high, '?' not yet seen, '#' outside the world. Optional radius_cells sets how far the local map extends, defaulting to 12.",
   scan_voxels: "Scan source-backed exposed voxel faces inside the articulated head sensor's real range and field of view. Each result contains an exact integer coordinate, material, chunk, face interaction points, adjacent placement coordinates and current gripper reach. Use these coordinates rather than inventing a block location. The backend returns only chunks actually loaded in physics and safely caps the effective radius to sensor range and results to 48, even when a larger positive request is supplied.",
   inspect_voxel: "Read the current material, world-space center, chunk, interaction geometry, support state, voxel revision, and Recast-validated reachable_standoff_poses for one exact coordinate. Each standoff already pairs a base target with the voxel face_point so the planar arm can be aligned before IK. For an occupied cell, use an exposed_faces interaction_point before breaking. For an empty supported cell, use a placement_interaction_points interaction_point before placing; integer column/level/row values are voxel indexes, never world-space arm positions. It does not edit the world. A coordinate should come from scan_voxels, the structured goal, or an accepted voxel receipt.",
   recall_spatial_memory: "Query durable structured spatial memory built only from accepted action receipts and authoritative world snapshots. Filter by kind, exact voxel coordinate, entity id, text, or a world-space near/radius region. Every result includes the world and voxel revision plus its source transaction and agent, so stale observations remain identifiable rather than being presented as current sensor truth. Use this before revisiting an area or entity, then re-observe before acting when the remembered revision is old.",
@@ -149,6 +162,7 @@ export const ToolDescriptions: Record<ToolName, string> = {
 };
 
 export const SkillDescriptions: Record<SkillName, string> = {
+  navigate_frontier: "Physically navigate to one model-selected reachable frontier from a current accepted survey_terrain receipt. Pass that receipt's exact transaction_id and one exact choice_id returned inside it. The harness validates ownership, world revision and candidate identity, then atomically plans and executes only that chosen target through Recast and Rapier. It never selects a choice, substitutes another frontier, retries automatically, or moves without this explicit model call. After any body command, survey again before the next frontier movement.",
   execute_base_plan: "Execute one unconsumed base-footprint path plan from an accepted plan_base_path receipt granted to this agent. Pass that receipt's exact transaction_id as planning_transaction_id. The plan_id inside the receipt's result is the world's internal handle and is never accepted here. Every step also collision-checks the current articulated links and attached payload; a named-link collision requires a model-chosen joint reconfiguration or different target before replanning. A plan stays valid across any number of observations and expires only when a body command changes the world; plan_already_consumed and stale_plan_revision both mean plan_base_path must be called again from the current pose.",
   execute_joint_plan: "Execute one unconsumed arm plan from an accepted plan_joint_targets, solve_end_effector_position, or solve_end_effector_pose receipt granted to this agent. Pass that receipt's exact transaction_id as planning_transaction_id. The plan_id inside the receipt's result is the world's internal handle and is never accepted here. It moves only the arm joints returned by that plan. A joint-target plan may execute beside an independently leased moving base; a fixed world-space IK plan may not. A plan stays valid across observations and expires when a body command changes the world before execution begins.",
   drive_base: "Drive the mobile base with explicit linear and angular velocity for a bounded duration. Positive linear velocity moves along the current forward heading; negative linear velocity reverses without first turning, which permits a model-selected retreat from a close manipulation pose.",
@@ -160,6 +174,7 @@ export const SkillDescriptions: Record<SkillName, string> = {
 };
 
 const SkillChannels: Record<SkillName, BodyChannel[]> = {
+  navigate_frontier: ["base"],
   execute_base_plan: ["base"],
   execute_joint_plan: ["arm"],
   drive_base: ["base"],
@@ -292,6 +307,56 @@ export async function executeSkill(
   rawInput: unknown
 ): Promise<CommandResult> {
   if (!isSkillName(name)) return rejected("unknown_skill", { name });
+  if (name === "navigate_frontier") {
+    const input = SkillInputs.navigate_frontier.parse(rawInput);
+    const source = {
+      survey_transaction_id: input.survey_transaction_id,
+      choice_id: input.choice_id,
+      selected_target: input.target,
+      selected_face_point: input.face_point
+    };
+    const currentWorldRevision = world.snapshot().world_revision;
+    if (currentWorldRevision !== input.survey_world_revision) {
+      return rejected("stale_survey_revision", {
+        ...source,
+        surveyed_world_revision: input.survey_world_revision,
+        current_world_revision: currentWorldRevision,
+        recovery: "The world changed before execution began. Call survey_terrain again and make a fresh model choice from the new frontier set."
+      });
+    }
+    const planned = world.planBasePath(input.target, input.face_point);
+    const planningDetail = objectDetail(planned.detail);
+    if (!planned.accepted) {
+      return {
+        ...planned,
+        detail: { ...source, phase: "planning", ...planningDetail }
+      };
+    }
+    const planId = planningDetail.plan_id;
+    if (typeof planId !== "string" || planId.length === 0) {
+      return rejected("frontier_plan_missing_id", {
+        ...source,
+        phase: "planning",
+        planning_result: planned.detail
+      });
+    }
+    const executed = await world.executeBasePlan(
+      command,
+      planId,
+      motionOptions(input.options)
+    );
+    return {
+      ...executed,
+      detail: {
+        ...source,
+        ...objectDetail(executed.detail),
+        requested_target: planningDetail.requested_target ?? input.target,
+        resolved_target: planningDetail.resolved_target ?? input.target,
+        face: planningDetail.face ?? input.face_point,
+        planning_distance: planningDetail.distance ?? null
+      }
+    };
+  }
   if (name === "execute_base_plan") {
     const input = SkillInputs.execute_base_plan.parse(rawInput);
     return world.executeBasePlan(command, input.plan_id, motionOptions(input.options));
@@ -362,6 +427,12 @@ function jointTargets(input: z.infer<typeof JointTargetsSchema>): Partial<ArmJoi
     ...(input.elbow !== undefined ? { elbow: input.elbow } : {}),
     ...(input.wrist !== undefined ? { wrist: input.wrist } : {})
   };
+}
+
+function objectDetail(value: JsonValue): Record<string, JsonValue> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : { value };
 }
 
 function assertUnreachable(value: never): never {

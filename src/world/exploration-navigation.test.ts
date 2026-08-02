@@ -61,6 +61,53 @@ describe("model-facing terrain frontier", () => {
       world.dispose();
     }
   });
+
+  it("rechecks the survey revision at the instant an atomic frontier command starts", async () => {
+    const catalog = await loadRuntimeCatalog();
+    const world = await RapierWorld.create(catalog.materialize("voxel_survey", 23));
+    try {
+      const surveyed = world.surveyTerrain(12);
+      const frontier = record(surveyed.detail).frontier;
+      if (!Array.isArray(frontier) || frontier.length === 0) throw new Error("Expected a frontier");
+      const selected = record(frontier[0]);
+      const surveyedRevision = world.snapshot().world_revision;
+      const headMoved = await executeSkill(world, {
+        id: "intervening_head_command",
+        agentId: "sensor_agent",
+        agentName: "Sensor agent",
+        skill: "set_head_target",
+        channels: ["head"]
+      }, "set_head_target", { yaw: 0.25, pitch: -0.1 });
+      expect(headMoved).toMatchObject({ accepted: true, code: "head_target_reached" });
+      const beforeAttempt = world.snapshot();
+
+      const result = await executeSkill(world, {
+        id: "stale_frontier_command",
+        agentId: "frontier_agent",
+        agentName: "Frontier agent",
+        skill: "navigate_frontier",
+        channels: ["base"]
+      }, "navigate_frontier", {
+        survey_transaction_id: "frontier_agent:survey",
+        survey_world_revision: surveyedRevision,
+        choice_id: selected.choice_id,
+        target: point(selected.target),
+        face_point: point(selected.face_point)
+      });
+
+      expect(result).toMatchObject({
+        accepted: false,
+        code: "stale_survey_revision",
+        detail: {
+          surveyed_world_revision: surveyedRevision,
+          current_world_revision: beforeAttempt.world_revision
+        }
+      });
+      expect(world.snapshot().robot.position).toEqual(beforeAttempt.robot.position);
+    } finally {
+      world.dispose();
+    }
+  });
 });
 
 function record(value: unknown): Record<string, unknown> {

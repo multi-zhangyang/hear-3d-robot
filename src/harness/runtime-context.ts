@@ -44,6 +44,7 @@ import {
   verifyGoalPredicateBlockerEvidence,
   verifyReceiptEvidence
 } from "./evidence-contract.js";
+import { resolveFrontierNavigation } from "./frontier-navigation.js";
 import {
   goalMemoryContextRecords,
   goalRelevantSpatialMemory
@@ -1448,6 +1449,15 @@ export class HarnessRuntimeContext {
     input: unknown,
     agentId: string
   ): { ok: true; input: unknown } | { ok: false; result: CommandResult } {
+    if (name === "navigate_frontier") {
+      return resolveFrontierNavigation({
+        rawInput: input,
+        agent: this.#hierarchy.get(agentId),
+        currentWorldRevision: this.#world.snapshot().world_revision,
+        lookupReceipt: (transactionId) =>
+          this.#checkpoint.committed_actions[transactionId]
+      });
+    }
     if (name !== "execute_base_plan" && name !== "execute_joint_plan") {
       return { ok: true, input };
     }

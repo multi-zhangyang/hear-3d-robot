@@ -188,7 +188,8 @@ function fixtureEvidenceRequirement(capabilities: string[]) {
   }
   const channel = action === "set_head_target" ? "head"
     : action === "set_gripper_target" ? "gripper"
-      : action === "drive_base" || action === "execute_base_plan" ? "base" : "arm";
+      : action === "drive_base" || action === "execute_base_plan"
+        || action === "navigate_frontier" ? "base" : "arm";
   return receiptEvidenceRequirement(0, action, { kind: "body", channel });
 }
 
@@ -1208,6 +1209,70 @@ describe("HarnessRuntimeContext", () => {
           source_transaction_id: planningTransaction,
           source_action: "plan_base_path",
           source_target: { kind: "position", position: target }
+        })
+      ]);
+    } finally {
+      await disposeFixture(fixture);
+    }
+  }, 20_000);
+
+  it("executes exactly one model-selected current frontier and verifies the survey source", async () => {
+    const fixture = await createRuntimeFixture(
+      ["navigate_frontier", "survey_terrain"],
+      undefined,
+      0,
+      "voxel_survey",
+      19
+    );
+    try {
+      const surveyed = outputRecord(await fixture.runtime.invokeTool(
+        "survey_terrain",
+        { radius_cells: 12 },
+        "sdk_atomic_frontier_survey"
+      ));
+      expect(surveyed).toMatchObject({ accepted: true, code: "terrain_survey" });
+      const frontier = objectRecord(surveyed.detail)?.frontier;
+      if (!Array.isArray(frontier) || frontier.length < 2) {
+        throw new Error("Terrain survey returned too few reachable frontiers");
+      }
+      const selected = objectRecord(frontier.at(-1));
+      const choiceId = selected?.choice_id;
+      if (typeof choiceId !== "string") throw new Error("Frontier has no choice_id");
+      const surveyTransaction = `${fixture.activeId}:sdk_atomic_frontier_survey`;
+
+      const moved = outputRecord(await fixture.runtime.invokeSkill(
+        "navigate_frontier",
+        {
+          survey_transaction_id: surveyTransaction,
+          choice_id: choiceId,
+          options: { max_velocity: 0.8, max_duration_seconds: 30, tolerance: 0.08 }
+        },
+        "sdk_atomic_frontier_move"
+      ));
+      expect(moved).toMatchObject({
+        accepted: true,
+        code: "base_plan_completed",
+        detail: {
+          survey_transaction_id: surveyTransaction,
+          choice_id: choiceId,
+          selected_target: point(selected.target),
+          selected_face_point: point(selected.face_point)
+        }
+      });
+
+      const movementTransaction = `${fixture.activeId}:sdk_atomic_frontier_move`;
+      expect(fixture.runtime.assertChildEvidence(
+        fixture.activeId,
+        "completed",
+        [{ criterion_index: 0, transaction_ids: [movementTransaction] }],
+        []
+      )).toEqual([
+        expect.objectContaining({
+          action: "navigate_frontier",
+          source_transaction_id: surveyTransaction,
+          source_action: "survey_terrain",
+          source_choice_id: choiceId,
+          source_target: { kind: "position", position: point(selected.target) }
         })
       ]);
     } finally {

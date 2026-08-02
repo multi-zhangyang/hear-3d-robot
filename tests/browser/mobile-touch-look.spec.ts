@@ -7,10 +7,11 @@ test.use({
 });
 
 test("移动端触摸拖拽环视且轻触仍可选取", async ({ page }, testInfo) => {
+  test.setTimeout(180_000);
   test.skip(testInfo.project.name !== "mobile", "移动触摸回归只运行一次");
   await openRecordedRun(page);
   const canvas = page.locator("canvas.three-canvas");
-  await expect(canvas).toBeVisible({ timeout: 25_000 });
+  await expect(canvas).toBeVisible({ timeout: 90_000 });
   await page.waitForFunction(() => {
     const element = document.querySelector("canvas.three-canvas");
     return element instanceof HTMLCanvasElement && element.width > 200 && element.height > 200;

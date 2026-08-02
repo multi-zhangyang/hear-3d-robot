@@ -30,6 +30,7 @@ export interface VerifiedReceiptEvidence {
   source_transaction_id?: string;
   source_action?: string;
   source_target?: EvidenceTarget;
+  source_choice_id?: string;
 }
 
 export interface VerifiedBlockerEvidence extends VerifiedReceiptEvidence {
@@ -61,6 +62,13 @@ const NON_TERMINAL_BLOCKER_CODES: ReadonlySet<string> = new Set([
   "planning_transaction_not_granted",
   "invalid_planning_transaction",
   "planning_receipt_missing_plan",
+  "unknown_survey_transaction",
+  "survey_transaction_not_granted",
+  "invalid_survey_transaction",
+  "stale_survey_revision",
+  "invalid_survey_frontier",
+  "unknown_frontier_choice",
+  "ambiguous_frontier_choice",
   "unknown_base_plan",
   "unknown_arm_plan",
   "plan_already_consumed",
@@ -103,6 +111,15 @@ const RECEIPT_BLOCKER_CODES: Readonly<Record<string, readonly string[]>> = {
   ],
   execute_base_plan: [
     "base_path_collision",
+    "base_plan_timeout",
+    "base_rotation_blocked",
+    "base_plan_blocked"
+  ],
+  navigate_frontier: [
+    "invalid_base_face_point",
+    "base_path_collision",
+    "base_path_unavailable",
+    "frontier_plan_missing_id",
     "base_plan_timeout",
     "base_rotation_blocked",
     "base_plan_blocked"
@@ -216,6 +233,7 @@ const POLICIES: Readonly<Record<string, ReceiptEvidencePolicy>> = {
     endEffectorPosition
   ),
   execute_base_plan: policy(CURRENT_MOTION, "body", ["base_plan_completed"], body("base")),
+  navigate_frontier: policy(CURRENT_MOTION, "body", ["base_plan_completed"], body("base")),
   execute_joint_plan: policy(CURRENT_MOTION, "body", ["joint_targets_reached"], body("arm")),
   drive_base: policy(CURRENT_MOTION, "body", ["base_motion_completed"], body("base")),
   set_head_target: policy(CURRENT_MOTION, "body", ["head_target_reached"], body("head")),
@@ -573,8 +591,11 @@ function verifyExecutionSource(
   provenance: ReceiptEvidenceProvenanceContext | undefined
 ): Pick<
   VerifiedReceiptEvidence,
-  "source_transaction_id" | "source_action" | "source_target"
+  "source_transaction_id" | "source_action" | "source_target" | "source_choice_id"
 > | undefined {
+  if (receipt.name === "navigate_frontier") {
+    return verifyFrontierSelectionSource(receipt, provenance);
+  }
   const expectedPlanningActions = executionPlanningActions(receipt.name);
   if (!expectedPlanningActions) return undefined;
   if (!provenance) {
@@ -646,6 +667,86 @@ function verifyExecutionSource(
     source_transaction_id: source.transaction_id,
     source_action: source.name,
     source_target: sourcePolicy.target(source)
+  };
+}
+
+function verifyFrontierSelectionSource(
+  receipt: ActionReceipt,
+  provenance: ReceiptEvidenceProvenanceContext | undefined
+): Pick<
+  VerifiedReceiptEvidence,
+  "source_transaction_id" | "source_action" | "source_target" | "source_choice_id"
+> {
+  if (!provenance) {
+    throw new Error(
+      `Frontier navigation evidence ${receipt.transaction_id} requires receipt provenance context`
+    );
+  }
+  const surveyTransactionId = stringField(
+    receipt.input,
+    "survey_transaction_id",
+    receipt.name
+  );
+  const choiceId = stringField(receipt.input, "choice_id", receipt.name);
+  const beforeRevision = receiptWorldBeforeRevision(receipt);
+  if (beforeRevision === null) {
+    throw new Error(
+      `Frontier navigation evidence ${receipt.transaction_id} has no canonical world_before_revision`
+    );
+  }
+  const source = provenance.lookupReceipt(surveyTransactionId);
+  if (!source || source.transaction_id !== surveyTransactionId) {
+    throw new Error(
+      `Frontier navigation evidence ${receipt.transaction_id} references unknown survey transaction ${surveyTransactionId}`
+    );
+  }
+  if (!source.accepted || source.kind !== "tool" || source.name !== "survey_terrain"
+    || source.code !== "terrain_survey") {
+    throw new Error(
+      `Frontier source ${surveyTransactionId} is not an accepted terrain survey`
+    );
+  }
+  if (!provenance.isSourceAuthorized(source)) {
+    throw new Error(`Terrain survey ${surveyTransactionId} is not authorized for this evidence branch`);
+  }
+  if (source.world_revision !== beforeRevision) {
+    throw new Error(
+      `Terrain survey ${surveyTransactionId} is from world revision ${source.world_revision}; `
+      + `frontier navigation began at revision ${beforeRevision}`
+    );
+  }
+
+  const frontier = record(source.detail)?.frontier;
+  if (!Array.isArray(frontier)) {
+    throw new Error(`Terrain survey ${surveyTransactionId} has no canonical frontier set`);
+  }
+  const matches = frontier.filter((entry) => record(entry)?.choice_id === choiceId);
+  if (matches.length !== 1) {
+    throw new Error(
+      `Terrain survey ${surveyTransactionId} does not contain one unique choice ${choiceId}`
+    );
+  }
+  const selected = matches[0]!;
+  const sourceTarget = vec3Field(selected, "target", "survey_terrain frontier");
+  const sourceFacePoint = vec3Field(selected, "face_point", "survey_terrain frontier");
+  const recordedTarget = vec3Field(receipt.detail, "selected_target", receipt.name);
+  const requestedTarget = vec3Field(receipt.detail, "requested_target", receipt.name);
+  const recordedFacePoint = vec3Field(receipt.detail, "selected_face_point", receipt.name);
+  const plannedFacePoint = vec3Field(receipt.detail, "face", receipt.name);
+  if (!isDeepStrictEqual(recordedTarget, sourceTarget)
+    || !isDeepStrictEqual(requestedTarget, sourceTarget)
+    || !isDeepStrictEqual(recordedFacePoint, sourceFacePoint)
+    || !isDeepStrictEqual(plannedFacePoint, sourceFacePoint)) {
+    throw new Error(
+      `Frontier navigation ${receipt.transaction_id} does not match source choice ${choiceId}`
+    );
+  }
+  planId(receipt, "execution");
+  return {
+    source_transaction_id: source.transaction_id,
+    source_action: source.name,
+    source_target: { kind: "position", position: sourceTarget },
+    source_choice_id: choiceId
   };
 }
 
