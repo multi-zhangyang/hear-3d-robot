@@ -47,6 +47,30 @@ export function createHumanoidRunCheckpoint(input: {
   };
 }
 
+export function reconcileHumanoidHierarchyCapabilities(
+  source: HumanoidRunCheckpoint
+): HumanoidRunCheckpoint {
+  const checkpoint = structuredClone(source);
+  checkpoint.capability_catalog = [...HUMANOID_CAPABILITIES];
+  const coordinator = checkpoint.nodes[HUMANOID_AGENT_IDS.coordinator];
+  if (coordinator) coordinator.capabilities = [...HUMANOID_CAPABILITIES];
+  const sentry = checkpoint.nodes[HUMANOID_AGENT_IDS.sentry];
+  if (sentry) sentry.capabilities = ["observe_humanoid"];
+  const motion = checkpoint.nodes[HUMANOID_AGENT_IDS.motion];
+  if (motion) motion.capabilities = [
+    "observe_humanoid",
+    "recall_embodied_history",
+    "plan_whole_body_motion_candidates",
+    "plan_humanoid_navigation"
+  ];
+  const executor = checkpoint.nodes[HUMANOID_AGENT_IDS.executor];
+  if (executor) executor.capabilities = [
+    "execute_whole_body_motion",
+    "execute_humanoid_navigation"
+  ];
+  return checkpoint;
+}
+
 function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string, TaskNode> {
   const coordinator = node({
     id: HUMANOID_AGENT_IDS.coordinator,
@@ -87,7 +111,8 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     criteria: ["产生 accepted 规划回执或带物理证据的拒绝回执。"],
     capabilities: [
       "observe_humanoid",
-      "plan_whole_body_motion",
+      "recall_embodied_history",
+      "plan_whole_body_motion_candidates",
       "plan_humanoid_navigation"
     ],
     mayDelegate: false,

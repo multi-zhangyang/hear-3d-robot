@@ -33,7 +33,11 @@ export interface ModelMoment {
 }
 
 const HUMANOID_SENSE_ACTIONS = new Set(["observe_humanoid"]);
-const HUMANOID_PLAN_ACTIONS = new Set(["plan_whole_body_motion", "plan_humanoid_navigation"]);
+const HUMANOID_PLAN_ACTIONS = new Set([
+  "plan_whole_body_motion",
+  "plan_whole_body_motion_candidates",
+  "plan_humanoid_navigation"
+]);
 
 export function presentAction(action: HumanoidActionReceipt): PresentedAction {
   const name = action.action;
@@ -60,13 +64,20 @@ export function presentAction(action: HumanoidActionReceipt): PresentedAction {
 }
 
 export function presentEmbodiedEpisode(episode: HumanoidEmbodiedEpisode): PresentedAction {
+  const candidateSelection = episode.candidate_count !== undefined
+    && episode.selected_rank !== undefined
+    ? ` · 候选 ${episode.selected_rank}/${episode.candidate_count}`
+    : "";
+  const optionResult = episode.motion_option
+    ? ` · 物理达成 ${episode.motion_option.actual_termination_frame}/${episode.motion_option.predicted_termination_frame} 帧`
+    : "";
   return {
     id: `episode-${episode.sequence}-${episode.transaction_id}`,
     at: episode.recorded_at,
     agent: "具身记忆",
     title: "物理经历已记住",
     detail: modelOutputLabel(episode.model_summary, 160) ?? "已保存本次物理执行结果。",
-    meta: `${episode.frame_count.toLocaleString("zh-CN")} 个物理帧 · 世界版本 ${episode.world_after_revision}`,
+    meta: `${episode.frame_count.toLocaleString("zh-CN")} 个物理帧${candidateSelection}${optionResult} · 世界版本 ${episode.world_after_revision}`,
     tone: episode.fallen ? "warning" : episode.goal_success ? "success" : "neutral",
     category: "verify",
     channels: []
@@ -221,6 +232,13 @@ function toolFacts(payload: Record<string, unknown> | null): string[] {
   }
   const target = pointText(payload.target) ?? pointText(detail?.target);
   if (target) facts.push(`目标 ${target}`);
+  const candidateCount = numeric(detail?.candidate_count);
+  const selectedRank = numeric(detail?.selected_rank);
+  if (candidateCount !== null) {
+    facts.push(selectedRank === null
+      ? `${candidateCount} 个候选均已预演`
+      : `${candidateCount} 个候选 · 选择第 ${selectedRank} 个`);
+  }
   const checker = record(payload.checker);
   if (Array.isArray(checker?.checks)) {
     const passed = checker.checks.filter((check) => record(check)?.passed === true).length;
@@ -265,20 +283,67 @@ export function shortTime(value: string): string {
 function actionDetail(action: HumanoidActionReceipt): string {
   const name = action.action;
   const input = record(action.input);
+  if (name === "execute_whole_body_motion") {
+    const optionDetail = physicalOptionDetail(action);
+    if (optionDetail) return optionDetail;
+  }
   if (!action.accepted) {
     return `动作被拒绝：${resultCodeLabel(action.code)}。`;
   }
   const target = pointText(input?.target);
   if (name === "plan_humanoid_navigation" && target) return `已对前往 ${target} 的双足路线完成物理预演。`;
   if (name === "execute_humanoid_navigation") return "机器人已执行模型选择的双足导航分块。";
+  if (name === "plan_whole_body_motion_candidates") {
+    const detail = record(action.detail);
+    const candidateCount = numeric(detail?.candidate_count);
+    const selectedRank = numeric(detail?.selected_rank);
+    return candidateCount !== null && selectedRank !== null
+      ? `${candidateCount} 个模型候选已分别完成 MuJoCo 预演，选择第 ${selectedRank} 个可行动作。`
+      : "模型候选已分别完成 MuJoCo 物理预演。";
+  }
   if (name === "plan_whole_body_motion") return "已对连续全身动作完成 MuJoCo 物理预演。";
-  if (name === "execute_whole_body_motion") return "YAHMP 已在 MuJoCo 中执行连续全身动作。";
+  if (name === "execute_whole_body_motion") return "已在 MuJoCo 中执行连续全身动作。";
   if (name === "observe_humanoid") return "已更新头部感知、身体姿态、接触、平衡和持久对象状态。";
   if (target) return `目标位置：${target}。`;
   if (action.channels.length > 0) {
     return `使用${action.channels.map(bodyChannelLabel).join("、")}控制通道完成动作。`;
   }
   return resultCodeLabel(action.code);
+}
+
+function physicalOptionDetail(action: HumanoidActionReceipt): string | null {
+  const detail = record(action.detail);
+  const result = record(detail?.result);
+  const option = record(result?.option);
+  if (!option) return null;
+  const predictedFrame = numeric(option.predicted_termination_frame);
+  const actualFrame = numeric(option.actual_termination_frame);
+  const motion = record(result?.motion);
+  const step = numeric(motion?.control_step_seconds);
+  const timing = predictedFrame !== null && actualFrame !== null
+    ? step !== null
+      ? `预测 ${(predictedFrame * step).toFixed(2)} 秒 · 实际 ${(actualFrame * step).toFixed(2)} 秒`
+      : `预测 ${predictedFrame} 帧 · 实际 ${actualFrame} 帧`
+    : "";
+  if (option.status === "succeeded") {
+    return timing ? `物理目标稳定达成 · ${timing}` : "物理目标稳定达成。";
+  }
+  if (option.termination_reason === "motion_goal_uncertain") {
+    return timing ? `目标状态不可确定 · ${timing}` : "目标状态不可确定，未判定成功。";
+  }
+  if (option.termination_reason === "motion_goal_unmet") {
+    return timing ? `物理目标未达成 · ${timing}` : "动作上界已到，物理目标未达成。";
+  }
+  if (option.termination_reason === "execution_drift") {
+    const driftStreak = numeric(option.drift_streak);
+    return driftStreak === null
+      ? "执行偏离物理预演，剩余动作已截断并交回重规划。"
+      : `执行连续 ${driftStreak} 帧偏离物理预演，已截断并交回重规划。`;
+  }
+  if (option.termination_reason === "motion_constraint_violated") {
+    return "持续物理约束被违反，动作已提前终止并交回重规划。";
+  }
+  return "物理执行失败，未判定目标达成。";
 }
 
 export function receiptFrames(action: HumanoidActionReceipt): number {

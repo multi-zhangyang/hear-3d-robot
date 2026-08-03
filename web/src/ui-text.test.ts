@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   agentNameLabel,
+  bodyChannelLabel,
   entityLabel,
   humanoidControllerLabel,
   modelOutputLabel,
@@ -11,6 +12,17 @@ import {
 import type { TaskNode } from "./types";
 
 describe("中文界面文案", () => {
+  it("覆盖全部六个人形身体通道", () => {
+    expect([
+      bodyChannelLabel("locomotion"),
+      bodyChannelLabel("left_leg"),
+      bodyChannelLabel("right_leg"),
+      bodyChannelLabel("torso"),
+      bodyChannelLabel("left_arm"),
+      bodyChannelLabel("right_arm")
+    ]).toEqual(["双足运动", "左腿", "右腿", "躯干", "左臂", "右臂"]);
+  });
+
   it("为模型生成的带编号角色保留身份并显示中文名称", () => {
     expect(agentNameLabel("humanoid-coordinator")).toBe("自主协调智能体");
     expect(agentNameLabel("人形自主协调智能体")).toBe("自主协调智能体");

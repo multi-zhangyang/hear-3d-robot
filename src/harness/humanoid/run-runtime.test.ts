@@ -57,6 +57,14 @@ describe("HumanoidRunRuntime", () => {
         goal: scenario.default_goal,
         world
       });
+      initial.capability_catalog = initial.capability_catalog.filter((capability) => (
+        capability !== "plan_whole_body_motion_candidates"
+      ));
+      initial.nodes[HUMANOID_AGENT_IDS.motion]!.capabilities = [
+        "observe_humanoid",
+        "plan_whole_body_motion",
+        "plan_humanoid_navigation"
+      ];
       await store.writeCheckpoint(initial);
       const runtime = new HumanoidRunRuntime({
         store,
@@ -89,14 +97,16 @@ describe("HumanoidRunRuntime", () => {
               position: {
                 ...world.snapshot().robot.links.left_wrist_yaw_link.position,
                 y: world.snapshot().robot.links.left_wrist_yaw_link.position.y + 0.01
-              }
+              },
+              tolerance_m: 0.045
             },
             right_hand: {
               frame: "world" as const,
               position: {
                 ...world.snapshot().robot.links.right_wrist_yaw_link.position,
                 y: world.snapshot().robot.links.right_wrist_yaw_link.position.y + 0.01
-              }
+              },
+              tolerance_m: 0.045
             }
           }
         ]
@@ -118,21 +128,63 @@ describe("HumanoidRunRuntime", () => {
       expect(execution.accepted).toBe(true);
       expect(execution.frameCount).toBeGreaterThan(10);
 
-      expect(runtime.validateCycleEvidence([execution.transactionId])).toMatchObject({
-        transactionId: execution.transactionId,
-        action: "execute_whole_body_motion"
-      });
+      expect(() => runtime.validateCycleEvidence([execution.transactionId])).toThrow(
+        "requires accepted execution evidence"
+      );
 
+      const pendingBefore = world.snapshot();
+      const pendingTarget = {
+        ...pendingBefore.robot.rootPosition,
+        z: pendingBefore.robot.rootPosition.z + 0.08
+      };
       const pendingPlan = await runtime.invoke(
-        "plan_whole_body_motion",
-        { ...planInput, id: "unconsumed-arm-motion" },
+        "plan_whole_body_motion_candidates",
+        {
+          objective: "比较下一次连续全身动作候选",
+          termination: {
+            option_id: "persisted-forward-option",
+            predicates: [{
+              type: "root_near_point",
+              body: null,
+              object_id: null,
+              zone_id: null,
+              target: pendingTarget,
+              tolerance_m: 0.035,
+              minimum_normal_force: null,
+              expected: null
+            }],
+            stable_steps: 2,
+            phases: null
+          },
+          candidates: [
+            {
+              id: "unconsumed-noop-motion",
+              intent: "没有实现前进目标",
+              duration_seconds: 0.8,
+              keyframes: [{ at_seconds: 0 }, { at_seconds: 0.8 }]
+            },
+            {
+              id: "unconsumed-balanced-motion",
+              intent: "保持双足支撑并连续前进",
+              duration_seconds: 0.8,
+              keyframes: [
+                {
+                  at_seconds: 0,
+                  root_velocity: { forward_mps: 0.2, lateral_mps: 0 }
+                },
+                {
+                  at_seconds: 0.8,
+                  root_velocity: { forward_mps: 0.2, lateral_mps: 0 }
+                }
+              ]
+            }
+          ]
+        },
         "plan-unconsumed",
         HUMANOID_AGENT_IDS.motion
       );
       expect(pendingPlan.accepted).toBe(true);
-      expect(() => runtime.validateCycleEvidence([execution.transactionId])).toThrow(
-        "unconsumed accepted plan"
-      );
+      expect(pendingPlan.code).toBe("whole_body_candidates_validated");
       const pendingExecution = await runtime.invoke(
         "execute_whole_body_motion",
         { planning_transaction_id: pendingPlan.transactionId },
@@ -140,6 +192,10 @@ describe("HumanoidRunRuntime", () => {
         HUMANOID_AGENT_IDS.executor
       );
       expect(pendingExecution.accepted).toBe(true);
+      expect(runtime.validateCycleEvidence([pendingExecution.transactionId])).toMatchObject({
+        transactionId: pendingExecution.transactionId,
+        code: "motion_option_succeeded"
+      });
       await runtime.completeCycle(JSON.stringify({
         status: "cycle_completed",
         evidence_transaction_ids: [pendingExecution.transactionId]
@@ -147,10 +203,99 @@ describe("HumanoidRunRuntime", () => {
       expect(() => runtime.validateCycleEvidence([pendingExecution.transactionId])).toThrow(
         "already consumed"
       );
+      const rejectedExecution = await runtime.invoke(
+        "execute_whole_body_motion",
+        { planning_transaction_id: "missing-historical-plan" },
+        "execute-rejected-history",
+        HUMANOID_AGENT_IDS.executor
+      );
+      expect(rejectedExecution).toMatchObject({
+        accepted: false,
+        code: "planning_receipt_missing",
+        frameCount: 0
+      });
+      const beforeRecall = runtime.snapshot();
+      expect(await runtime.recallEmbodiedHistory({
+        source_refs: [
+          "episode:1",
+          `action:${pendingExecution.transactionId}`,
+          `action:${rejectedExecution.transactionId}`
+        ],
+        before_sequence: 2,
+        limit: 3
+      })).toMatchObject({
+        historical_only: true,
+        episodes: [{
+          source_ref: "episode:1",
+          sequence: 1,
+          transaction_id: pendingExecution.transactionId
+        }],
+        actions: expect.arrayContaining([
+          expect.objectContaining({
+            source_ref: `action:${pendingExecution.transactionId}`,
+            historical_only: true,
+            transactionId: pendingExecution.transactionId,
+            accepted: true,
+            code: "motion_option_succeeded",
+            frameCount: pendingExecution.frameCount,
+            worldBeforeRevision: pendingExecution.worldBeforeRevision,
+            worldAfterRevision: pendingExecution.worldAfterRevision,
+            detail: expect.objectContaining({ result: expect.any(Object) })
+          }),
+          expect.objectContaining({
+            source_ref: `action:${rejectedExecution.transactionId}`,
+            historical_only: true,
+            transactionId: rejectedExecution.transactionId,
+            accepted: false,
+            code: "planning_receipt_missing",
+            frameCount: 0,
+            worldBeforeRevision: rejectedExecution.worldBeforeRevision,
+            worldAfterRevision: rejectedExecution.worldAfterRevision
+          })
+        ]),
+        missing_source_refs: []
+      });
+      expect(await runtime.recallEmbodiedHistory({ limit: 3 })).toMatchObject({
+        historical_only: true,
+        ordered_source_refs: expect.arrayContaining([
+          "episode:1",
+          `action:${pendingExecution.transactionId}`,
+          `action:${rejectedExecution.transactionId}`
+        ]),
+        episodes: [expect.objectContaining({ source_ref: "episode:1" })],
+        actions: expect.arrayContaining([
+          expect.objectContaining({
+            source_ref: `action:${rejectedExecution.transactionId}`,
+            accepted: false,
+            code: "planning_receipt_missing"
+          })
+        ])
+      });
+      const olderHistory = await runtime.recallEmbodiedHistory({
+        before_sequence: 1,
+        limit: 3
+      }) as {
+        ordered_source_refs: string[];
+      };
+      expect(olderHistory.ordered_source_refs).not.toContain("episode:1");
+      expect(olderHistory.ordered_source_refs).not.toContain(
+        `action:${pendingExecution.transactionId}`
+      );
+      expect(olderHistory.ordered_source_refs).not.toContain(
+        `action:${rejectedExecution.transactionId}`
+      );
+      expect(runtime.snapshot()).toEqual(beforeRecall);
 
       const persisted = await store.readHumanoidCheckpoint();
       expect(persisted.status).toBe("running");
       expect(persisted.pending_lifecycle_events).toEqual([]);
+      expect(persisted.capability_catalog).toContain("plan_whole_body_motion_candidates");
+      expect(persisted.nodes[HUMANOID_AGENT_IDS.motion]!.capabilities).toEqual([
+        "observe_humanoid",
+        "recall_embodied_history",
+        "plan_whole_body_motion_candidates",
+        "plan_humanoid_navigation"
+      ]);
       expect(persisted.world.frame).toBe(world.snapshot().frame);
       expect(persisted.world_checkpoint.frame).toBe(persisted.world.frame);
       expect(persisted.world_checkpoint.worldRevision).toBe(persisted.world.worldRevision);
@@ -164,7 +309,16 @@ describe("HumanoidRunRuntime", () => {
           sequence: 1,
           transaction_id: pendingExecution.transactionId,
           action: "execute_whole_body_motion",
-          code: "motion_completed",
+          planning_action: "plan_whole_body_motion_candidates",
+          candidate_count: 2,
+          selected_rank: 2,
+          selected_candidate_id: "unconsumed-balanced-motion",
+          code: "motion_option_succeeded",
+          motion_option: {
+            option_id: "persisted-forward-option",
+            status: "succeeded",
+            termination_reason: "physical_success"
+          },
           world_after_revision: pendingExecution.worldAfterRevision,
           goal_success: true
         }]

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ScenarioSchema } from "../../domain/schema.js";
 import { HumanoidObjectMemory } from "./object-memory.js";
+import { detectHumanoidMotionOption } from "./motion-option.js";
 import { HumanoidSimulation } from "./simulation.js";
 
 const scenario = ScenarioSchema.parse({
@@ -54,26 +55,102 @@ describe("HumanoidObjectMemory", () => {
       const sensed = simulation.senseObjects(scenario.visibility_radius);
       expect(Object.keys(sensed.objects)).toEqual(["near"]);
 
-      memory.observe(10, 5, sensed.objects);
-      const visible = memory.tokens(simulation.snapshot(), 5, new Set(["near"]));
+      const authoritative = simulation.snapshot();
+      memory.refresh(
+        10,
+        5,
+        authoritative.objects,
+        new Set(Object.keys(sensed.objects))
+      );
+      const visible = memory.tokens(authoritative, 10, 5);
       expect(visible).toHaveLength(1);
       expect(visible[0]).toMatchObject({
         id: "near",
         kind: "crate",
+        role: "manipulable",
         status: "visible",
+        state: "active",
+        authority: "mujoco_exact",
+        exact: true,
+        observable: true,
+        observedFrame: 10,
+        observedWorldRevision: 5,
         firstSeenRevision: 5,
         lastSeenRevision: 5,
         observationCount: 1,
         ageRevisions: 0
       });
       expect(visible.some((token) => token.id === "hidden")).toBe(false);
+      expect(memory.activeObjectStates()).toHaveLength(2);
+      const contract = {
+        option_id: "near-at-observed-pose",
+        predicates: [{
+          type: "object_near_point" as const,
+          object_id: "near",
+          target: { ...visible[0]!.position },
+          tolerance_m: 0.01
+        }],
+        stable_steps: 1
+      };
+      expect(detectHumanoidMotionOption(contract, {
+        snapshot: authoritative,
+        observableObjects: memory.observableObjectStates(10, 5).map((state) => ({
+          id: state.id,
+          position: state.pose.position,
+          size: state.size
+        })),
+        zones: []
+      })).toMatchObject({ allSatisfied: true, hasUncertain: false });
+
+      memory.refresh(10, 5, authoritative.objects, new Set());
+      const occluded = memory.tokens(authoritative, 10, 5);
+      expect(occluded[0]).toMatchObject({
+        id: "near",
+        status: "remembered",
+        state: "historical",
+        authority: "sensor_history",
+        exact: false,
+        observable: false,
+        observedFrame: 10,
+        observedWorldRevision: 5
+      });
+      expect(memory.observedObjectIds(10, 5)).toEqual(new Set());
+      expect(memory.observableObjectStates(10, 5)).toEqual([]);
+      expect(detectHumanoidMotionOption(contract, {
+        snapshot: authoritative,
+        observableObjects: memory.observableObjectStates(10, 5).map((state) => ({
+          id: state.id,
+          position: state.pose.position,
+          size: state.size
+        })),
+        zones: []
+      })).toMatchObject({
+        allSatisfied: false,
+        hasUncertain: true,
+        evidence: [expect.objectContaining({
+          status: "uncertain",
+          objectObservable: false,
+          reason: "object_not_observable"
+        })]
+      });
 
       const restored = new HumanoidObjectMemory(scenario, memory.checkpoint());
-      const remembered = restored.tokens(simulation.snapshot(), 9, new Set());
+      expect(restored.observedObjectIds(10, 5)).toEqual(new Set());
+      expect(restored.tokens(authoritative, 10, 5)[0]).toMatchObject({
+        status: "remembered",
+        state: "historical",
+        observable: false,
+        exact: false
+      });
+      const remembered = restored.tokens(authoritative, 10, 9);
       expect(remembered).toHaveLength(1);
       expect(remembered[0]).toMatchObject({
         id: "near",
         status: "remembered",
+        state: "historical",
+        authority: "sensor_history",
+        exact: false,
+        observable: false,
         lastSeenRevision: 5,
         ageRevisions: 4
       });

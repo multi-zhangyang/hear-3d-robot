@@ -135,6 +135,83 @@ describe("HumanoidActionRuntime", () => {
       expect(stale.code).toBe("plan_stale");
       expect(stale.frameCount).toBe(0);
 
+      const candidateBefore = runtime.snapshot();
+      const candidateTarget = {
+        ...candidateBefore.robot.rootPosition,
+        z: candidateBefore.robot.rootPosition.z + 0.08
+      };
+      const candidatePlan = await runtime.invoke(
+        "plan_whole_body_motion_candidates",
+        {
+          objective: "比较模型提出的全身姿态候选并执行可行者",
+          termination: {
+            option_id: "runtime-forward-option",
+            predicates: [{
+              type: "root_near_point",
+              body: null,
+              object_id: null,
+              zone_id: null,
+              target: candidateTarget,
+              tolerance_m: 0.035,
+              minimum_normal_force: null,
+              expected: null
+            }],
+            stable_steps: 2,
+            phases: null
+          },
+          candidates: [
+            {
+              id: "runtime-noop-candidate",
+              intent: "不实现当前前进目标",
+              duration_seconds: 0.8,
+              keyframes: [{ at_seconds: 0 }, { at_seconds: 0.8 }]
+            },
+            {
+              id: "runtime-grounded-candidate",
+              intent: "保持支撑并连续前进",
+              duration_seconds: 0.8,
+              keyframes: [
+                {
+                  at_seconds: 0,
+                  root_velocity: { forward_mps: 0.2, lateral_mps: 0 }
+                },
+                {
+                  at_seconds: 0.8,
+                  root_velocity: { forward_mps: 0.2, lateral_mps: 0 }
+                }
+              ]
+            }
+          ]
+        },
+        "candidate-plan",
+        "motion-agent"
+      );
+      expect(candidatePlan).toMatchObject({
+        accepted: true,
+        code: "whole_body_candidates_validated"
+      });
+      expect(record(candidatePlan.detail)).toMatchObject({
+        plan_id: "runtime-grounded-candidate",
+        selected_candidate_id: "runtime-grounded-candidate",
+        selected_rank: 2,
+        candidate_count: 2,
+        selection: "model_rank_then_physics"
+      });
+      const candidateExecution = await runtime.invoke(
+        "execute_whole_body_motion",
+        { planning_transaction_id: candidatePlan.transactionId },
+        "candidate-execution",
+        "executor-agent"
+      );
+      expect(candidateExecution.accepted).toBe(true);
+      expect(candidateExecution.code).toBe("motion_option_succeeded");
+      expect(record(candidateExecution.detail)).toMatchObject({
+        planning_action: "plan_whole_body_motion_candidates",
+        candidate_count: 2,
+        selected_rank: 2,
+        selected_candidate_id: "runtime-grounded-candidate"
+      });
+
       const beforeNavigation = runtime.snapshot();
       const route = await runtime.invoke(
         "plan_humanoid_navigation",

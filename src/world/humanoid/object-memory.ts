@@ -8,6 +8,13 @@ import {
   vectorLength
 } from "../geometry.js";
 import { humanoidObjectContacts } from "./motion-plan.js";
+import {
+  historicalHumanoidObjectState,
+  HumanoidAuthoritativeObjectFrame,
+  type HumanoidObjectRole,
+  type HumanoidObjectStateDescriptor,
+  type HumanoidRoleObjectState
+} from "./object-state.js";
 import type {
   HumanoidObjectSnapshot,
   HumanoidSimulationSnapshot
@@ -36,11 +43,19 @@ export type HumanoidObjectMemoryCheckpoint = z.infer<
 
 export interface HumanoidObjectToken {
   id: string;
+  role: HumanoidObjectRole;
   kind: string;
   color: string;
   size: Vec3;
   portable: boolean;
   status: "visible" | "remembered";
+  state: HumanoidRoleObjectState["state"];
+  authority: HumanoidRoleObjectState["authority"];
+  exact: boolean;
+  observable: boolean;
+  pose: HumanoidRoleObjectState["pose"];
+  observedFrame: number;
+  observedWorldRevision: number;
   position: Vec3;
   rotation: HumanoidObjectSnapshot["rotation"];
   linearVelocity: Vec3;
@@ -63,12 +78,8 @@ export interface HumanoidObjectToken {
   }>;
 }
 
-interface ObjectDescriptor {
-  id: string;
-  kind: string;
+interface ObjectDescriptor extends HumanoidObjectStateDescriptor {
   color: string;
-  size: Vec3;
-  portable: boolean;
 }
 
 type ObjectRecord = z.infer<typeof ObjectStateSchema>;
@@ -76,6 +87,7 @@ type ObjectRecord = z.infer<typeof ObjectStateSchema>;
 export class HumanoidObjectMemory {
   readonly #descriptors: ReadonlyMap<string, ObjectDescriptor>;
   readonly #records = new Map<string, ObjectRecord>();
+  readonly #authoritativeFrame: HumanoidAuthoritativeObjectFrame;
 
   constructor(
     scenario: Scenario,
@@ -88,6 +100,9 @@ export class HumanoidObjectMemory {
       size: { ...object.size },
       portable: object.portable
     }]));
+    this.#authoritativeFrame = new HumanoidAuthoritativeObjectFrame(
+      this.#descriptors.values()
+    );
     if (!checkpoint) return;
     const parsed = HumanoidObjectMemoryCheckpointSchema.parse(checkpoint);
     for (const record of parsed.records) {
@@ -103,17 +118,35 @@ export class HumanoidObjectMemory {
     worldRevision: number,
     visibleObjects: Readonly<Record<string, HumanoidObjectSnapshot>>
   ): void {
-    for (const [id, object] of Object.entries(visibleObjects)) {
-      if (!this.#descriptors.has(id)) {
-        throw new Error(`Humanoid sensor returned an unknown object: ${id}`);
-      }
+    this.refresh(
+      frame,
+      worldRevision,
+      visibleObjects,
+      new Set(Object.keys(visibleObjects))
+    );
+  }
+
+  refresh(
+    frame: number,
+    worldRevision: number,
+    authoritativeObjects: Readonly<Record<string, HumanoidObjectSnapshot>>,
+    observableObjectIds: ReadonlySet<string>
+  ): void {
+    this.#authoritativeFrame.refresh(
+      frame,
+      worldRevision,
+      authoritativeObjects,
+      observableObjectIds
+    );
+    for (const state of this.#authoritativeFrame.observableStates(frame, worldRevision)) {
+      const id = state.id;
       const previous = this.#records.get(id);
       this.#records.set(id, {
         id,
-        position: { ...object.position },
-        rotation: { ...object.rotation },
-        linearVelocity: { ...object.linearVelocity },
-        angularVelocity: { ...object.angularVelocity },
+        position: { ...state.pose.position },
+        rotation: { ...state.pose.rotation },
+        linearVelocity: { ...state.linearVelocity },
+        angularVelocity: { ...state.angularVelocity },
         firstSeenRevision: previous?.firstSeenRevision ?? worldRevision,
         lastSeenRevision: worldRevision,
         lastSeenFrame: frame,
@@ -127,28 +160,42 @@ export class HumanoidObjectMemory {
 
   tokens(
     snapshot: HumanoidSimulationSnapshot,
-    worldRevision: number,
-    visibleObjectIds: ReadonlySet<string>
+    frame: number,
+    worldRevision: number
   ): HumanoidObjectToken[] {
     const contacts = humanoidObjectContacts(snapshot);
+    const observable = new Map(this.#authoritativeFrame
+      .observableStates(frame, worldRevision)
+      .map((state) => [state.id, state]));
     return [...this.#records.values()]
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((record) => {
         const descriptor = this.#descriptors.get(record.id);
         if (!descriptor) throw new Error(`Missing humanoid object descriptor: ${record.id}`);
-        const delta = subtract(record.position, snapshot.rootPosition);
+        const active = observable.get(record.id);
+        const state = active ?? historicalHumanoidObjectState(descriptor, record);
+        const position = state.pose.position;
+        const delta = subtract(position, snapshot.rootPosition);
         const local = rotateVector(inverseQuaternion(snapshot.rootRotation), delta);
         return {
           id: record.id,
+          role: state.role,
           kind: descriptor.kind,
           color: descriptor.color,
           size: { ...descriptor.size },
           portable: descriptor.portable,
-          status: visibleObjectIds.has(record.id) ? "visible" : "remembered",
-          position: { ...record.position },
-          rotation: { ...record.rotation },
-          linearVelocity: { ...record.linearVelocity },
-          angularVelocity: { ...record.angularVelocity },
+          status: active ? "visible" : "remembered",
+          state: state.state,
+          authority: state.authority,
+          exact: state.exact,
+          observable: state.observable,
+          pose: structuredClone(state.pose),
+          observedFrame: record.lastSeenFrame,
+          observedWorldRevision: record.lastSeenRevision,
+          position: { ...position },
+          rotation: { ...state.pose.rotation },
+          linearVelocity: { ...state.linearVelocity },
+          angularVelocity: { ...state.angularVelocity },
           firstSeenRevision: record.firstSeenRevision,
           lastSeenRevision: record.lastSeenRevision,
           lastSeenFrame: record.lastSeenFrame,
@@ -159,15 +206,15 @@ export class HumanoidObjectMemory {
             bearingRadians: Math.atan2(local.x, local.z),
             verticalOffset: delta.y,
             distanceToLeftWrist: distance(
-              record.position,
+              position,
               snapshot.links.left_wrist_yaw_link.position
             ),
             distanceToRightWrist: distance(
-              record.position,
+              position,
               snapshot.links.right_wrist_yaw_link.position
             )
           },
-          currentContacts: contacts
+          currentContacts: (active ? contacts : [])
             .filter((contact) => contact.objectId === record.id)
             .map((contact) => ({
               body: contact.body,
@@ -184,10 +231,21 @@ export class HumanoidObjectMemory {
     });
   }
 
-  observedObjectIds(worldRevision: number): ReadonlySet<string> {
-    return new Set([...this.#records.values()]
-      .filter((record) => record.lastSeenRevision === worldRevision)
-      .map((record) => record.id));
+  observedObjectIds(frame: number, worldRevision: number): ReadonlySet<string> {
+    return new Set(this.#authoritativeFrame
+      .observableStates(frame, worldRevision)
+      .map((state) => state.id));
+  }
+
+  observableObjectStates(
+    frame: number,
+    worldRevision: number
+  ): HumanoidRoleObjectState[] {
+    return this.#authoritativeFrame.observableStates(frame, worldRevision);
+  }
+
+  activeObjectStates(): HumanoidRoleObjectState[] {
+    return this.#authoritativeFrame.activeStates();
   }
 }
 

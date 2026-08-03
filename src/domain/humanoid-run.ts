@@ -16,12 +16,14 @@ const HumanoidActionNameSchema = z.enum(HUMANOID_ACTION_NAMES);
 
 const HumanoidBodyChannelSchema = z.enum([
   "locomotion",
+  "left_leg",
+  "right_leg",
   "torso",
   "left_arm",
   "right_arm"
 ]);
 
-const PersistedHumanoidActionReceiptSchema = z.object({
+export const PersistedHumanoidActionReceiptSchema = z.object({
   transactionId: z.string().min(1),
   agentId: z.string().min(1),
   action: HumanoidActionNameSchema,
@@ -52,8 +54,28 @@ const HumanoidCheckerResultSchema = z.object({
 
 export const HumanoidEmbodiedEpisodeSchema = z.object({
   sequence: z.number().int().positive(),
+  source_ref: z.string().regex(/^episode:[1-9]\d*$/).optional(),
   transaction_id: z.string().min(1),
   action: z.enum(["execute_whole_body_motion", "execute_humanoid_navigation"]),
+  planning_action: z.enum([
+    "plan_whole_body_motion",
+    "plan_whole_body_motion_candidates",
+    "plan_humanoid_navigation"
+  ]).optional(),
+  candidate_count: z.number().int().min(2).max(3).optional(),
+  selected_rank: z.number().int().min(1).max(3).optional(),
+  selected_candidate_id: z.string().min(1).optional(),
+  motion_option: z.object({
+    option_id: z.string().min(1),
+    status: z.literal("succeeded"),
+    termination_reason: z.literal("physical_success"),
+    full_frame_count: z.number().int().positive(),
+    executed_prefix_frame_count: z.number().int().positive(),
+    predicted_termination_frame: z.number().int().positive(),
+    actual_termination_frame: z.number().int().positive(),
+    artifact_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    rollout_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional()
+  }).strict().optional(),
   code: z.string().min(1),
   model_summary: z.string().trim().min(1),
   world_before_revision: z.number().int().nonnegative(),
@@ -66,7 +88,57 @@ export const HumanoidEmbodiedEpisodeSchema = z.object({
   upright: z.number().finite(),
   goal_success: z.boolean(),
   recorded_at: z.string().datetime()
-}).strict();
+}).strict().superRefine((episode, context) => {
+  const selection = [
+    episode.candidate_count,
+    episode.selected_rank,
+    episode.selected_candidate_id
+  ];
+  const present = selection.filter((value) => value !== undefined).length;
+  if (episode.planning_action === "plan_whole_body_motion_candidates") {
+    if (present !== selection.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["candidate_count"],
+        message: "Candidate-backed embodied memory requires complete selection evidence"
+      });
+    } else if (episode.selected_rank! > episode.candidate_count!) {
+      context.addIssue({
+        code: "custom",
+        path: ["selected_rank"],
+        message: "Selected candidate rank cannot exceed the candidate count"
+      });
+    }
+  } else if (present !== 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["candidate_count"],
+      message: "Candidate selection evidence requires a candidate planning action"
+    });
+  }
+  if (episode.code === "motion_option_succeeded" && !episode.motion_option) {
+    context.addIssue({
+      code: "custom",
+      path: ["motion_option"],
+      message: "A successful humanoid motion option requires physical termination evidence"
+    });
+  }
+  if (episode.motion_option) {
+    if (episode.action !== "execute_whole_body_motion"
+      || episode.motion_option.executed_prefix_frame_count
+        > episode.motion_option.full_frame_count
+      || episode.motion_option.actual_termination_frame
+        !== episode.motion_option.executed_prefix_frame_count
+      || episode.motion_option.predicted_termination_frame
+        > episode.motion_option.full_frame_count) {
+      context.addIssue({
+        code: "custom",
+        path: ["motion_option"],
+        message: "Humanoid embodied option evidence is inconsistent with its execution"
+      });
+    }
+  }
+});
 
 export const HumanoidEmbodiedMemoryStateSchema = z.object({
   version: z.literal(1),

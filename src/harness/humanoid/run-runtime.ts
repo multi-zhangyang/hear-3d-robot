@@ -6,7 +6,12 @@ import type {
   JsonValue,
   TaskNode
 } from "../../domain/schema.js";
-import type { HumanoidRunCheckpoint } from "../../domain/humanoid-run.js";
+import {
+  HumanoidEmbodiedEpisodeSchema,
+  PersistedHumanoidActionReceiptSchema,
+  type HumanoidEmbodiedEpisode,
+  type HumanoidRunCheckpoint
+} from "../../domain/humanoid-run.js";
 import type { RunStore } from "../../persistence/run-store.js";
 import {
   createLifecycleEvent,
@@ -25,8 +30,21 @@ import {
   recentEmbodiedEpisodes,
   retainRecentActionReceipts
 } from "./embodied-memory.js";
+import { reconcileHumanoidHierarchyCapabilities } from "./run-checkpoint.js";
 
 const FRAME_CHECKPOINT_INTERVAL = 10;
+const EMBODIED_RECALL_PAGE_SIZE = 64;
+
+export interface HumanoidEmbodiedRecallRequest {
+  source_refs?: string[];
+  before_sequence?: number;
+  limit: number;
+}
+
+type HistoricalHumanoidAction = HumanoidActionReceipt & {
+  source_ref: string;
+  historical_only: true;
+};
 
 export class HumanoidRunRuntime implements LongRunContextRuntime {
   readonly #store: RunStore;
@@ -48,7 +66,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#store = input.store;
     this.#goal = structuredClone(input.goal);
     this.#world = input.world;
-    this.#checkpoint = structuredClone(input.checkpoint);
+    this.#checkpoint = reconcileHumanoidHierarchyCapabilities(input.checkpoint);
     this.#eventSink = input.eventSink ?? (() => undefined);
     this.#signal = input.signal;
     this.#actions = new HumanoidActionRuntime(this.#world, {
@@ -86,6 +104,120 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     return this.#actions.receipt(transactionId);
   }
 
+  async recallEmbodiedHistory(
+    request: HumanoidEmbodiedRecallRequest
+  ): Promise<JsonValue> {
+    const requestedRefs = new Set(request.source_refs ?? []);
+    const requestedEpisodeRefs = new Set(
+      [...requestedRefs].filter((sourceRef) => sourceRef.startsWith("episode:"))
+    );
+    const requestedActionRefs = new Set(
+      [...requestedRefs].filter((sourceRef) => sourceRef.startsWith("action:"))
+    );
+    const episodes = new Map<string, HumanoidEmbodiedEpisode>();
+    let actionBeforeTime: string | undefined;
+    const consider = (rawEpisode: HumanoidEmbodiedEpisode): void => {
+      const episode = HumanoidEmbodiedEpisodeSchema.parse(rawEpisode);
+      const sourceRef = episode.source_ref ?? `episode:${episode.sequence}`;
+      if (requestedRefs.size === 0
+        && request.before_sequence === episode.sequence) {
+        actionBeforeTime = episode.recorded_at;
+      }
+      if (request.before_sequence !== undefined
+        && episode.sequence >= request.before_sequence) return;
+      if (requestedRefs.size > 0 && !requestedEpisodeRefs.has(sourceRef)) return;
+      episodes.set(sourceRef, { ...episode, source_ref: sourceRef });
+    };
+    for (const episode of [...this.#checkpoint.embodied_memory.recent_episodes].reverse()) {
+      consider(episode);
+    }
+
+    const enoughEpisodes = (): boolean => requestedRefs.size > 0
+      ? [...requestedEpisodeRefs].every((sourceRef) => episodes.has(sourceRef))
+      : episodes.size >= request.limit;
+    if (!enoughEpisodes()) {
+      const tail = await this.#store.readJournalTail("episodes", 1);
+      for (let end = tail.total; end > 0 && !enoughEpisodes();) {
+        const from = Math.max(0, end - EMBODIED_RECALL_PAGE_SIZE);
+        const page = await this.#store.readJournalPage("episodes", from, end - from);
+        for (let index = page.entries.length - 1; index >= 0; index -= 1) {
+          consider(HumanoidEmbodiedEpisodeSchema.parse(page.entries[index]));
+          if (enoughEpisodes()) break;
+        }
+        end = from;
+      }
+    }
+
+    const actions = new Map<string, HistoricalHumanoidAction>();
+    const enoughActions = (): boolean => requestedRefs.size > 0
+      ? [...requestedActionRefs].every((sourceRef) => actions.has(sourceRef))
+      : actions.size >= request.limit;
+    if (!enoughActions()) {
+      const tail = await this.#store.readJournalTail("actions", 1);
+      for (let end = tail.total; end > 0 && !enoughActions();) {
+        const from = Math.max(0, end - EMBODIED_RECALL_PAGE_SIZE);
+        const page = await this.#store.readJournalPage("actions", from, end - from);
+        for (let index = page.entries.length - 1; index >= 0; index -= 1) {
+          const receipt = executeActionJournalReceipt(page.entries[index]!);
+          if (!receipt) continue;
+          if (requestedRefs.size === 0
+            && actionBeforeTime !== undefined
+            && receipt.committedAt >= actionBeforeTime) continue;
+          const sourceRef = `action:${receipt.transactionId}`;
+          if (requestedRefs.size > 0 && !requestedActionRefs.has(sourceRef)) continue;
+          actions.set(sourceRef, {
+            ...receipt,
+            source_ref: sourceRef,
+            historical_only: true
+          });
+          if (enoughActions()) break;
+        }
+        end = from;
+      }
+    }
+
+    const selectedRecords = [
+      ...[...episodes.values()].map((episode) => ({
+        kind: "episode" as const,
+        sourceRef: episode.source_ref!,
+        recordedAt: episode.recorded_at,
+        value: episode
+      })),
+      ...[...actions.values()].map((action) => ({
+        kind: "action" as const,
+        sourceRef: action.source_ref,
+        recordedAt: action.committedAt,
+        value: action
+      }))
+    ].sort((left, right) => (
+      right.recordedAt.localeCompare(left.recordedAt)
+        || right.kind.localeCompare(left.kind)
+        || right.sourceRef.localeCompare(left.sourceRef)
+    )).slice(0, request.limit);
+    const selectedEpisodes = selectedRecords.flatMap((record) => (
+      record.kind === "episode" ? [record.value as HumanoidEmbodiedEpisode] : []
+    ));
+    const selectedActions = selectedRecords.flatMap((record) => (
+      record.kind === "action" ? [record.value as HistoricalHumanoidAction] : []
+    ));
+    const returnedRefs = new Set(selectedRecords.map((record) => record.sourceRef));
+    return json({
+      historical_only: true,
+      current_world_revision: this.#world.snapshot().worldRevision,
+      ordered_source_refs: selectedRecords.map((record) => record.sourceRef),
+      episodes: selectedEpisodes,
+      actions: selectedActions,
+      missing_source_refs: [...requestedRefs].filter((sourceRef) => (
+        !returnedRefs.has(sourceRef)
+      )),
+      next_before_sequence: requestedRefs.size === 0
+        && selectedEpisodes.length > 0
+        && Math.min(...selectedEpisodes.map((episode) => episode.sequence)) > 1
+        ? Math.min(...selectedEpisodes.map((episode) => episode.sequence))
+        : null
+    });
+  }
+
   validateCycleEvidence(
     evidenceTransactionIds: readonly string[]
   ): HumanoidActionReceipt {
@@ -96,10 +228,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
     const currentRevision = this.#world.snapshot().worldRevision;
     const execution = evidence.findLast((receipt) => (
-      receipt.accepted
+      completedPhysicalExecution(receipt)
       && receipt.worldAfterRevision === currentRevision
-      && (receipt.action === "execute_whole_body_motion"
-        || receipt.action === "execute_humanoid_navigation")
     ));
     if (!execution) {
       throw new Error(
@@ -116,6 +246,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const pendingPlan = receipts.slice(executionIndex + 1).find((receipt) => (
       receipt.accepted
       && (receipt.action === "plan_whole_body_motion"
+        || receipt.action === "plan_whole_body_motion_candidates"
         || receipt.action === "plan_humanoid_navigation")
     ));
     if (pendingPlan) {
@@ -322,10 +453,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const evidence = previousCycleEvidence(cycle);
     const execution = Object.values(this.#checkpoint.committed_actions).findLast((receipt) => (
       evidence.has(receipt.transactionId)
-      && receipt.accepted
+      && completedPhysicalExecution(receipt)
       && receipt.worldAfterRevision === world.worldRevision
-      && (receipt.action === "execute_whole_body_motion"
-        || receipt.action === "execute_humanoid_navigation")
     ));
     if (!execution) {
       throw new Error("Autonomous cycle completion lacks current physical execution evidence");
@@ -341,6 +470,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       world,
       goalSuccess: checker.success
     });
+    await this.#persistEmbodiedEpisode(memory.episode);
     this.#checkpoint.embodied_memory = memory.state;
     const actionWindow = retainRecentActionReceipts(
       this.#checkpoint.committed_actions
@@ -481,6 +611,17 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
   }
 
+  async #persistEmbodiedEpisode(episode: HumanoidEmbodiedEpisode): Promise<void> {
+    const parsed = HumanoidEmbodiedEpisodeSchema.parse(episode);
+    const tail = await this.#store.readJournalTail("episodes", 1);
+    const last = tail.entries[0];
+    if (last !== undefined) {
+      const previous = HumanoidEmbodiedEpisodeSchema.parse(last);
+      if (previous.source_ref === parsed.source_ref) return;
+    }
+    await this.#store.append("episodes", json(parsed));
+  }
+
   async #finish(
     status: "succeeded" | "failed" | "interrupted",
     output: string | null,
@@ -554,4 +695,23 @@ function cycleSummary(value: JsonValue): string {
     if (typeof summary === "string" && summary.trim()) return summary.trim();
   }
   return "完成一次有物理回执的人形自主循环";
+}
+
+function completedPhysicalExecution(receipt: HumanoidActionReceipt): boolean {
+  return receipt.accepted && (
+    receipt.action === "execute_whole_body_motion"
+      ? receipt.code === "motion_option_succeeded"
+      : receipt.action === "execute_humanoid_navigation"
+        && receipt.code === "navigation_completed"
+  );
+}
+
+function executeActionJournalReceipt(value: JsonValue): HumanoidActionReceipt | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Humanoid action journal contains a non-object record");
+  }
+  if (value.action !== "execute_whole_body_motion"
+    && value.action !== "execute_humanoid_navigation") return undefined;
+  const { runtime_event_id: _runtimeEventId, ...receipt } = value;
+  return PersistedHumanoidActionReceiptSchema.parse(receipt);
 }

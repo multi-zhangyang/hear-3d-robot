@@ -1,5 +1,16 @@
 import { z } from "zod";
-import { Vec3Schema } from "../../domain/schema.js";
+import {
+  JsonValueSchema,
+  Vec3Schema,
+  type JsonValue,
+  type Scenario,
+  type Vec3
+} from "../../domain/schema.js";
+import {
+  inverseQuaternion,
+  rotateVector,
+  subtract
+} from "../geometry.js";
 import {
   HUMANOID_BODY_NAMES,
   type HumanoidBodyName
@@ -13,15 +24,37 @@ import {
 import {
   HumanoidMotionArtifactSchema,
   hydrateHumanoidReference,
+  humanoidMotionArtifactSha256,
   serializeHumanoidReference,
   type HumanoidMotionArtifact
 } from "./motion-artifact.js";
+import {
+  HumanoidMotionOptionContractSchema,
+  advanceHumanoidMotionOptionMonitor,
+  createHumanoidMotionOptionMonitorState,
+  detectHumanoidMotionOption,
+  humanoidMotionOptionContractSha256,
+  type HumanoidMotionOptionContract,
+  type HumanoidMotionOptionDetection,
+  type HumanoidMotionOptionDetectorInput,
+  type HumanoidMotionOptionMonitorState,
+  type HumanoidMotionOptionObservableObject
+} from "./motion-option.js";
 import {
   HumanoidMotionGeneratorDescriptorSchema,
   TASK_SPACE_MOTION_GENERATOR_DESCRIPTOR,
   type HumanoidMotionGeneratorDescriptor
 } from "./motion-generator-contract.js";
 import {
+  captureHumanoidMotionRolloutFrame,
+  createHumanoidMotionRollout,
+  humanoidMotionRolloutSha256,
+  type HumanoidMotionDriftEvidence,
+  type HumanoidMotionRollout,
+  type HumanoidMotionRolloutFrame
+} from "./motion-rollout.js";
+import {
+  type HumanoidEndEffectorTarget,
   type HumanoidSimulation,
   type HumanoidSimulationSnapshot
 } from "./simulation.js";
@@ -34,7 +67,8 @@ const HumanoidRootVelocitySchema = z.object({
 const HumanoidEndEffectorTargetSchema = z.object({
   position: Vec3Schema.describe("末端目标位置；world 为世界坐标，pelvis 为相对骨盆坐标"),
   frame: z.enum(["world", "pelvis"]),
-  tolerance_m: z.number().finite().min(0.01).max(0.12).default(0.045)
+  tolerance_m: z.number().finite().min(0.01).max(0.12)
+    .describe("末端位置容差，单位米")
 }).strict();
 
 const HumanoidContactConstraintSchema = z.object({
@@ -50,14 +84,19 @@ type HumanoidContactConstraint = z.infer<typeof HumanoidContactConstraintSchema>
 
 const HumanoidKeyframeSchema = z.object({
   at_seconds: z.number().finite().nonnegative(),
-  root_velocity: HumanoidRootVelocitySchema.optional(),
-  root_yaw_velocity: z.number().finite().describe("根节点偏航角速度，单位弧度每秒").optional(),
-  root_height: z.number().finite().positive().optional(),
-  root_roll: z.number().finite().optional(),
-  root_pitch: z.number().finite().optional(),
-  torso_yaw: z.number().finite().min(-1.2).max(1.2).optional(),
-  left_hand: HumanoidEndEffectorTargetSchema.optional(),
-  right_hand: HumanoidEndEffectorTargetSchema.optional()
+  root_velocity: HumanoidRootVelocitySchema.nullable().optional(),
+  root_yaw_velocity: z.number().finite().describe("根节点偏航角速度，单位弧度每秒").nullable().optional(),
+  root_height: z.number().finite().nullable().optional().refine(
+    (value) => value == null || value > 0,
+    "root_height must be null when unused or a positive pelvis height in meters"
+  ),
+  root_roll: z.number().finite().nullable().optional(),
+  root_pitch: z.number().finite().nullable().optional(),
+  torso_yaw: z.number().finite().min(-1.2).max(1.2).nullable().optional(),
+  left_hand: HumanoidEndEffectorTargetSchema.nullable().optional(),
+  right_hand: HumanoidEndEffectorTargetSchema.nullable().optional(),
+  left_foot: HumanoidEndEffectorTargetSchema.nullable().optional(),
+  right_foot: HumanoidEndEffectorTargetSchema.nullable().optional()
 }).strict();
 
 export const HumanoidMotionPlanSchema = z.object({
@@ -68,6 +107,7 @@ export const HumanoidMotionPlanSchema = z.object({
   contact_constraints: z.array(HumanoidContactConstraintSchema)
     .max(16)
     .describe("只授权列出的 Link 接触列出的物体；未列出的身体-环境接触仍会拒绝计划")
+    .nullable()
     .optional(),
   keyframes: z.array(HumanoidKeyframeSchema).min(2).max(128)
 }).strict().superRefine((plan, context) => {
@@ -107,9 +147,139 @@ export const HumanoidMotionPlanSchema = z.object({
 
 export type HumanoidMotionPlan = z.infer<typeof HumanoidMotionPlanSchema>;
 
-export type HumanoidBodyChannel = "locomotion" | "torso" | "left_arm" | "right_arm";
+export function duplicateHumanoidMotionCandidateIndexes(
+  candidates: readonly HumanoidMotionPlan[]
+): Array<{ candidateIndex: number; originalIndex: number }> {
+  const firstIndexByContent = new Map<string, number>();
+  const duplicates: Array<{ candidateIndex: number; originalIndex: number }> = [];
+  candidates.forEach((candidate, candidateIndex) => {
+    const content = humanoidMotionCandidateContent(candidate);
+    const originalIndex = firstIndexByContent.get(content);
+    if (originalIndex === undefined) {
+      firstIndexByContent.set(content, candidateIndex);
+      return;
+    }
+    duplicates.push({ candidateIndex, originalIndex });
+  });
+  return duplicates;
+}
+
+export const HumanoidMotionCandidateBatchSchema = z.object({
+  objective: z.string().trim().min(1)
+    .describe("所有候选共同服务的当前自主目标"),
+  termination: HumanoidMotionOptionContractSchema
+    .describe("所有候选必须共同达成的可观测物理结果；时长只是最多八秒的执行上界"),
+  candidates: z.array(HumanoidMotionPlanSchema).min(2).max(3)
+    .describe("按模型偏好排序的不同连续全身动作候选；每个候选都会从同一物理状态完整预演")
+}).strict().superRefine((batch, context) => {
+  const ids = batch.candidates.map((candidate) => candidate.id);
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["candidates"],
+      message: "A humanoid motion candidate batch cannot repeat a plan identifier"
+    });
+  }
+  for (const duplicate of duplicateHumanoidMotionCandidateIndexes(
+    batch.candidates
+  )) {
+    context.addIssue({
+      code: "custom",
+      path: ["candidates", duplicate.candidateIndex],
+      message: `Candidate motion content duplicates candidate ${duplicate.originalIndex + 1}; id and intent labels do not make a distinct candidate`
+    });
+  }
+  const contactPredicates = batch.termination.predicates.filter((predicate) => (
+    predicate.type === "body_contact_object"
+  ));
+  batch.candidates.forEach((candidate, candidateIndex) => {
+    if (candidate.duration_seconds > 8) {
+      context.addIssue({
+        code: "custom",
+        path: ["candidates", candidateIndex, "duration_seconds"],
+        message: "Autonomous humanoid options must return control within eight seconds"
+      });
+    }
+    for (const predicate of contactPredicates) {
+      const authorized = candidate.contact_constraints?.some((constraint) => (
+        constraint.required
+        && constraint.body === predicate.body
+        && constraint.object_id === predicate.object_id
+      ));
+      if (!authorized) {
+        context.addIssue({
+          code: "custom",
+          path: ["candidates", candidateIndex, "contact_constraints"],
+          message: "A contact termination predicate requires the same required body-object contact constraint"
+        });
+      }
+    }
+  });
+});
+
+function humanoidMotionCandidateContent(candidate: HumanoidMotionPlan): string {
+  const contactConstraints = (candidate.contact_constraints ?? [])
+    .map((constraint) => ({
+      body: constraint.body,
+      object_id: constraint.object_id,
+      required: constraint.required
+    }))
+    .sort((left, right) => {
+      const leftKey = contactKey(left);
+      const rightKey = contactKey(right);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+  return JSON.stringify({
+    duration_seconds: candidate.duration_seconds,
+    contact_constraints: contactConstraints,
+    keyframes: candidate.keyframes.map((keyframe) => ({
+      at_seconds: keyframe.at_seconds,
+      root_velocity: keyframe.root_velocity ?? null,
+      root_yaw_velocity: keyframe.root_yaw_velocity ?? null,
+      root_height: keyframe.root_height ?? null,
+      root_roll: keyframe.root_roll ?? null,
+      root_pitch: keyframe.root_pitch ?? null,
+      torso_yaw: keyframe.torso_yaw ?? null,
+      left_hand: keyframe.left_hand ?? null,
+      right_hand: keyframe.right_hand ?? null,
+      left_foot: keyframe.left_foot ?? null,
+      right_foot: keyframe.right_foot ?? null
+    }))
+  });
+}
+
+export type HumanoidMotionCandidateBatch = z.infer<
+  typeof HumanoidMotionCandidateBatchSchema
+>;
+
+export const HumanoidMotionOptionCertificateSchema = z.object({
+  artifact_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  contract_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  rollout_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  rollout_frame_count: z.number().int().positive(),
+  drift_consecutive_steps: z.number().int().positive(),
+  validated_frame_limit: z.number().int().positive(),
+  predicted_termination_frame: z.number().int().positive(),
+  predicted_at_seconds: z.number().finite().positive(),
+  stable_steps: z.number().int().positive(),
+  evidence: JsonValueSchema
+}).strict();
+
+export type HumanoidMotionOptionCertificate = z.infer<
+  typeof HumanoidMotionOptionCertificateSchema
+>;
+
+export type HumanoidBodyChannel =
+  | "locomotion"
+  | "left_leg"
+  | "right_leg"
+  | "torso"
+  | "left_arm"
+  | "right_arm";
 const HUMANOID_CHANNEL_ORDER: readonly HumanoidBodyChannel[] = [
   "locomotion",
+  "left_leg",
+  "right_leg",
   "torso",
   "left_arm",
   "right_arm"
@@ -118,6 +288,10 @@ const HUMANOID_CHANNEL_ORDER: readonly HumanoidBodyChannel[] = [
 export interface HumanoidMotionValidationOptions {
   requireFinalSupport?: boolean;
   contactObjectIds?: ReadonlySet<string>;
+  motionOption?: {
+    contract: HumanoidMotionOptionContract;
+    scenario: Scenario;
+  };
 }
 
 export interface HumanoidObjectContact {
@@ -131,11 +305,26 @@ export interface HumanoidMotionValidation {
   failures: Array<{
     code: "fallen" | "environment_contact" | "required_contact_missing"
       | "unknown_contact_object" | "contact_object_not_currently_visible"
-      | "unsupported_finish" | "invalid_reference";
+      | "unsupported_finish" | "invalid_reference"
+      | "task_space_target_unmet"
+      | "motion_goal_already_satisfied" | "motion_goal_unmet"
+      | "motion_goal_uncertain" | "motion_constraint_violated"
+      | "execution_drift";
     atSeconds: number;
     bodies?: HumanoidBodyName[];
     contacts?: HumanoidObjectContact[];
     constraints?: HumanoidContactConstraint[];
+    drift?: HumanoidMotionDriftEvidence;
+    taskSpaceTarget?: {
+      body: HumanoidEndEffectorTarget["body"];
+      frame: HumanoidEndEffectorTarget["frame"];
+      target: Vec3;
+      achieved: Vec3;
+      errorMeters: number;
+      toleranceMeters: number;
+      requestedAtSeconds: number;
+      observedAtSeconds: number;
+    };
     message?: string;
   }>;
   evidence: {
@@ -153,6 +342,8 @@ export interface HumanoidMotionValidation {
 
 export interface PreparedHumanoidMotion {
   artifact: HumanoidMotionArtifact | null;
+  rollout: HumanoidMotionRollout | null;
+  optionCertificate: HumanoidMotionOptionCertificate | null;
   validation: HumanoidMotionValidation;
 }
 
@@ -187,13 +378,15 @@ export function occupiedHumanoidChannels(
   const channels = new Set<HumanoidBodyChannel>();
   for (const keyframe of plan.keyframes) {
     if (keyframe.root_velocity
-      || keyframe.root_yaw_velocity !== undefined
-      || keyframe.root_height !== undefined
-      || keyframe.root_roll !== undefined
-      || keyframe.root_pitch !== undefined) {
+      || keyframe.root_yaw_velocity != null
+      || keyframe.root_height != null
+      || keyframe.root_roll != null
+      || keyframe.root_pitch != null) {
       channels.add("locomotion");
     }
-    if (keyframe.torso_yaw !== undefined) channels.add("torso");
+    if (keyframe.torso_yaw != null) channels.add("torso");
+    if (keyframe.left_foot) channels.add("left_leg");
+    if (keyframe.right_foot) channels.add("right_leg");
     if (keyframe.left_hand) channels.add("left_arm");
     if (keyframe.right_hand) channels.add("right_arm");
   }
@@ -255,7 +448,9 @@ export async function prepareHumanoidMotion(
   options: HumanoidMotionValidationOptions = {},
   generator: HumanoidMotionGenerator = new TaskSpaceHumanoidMotionGenerator()
 ): Promise<PreparedHumanoidMotion> {
-  let artifact: HumanoidMotionArtifact;
+  const generationState = simulation.captureState();
+  let artifact: HumanoidMotionArtifact | undefined;
+  let generationError: unknown;
   try {
     const descriptor = HumanoidMotionGeneratorDescriptorSchema.parse(generator.descriptor);
     const controlStepSeconds = simulation.controllerDescriptor().controlStepSeconds;
@@ -271,14 +466,23 @@ export async function prepareHumanoidMotion(
       controlStepSeconds
     );
   } catch (error) {
+    generationError = error;
+  } finally {
+    simulation.restoreState(generationState);
+  }
+  if (generationError !== undefined || artifact === undefined) {
     const snapshot = simulation.snapshot();
     return {
       artifact: null,
+      rollout: null,
+      optionCertificate: null,
       validation: validationResult(
         [{
           code: "invalid_reference",
           atSeconds: 0,
-          message: error instanceof Error ? error.message : String(error)
+          message: generationError instanceof Error
+            ? generationError.message
+            : String(generationError ?? "Motion generator returned no artifact")
         }],
         snapshot,
         snapshot,
@@ -293,15 +497,13 @@ export async function prepareHumanoidMotion(
       )
     };
   }
-  return {
+  const validated = await validateHumanoidMotionArtifact(
+    simulation,
+    plan,
     artifact,
-    validation: await validateHumanoidMotionArtifact(
-      simulation,
-      plan,
-      artifact,
-      options
-    )
-  };
+    options
+  );
+  return { artifact, ...validated };
 }
 
 function assertMotionArtifactContract(
@@ -337,13 +539,19 @@ async function validateHumanoidMotionArtifact(
   plan: HumanoidMotionPlan,
   artifact: HumanoidMotionArtifact,
   options: HumanoidMotionValidationOptions
-): Promise<HumanoidMotionValidation> {
+): Promise<{
+  validation: HumanoidMotionValidation;
+  rollout: HumanoidMotionRollout | null;
+  optionCertificate: HumanoidMotionOptionCertificate | null;
+}> {
   const saved = simulation.captureState();
   const start = simulation.snapshot();
   const constraints = plan.contact_constraints ?? [];
   const allowed = new Set(constraints.map(contactKey));
   const required = constraints.filter((constraint) => constraint.required);
   const knownObjects = new Set(Object.keys(start.objects));
+  const physicalTargets = scheduledTaskSpaceTargets(plan);
+  let nextPhysicalTargetIndex = 0;
   const failures: HumanoidMotionValidation["failures"] = [];
   const contacted = new Set<HumanoidBodyName>();
   const environmentContacts = new Map<string, HumanoidObjectContact>();
@@ -353,6 +561,15 @@ async function validateHumanoidMotionArtifact(
   let minimumSupportMargin = start.balance.supportMargin;
   let finalSnapshot = start;
   let simulatedSteps = 0;
+  let optionDetection: HumanoidMotionOptionDetection | null = null;
+  let optionMonitor: HumanoidMotionOptionMonitorState | null = options.motionOption
+    ? createHumanoidMotionOptionMonitorState(options.motionOption.contract)
+    : null;
+  let optionObservationStatus: "satisfied" | "unsatisfied" | "uncertain" | null = null;
+  let predictedTerminationFrame: number | null = null;
+  let predictedAtSeconds: number | null = null;
+  let predictedEvidence: JsonValue | null = null;
+  const rolloutFrames: HumanoidMotionRolloutFrame[] = [];
   try {
     const unknownObjects = constraints.filter((constraint) => (
       !knownObjects.has(constraint.object_id)
@@ -363,19 +580,23 @@ async function validateHumanoidMotionArtifact(
         atSeconds: 0,
         constraints: unknownObjects
       });
-      return validationResult(
-        failures,
-        start,
-        start,
-        0,
-        minimumRootHeight,
-        minimumUpright,
-        minimumSupportMargin,
-        contacted,
-        environmentContacts,
-        required,
-        satisfiedRequired
-      );
+      return {
+        validation: validationResult(
+          failures,
+          start,
+          start,
+          0,
+          minimumRootHeight,
+          minimumUpright,
+          minimumSupportMargin,
+          contacted,
+          environmentContacts,
+          required,
+          satisfiedRequired
+        ),
+        rollout: null,
+        optionCertificate: null
+      };
     }
     const unseenObjects = options.contactObjectIds
       ? constraints.filter((constraint) => (
@@ -388,21 +609,123 @@ async function validateHumanoidMotionArtifact(
         atSeconds: 0,
         constraints: unseenObjects
       });
-      return validationResult(
-        failures,
+      return {
+        validation: validationResult(
+          failures,
+          start,
+          start,
+          0,
+          minimumRootHeight,
+          minimumUpright,
+          minimumSupportMargin,
+          contacted,
+          environmentContacts,
+          required,
+          satisfiedRequired
+        ),
+        rollout: null,
+        optionCertificate: null
+      };
+    }
+    while (physicalTargets[nextPhysicalTargetIndex]?.atSeconds === 0) {
+      const failure = physicalTaskSpaceTargetFailure(
+        physicalTargets[nextPhysicalTargetIndex]!,
         start,
-        start,
-        0,
-        minimumRootHeight,
-        minimumUpright,
-        minimumSupportMargin,
-        contacted,
-        environmentContacts,
-        required,
-        satisfiedRequired
+        0
       );
+      if (failure) failures.push(failure);
+      nextPhysicalTargetIndex += 1;
+    }
+    if (failures.length > 0) {
+      return {
+        validation: validationResult(
+          failures,
+          start,
+          start,
+          0,
+          minimumRootHeight,
+          minimumUpright,
+          minimumSupportMargin,
+          contacted,
+          environmentContacts,
+          required,
+          satisfiedRequired
+        ),
+        rollout: null,
+        optionCertificate: null
+      };
+    }
+    if (options.motionOption) {
+      optionDetection = detectOptionFromSimulation(
+        simulation,
+        start,
+        options.motionOption,
+        options.contactObjectIds
+      );
+      if (optionDetection.hasUncertain) {
+        failures.push({
+          code: "motion_goal_uncertain",
+          atSeconds: 0,
+          message: "Motion option references state that is not currently observable"
+        });
+      } else if (optionDetection.allSatisfied && required.length === 0) {
+        failures.push({
+          code: "motion_goal_already_satisfied",
+          atSeconds: 0,
+          message: "Motion option predicates are already satisfied before execution"
+        });
+      }
+      if (failures.length > 0) {
+        return {
+          validation: validationResult(
+            failures,
+            start,
+            start,
+            0,
+            minimumRootHeight,
+            minimumUpright,
+            minimumSupportMargin,
+            contacted,
+            environmentContacts,
+            required,
+            satisfiedRequired
+          ),
+          rollout: null,
+          optionCertificate: null
+        };
+      }
     }
     for (const frame of artifact.frames) {
+      if (options.motionOption && optionMonitor?.phase === "awaiting_precondition") {
+        const update = advanceHumanoidMotionOptionMonitor(
+          options.motionOption.contract,
+          optionMonitor,
+          motionOptionDetectorInputFromSimulation(
+            simulation,
+            finalSnapshot,
+            options.motionOption,
+            options.contactObjectIds
+          )
+        );
+        optionMonitor = update.state;
+        optionDetection = update.detection;
+        optionObservationStatus = update.observationStatus;
+        if (update.observationStatus !== "satisfied") {
+          const atSeconds = simulatedSteps === 0
+            ? 0
+            : artifact.frames[simulatedSteps - 1]!.atSeconds;
+          failures.push({
+            code: update.observationStatus === "uncertain"
+              ? "motion_goal_uncertain"
+              : "motion_constraint_violated",
+            atSeconds,
+            message: update.observationStatus === "uncertain"
+              ? "Motion option precondition is not observable before execution"
+              : "Motion option precondition is not satisfied before execution"
+          });
+          break;
+        }
+      }
       try {
         finalSnapshot = await simulation.step(hydrateHumanoidReference(frame.reference));
       } catch (error) {
@@ -414,6 +737,12 @@ async function validateHumanoidMotionArtifact(
         break;
       }
       simulatedSteps += 1;
+      if (options.motionOption) {
+        rolloutFrames.push(captureHumanoidMotionRolloutFrame(
+          frame.atSeconds,
+          finalSnapshot
+        ));
+      }
       minimumRootHeight = Math.min(minimumRootHeight, finalSnapshot.rootPosition.y);
       minimumUpright = Math.min(minimumUpright, finalSnapshot.balance.upright);
       if (finalSnapshot.balance.supportMargin !== null) {
@@ -453,6 +782,66 @@ async function validateHumanoidMotionArtifact(
         failures.push({ code: "fallen", atSeconds: frame.atSeconds });
         break;
       }
+      while ((physicalTargets[nextPhysicalTargetIndex]?.atSeconds ?? Infinity)
+        <= frame.atSeconds + 1e-9) {
+        const failure = physicalTaskSpaceTargetFailure(
+          physicalTargets[nextPhysicalTargetIndex]!,
+          finalSnapshot,
+          frame.atSeconds
+        );
+        if (failure) failures.push(failure);
+        nextPhysicalTargetIndex += 1;
+      }
+      if (failures.length > 0) break;
+      if (options.motionOption && optionMonitor?.phase !== "awaiting_precondition") {
+        if (!optionMonitor) {
+          throw new Error("Humanoid motion option monitor is missing");
+        }
+        const update = advanceHumanoidMotionOptionMonitor(
+          options.motionOption.contract,
+          optionMonitor,
+          motionOptionDetectorInputFromSimulation(
+            simulation,
+            finalSnapshot,
+            options.motionOption,
+            options.contactObjectIds
+          )
+        );
+        optionMonitor = update.state;
+        optionDetection = update.detection;
+        optionObservationStatus = update.observationStatus;
+        if (optionMonitor.phase === "violated") {
+          failures.push({
+            code: "motion_constraint_violated",
+            atSeconds: frame.atSeconds,
+            message: "Motion option violated its during constraint"
+          });
+          break;
+        }
+        if (optionMonitor.phase === "indeterminate") {
+          failures.push({
+            code: "motion_goal_uncertain",
+            atSeconds: frame.atSeconds,
+            message: "Motion option lost observable evidence for its during constraint"
+          });
+          break;
+        }
+        if (optionMonitor.phase === "succeeded"
+          && missingRequiredHumanoidContacts(
+            required,
+            satisfiedRequired
+          ).length === 0
+          && finalSnapshot.balance.support !== "none"
+          && predictedTerminationFrame === null) {
+          predictedTerminationFrame = simulatedSteps;
+          predictedAtSeconds = frame.atSeconds;
+          predictedEvidence = asJson({
+            predicates: optionDetection.evidence,
+            phases: optionDetection.phases,
+            monitor: optionMonitor
+          });
+        }
+      }
     }
     const missingRequired = required.filter((constraint) => (
       !satisfiedRequired.has(contactKey(constraint))
@@ -472,22 +861,110 @@ async function validateHumanoidMotionArtifact(
         atSeconds: plan.duration_seconds
       });
     }
-    return validationResult(
-      failures,
-      start,
-      finalSnapshot,
-      simulatedSteps,
-      minimumRootHeight,
-      minimumUpright,
-      minimumSupportMargin,
-      contacted,
-      environmentContacts,
-      required,
-      satisfiedRequired
-    );
+    if (failures.length === 0
+      && options.motionOption
+      && predictedTerminationFrame === null) {
+      failures.push({
+        code: optionObservationStatus === "uncertain" || optionDetection?.hasUncertain
+          ? "motion_goal_uncertain"
+          : "motion_goal_unmet",
+        atSeconds: plan.duration_seconds,
+        message: optionObservationStatus === "uncertain" || optionDetection?.hasUncertain
+          ? "Motion option ended without observable success evidence"
+          : "Motion option exhausted its verified horizon before physical success"
+      });
+    }
+    const rollout = failures.length === 0
+      && options.motionOption
+      && rolloutFrames.length === artifact.frames.length
+      ? createHumanoidMotionRollout(rolloutFrames)
+      : null;
+    const optionCertificate = failures.length === 0
+      && options.motionOption
+      && rollout !== null
+      && predictedTerminationFrame !== null
+      && predictedAtSeconds !== null
+      && predictedEvidence !== null
+      ? HumanoidMotionOptionCertificateSchema.parse({
+          artifact_sha256: humanoidMotionArtifactSha256(artifact),
+          contract_sha256: humanoidMotionOptionContractSha256(
+            options.motionOption.contract
+          ),
+          rollout_sha256: humanoidMotionRolloutSha256(rollout),
+          rollout_frame_count: rollout.frames.length,
+          drift_consecutive_steps: rollout.limits.consecutive_steps,
+          validated_frame_limit: artifact.frames.length,
+          predicted_termination_frame: predictedTerminationFrame,
+          predicted_at_seconds: predictedAtSeconds,
+          stable_steps: options.motionOption.contract.stable_steps,
+          evidence: predictedEvidence
+        })
+      : null;
+    return {
+      rollout,
+      validation: validationResult(
+        failures,
+        start,
+        finalSnapshot,
+        simulatedSteps,
+        minimumRootHeight,
+        minimumUpright,
+        minimumSupportMargin,
+        contacted,
+        environmentContacts,
+        required,
+        satisfiedRequired
+      ),
+      optionCertificate
+    };
   } finally {
     simulation.restoreState(saved);
   }
+}
+
+function detectOptionFromSimulation(
+  simulation: HumanoidSimulation,
+  snapshot: HumanoidSimulationSnapshot,
+  option: NonNullable<HumanoidMotionValidationOptions["motionOption"]>,
+  boundObjectIds?: ReadonlySet<string>
+): HumanoidMotionOptionDetection {
+  return detectHumanoidMotionOption(
+    option.contract,
+    motionOptionDetectorInputFromSimulation(
+      simulation,
+      snapshot,
+      option,
+      boundObjectIds
+    )
+  );
+}
+
+function motionOptionDetectorInputFromSimulation(
+  simulation: HumanoidSimulation,
+  snapshot: HumanoidSimulationSnapshot,
+  option: NonNullable<HumanoidMotionValidationOptions["motionOption"]>,
+  boundObjectIds?: ReadonlySet<string>
+): HumanoidMotionOptionDetectorInput {
+  const visible = simulation.senseObjects(option.scenario.visibility_radius).objects;
+  const observableObjects: HumanoidMotionOptionObservableObject[] = [];
+  for (const descriptor of option.scenario.objects) {
+    const object = visible[descriptor.id];
+    if (!object || boundObjectIds && !boundObjectIds.has(descriptor.id)) continue;
+    observableObjects.push({
+      id: descriptor.id,
+      position: { ...object.position },
+      size: { ...descriptor.size }
+    });
+  }
+  return {
+    snapshot,
+    observableObjects,
+    zones: option.scenario.zones
+  };
+}
+
+function asJson(value: unknown): JsonValue {
+  return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
 
 function taskSpaceReference(
@@ -504,18 +981,24 @@ function taskSpaceReference(
           ]
         }
       : {}),
-    ...(keyframe.root_yaw_velocity !== undefined
+    ...(keyframe.root_yaw_velocity != null
       ? { rootYawVelocity: keyframe.root_yaw_velocity }
       : {}),
-    ...(keyframe.root_height !== undefined ? { rootHeight: keyframe.root_height } : {}),
-    ...(keyframe.root_roll !== undefined ? { rootRoll: keyframe.root_roll } : {}),
-    ...(keyframe.root_pitch !== undefined ? { rootPitch: keyframe.root_pitch } : {}),
-    ...(keyframe.torso_yaw !== undefined
+    ...(keyframe.root_height != null ? { rootHeight: keyframe.root_height } : {}),
+    ...(keyframe.root_roll != null ? { rootRoll: keyframe.root_roll } : {}),
+    ...(keyframe.root_pitch != null ? { rootPitch: keyframe.root_pitch } : {}),
+    ...(keyframe.torso_yaw != null
       ? { joints: { waist_yaw_joint: keyframe.torso_yaw } }
       : {})
   };
   const rooted = targetReference(baseline, rootTarget);
-  const targets = [
+  return simulation.solveEndEffectorTargets(rooted, taskSpaceTargets(keyframe)).reference;
+}
+
+function taskSpaceTargets(
+  keyframe: z.infer<typeof HumanoidKeyframeSchema>
+): HumanoidEndEffectorTarget[] {
+  return [
     ...(keyframe.left_hand ? [{
       body: "left_wrist_yaw_link" as const,
       position: keyframe.left_hand.position,
@@ -527,9 +1010,74 @@ function taskSpaceReference(
       position: keyframe.right_hand.position,
       frame: keyframe.right_hand.frame,
       tolerance: keyframe.right_hand.tolerance_m
+    }] : []),
+    ...(keyframe.left_foot ? [{
+      body: "left_ankle_roll_link" as const,
+      position: keyframe.left_foot.position,
+      frame: keyframe.left_foot.frame,
+      tolerance: keyframe.left_foot.tolerance_m
+    }] : []),
+    ...(keyframe.right_foot ? [{
+      body: "right_ankle_roll_link" as const,
+      position: keyframe.right_foot.position,
+      frame: keyframe.right_foot.frame,
+      tolerance: keyframe.right_foot.tolerance_m
     }] : [])
   ];
-  return simulation.solveEndEffectorTargets(rooted, targets).reference;
+}
+
+interface ScheduledTaskSpaceTarget {
+  atSeconds: number;
+  target: HumanoidEndEffectorTarget;
+}
+
+function scheduledTaskSpaceTargets(
+  plan: HumanoidMotionPlan
+): ScheduledTaskSpaceTarget[] {
+  return plan.keyframes.flatMap((keyframe) => (
+    taskSpaceTargets(keyframe).map((target) => ({
+      atSeconds: keyframe.at_seconds,
+      target
+    }))
+  ));
+}
+
+function physicalTaskSpaceTargetFailure(
+  scheduled: ScheduledTaskSpaceTarget,
+  snapshot: HumanoidSimulationSnapshot,
+  observedAtSeconds: number
+): HumanoidMotionValidation["failures"][number] | null {
+  const target = scheduled.target;
+  const achievedWorld = snapshot.links[target.body].position;
+  const achieved = target.frame === "world"
+    ? { ...achievedWorld }
+    : rotateVector(
+        inverseQuaternion(snapshot.links.pelvis.rotation),
+        subtract(achievedWorld, snapshot.links.pelvis.position)
+      );
+  const errorMeters = Math.hypot(
+    achieved.x - target.position.x,
+    achieved.y - target.position.y,
+    achieved.z - target.position.z
+  );
+  if (errorMeters <= target.tolerance + 1e-9) return null;
+  const evidence = {
+    body: target.body,
+    frame: target.frame,
+    target: { ...target.position },
+    achieved,
+    errorMeters,
+    toleranceMeters: target.tolerance,
+    requestedAtSeconds: scheduled.atSeconds,
+    observedAtSeconds
+  };
+  return {
+    code: "task_space_target_unmet",
+    atSeconds: observedAtSeconds,
+    taskSpaceTarget: evidence,
+    message: `Physical task-space target missed: ${target.body} `
+      + `error=${errorMeters.toFixed(3)}m tolerance=${target.tolerance.toFixed(3)}m`
+  };
 }
 
 function validationResult(

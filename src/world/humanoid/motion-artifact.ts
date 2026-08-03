@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import type { HumanoidReference } from "./reference.js";
 
 const FiniteArraySchema = z.array(z.number().finite());
@@ -86,12 +87,22 @@ export function humanoidMotionArtifactSummary(
   control_step_seconds: number;
   duration_seconds: number;
   frame_count: number;
+  sha256: string;
 } {
+  const parsed = HumanoidMotionArtifactSchema.parse(artifact);
   return {
-    protocol: artifact.protocol,
-    generator: artifact.generator,
-    control_step_seconds: artifact.controlStepSeconds,
-    duration_seconds: artifact.durationSeconds,
-    frame_count: artifact.frames.length
+    protocol: parsed.protocol,
+    generator: parsed.generator,
+    control_step_seconds: parsed.controlStepSeconds,
+    duration_seconds: parsed.durationSeconds,
+    frame_count: parsed.frames.length,
+    sha256: humanoidMotionArtifactSha256(parsed)
   };
+}
+
+export function humanoidMotionArtifactSha256(
+  artifact: HumanoidMotionArtifact
+): string {
+  const parsed = HumanoidMotionArtifactSchema.parse(artifact);
+  return createHash("sha256").update(JSON.stringify(parsed)).digest("hex");
 }

@@ -28,37 +28,44 @@ function HumanoidStageComponent(props: HumanoidStageProps): React.JSX.Element {
     let disposed = false;
     const abort = new AbortController();
     let controller: HumanoidStageController | null = null;
+    let startTimer = 0;
     setLoading(true);
     setFailure(false);
-    void import("./create-humanoid-stage")
-      .then(({ createHumanoidStage }) => createHumanoidStage(
-        host,
-        props.details.definition.scenario,
-        props.details.checkpoint.world,
-        props.frameBuffer,
-        liveRef.current,
-        (message) => {
-          if (!disposed) setFailure(message !== null);
-        },
-        abort.signal
-      ))
-      .then((created) => {
-        if (disposed) {
-          created.dispose();
-          return;
-        }
-        controller = created;
-        controllerRef.current = created;
-        created.setCameraMode(modeRef.current);
-        setLoading(false);
-      })
-      .catch((error) => {
-        if (disposed || error instanceof DOMException && error.name === "AbortError") return;
-        setLoading(false);
-        setFailure(true);
-      });
+    const startFrame = window.requestAnimationFrame(() => {
+      startTimer = window.setTimeout(() => {
+        void import("./create-humanoid-stage")
+          .then(({ createHumanoidStage }) => createHumanoidStage(
+            host,
+            props.details.definition.scenario,
+            props.details.checkpoint.world,
+            props.frameBuffer,
+            liveRef.current,
+            (message) => {
+              if (!disposed) setFailure(message !== null);
+            },
+            abort.signal
+          ))
+          .then((created) => {
+            if (disposed) {
+              created.dispose();
+              return;
+            }
+            controller = created;
+            controllerRef.current = created;
+            created.setCameraMode(modeRef.current);
+            setLoading(false);
+          })
+          .catch((error) => {
+            if (disposed || error instanceof DOMException && error.name === "AbortError") return;
+            setLoading(false);
+            setFailure(true);
+          });
+      }, 0);
+    });
     return () => {
       disposed = true;
+      window.cancelAnimationFrame(startFrame);
+      window.clearTimeout(startTimer);
       abort.abort();
       controller?.dispose();
       if (controllerRef.current === controller) controllerRef.current = null;

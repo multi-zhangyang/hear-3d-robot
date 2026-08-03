@@ -1,8 +1,9 @@
 import * as THREE from "three";
 import { disposeMaterial, disposeObject } from "../three-kit";
 import type { HumanoidWorldSnapshot, ScenarioDefinition, Vec3 } from "../types";
-import { createFloor, zoneOutline } from "../stage/scene-primitives";
+import { zoneOutline } from "../stage/scene-primitives";
 import { G1Rig } from "./g1-rig";
+import { createHumanoidTerrain } from "./humanoid-terrain";
 
 interface ObjectVisual {
   mesh: THREE.Mesh;
@@ -33,8 +34,8 @@ export class HumanoidWorldScene {
     this.#scenario = scenario;
     this.rig = rig;
     this.root.name = "humanoid-world";
-    scene.add(createFloor(scenario.bounds, 1), this.root);
-    this.root.add(rig.root);
+    scene.add(this.root);
+    this.root.add(createHumanoidTerrain(scenario.bounds, scenario.seed), rig.root);
     this.#addObstacles();
     this.#addZones();
     this.#addObjects();
@@ -96,9 +97,9 @@ export class HumanoidWorldScene {
   #addObstacles(): void {
     for (const obstacle of this.#scenario.obstacles) {
       const material = new THREE.MeshStandardMaterial({
-        color: obstacle.id.startsWith("world_boundary") ? 0x243029 : blockColor(obstacle.id),
-        roughness: 0.86,
-        metalness: 0.04
+        color: obstacle.id.startsWith("world_boundary") ? 0x31463c : blockColor(obstacle.id),
+        roughness: 0.9,
+        metalness: 0.02
       });
       const mesh = new THREE.Mesh(
         new THREE.BoxGeometry(obstacle.size.x, obstacle.size.y, obstacle.size.z),
@@ -110,7 +111,7 @@ export class HumanoidWorldScene {
       mesh.name = obstacle.id;
       const edges = new THREE.LineSegments(
         new THREE.EdgesGeometry(mesh.geometry),
-        new THREE.LineBasicMaterial({ color: 0x526158, transparent: true, opacity: 0.45 })
+        new THREE.LineBasicMaterial({ color: 0x9ab7a5, transparent: true, opacity: 0.38 })
       );
       mesh.add(edges);
       this.root.add(mesh);
@@ -218,6 +219,6 @@ function blockColor(id: string): number {
     hash ^= character.codePointAt(0) ?? 0;
     hash = Math.imul(hash, 16777619);
   }
-  const palette = [0x536358, 0x665c4c, 0x495a61, 0x5f6650, 0x575369];
+  const palette = [0x66786a, 0x806e55, 0x586f77, 0x71805f, 0x69627b];
   return palette[Math.abs(hash) % palette.length]!;
 }

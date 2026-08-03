@@ -1,7 +1,99 @@
 import { describe, expect, it } from "vitest";
-import { presentEmbodiedEpisode, presentFramework } from "./presenter";
+import { presentAction, presentEmbodiedEpisode, presentFramework } from "./presenter";
 
 describe("agent timeline presenter", () => {
+  it("shows the real candidate count and selected physical rank", () => {
+    const presented = presentAction({
+      transactionId: "candidate-plan",
+      agentId: "humanoid-motion-reference",
+      action: "plan_whole_body_motion_candidates",
+      input: { objective: "比较全身候选", candidates: [] },
+      fingerprint: "fingerprint",
+      accepted: true,
+      code: "whole_body_candidates_validated",
+      worldBeforeRevision: 4,
+      worldAfterRevision: 4,
+      frameCount: 0,
+      channels: ["torso"],
+      detail: { candidate_count: 3, selected_rank: 2 },
+      committedAt: "2026-08-03T00:00:00.000Z"
+    });
+
+    expect(presented).toMatchObject({
+      title: "筛选全身候选",
+      detail: "3 个模型候选已分别完成 MuJoCo 预演，选择第 2 个可行动作。",
+      meta: "全身候选已通过物理筛选",
+      tone: "success",
+      category: "plan"
+    });
+  });
+
+  it("presents physical option success with predicted and actual termination", () => {
+    const presented = presentAction({
+      transactionId: "execute-option",
+      agentId: "humanoid-executor",
+      action: "execute_whole_body_motion",
+      input: { planning_transaction_id: "candidate-plan" },
+      fingerprint: "fingerprint",
+      accepted: true,
+      code: "motion_option_succeeded",
+      worldBeforeRevision: 4,
+      worldAfterRevision: 31,
+      frameCount: 27,
+      channels: ["locomotion"],
+      detail: {
+        result: {
+          motion: { control_step_seconds: 0.02 },
+          option: {
+            status: "succeeded",
+            termination_reason: "physical_success",
+            predicted_termination_frame: 29,
+            actual_termination_frame: 27
+          }
+        }
+      },
+      committedAt: "2026-08-03T00:00:01.000Z"
+    });
+
+    expect(presented).toMatchObject({
+      detail: "物理目标稳定达成 · 预测 0.58 秒 · 实际 0.54 秒",
+      meta: "27 个物理帧",
+      tone: "active"
+    });
+  });
+
+  it("presents rollout drift as an early physical interruption", () => {
+    const presented = presentAction({
+      transactionId: "execute-drifted-option",
+      agentId: "humanoid-executor",
+      action: "execute_whole_body_motion",
+      input: { planning_transaction_id: "candidate-plan" },
+      fingerprint: "fingerprint",
+      accepted: false,
+      code: "motion_execution_drifted",
+      worldBeforeRevision: 4,
+      worldAfterRevision: 7,
+      frameCount: 3,
+      channels: ["locomotion"],
+      detail: {
+        result: {
+          option: {
+            status: "failed",
+            termination_reason: "execution_drift",
+            drift_streak: 3
+          }
+        }
+      },
+      committedAt: "2026-08-03T00:00:01.000Z"
+    });
+
+    expect(presented).toMatchObject({
+      detail: "执行连续 3 帧偏离物理预演，已截断并交回重规划。",
+      meta: "3 个物理帧",
+      tone: "warning"
+    });
+  });
+
   it("derives stable keys from the durable runtime event identity", () => {
     const entry = {
       runtime_event_id: "framework-event-1",

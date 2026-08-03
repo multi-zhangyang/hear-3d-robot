@@ -11,29 +11,51 @@ import {
 import {
   HumanoidWorldCheckpointSchema,
   type HumanoidMotionExecutionProgress,
+  type HumanoidMotionOptionExecutionState,
   type HumanoidWorldCheckpoint
 } from "./checkpoint.js";
 import {
   blockedHumanoidContacts,
   humanoidContactKey,
   humanoidObjectContacts,
+  HumanoidMotionCandidateBatchSchema,
   HumanoidMotionPlanSchema,
   missingRequiredHumanoidContacts,
   occupiedHumanoidChannels,
   prepareHumanoidMotion,
   TaskSpaceHumanoidMotionGenerator,
   type HumanoidMotionPlan,
+  type HumanoidMotionCandidateBatch,
   type HumanoidBodyChannel,
   type HumanoidMotionGenerator,
-  type HumanoidMotionValidation
+  type HumanoidMotionOptionCertificate,
+  type HumanoidMotionValidation,
+  type PreparedHumanoidMotion
 } from "./motion-plan.js";
 import type { HumanoidMotionGeneratorDescriptor } from "./motion-generator-contract.js";
 import {
   humanoidMotionArtifactSummary,
+  humanoidMotionArtifactSha256,
   hydrateHumanoidReference,
   serializeHumanoidReference,
   type HumanoidMotionArtifact
 } from "./motion-artifact.js";
+import {
+  detectHumanoidMotionDrift,
+  humanoidMotionRolloutSha256,
+  type HumanoidMotionDriftEvidence,
+  type HumanoidMotionRollout
+} from "./motion-rollout.js";
+import {
+  advanceHumanoidMotionOptionMonitor,
+  createHumanoidMotionOptionMonitorState,
+  detectHumanoidMotionOption,
+  humanoidMotionOptionContractSha256,
+  type HumanoidMotionOptionContract,
+  type HumanoidMotionOptionDetection,
+  type HumanoidMotionOptionDetectorInput,
+  type HumanoidMotionOptionObservableObject
+} from "./motion-option.js";
 import {
   HumanoidObjectMemory,
   type HumanoidObjectMemoryCheckpoint,
@@ -82,10 +104,38 @@ export interface WholeBodyPlanReceipt {
   validation: HumanoidMotionValidation;
 }
 
+interface WholeBodyCandidateEvaluation {
+  rank: number;
+  planId: string;
+  intent: string;
+  channels: HumanoidBodyChannel[];
+  motion: ReturnType<typeof humanoidMotionArtifactSummary> | null;
+  optionCertificate: HumanoidMotionOptionCertificate | null;
+  validation: HumanoidMotionValidation;
+}
+
+export interface WholeBodyCandidatePlanReceipt {
+  accepted: boolean;
+  planId: string;
+  selectedCandidateId: string | null;
+  selectedRank: number | null;
+  createdRevision: number;
+  channels: HumanoidBodyChannel[];
+  motion: ReturnType<typeof humanoidMotionArtifactSummary> | null;
+  option: {
+    contract: HumanoidMotionOptionContract;
+    certificate: HumanoidMotionOptionCertificate;
+  } | null;
+  selection: "model_rank_then_physics";
+  candidates: WholeBodyCandidateEvaluation[];
+}
+
 export interface HumanoidExecutionReceipt {
   accepted: boolean;
   code: "motion_completed" | "navigation_completed" | "plan_stale"
-    | "motion_failed" | "navigation_blocked";
+    | "motion_failed" | "navigation_blocked" | "motion_option_succeeded"
+    | "motion_goal_unmet" | "motion_goal_uncertain"
+    | "motion_execution_drifted" | "motion_constraint_violated";
   frames: number;
   finalSnapshot: HumanoidWorldSnapshot;
   detail: {
@@ -93,6 +143,20 @@ export interface HumanoidExecutionReceipt {
     reason?: string;
     travelledDistance?: number;
     motion?: ReturnType<typeof humanoidMotionArtifactSummary>;
+    option?: {
+      option_id: string;
+      status: HumanoidMotionOptionExecutionState["status"];
+      termination_reason: HumanoidMotionOptionExecutionState["terminationReason"];
+      full_frame_count: number;
+      executed_prefix_frame_count: number;
+      predicted_termination_frame: number;
+      actual_termination_frame: number | null;
+      artifact_sha256: string;
+      rollout_sha256: string;
+      drift_streak: number;
+      drift_evidence: HumanoidMotionDriftEvidence | null;
+      evidence: HumanoidMotionOptionExecutionState["lastEvidence"];
+    };
   };
 }
 
@@ -113,7 +177,9 @@ export type HumanoidFrameSink = (snapshot: HumanoidWorldSnapshot) => void | Prom
 interface StoredMotionPlan {
   plan: HumanoidMotionPlan;
   artifact: HumanoidMotionArtifact;
+  rollout: HumanoidMotionRollout | null;
   createdRevision: number;
+  option: HumanoidMotionOptionExecutionState | null;
   progress: HumanoidMotionExecutionProgress;
 }
 
@@ -217,10 +283,11 @@ export class HumanoidWorld {
   observe(): HumanoidWorldObservation {
     const snapshot = this.snapshot();
     const sensed = this.#simulation.senseObjects(this.#scenario.visibility_radius);
-    this.#objectMemory.observe(
+    this.#objectMemory.refresh(
       snapshot.frame,
       snapshot.worldRevision,
-      sensed.objects
+      snapshot.robot.objects,
+      new Set(Object.keys(sensed.objects))
     );
     const { objects: _objects, ...robot } = snapshot.robot;
     return {
@@ -231,8 +298,8 @@ export class HumanoidWorld {
       robot,
       objectTokens: this.#objectMemory.tokens(
         snapshot.robot,
-        snapshot.worldRevision,
-        new Set(Object.keys(sensed.objects))
+        snapshot.frame,
+        snapshot.worldRevision
       ),
       navigation: structuredClone(snapshot.navigation)
     };
@@ -270,17 +337,26 @@ export class HumanoidWorld {
       this.#simulation,
       plan,
       this.#reference,
-      { contactObjectIds: this.#objectMemory.observedObjectIds(this.#worldRevision) },
+      {
+        contactObjectIds: this.#objectMemory.observedObjectIds(
+          this.#frame,
+          this.#worldRevision
+        )
+      },
       this.#motionGenerator
     );
     if (prepared.validation.feasible && prepared.artifact) {
       this.#motions.set(plan.id, {
         plan: structuredClone(plan),
         artifact: structuredClone(prepared.artifact),
+        rollout: null,
         createdRevision: this.#worldRevision,
+        option: null,
         progress: {
           nextFrameIndex: 0,
           satisfiedContactKeys: [],
+          driftStreak: 0,
+          lastDrift: null,
           failure: null
         }
       });
@@ -297,18 +373,139 @@ export class HumanoidWorld {
     };
   }
 
+  async planWholeBodyMotionCandidates(
+    rawBatch: HumanoidMotionCandidateBatch
+  ): Promise<WholeBodyCandidatePlanReceipt> {
+    const batch = HumanoidMotionCandidateBatchSchema.parse(rawBatch);
+    for (const candidate of batch.candidates) {
+      if (this.#motions.has(candidate.id)) {
+        throw new Error(`Duplicate humanoid motion plan: ${candidate.id}`);
+      }
+    }
+    const visibleContactObjects = this.#objectMemory.observedObjectIds(
+      this.#frame,
+      this.#worldRevision
+    );
+    const prepared: Array<{
+      rank: number;
+      plan: HumanoidMotionPlan;
+      channels: HumanoidBodyChannel[];
+      result: PreparedHumanoidMotion;
+    }> = [];
+    for (let index = 0; index < batch.candidates.length; index += 1) {
+      const plan = batch.candidates[index]!;
+      const result = await prepareHumanoidMotion(
+        this.#simulation,
+        plan,
+        this.#reference,
+        {
+          contactObjectIds: visibleContactObjects,
+          motionOption: {
+            contract: batch.termination,
+            scenario: this.#scenario
+          }
+        },
+        this.#motionGenerator
+      );
+      prepared.push({
+        rank: index + 1,
+        plan,
+        channels: occupiedHumanoidChannels(plan),
+        result
+      });
+    }
+    const selected = prepared.find((candidate) => (
+      candidate.result.validation.feasible
+      && candidate.result.artifact !== null
+      && candidate.result.rollout !== null
+      && candidate.result.optionCertificate !== null
+    ));
+    if (selected?.result.artifact
+      && selected.result.rollout
+      && selected.result.optionCertificate) {
+      this.#motions.set(selected.plan.id, {
+        plan: structuredClone(selected.plan),
+        artifact: structuredClone(selected.result.artifact),
+        rollout: structuredClone(selected.result.rollout),
+        createdRevision: this.#worldRevision,
+        option: {
+          contract: structuredClone(batch.termination),
+          certificate: structuredClone(selected.result.optionCertificate),
+          monitor: createHumanoidMotionOptionMonitorState(batch.termination),
+          status: "planned",
+          successStreak: 0,
+          actualTerminationFrame: null,
+          terminationReason: null,
+          lastEvidence: null
+        },
+        progress: {
+          nextFrameIndex: 0,
+          satisfiedContactKeys: [],
+          driftStreak: 0,
+          lastDrift: null,
+          failure: null
+        }
+      });
+    }
+    return {
+      accepted: selected !== undefined,
+      planId: selected?.plan.id ?? "",
+      selectedCandidateId: selected?.plan.id ?? null,
+      selectedRank: selected?.rank ?? null,
+      createdRevision: this.#worldRevision,
+      channels: selected?.channels ?? [],
+      motion: selected?.result.artifact
+        ? humanoidMotionArtifactSummary(selected.result.artifact)
+        : null,
+      option: selected?.result.optionCertificate
+        ? {
+            contract: structuredClone(batch.termination),
+            certificate: structuredClone(selected.result.optionCertificate)
+          }
+        : null,
+      selection: "model_rank_then_physics",
+      candidates: prepared.map((candidate) => ({
+        rank: candidate.rank,
+        planId: candidate.plan.id,
+        intent: candidate.plan.intent,
+        channels: candidate.channels,
+        motion: candidate.result.artifact
+          ? humanoidMotionArtifactSummary(candidate.result.artifact)
+          : null,
+        optionCertificate: candidate.result.optionCertificate
+          ? structuredClone(candidate.result.optionCertificate)
+          : null,
+        validation: candidate.result.validation
+      }))
+    };
+  }
+
   async executeWholeBodyMotion(
     planId: string,
     frameSink?: HumanoidFrameSink
   ): Promise<HumanoidExecutionReceipt> {
     const stored = this.#motions.get(planId);
     if (!stored) throw new Error(`Unknown humanoid motion plan: ${planId}`);
+    if (stored.option) assertMotionOptionIntegrity(stored);
     const expectedRevision = stored.createdRevision + stored.progress.nextFrameIndex;
     if (expectedRevision !== this.#worldRevision) {
       this.#motions.delete(planId);
       return this.#receipt(false, "plan_stale", 0, {
         reason: `expected_revision=${expectedRevision}, world_revision=${this.#worldRevision}`
       });
+    }
+    if (stored.option && isTerminalMotionOption(stored.option)) {
+      if (stored.option.status === "succeeded"
+        && missingRequiredHumanoidContacts(
+          stored.plan.contact_constraints ?? [],
+          new Set(stored.progress.satisfiedContactKeys)
+        ).length > 0) {
+        stored.option.status = "goal_unmet";
+        stored.option.terminationReason = "motion_goal_unmet";
+      }
+      const receipt = this.#motionOptionReceipt(stored, 0);
+      this.#motions.delete(planId);
+      return receipt;
     }
     let frames = 0;
     const failures: HumanoidMotionValidation["failures"] = stored.progress.failure
@@ -317,17 +514,76 @@ export class HumanoidWorld {
     const constraints = stored.plan.contact_constraints ?? [];
     const satisfiedContacts = new Set(stored.progress.satisfiedContactKeys);
     let lastReference = this.#reference;
+    let lastOptionDetection: HumanoidMotionOptionDetection | null = null;
+    if (stored.option) stored.option.status = "executing";
+    const frameLimit = stored.option
+      ? stored.option.certificate.validated_frame_limit
+      : stored.artifact.frames.length;
     for (
       let index = stored.progress.nextFrameIndex;
-      index < stored.artifact.frames.length && failures.length === 0;
+      index < frameLimit && failures.length === 0;
       index += 1
     ) {
       const frame = stored.artifact.frames[index]!;
+      if (stored.option?.monitor.phase === "awaiting_precondition") {
+        const update = advanceHumanoidMotionOptionMonitor(
+          stored.option.contract,
+          stored.option.monitor,
+          this.#motionOptionDetectorInput(this.#simulation.snapshot())
+        );
+        stored.option.monitor = update.state;
+        stored.option.successStreak = update.state.terminalStableSteps;
+        lastOptionDetection = update.detection;
+        stored.option.lastEvidence = jsonOptionEvidence(
+          update.detection,
+          update.state
+        );
+        if (update.observationStatus !== "satisfied") {
+          const atSeconds = index === 0
+            ? 0
+            : stored.artifact.frames[index - 1]!.atSeconds;
+          const uncertain = update.observationStatus === "uncertain";
+          failures.push({
+            code: uncertain ? "motion_goal_uncertain" : "motion_constraint_violated",
+            atSeconds,
+            message: uncertain
+              ? "Motion option precondition is not observable before execution"
+              : "Motion option precondition is not satisfied before execution"
+          });
+          if (!uncertain) {
+            stored.progress.failure = {
+              code: "motion_constraint_violated",
+              atSeconds
+            };
+          }
+          stored.option.status = uncertain ? "goal_unmet" : "failed";
+          stored.option.actualTerminationFrame = index;
+          stored.option.terminationReason = uncertain
+            ? "motion_goal_uncertain"
+            : "motion_constraint_violated";
+          break;
+        }
+      }
       const reference = hydrateHumanoidReference(frame.reference);
       const snapshot = await this.#simulation.step(reference);
       frames += 1;
       lastReference = reference;
       this.#reference = reference;
+      if (stored.option && stored.rollout) {
+        const predicted = stored.rollout.frames[index];
+        if (!predicted || Math.abs(predicted.atSeconds - frame.atSeconds) > 1e-9) {
+          throw new Error("Humanoid motion rollout frame does not match its artifact");
+        }
+        const drift = detectHumanoidMotionDrift(
+          snapshot,
+          predicted,
+          stored.rollout.limits
+        );
+        stored.progress.lastDrift = drift;
+        stored.progress.driftStreak = drift.drifted
+          ? stored.progress.driftStreak + 1
+          : 0;
+      }
       for (const contact of humanoidObjectContacts(snapshot)) {
         if (contact.objectId === null) continue;
         if (constraints.some((constraint) => (
@@ -357,10 +613,116 @@ export class HumanoidWorld {
         const failure = { code: "fallen", atSeconds: frame.atSeconds } as const;
         failures.push(failure);
         stored.progress.failure = failure;
+      } else if (stored.option
+        && stored.rollout
+        && stored.progress.lastDrift?.drifted
+        && stored.progress.driftStreak >= stored.rollout.limits.consecutive_steps) {
+        const failure = {
+          code: "execution_drift",
+          atSeconds: frame.atSeconds,
+          drift: { ...stored.progress.lastDrift },
+          message: "Physical execution persistently diverged from its validated rollout"
+        } as const;
+        failures.push(failure);
+        stored.progress.failure = {
+          code: failure.code,
+          atSeconds: failure.atSeconds,
+          drift: { ...failure.drift }
+        };
       }
       stored.progress.nextFrameIndex = index + 1;
       stored.progress.satisfiedContactKeys = [...satisfiedContacts];
+      if (stored.option) {
+        const detectorInput = this.#motionOptionDetectorInput(snapshot);
+        if (failures.length > 0) {
+          lastOptionDetection = detectHumanoidMotionOption(
+            stored.option.contract,
+            detectorInput
+          );
+          stored.option.lastEvidence = jsonOptionEvidence(
+            lastOptionDetection,
+            stored.option.monitor
+          );
+          stored.option.status = "failed";
+          stored.option.actualTerminationFrame = index + 1;
+          stored.option.terminationReason = stored.progress.failure?.code
+            ?? "environment_contact";
+        } else {
+          const update = advanceHumanoidMotionOptionMonitor(
+            stored.option.contract,
+            stored.option.monitor,
+            detectorInput
+          );
+          stored.option.monitor = update.state;
+          stored.option.successStreak = update.state.terminalStableSteps;
+          lastOptionDetection = update.detection;
+          stored.option.lastEvidence = jsonOptionEvidence(
+            update.detection,
+            update.state
+          );
+          if (update.state.phase === "indeterminate") {
+            failures.push({
+              code: "motion_goal_uncertain",
+              atSeconds: frame.atSeconds,
+              message: "Motion option lost observable evidence for its during constraint"
+            });
+            stored.option.status = "goal_unmet";
+            stored.option.actualTerminationFrame = index + 1;
+            stored.option.terminationReason = "motion_goal_uncertain";
+          } else if (update.state.phase === "violated") {
+            const failure = {
+              code: "motion_constraint_violated",
+              atSeconds: frame.atSeconds,
+              message: "Motion option violated its during constraint"
+            } as const;
+            failures.push(failure);
+            stored.progress.failure = {
+              code: failure.code,
+              atSeconds: failure.atSeconds
+            };
+            stored.option.status = "failed";
+            stored.option.actualTerminationFrame = index + 1;
+            stored.option.terminationReason = failure.code;
+          }
+          const missingRequired = missingRequiredHumanoidContacts(
+            constraints,
+            satisfiedContacts
+          );
+          if (update.state.phase === "succeeded"
+            && missingRequired.length === 0
+            && snapshot.balance.support !== "none"
+            && failures.length === 0) {
+            stored.option.status = "succeeded";
+            stored.option.actualTerminationFrame = index + 1;
+            stored.option.terminationReason = "physical_success";
+          }
+        }
+      }
       await this.#commitFrame(frameSink);
+      if (stored.option && isTerminalMotionOption(stored.option)) break;
+    }
+    if (stored.option) {
+      if (!isTerminalMotionOption(stored.option)) {
+        const uncertain = lastOptionDetection?.hasUncertain ?? true;
+        stored.option.status = "goal_unmet";
+        stored.option.actualTerminationFrame = stored.progress.nextFrameIndex;
+        stored.option.terminationReason = uncertain
+          ? "motion_goal_uncertain"
+          : "motion_goal_unmet";
+        failures.push({
+          code: uncertain ? "motion_goal_uncertain" : "motion_goal_unmet",
+          atSeconds: stored.artifact.frames[
+            Math.max(0, stored.progress.nextFrameIndex - 1)
+          ]!.atSeconds,
+          message: uncertain
+            ? "Motion option ended without observable success evidence"
+            : "Motion option exhausted its verified horizon before physical success"
+        });
+      }
+      this.#reference = lastReference;
+      const receipt = this.#motionOptionReceipt(stored, frames, failures);
+      this.#motions.delete(planId);
+      return receipt;
     }
     const missingContacts = missingRequiredHumanoidContacts(
       constraints,
@@ -533,7 +895,9 @@ export class HumanoidWorld {
     for (const entry of checkpoint.motions) {
       const expectedRevision = entry.createdRevision + entry.progress.nextFrameIndex;
       if (expectedRevision === checkpoint.worldRevision) {
-        this.#motions.set(entry.plan.id, structuredClone(entry));
+        const restored = structuredClone(entry);
+        restored.progress.satisfiedContactKeys = [];
+        this.#motions.set(entry.plan.id, restored);
       }
     }
     this.#routes.clear();
@@ -658,6 +1022,77 @@ export class HumanoidWorld {
       }));
   }
 
+  #motionOptionDetectorInput(
+    snapshot: HumanoidSimulationSnapshot
+  ): HumanoidMotionOptionDetectorInput {
+    const sensed = this.#simulation.senseObjects(
+      this.#scenario.visibility_radius
+    );
+    const observedFrame = this.#frame + 1;
+    const observedWorldRevision = this.#worldRevision + 1;
+    this.#objectMemory.refresh(
+      observedFrame,
+      observedWorldRevision,
+      snapshot.objects,
+      new Set(Object.keys(sensed.objects))
+    );
+    const observableObjects: HumanoidMotionOptionObservableObject[] = this.#objectMemory
+      .observableObjectStates(observedFrame, observedWorldRevision)
+      .map((object) => ({
+        id: object.id,
+        position: { ...object.pose.position },
+        size: { ...object.size }
+      }));
+    return {
+      snapshot,
+      observableObjects,
+      zones: this.#scenario.zones
+    };
+  }
+
+  #motionOptionReceipt(
+    stored: StoredMotionPlan,
+    frames: number,
+    failures: HumanoidMotionValidation["failures"] = []
+  ): HumanoidExecutionReceipt {
+    const option = stored.option;
+    if (!option || !isTerminalMotionOption(option)) {
+      throw new Error("Humanoid motion option has no terminal physical result");
+    }
+    const accepted = option.status === "succeeded";
+    const code: HumanoidExecutionReceipt["code"] = accepted
+      ? "motion_option_succeeded"
+      : option.status === "failed"
+        ? option.terminationReason === "execution_drift"
+          ? "motion_execution_drifted"
+          : option.terminationReason === "motion_constraint_violated"
+            ? "motion_constraint_violated"
+            : "motion_failed"
+        : option.terminationReason === "motion_goal_uncertain"
+          ? "motion_goal_uncertain"
+          : "motion_goal_unmet";
+    return this.#receipt(accepted, code, frames, {
+      motion: humanoidMotionArtifactSummary(stored.artifact),
+      ...(failures.length === 0 ? {} : { failures }),
+      option: {
+        option_id: option.contract.option_id,
+        status: option.status,
+        termination_reason: option.terminationReason,
+        full_frame_count: stored.artifact.frames.length,
+        executed_prefix_frame_count: stored.progress.nextFrameIndex,
+        predicted_termination_frame: option.certificate.predicted_termination_frame,
+        actual_termination_frame: option.actualTerminationFrame,
+        artifact_sha256: option.certificate.artifact_sha256,
+        rollout_sha256: option.certificate.rollout_sha256,
+        drift_streak: stored.progress.driftStreak,
+        drift_evidence: stored.progress.lastDrift
+          ? { ...stored.progress.lastDrift }
+          : null,
+        evidence: option.lastEvidence
+      }
+    });
+  }
+
   #receipt(
     accepted: boolean,
     code: HumanoidExecutionReceipt["code"],
@@ -753,6 +1188,21 @@ function validationFailure(
   if (failure.code === "fallen") {
     return { code: "fallen", atSeconds: failure.atSeconds };
   }
+  if (failure.code === "execution_drift") {
+    return {
+      code: "execution_drift",
+      atSeconds: failure.atSeconds,
+      ...(failure.drift ? { drift: { ...failure.drift } } : {}),
+      message: "Physical execution persistently diverged from its validated rollout"
+    };
+  }
+  if (failure.code === "motion_constraint_violated") {
+    return {
+      code: "motion_constraint_violated",
+      atSeconds: failure.atSeconds,
+      message: "Motion option violated its during constraint"
+    };
+  }
   return {
     code: "environment_contact",
     atSeconds: failure.atSeconds,
@@ -761,4 +1211,58 @@ function validationFailure(
       ? { contacts: failure.contacts.map((contact) => ({ ...contact })) }
       : {})
   };
+}
+
+function isTerminalMotionOption(
+  option: HumanoidMotionOptionExecutionState
+): boolean {
+  return option.status === "succeeded"
+    || option.status === "failed"
+    || option.status === "goal_unmet";
+}
+
+function assertMotionOptionIntegrity(stored: StoredMotionPlan): void {
+  const option = stored.option;
+  if (!option) return;
+  if (!stored.rollout) {
+    throw new Error("Humanoid motion option is missing its validated rollout");
+  }
+  const certificate = option.certificate;
+  const predictedFrame = stored.artifact.frames[
+    certificate.predicted_termination_frame - 1
+  ];
+  const valid = certificate.artifact_sha256
+      === humanoidMotionArtifactSha256(stored.artifact)
+    && certificate.contract_sha256
+      === humanoidMotionOptionContractSha256(option.contract)
+    && option.monitor.contractSha256 === certificate.contract_sha256
+    && option.successStreak === option.monitor.terminalStableSteps
+    && certificate.rollout_sha256
+      === humanoidMotionRolloutSha256(stored.rollout)
+    && certificate.rollout_frame_count === stored.rollout.frames.length
+    && certificate.rollout_frame_count === stored.artifact.frames.length
+    && certificate.drift_consecutive_steps
+      === stored.rollout.limits.consecutive_steps
+    && certificate.validated_frame_limit === stored.artifact.frames.length
+    && certificate.predicted_termination_frame >= certificate.stable_steps
+    && certificate.predicted_termination_frame <= certificate.validated_frame_limit
+    && certificate.stable_steps === option.contract.stable_steps
+    && predictedFrame !== undefined
+    && Math.abs(predictedFrame.atSeconds - certificate.predicted_at_seconds) <= 1e-9;
+  if (!valid) {
+    throw new Error("Humanoid motion option certificate integrity check failed");
+  }
+}
+
+function jsonOptionEvidence(
+  detection: HumanoidMotionOptionDetection,
+  monitor: HumanoidMotionOptionExecutionState["monitor"]
+): HumanoidMotionOptionExecutionState["lastEvidence"] {
+  return JSON.parse(JSON.stringify({
+    predicates: detection.evidence,
+    phases: detection.phases,
+    monitor
+  })) as HumanoidMotionOptionExecutionState[
+    "lastEvidence"
+  ];
 }

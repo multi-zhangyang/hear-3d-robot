@@ -42,6 +42,43 @@ describe("humanoid multi-scale embodied memory", () => {
     );
   });
 
+  it("retains physically selected candidate evidence across context compaction", () => {
+    const input = episodeInput(1);
+    input.execution.code = "motion_option_succeeded";
+    input.execution.detail = {
+      planning_action: "plan_whole_body_motion_candidates",
+      candidate_count: 3,
+      selected_rank: 2,
+      selected_candidate_id: "balanced-candidate",
+      result: {
+        option: {
+          option_id: "reach-target",
+          status: "succeeded",
+          termination_reason: "physical_success",
+          full_frame_count: 100,
+          executed_prefix_frame_count: 31,
+          predicted_termination_frame: 33,
+          actual_termination_frame: 31,
+          artifact_sha256: "a".repeat(64)
+        }
+      }
+    };
+
+    expect(appendEmbodiedEpisode(input).episode).toMatchObject({
+      planning_action: "plan_whole_body_motion_candidates",
+      candidate_count: 3,
+      selected_rank: 2,
+      selected_candidate_id: "balanced-candidate",
+      motion_option: {
+        option_id: "reach-target",
+        status: "succeeded",
+        actual_termination_frame: 31,
+        predicted_termination_frame: 33,
+        artifact_sha256: "a".repeat(64)
+      }
+    });
+  });
+
   it("bounds the hot checkpoint receipt window without changing append-only evidence", () => {
     const receipts = Object.fromEntries(Array.from({ length: 40 }, (_, index) => (
       [`receipt-${index + 1}`, { sequence: index + 1 }]

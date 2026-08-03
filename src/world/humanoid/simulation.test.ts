@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { JsonValue } from "../../domain/schema.js";
 import { HUMANOID_JOINT_INDEX, HUMANOID_JOINT_NAMES } from "./model.js";
+import { inverseQuaternion, rotateVector, subtract } from "../geometry.js";
 import {
   interpolateReference,
   neutralHumanoidReference,
@@ -43,6 +44,37 @@ describe("HumanoidSimulation", () => {
       expect(Object.keys(standing.links)).toContain("left_ankle_roll_link");
       expect(Object.keys(standing.links)).toContain("right_wrist_yaw_link");
       expect(Object.keys(standing.links)).toContain("head_link");
+
+      const leftFootInPelvis = rotateVector(
+        inverseQuaternion(standing.links.pelvis.rotation),
+        subtract(
+          standing.links.left_ankle_roll_link.position,
+          standing.links.pelvis.position
+        )
+      );
+      const footSolution = simulation.solveEndEffectorTargets(neutral, [{
+        body: "left_ankle_roll_link",
+        position: {
+          ...leftFootInPelvis,
+          y: leftFootInPelvis.y + 0.08,
+          z: leftFootInPelvis.z + 0.03
+        },
+        frame: "pelvis",
+        tolerance: 0.025
+      }]);
+      expect(footSolution.residuals).toEqual([
+        expect.objectContaining({
+          body: "left_ankle_roll_link",
+          error: expect.any(Number)
+        })
+      ]);
+      expect(footSolution.residuals[0]!.error).toBeLessThanOrEqual(0.025);
+      expect(footSolution.reference.jointPositions[3]).toBeGreaterThan(
+        neutral.jointPositions[3]! + 0.2
+      );
+      expect(Array.from(footSolution.reference.jointPositions.slice(6))).toEqual(
+        Array.from(neutral.jointPositions.slice(6))
+      );
 
       const raised = targetReference(neutral, {
         joints: {

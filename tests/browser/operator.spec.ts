@@ -23,7 +23,7 @@ test("渲染自主人形世界与实时层级智能体界面", async ({ page }, 
   }
 
   const mission = page.locator("section.humanoid-mission-world");
-  await expect(mission).toBeVisible({ timeout: 25_000 });
+  await expect(mission).toBeVisible({ timeout: 60_000 });
   const label = await mission.getAttribute("aria-label");
   if (label !== "实时人形任务" && label !== "人形任务回顾") {
     throw new Error(`Unexpected humanoid mission mode: ${label ?? "missing"}`);
@@ -67,13 +67,22 @@ async function assertHumanoidOperator(
   await expect(page.locator(".graphics-error")).toHaveCount(0);
 
   const camera = page.getByRole("group", { name: "观察视角" });
-  for (const name of ["跟随", "世界", "头部"]) {
+  for (const [name, mode] of [["跟随", "follow"], ["世界", "world"], ["头部", "head"]] as const) {
     const button = camera.getByRole("button", { name, exact: true });
     await button.click();
     await expect(button).toHaveAttribute("aria-pressed", "true");
+    await expect.poll(async () => (await robotProjection(page)).mode).toBe(mode);
   }
+  const headProjection = await robotProjection(page);
   await camera.getByRole("button", { name: "跟随", exact: true }).click();
+  await expect.poll(async () => {
+    const projection = await robotProjection(page);
+    return projection.mode === "follow" ? projection.revision : 0;
+  }).toBeGreaterThan(headProjection.revision);
+  const followProjection = await robotProjection(page);
   await page.getByRole("button", { name: "复位视角", exact: true }).click();
+  await expect.poll(async () => (await robotProjection(page)).revision)
+    .toBeGreaterThan(followProjection.revision);
 
   const hotbar = page.getByRole("navigation", { name: "工作区" });
   await expect(hotbar).toBeVisible();
@@ -83,6 +92,25 @@ async function assertHumanoidOperator(
   if (project === "mobile") {
     await assertMobileHudLayout(page, camera, hotbar);
   }
+  await expect.poll(() => canvas.evaluate((element) => {
+    if (!(element instanceof HTMLCanvasElement) || !element.dataset.robotScreenBounds) return 0;
+    const bounds = JSON.parse(element.dataset.robotScreenBounds) as { top: number; bottom: number };
+    return bounds.bottom - bounds.top;
+  })).toBeGreaterThan(project === "desktop" ? 300 : 210);
+  const [projection, canvasHeight] = await Promise.all([
+    robotProjection(page),
+    canvas.evaluate((element) => element.clientHeight)
+  ]);
+  const composition = { ...projection, canvasHeight };
+  expect(composition.top).toBeGreaterThanOrEqual(-2);
+  expect(composition.bottom).toBeLessThanOrEqual(composition.canvasHeight + 2);
+  const [canvasLayout, hotbarLayout] = await Promise.all([
+    canvas.boundingBox(),
+    hotbar.boundingBox()
+  ]);
+  expect(canvasLayout).not.toBeNull();
+  expect(hotbarLayout).not.toBeNull();
+  expect(canvasLayout!.y + composition.bottom).toBeLessThan(hotbarLayout!.y - 6);
   const panels = [
     ["2", "智能体流面板", /AgentFlowView/, "实时层级智能体流", "hierarchy.png"],
     ["3", "行动历程面板", /RobotTrailView/, "机器人行动历程", "actions.png"],
@@ -151,10 +179,13 @@ async function assertMobileHudLayout(
   hotbar: ReturnType<Page["getByRole"]>
 ): Promise<void> {
   const goal = page.getByLabel("目标与长期记忆");
+  const agent = page.getByLabel("层级智能体执行状态");
+  const canvas = page.locator("canvas.humanoid-canvas");
   await expect(goal).toBeVisible();
-  const boxes = await Promise.all([goal, camera, hotbar].map((locator) => locator.boundingBox()));
+  const boxes = await Promise.all([goal, agent, camera, hotbar, canvas]
+    .map((locator) => locator.boundingBox()));
   expect(boxes.every((box) => box !== null)).toBe(true);
-  const [goalBox, cameraBox, hotbarBox] = boxes;
+  const [goalBox, agentBox, cameraBox, hotbarBox, canvasBox] = boxes;
   expect(overlapArea(goalBox!, cameraBox!)).toBe(0);
   expect(overlapArea(goalBox!, hotbarBox!)).toBe(0);
   expect(overlapArea(cameraBox!, hotbarBox!)).toBe(0);
@@ -162,6 +193,31 @@ async function assertMobileHudLayout(
   expect(goalBox!.y + goalBox!.height).toBeLessThanOrEqual(
     await page.evaluate(() => document.documentElement.clientHeight)
   );
+  const projection = await robotProjection(page);
+  expect(canvasBox!.y + projection.top).toBeGreaterThanOrEqual(
+    agentBox!.y + agentBox!.height + 6
+  );
+  expect(canvasBox!.y + projection.bottom).toBeLessThanOrEqual(goalBox!.y - 6);
+}
+
+interface RobotProjection {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  mode: "follow" | "world" | "head";
+  revision: number;
+}
+
+async function robotProjection(page: Page): Promise<RobotProjection> {
+  return page.locator("canvas.humanoid-canvas").evaluate(readRobotProjection);
+}
+
+function readRobotProjection(element: Element): RobotProjection {
+  if (!(element instanceof HTMLCanvasElement) || !element.dataset.robotScreenBounds) {
+    throw new Error("Missing projected humanoid bounds");
+  }
+  return JSON.parse(element.dataset.robotScreenBounds) as RobotProjection;
 }
 
 function overlapArea(

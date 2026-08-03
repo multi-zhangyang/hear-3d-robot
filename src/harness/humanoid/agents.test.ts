@@ -26,6 +26,7 @@ describe("humanoid agent hierarchy", () => {
     const modelOwners: string[] = [];
     const sessionOwners: string[] = [];
     const models: Model[] = [];
+    const recallRequests: unknown[] = [];
     const execution = receipt({
       transactionId: "execute-accepted",
       action: "execute_whole_body_motion",
@@ -37,6 +38,14 @@ describe("humanoid agent hierarchy", () => {
     });
     const runtime = {
       invoke: async () => execution,
+      recallEmbodiedHistory: async (request: unknown) => {
+        recallRequests.push(request);
+        return {
+          historical_only: false,
+          current_world_revision: 20,
+          episodes: [{ source_ref: "episode:7", sequence: 7 }]
+        };
+      },
       validateCycleEvidence: (transactionIds: readonly string[]) => {
         expect(transactionIds).toEqual([execution.transactionId]);
         return structuredClone(execution);
@@ -82,6 +91,7 @@ describe("humanoid agent hierarchy", () => {
     );
 
     expect(hierarchy.coordinator.tools.map((entry) => entry.name)).toEqual([
+      "recall_embodied_history",
       "delegate_humanoid_sentry",
       "delegate_motion_reference",
       "delegate_physics_executor",
@@ -95,13 +105,36 @@ describe("humanoid agent hierarchy", () => {
     ]);
     expect(hierarchy.motion.tools.map((entry) => entry.name)).toEqual([
       "observe_humanoid",
-      "plan_whole_body_motion",
+      "recall_embodied_history",
+      "plan_whole_body_motion_candidates",
       "plan_humanoid_navigation"
     ]);
     expect(hierarchy.executor.tools.map((entry) => entry.name)).toEqual([
       "execute_whole_body_motion",
       "execute_humanoid_navigation"
     ]);
+    expect(hierarchy.sentry.tools.map((entry) => entry.name)).not.toContain(
+      "recall_embodied_history"
+    );
+    expect(hierarchy.executor.tools.map((entry) => entry.name)).not.toContain(
+      "recall_embodied_history"
+    );
+
+    const recall = hierarchy.coordinator.tools.find(
+      (entry) => entry.name === "recall_embodied_history"
+    );
+    if (!recall || recall.type !== "function") {
+      throw new Error("Embodied history recall tool is missing");
+    }
+    const recalled = await recall.invoke(
+      new RunContext({ runId: "humanoid-recall-test" }),
+      JSON.stringify({ source_refs: ["episode:7"], limit: 1 })
+    );
+    expect(JSON.parse(String(recalled))).toMatchObject({
+      historical_only: true,
+      episodes: [{ source_ref: "episode:7", sequence: 7 }]
+    });
+    expect(recallRequests).toEqual([{ source_refs: ["episode:7"], limit: 1 }]);
 
     const complete = hierarchy.coordinator.tools.find(
       (entry) => entry.name === "complete_autonomous_cycle"
@@ -130,6 +163,7 @@ describe("humanoid agent hierarchy", () => {
       provider,
       runtime: {
         invoke: async () => { throw new Error("outside test"); },
+        recallEmbodiedHistory: async () => { throw new Error("outside test"); },
         validateCycleEvidence: () => { throw new Error("outside test"); }
       } as never,
       createModel: () => shared,

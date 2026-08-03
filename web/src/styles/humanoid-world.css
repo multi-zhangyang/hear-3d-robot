@@ -9,6 +9,9 @@
   position: absolute;
   inset: 0;
   overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 35%, rgba(71, 112, 101, .18), transparent 42%),
+    linear-gradient(180deg, #19272f, #111a20);
 }
 
 .humanoid-stage-bar {
@@ -171,9 +174,23 @@
 }
 
 @media (max-width: 620px) {
-  .humanoid-agent-hud { width: calc(100vw - 24px); }
+  .humanoid-agent-hud {
+    width: calc(100vw - 24px);
+    padding: 11px 12px;
+  }
   .humanoid-agent-chain { grid-template-columns: 1fr 1fr; }
-  .humanoid-agent-focus { margin: 9px 0; }
+  .humanoid-agent-focus { margin: 6px 0 7px; }
+  .humanoid-agent-focus span { font-size: 15px; }
+  .humanoid-agent-focus strong { font-size: 10px; }
+  .humanoid-agent-chain > div {
+    min-height: 31px;
+    padding: 3px 7px;
+  }
+  .humanoid-agent-chain b { font-size: 9px; }
+  .humanoid-agent-chain small,
+  .humanoid-agent-chain em { font-size: 8px; }
+  .humanoid-channel-grid { gap: 4px 8px; margin-top: 7px; }
+  .humanoid-channel-grid span { font-size: 9px; }
   .humanoid-state-hud { display: none; }
   .humanoid-goal-hud {
     right: 12px;

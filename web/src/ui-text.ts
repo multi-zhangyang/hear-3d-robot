@@ -35,6 +35,8 @@ const STREAM_STATUS: Record<StreamState, string> = {
 
 const BODY_CHANNEL: Record<HumanoidBodyChannel, string> = {
   locomotion: "双足运动",
+  left_leg: "左腿",
+  right_leg: "右腿",
   torso: "躯干",
   left_arm: "左臂",
   right_arm: "右臂"
@@ -42,7 +44,9 @@ const BODY_CHANNEL: Record<HumanoidBodyChannel, string> = {
 
 const ACTION_LABELS: Record<string, string> = {
   observe_humanoid: "感知人形世界",
+  recall_embodied_history: "召回具身历史",
   plan_whole_body_motion: "规划全身动作",
+  plan_whole_body_motion_candidates: "筛选全身候选",
   execute_whole_body_motion: "执行全身动作",
   plan_humanoid_navigation: "规划双足路线",
   execute_humanoid_navigation: "执行双足导航",
@@ -58,9 +62,16 @@ const RESULT_CODES: Record<string, string> = {
   humanoid_observed: "人形世界状态已感知",
   whole_body_plan_validated: "全身动作已通过物理预演",
   whole_body_plan_rejected: "全身动作未通过物理预演",
+  whole_body_candidates_validated: "全身候选已通过物理筛选",
+  whole_body_candidates_rejected: "全身候选均未通过物理筛选",
   humanoid_route_validated: "双足路线已通过物理预演",
   humanoid_route_rejected: "没有可行的双足路线",
   motion_completed: "全身动作已完成",
+  motion_option_succeeded: "物理目标已稳定达成",
+  motion_goal_unmet: "物理目标未达成",
+  motion_goal_uncertain: "物理目标当前不可确定",
+  motion_execution_drifted: "执行偏离预演，已提前截断",
+  motion_constraint_violated: "动作违反持续物理约束",
   motion_failed: "全身动作执行失败",
   navigation_completed: "双足导航分块已完成",
   navigation_blocked: "双足导航受阻",
@@ -72,6 +83,7 @@ const RESULT_CODES: Record<string, string> = {
   invalid_tool_input: "动作输入无效",
   invalid_reference: "全身运动参考无效",
   environment_contact: "动作产生未授权环境接触",
+  execution_drift: "执行轨迹持续偏离预演",
   fallen: "机器人在物理预演中失去平衡",
   required_contact_missing: "动作缺少要求的物理接触",
   unknown_contact_object: "接触目标不存在",

@@ -28,7 +28,13 @@ export interface Goal {
   predicates: GoalPredicate[];
 }
 
-export type HumanoidBodyChannel = "locomotion" | "torso" | "left_arm" | "right_arm";
+export type HumanoidBodyChannel =
+  | "locomotion"
+  | "left_leg"
+  | "right_leg"
+  | "torso"
+  | "left_arm"
+  | "right_arm";
 
 interface HumanoidJointState {
   position: number;
@@ -177,8 +183,25 @@ export interface HumanoidCheckerResult {
 
 export interface HumanoidEmbodiedEpisode {
   sequence: number;
+  source_ref?: string;
   transaction_id: string;
   action: "execute_whole_body_motion" | "execute_humanoid_navigation";
+  planning_action?: "plan_whole_body_motion"
+    | "plan_whole_body_motion_candidates"
+    | "plan_humanoid_navigation";
+  candidate_count?: number;
+  selected_rank?: number;
+  selected_candidate_id?: string;
+  motion_option?: {
+    option_id: string;
+    status: "succeeded";
+    termination_reason: "physical_success";
+    full_frame_count: number;
+    executed_prefix_frame_count: number;
+    predicted_termination_frame: number;
+    actual_termination_frame: number;
+    artifact_sha256: string;
+  };
   code: string;
   model_summary: string;
   world_before_revision: number;
@@ -203,6 +226,7 @@ export interface HumanoidEmbodiedMemoryState {
 type HumanoidActionName =
   | "observe_humanoid"
   | "plan_whole_body_motion"
+  | "plan_whole_body_motion_candidates"
   | "execute_whole_body_motion"
   | "plan_humanoid_navigation"
   | "execute_humanoid_navigation";

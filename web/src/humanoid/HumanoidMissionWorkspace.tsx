@@ -25,7 +25,14 @@ interface HumanoidMissionWorkspaceProps {
   streamState: StreamState;
 }
 
-const CHANNELS: HumanoidBodyChannel[] = ["locomotion", "torso", "left_arm", "right_arm"];
+export const HUMANOID_BODY_CHANNELS: readonly HumanoidBodyChannel[] = [
+  "locomotion",
+  "left_leg",
+  "right_leg",
+  "torso",
+  "left_arm",
+  "right_arm"
+];
 
 export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): React.JSX.Element {
   const { checkpoint } = props.details;
@@ -38,7 +45,7 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
   const current = checkpoint.active_agent_id
     ? checkpoint.nodes[checkpoint.active_agent_id]
     : checkpoint.nodes[checkpoint.root_id];
-  const activeChannels = movingChannels(frame);
+  const activeChannels = movingHumanoidChannels(frame);
   const latest = props.details.actions.at(-1);
   const passed = checkpoint.checker?.checks.filter((check) => check.passed).length ?? 0;
   const total = checkpoint.goal.predicates.length;
@@ -72,7 +79,7 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
           ))}
         </div>
         <div className="humanoid-channel-grid" aria-label="人形身体通道">
-          {CHANNELS.map((channel) => (
+          {HUMANOID_BODY_CHANNELS.map((channel) => (
             <span key={channel} className={activeChannels.includes(channel) ? "active" : ""}>
               <i />{bodyChannelLabel(channel)}
             </span>
@@ -126,18 +133,30 @@ function Metric(props: { label: string; value: string | number; active?: boolean
   return <span className={props.active ? "active" : ""}><small>{props.label}</small><b>{props.value}</b></span>;
 }
 
-function movingChannels(frame: HumanoidWorldSnapshot): HumanoidBodyChannel[] {
+export function movingHumanoidChannels(
+  frame: HumanoidWorldSnapshot
+): HumanoidBodyChannel[] {
   const active = new Set<HumanoidBodyChannel>();
+  const pelvis = frame.robot.links.pelvis;
+  if (pelvis && (
+    Math.hypot(pelvis.linearVelocity.x, pelvis.linearVelocity.z) >= 0.05
+      || Math.abs(pelvis.angularVelocity.y) >= 0.08
+  )) {
+    active.add("locomotion");
+  }
   for (const [name, joint] of Object.entries(frame.robot.joints)) {
     if (Math.abs(joint.velocity) < 0.08) continue;
-    if (name.startsWith("left_hip") || name.startsWith("left_knee") || name.startsWith("left_ankle")
-      || name.startsWith("right_hip") || name.startsWith("right_knee") || name.startsWith("right_ankle")) {
-      active.add("locomotion");
+    if (name.startsWith("left_hip") || name.startsWith("left_knee")
+      || name.startsWith("left_ankle")) {
+      active.add("left_leg");
+    } else if (name.startsWith("right_hip") || name.startsWith("right_knee")
+      || name.startsWith("right_ankle")) {
+      active.add("right_leg");
     } else if (name.startsWith("waist_")) active.add("torso");
     else if (name.startsWith("left_")) active.add("left_arm");
     else if (name.startsWith("right_")) active.add("right_arm");
   }
-  return CHANNELS.filter((channel) => active.has(channel));
+  return HUMANOID_BODY_CHANNELS.filter((channel) => active.has(channel));
 }
 
 function forceLabel(force: number): string {

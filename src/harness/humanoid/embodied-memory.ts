@@ -29,10 +29,36 @@ export function appendEmbodiedEpisode(input: {
     || input.execution.worldAfterRevision !== input.world.worldRevision) {
     throw new Error("Embodied memory requires current accepted execution evidence");
   }
+  const executionDetail = jsonRecord(input.execution.detail);
+  const planningAction = executionDetail?.planning_action;
+  const candidateCount = executionDetail?.candidate_count;
+  const selectedRank = executionDetail?.selected_rank;
+  const selectedCandidateId = executionDetail?.selected_candidate_id;
+  const resultDetail = jsonRecord(executionDetail?.result);
+  const optionDetail = jsonRecord(resultDetail?.option);
+  const candidateSelection = planningAction === "plan_whole_body_motion_candidates"
+    && typeof candidateCount === "number"
+    && typeof selectedRank === "number"
+    && typeof selectedCandidateId === "string"
+    ? {
+        candidate_count: candidateCount,
+        selected_rank: selectedRank,
+        selected_candidate_id: selectedCandidateId
+      }
+    : {};
+  const motionOption = physicalOptionMemory(optionDetail);
   const episode = HumanoidEmbodiedEpisodeSchema.parse({
     sequence: input.sequence,
+    source_ref: `episode:${input.sequence}`,
     transaction_id: input.execution.transactionId,
     action: input.execution.action,
+    ...(planningAction === "plan_whole_body_motion"
+      || planningAction === "plan_whole_body_motion_candidates"
+      || planningAction === "plan_humanoid_navigation"
+      ? { planning_action: planningAction }
+      : {}),
+    ...candidateSelection,
+    ...(motionOption ? { motion_option: motionOption } : {}),
     code: input.execution.code,
     model_summary: input.modelSummary,
     world_before_revision: input.execution.worldBeforeRevision,
@@ -57,6 +83,55 @@ export function appendEmbodiedEpisode(input: {
     }),
     episode
   };
+}
+
+function physicalOptionMemory(
+  option: Record<string, unknown> | undefined
+): {
+  option_id: string;
+  status: "succeeded";
+  termination_reason: "physical_success";
+  full_frame_count: number;
+  executed_prefix_frame_count: number;
+  predicted_termination_frame: number;
+  actual_termination_frame: number;
+  artifact_sha256: string;
+  rollout_sha256?: string;
+} | undefined {
+  if (!option
+    || typeof option.option_id !== "string"
+    || option.status !== "succeeded"
+    || option.termination_reason !== "physical_success"
+    || !positiveInteger(option.full_frame_count)
+    || !positiveInteger(option.executed_prefix_frame_count)
+    || !positiveInteger(option.predicted_termination_frame)
+    || !positiveInteger(option.actual_termination_frame)
+    || typeof option.artifact_sha256 !== "string") {
+    return undefined;
+  }
+  return {
+    option_id: option.option_id,
+    status: option.status,
+    termination_reason: option.termination_reason,
+    full_frame_count: option.full_frame_count,
+    executed_prefix_frame_count: option.executed_prefix_frame_count,
+    predicted_termination_frame: option.predicted_termination_frame,
+    actual_termination_frame: option.actual_termination_frame,
+    artifact_sha256: option.artifact_sha256,
+    ...(typeof option.rollout_sha256 === "string"
+      ? { rollout_sha256: option.rollout_sha256 }
+      : {})
+  };
+}
+
+function positiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 export function recentEmbodiedEpisodes(

@@ -10,6 +10,11 @@ import {
   HumanoidActionInputs,
   type HumanoidActionName
 } from "./actions.js";
+import { normalizeHumanoidMotionCandidateBatchInput } from "./motion-candidate-input.js";
+
+type HumanoidPlanningActionName = "plan_whole_body_motion"
+  | "plan_whole_body_motion_candidates"
+  | "plan_humanoid_navigation";
 
 export interface HumanoidActionReceipt {
   transactionId: string;
@@ -64,6 +69,7 @@ export class HumanoidActionRuntime {
       });
       if (receipt.accepted
         && (receipt.action === "plan_whole_body_motion"
+          || receipt.action === "plan_whole_body_motion_candidates"
           || receipt.action === "plan_humanoid_navigation")) {
         const planId = jsonObject(receipt.detail)?.plan_id;
         if (typeof planId === "string" && planId) {
@@ -189,11 +195,52 @@ export class HumanoidActionRuntime {
         }
       };
     }
+    if (name === "plan_whole_body_motion_candidates") {
+      const batch = normalizeHumanoidMotionCandidateBatchInput(
+        HumanoidActionInputs.plan_whole_body_motion_candidates.parse(rawInput)
+      );
+      const result = await this.#world.planWholeBodyMotionCandidates(batch);
+      if (result.accepted) this.#planChannels.set(result.planId, result.channels);
+      return {
+        accepted: result.accepted,
+        code: result.accepted
+          ? "whole_body_candidates_validated"
+          : "whole_body_candidates_rejected",
+        channels: result.channels,
+        detail: {
+          plan_id: result.planId,
+          objective: batch.objective,
+          created_revision: result.createdRevision,
+          selection: result.selection,
+          selected_candidate_id: result.selectedCandidateId,
+          selected_rank: result.selectedRank,
+          candidate_count: result.candidates.length,
+          termination: batch.termination,
+          option: result.option,
+          motion: result.motion,
+          candidates: result.candidates.map((candidate) => ({
+            rank: candidate.rank,
+            plan_id: candidate.planId,
+            intent: candidate.intent,
+            selected: candidate.planId === result.selectedCandidateId,
+            channels: candidate.channels,
+            motion: candidate.motion,
+            option_certificate: candidate.optionCertificate,
+            validation: {
+              feasible: candidate.validation.feasible,
+              failures: candidate.validation.failures,
+              evidence: candidate.validation.evidence,
+              predicted_final: conciseRobot(candidate.validation.finalSnapshot)
+            }
+          }))
+        }
+      };
+    }
     if (name === "execute_whole_body_motion") {
       const input = HumanoidActionInputs.execute_whole_body_motion.parse(rawInput);
       const reference = this.#planningReference(
         input.planning_transaction_id,
-        "plan_whole_body_motion"
+        ["plan_whole_body_motion", "plan_whole_body_motion_candidates"]
       );
       if (!reference.accepted) return reference.result;
       const channels = this.#planChannels.get(reference.planId) ?? [];
@@ -205,6 +252,8 @@ export class HumanoidActionRuntime {
         channels,
         detail: {
           planning_transaction_id: input.planning_transaction_id,
+          planning_action: reference.planningAction,
+          ...reference.candidateSelection,
           plan_id: reference.planId,
           frames: result.frames,
           result: result.detail,
@@ -235,7 +284,7 @@ export class HumanoidActionRuntime {
     const input = HumanoidActionInputs.execute_humanoid_navigation.parse(rawInput);
     const reference = this.#planningReference(
       input.planning_transaction_id,
-      "plan_humanoid_navigation"
+      ["plan_humanoid_navigation"]
     );
     if (!reference.accepted) return reference.result;
     const result = await this.#world.executeNavigation(reference.planId, this.#frameSink);
@@ -246,6 +295,7 @@ export class HumanoidActionRuntime {
       channels: ["locomotion"],
       detail: {
         planning_transaction_id: input.planning_transaction_id,
+        planning_action: reference.planningAction,
         plan_id: reference.planId,
         frames: result.frames,
         result: result.detail,
@@ -256,10 +306,16 @@ export class HumanoidActionRuntime {
 
   #planningReference(
     transactionId: string,
-    expectedAction: "plan_whole_body_motion" | "plan_humanoid_navigation"
+    expectedActions: readonly HumanoidPlanningActionName[]
   ): {
     accepted: true;
     planId: string;
+    planningAction: HumanoidPlanningActionName;
+    candidateSelection: {
+      candidate_count: number;
+      selected_rank: number;
+      selected_candidate_id: string;
+    } | undefined;
   } | {
     accepted: false;
     result: {
@@ -274,14 +330,14 @@ export class HumanoidActionRuntime {
       return rejectedPlanningReference(
         "planning_receipt_missing",
         transactionId,
-        expectedAction
+        expectedActions
       );
     }
-    if (receipt.action !== expectedAction) {
+    if (!expectedActions.includes(receipt.action as HumanoidPlanningActionName)) {
       return rejectedPlanningReference(
         "planning_receipt_action_mismatch",
         transactionId,
-        expectedAction,
+        expectedActions,
         receipt.action
       );
     }
@@ -289,7 +345,7 @@ export class HumanoidActionRuntime {
       return rejectedPlanningReference(
         "planning_receipt_rejected",
         transactionId,
-        expectedAction,
+        expectedActions,
         receipt.action
       );
     }
@@ -298,11 +354,33 @@ export class HumanoidActionRuntime {
       return rejectedPlanningReference(
         "planning_receipt_missing_plan",
         transactionId,
-        expectedAction,
+        expectedActions,
         receipt.action
       );
     }
-    return { accepted: true, planId };
+    const detail = jsonObject(receipt.detail);
+    const candidateCount = detail?.candidate_count;
+    const selectedRank = detail?.selected_rank;
+    const selectedCandidateId = detail?.selected_candidate_id;
+    const candidateSelection = receipt.action === "plan_whole_body_motion_candidates"
+      && typeof candidateCount === "number"
+      && Number.isSafeInteger(candidateCount)
+      && typeof selectedRank === "number"
+      && Number.isSafeInteger(selectedRank)
+      && typeof selectedCandidateId === "string"
+      && selectedCandidateId
+      ? {
+          candidate_count: candidateCount,
+          selected_rank: selectedRank,
+          selected_candidate_id: selectedCandidateId
+        }
+      : undefined;
+    return {
+      accepted: true,
+      planId,
+      planningAction: receipt.action as HumanoidPlanningActionName,
+      candidateSelection
+    };
   }
 }
 
@@ -340,11 +418,19 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
       : [])),
     object_tokens: snapshot.objectTokens.map((token) => ({
       id: token.id,
+      role: token.role,
       kind: token.kind,
       color: token.color,
       size: token.size,
       portable: token.portable,
       status: token.status,
+      state: token.state,
+      authority: token.authority,
+      exact: token.exact,
+      observable: token.observable,
+      pose: token.pose,
+      observed_frame: token.observedFrame,
+      observed_world_revision: token.observedWorldRevision,
       position: token.position,
       rotation: token.rotation,
       linear_velocity: token.linearVelocity,
@@ -397,7 +483,7 @@ function jsonObject(value: JsonValue): Record<string, JsonValue> | undefined {
 function rejectedPlanningReference(
   code: string,
   transactionId: string,
-  expectedAction: "plan_whole_body_motion" | "plan_humanoid_navigation",
+  expectedActions: readonly HumanoidPlanningActionName[],
   actualAction?: HumanoidActionName
 ): {
   accepted: false;
@@ -416,7 +502,9 @@ function rejectedPlanningReference(
       channels: [],
       detail: {
         planning_transaction_id: transactionId,
-        expected_action: expectedAction,
+        expected_action: expectedActions.length === 1
+          ? expectedActions[0]!
+          : [...expectedActions],
         actual_action: actualAction ?? null,
         automatic_actuation: false
       }

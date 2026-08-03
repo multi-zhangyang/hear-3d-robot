@@ -64,6 +64,7 @@ export type JournalName =
   | "actions"
   | "hierarchy"
   | "checker"
+  | "episodes"
   | "context";
 
 export interface JournalPage {

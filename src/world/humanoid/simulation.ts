@@ -31,6 +31,10 @@ import {
 import {
   YahmpController
 } from "./yahmp-controller.js";
+import {
+  humanoidEndEffectorJointIndexes,
+  type HumanoidEndEffectorBody
+} from "./task-space-targets.js";
 import type {
   HumanoidControllerDescriptor,
   HumanoidControllerState,
@@ -135,7 +139,7 @@ export interface HumanoidSimulationSnapshot {
 }
 
 export interface HumanoidEndEffectorTarget {
-  body: "left_wrist_yaw_link" | "right_wrist_yaw_link";
+  body: HumanoidEndEffectorBody;
   position: Vec3;
   frame: "world" | "pelvis";
   tolerance: number;
@@ -408,9 +412,7 @@ export class HumanoidSimulation {
           : add(pelvis, rotateVector(pelvisRotation, target.position))
       }));
       const jointIndexes = [...new Set(resolved.flatMap((target) => (
-        target.body.startsWith("left_")
-          ? [15, 16, 17, 18, 19, 20, 21]
-          : [22, 23, 24, 25, 26, 27, 28]
+        humanoidEndEffectorJointIndexes(target.body)
       )))];
       const epsilon = 1e-4;
       for (let iteration = 0; iteration < 96; iteration += 1) {

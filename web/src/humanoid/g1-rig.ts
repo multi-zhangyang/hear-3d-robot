@@ -72,19 +72,30 @@ export class G1Rig {
   static async create(signal?: AbortSignal): Promise<G1Rig> {
     const rig = new G1Rig();
     const loader = new STLLoader();
-    const geometries = await Promise.all(BODY_PARTS.map(async (part) => {
+    const buffers = await Promise.all(BODY_PARTS.map(async (part) => {
       signal?.throwIfAborted();
       const response = await fetch(
         `/humanoid/g1/meshes/${part.mesh}.STL`,
         signal ? { signal } : undefined
       );
       if (!response.ok) throw new Error(`无法载入 G1 部件：${part.mesh}`);
-      return transformMujocoGeometry(loader.parse(await response.arrayBuffer()));
+      return response.arrayBuffer();
     }));
-    signal?.throwIfAborted();
-    BODY_PARTS.forEach((part, index) => rig.#addPart(part, geometries[index]!));
-    rig.#addVisionBand();
-    return rig;
+    const geometries: THREE.BufferGeometry[] = [];
+    try {
+      for (const buffer of buffers) {
+        signal?.throwIfAborted();
+        geometries.push(transformMujocoGeometry(loader.parse(buffer)));
+        await yieldToBrowser();
+      }
+      signal?.throwIfAborted();
+      BODY_PARTS.forEach((part, index) => rig.#addPart(part, geometries[index]!));
+      rig.#addVisionBand();
+      return rig;
+    } catch (error) {
+      geometries.forEach((geometry) => geometry.dispose());
+      throw error;
+    }
   }
 
   private constructor() {
@@ -168,4 +179,8 @@ export class G1Rig {
       material.emissiveIntensity = touching ? Math.min(1.2, 0.25 + force / 900) : 0;
     }
   }
+}
+
+function yieldToBrowser(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
 }

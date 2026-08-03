@@ -61,6 +61,7 @@ describe("Operator API", () => {
       expect(bootstrap.json().capability_catalog).toEqual(expect.arrayContaining([
         "observe_humanoid",
         "plan_whole_body_motion",
+        "plan_whole_body_motion_candidates",
         "execute_whole_body_motion",
         "plan_humanoid_navigation",
         "execute_humanoid_navigation"
