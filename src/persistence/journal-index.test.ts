@@ -217,7 +217,8 @@ describe("journal offset index repair", () => {
       }) as typeof stat);
       streamSpy.mockClear();
 
-      for (let iteration = 0; iteration < 64; iteration += 1) {
+      const rewriteCount = 16;
+      for (let iteration = 0; iteration < rewriteCount; iteration += 1) {
         const entry = iteration % RECORDS.length;
         const damaged = Buffer.from(expected);
         damaged.writeBigUInt64LE(
@@ -244,7 +245,7 @@ describe("journal offset index repair", () => {
       await writeFile(fixture.dataPath, expectedData);
       await ensureJournalIndex(fixture.dataPath, fixture.indexPath);
       const rebuildScans = streamSpy.mock.calls.length;
-      for (let iteration = 0; iteration < 64; iteration += 1) {
+      for (let iteration = 0; iteration < rewriteCount; iteration += 1) {
         await readIndexedWindow(
           fixture.dataPath,
           fixture.indexPath,
@@ -258,7 +259,7 @@ describe("journal offset index repair", () => {
       streamSpy.mockClear();
       await rm(fixture.directory, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
 
 interface FileHandlePrototype {

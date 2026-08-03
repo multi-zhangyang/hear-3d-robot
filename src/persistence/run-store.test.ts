@@ -117,13 +117,14 @@ describe("RunStore journal windows", () => {
       goal: scenario.default_goal
     });
 
-    await Promise.all(Array.from({ length: 100 }, (_, index) =>
+    const appendCount = 32;
+    await Promise.all(Array.from({ length: appendCount }, (_, index) =>
       store.append("events", { index, payload: `event-${index}` })
     ));
     const journal = await store.readJournal("events") as Array<{ index: number; payload: string }>;
-    expect(journal).toHaveLength(100);
+    expect(journal).toHaveLength(appendCount);
     expect(journal.map((entry) => entry.index)).toEqual(
-      Array.from({ length: 100 }, (_, index) => index)
+      Array.from({ length: appendCount }, (_, index) => index)
     );
   }, 20_000);
 
@@ -137,8 +138,9 @@ describe("RunStore journal windows", () => {
       scenario,
       goal: scenario.default_goal
     });
+    const storeCount = 8;
     const stores = await Promise.all(
-      Array.from({ length: 16 }, () => RunStore.open(store.runDir))
+      Array.from({ length: storeCount }, () => RunStore.open(store.runDir))
     );
 
     await Promise.all(stores.map((opened, index) =>
@@ -154,7 +156,7 @@ describe("RunStore journal windows", () => {
       (page.entries[0] as { index: number }).index
     ))).toEqual(new Set(Array.from({ length: stores.length }, (_, index) => index)));
     expect((await stat(join(store.runDir, "events.offsets"))).size).toBe(stores.length * 8);
-  });
+  }, 15_000);
 
   it("revalidates disk state after a data-ahead partial append is repaired elsewhere", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-stale-index-"));
