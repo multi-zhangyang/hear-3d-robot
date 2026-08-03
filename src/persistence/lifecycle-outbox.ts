@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type {
   JsonValue,
-  RunCheckpoint,
   RunLifecycleEvent,
   RunLifecycleEventType
 } from "../domain/schema.js";
+import type { AnyRunCheckpoint } from "../domain/run-checkpoint.js";
 import type { RunStore } from "./run-store.js";
 
 export type LifecycleEventSink = (
@@ -29,7 +29,7 @@ export function createLifecycleEvent(input: {
 
 export async function reconcileLifecycleOutbox(input: {
   store: RunStore;
-  checkpoint: RunCheckpoint;
+  checkpoint: AnyRunCheckpoint;
   persistCheckpoint: () => Promise<void>;
   eventSink?: LifecycleEventSink;
 }): Promise<void> {

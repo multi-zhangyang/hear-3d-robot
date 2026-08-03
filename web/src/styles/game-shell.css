@@ -353,7 +353,11 @@
   .operator-toolbar > .mission-actions { width: auto; flex: 0 0 auto; justify-content: flex-end; }
   .run-select { width: 100%; }
   .game-main { height: auto; min-height: 0; }
-  .game-hotbar { bottom: 5px; width: calc(100% - 10px); justify-content: center; }
+  .game-hotbar {
+    bottom: max(5px, env(safe-area-inset-bottom, 0px));
+    width: calc(100% - 10px);
+    justify-content: center;
+  }
   .hotbar-slot { width: min(72px, 24vw); height: 52px; }
   .hotbar-slot b { font-size: 17px; }
   .hotbar-slot span { font-size: 8px; }

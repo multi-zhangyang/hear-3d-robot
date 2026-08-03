@@ -24,7 +24,7 @@ async function smokeProductionOperator() {
       timeout: 10_000
     });
     assert.equal(cli.stderr, "");
-    assert.match(cli.stdout, /^voxel_expanse\t/m);
+    assert.match(cli.stdout, /^humanoid_frontier\t/m);
 
     const [{ loadRuntimeCatalog }, { createOperatorServer }] = await Promise.all([
       import("../dist/config/load.js"),

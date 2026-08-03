@@ -11,7 +11,10 @@ import {
 import { GoalSchema } from "./domain/schema.js";
 import type { MutationFence } from "./persistence/mutation-fence.js";
 import { resolveRunDirectory } from "./persistence/run-store.js";
-import { resumeMission, startMission } from "./runtime/mission-runner.js";
+import {
+  resumeHumanoidMission,
+  startHumanoidMission
+} from "./runtime/humanoid-mission-runner.js";
 import { errorMessage } from "./runtime/error-message.js";
 import {
   acquireOperatorLease,
@@ -48,8 +51,8 @@ async function main(argv: string[]): Promise<void> {
     if (command === "scenarios") {
       const catalog = await loadRuntimeCatalog();
       for (const [id, template] of Object.entries(catalog.templates)) {
-        const shape = template.kind === "generated"
-          ? `generated ${template.generate.terrain.size}x${template.generate.terrain.size}`
+        const shape = template.kind === "procedural"
+          ? `procedural ${template.generate.bounds.width}x${template.generate.bounds.depth}`
           : "authored";
         process.stdout.write(`${id}\t${template.title}\t${shape}\n`);
       }
@@ -66,7 +69,7 @@ async function main(argv: string[]): Promise<void> {
         Promise.resolve(loadProviderConfig()),
         Promise.resolve(loadServerConfig())
       ]);
-      const result = await withMissionSignals(server.runsDir, (signal, mutationFence) => startMission({
+      const result = await withMissionSignals(server.runsDir, (signal, mutationFence) => startHumanoidMission({
         runsDir: server.runsDir,
         mission,
         scenarioId,
@@ -88,11 +91,10 @@ async function main(argv: string[]): Promise<void> {
         Promise.resolve(loadProviderConfig()),
         Promise.resolve(loadServerConfig())
       ]);
-      const result = await withMissionSignals(server.runsDir, (signal, mutationFence) => resumeMission({
+      const result = await withMissionSignals(server.runsDir, (signal, mutationFence) => resumeHumanoidMission({
         runDir: resolveRunDirectory(server.runsDir, runId),
         catalog,
         provider,
-        freshContext: options["fresh-context"] === "true",
         signal,
         mutationFence
       }));

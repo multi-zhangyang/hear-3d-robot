@@ -25,7 +25,7 @@ const FENCE_CHILD = fileURLToPath(
 );
 const RUN_FIXTURE = resolve(
   process.cwd(),
-  "tests/fixtures/runs/20000101T000000Z_fetch_red_block_00000000"
+  "tests/fixtures/runs/20260802T204346Z_humanoid_courtyard_8071d876"
 );
 
 describe("Operator runs-directory lease", () => {
@@ -665,10 +665,10 @@ describe("Operator runs-directory lease", () => {
 
 async function createRunStore(runsDir: string, mission: string): Promise<RunStore> {
   const catalog = await loadRuntimeCatalog();
-  const scenario = catalog.materialize("open_navigation", 0);
+  const scenario = catalog.materialize("humanoid_courtyard", 0);
   return RunStore.create(runsDir, {
     mission,
-    scenarioId: "open_navigation",
+    scenarioId: "humanoid_courtyard",
     scenario,
     goal: scenario.default_goal
   });

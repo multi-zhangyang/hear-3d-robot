@@ -1,268 +1,109 @@
 scenarios:
-  voxel_expanse:
-    kind: generated
-    title: Voxel expanse
+  humanoid_frontier:
+    kind: procedural
+    runtime: humanoid_g1
+    title: 人形方块边境
     generate:
-      terrain:
-        size: 80
-        cell: 1
-        block: 0.9
-        relief: 3
-        density: 0.26
-      visibility_radius: 7
-      objects:
-        - id: red_block
-          kind: block
-          color: "#d84a4a"
-          size: { x: 0.5, y: 0.5, z: 0.5 }
-          portable: true
-        - id: blue_block
-          kind: block
-          color: "#3f6fd8"
-          size: { x: 0.5, y: 0.5, z: 0.5 }
-          portable: true
-      zones:
-        - id: green_zone
-          color: "#3d9b68"
-          size: { x: 1.8, y: 0.02, z: 1.8 }
-      default_goal:
-        summary: Red block rests inside the green zone and is no longer attached to the robot.
-        predicates:
-          - type: object_in_zone
-            object_id: red_block
-            zone_id: green_zone
-            expected: true
-            tolerance: 0.05
-          - type: object_attached
-            object_id: red_block
-            expected: false
-
-  voxel_highlands:
-    kind: generated
-    title: Voxel highlands
-    generate:
-      terrain:
-        size: 96
-        cell: 1
-        block: 0.9
-        relief: 4
-        density: 0.34
+      bounds: { width: 36, depth: 36 }
+      cell: 3
+      obstacle_density: 0.16
+      minimum_obstacle_height: 0.55
+      maximum_obstacle_height: 2.7
       visibility_radius: 8
       objects:
-        - id: red_block
-          kind: block
-          color: "#d84a4a"
+        - id: amber_crate
+          kind: crate
+          color: "#c7833b"
           size: { x: 0.5, y: 0.5, z: 0.5 }
           portable: true
-        - id: amber_block
-          kind: block
-          color: "#d89a3f"
-          size: { x: 0.45, y: 0.45, z: 0.45 }
-          portable: true
-        - id: blue_block
-          kind: block
-          color: "#3f6fd8"
-          size: { x: 0.5, y: 0.5, z: 0.5 }
+        - id: blue_crate
+          kind: crate
+          color: "#4778c8"
+          size: { x: 0.55, y: 0.55, z: 0.55 }
           portable: true
       zones:
-        - id: green_zone
-          color: "#3d9b68"
-          size: { x: 1.8, y: 0.02, z: 1.8 }
+        - id: frontier_beacon
+          color: "#55b38b"
+          size: { x: 2.2, y: 0.02, z: 2.2 }
       default_goal:
-        summary: Red block rests inside the green zone and is no longer attached to the robot.
+        summary: 自主穿越随机方块世界并进入信标区域。
         predicates:
-          - type: object_in_zone
-            object_id: red_block
-            zone_id: green_zone
-            expected: true
-            tolerance: 0.05
-          - type: object_attached
-            object_id: red_block
-            expected: false
+          - type: robot_in_zone
+            zone_id: frontier_beacon
+            tolerance: 0.2
 
-  voxel_survey:
-    kind: generated
-    title: Voxel survey
+  humanoid_realm:
+    kind: procedural
+    runtime: humanoid_g1
+    title: 人形方块疆域
     generate:
-      terrain:
-        size: 80
-        cell: 1
-        block: 0.9
-        relief: 3
-        density: 0.3
-      visibility_radius: 8
-      objects: []
-      zones:
-        - id: arrival_zone
-          color: "#4b83c3"
-          size: { x: 1.5, y: 0.02, z: 1.5 }
-      default_goal:
-        summary: Robot autonomously maps at least five percent of the unknown terrain.
-        predicates:
-          - type: terrain_explored
-            minimum_fraction: 0.05
-
-  voxel_realm:
-    kind: generated
-    title: Voxel realm
-    generate:
-      terrain:
-        size: 192
-        cell: 1
-        block: 0.9
-        chunk_size: 16
-        maximum_height: 24
-        relief: 5
-        density: 0.31
+      bounds: { width: 54, depth: 54 }
+      cell: 3
+      obstacle_density: 0.19
+      minimum_obstacle_height: 0.45
+      maximum_obstacle_height: 3.2
       visibility_radius: 9
       objects:
-        - id: red_block
-          kind: block
-          color: "#d84a4a"
-          size: { x: 0.5, y: 0.5, z: 0.5 }
+        - id: copper_crate
+          kind: crate
+          color: "#b96f45"
+          size: { x: 0.55, y: 0.55, z: 0.55 }
           portable: true
-        - id: amber_block
-          kind: block
-          color: "#d89a3f"
+        - id: moss_crate
+          kind: crate
+          color: "#6f9651"
+          size: { x: 0.6, y: 0.6, z: 0.6 }
+          portable: true
+        - id: violet_crate
+          kind: crate
+          color: "#7d63b8"
           size: { x: 0.45, y: 0.45, z: 0.45 }
           portable: true
       zones:
-        - id: green_zone
-          color: "#3d9b68"
-          size: { x: 1.8, y: 0.02, z: 1.8 }
+        - id: distant_beacon
+          color: "#58b99c"
+          size: { x: 2.3, y: 0.02, z: 2.3 }
+        - id: rest_clearing
+          color: "#e2b95f"
+          size: { x: 2.1, y: 0.02, z: 2.1 }
       default_goal:
-        summary: Robot autonomously maps at least one percent of the large unknown world.
+        summary: 自主探索大型方块疆域并抵达远方信标。
         predicates:
-          - type: terrain_explored
-            minimum_fraction: 0.01
+          - type: robot_in_zone
+            zone_id: distant_beacon
+            tolerance: 0.2
 
-  open_navigation:
+  humanoid_courtyard:
     kind: authored
-    title: Open navigation
+    runtime: humanoid_g1
+    title: 人形庭院
     scenario:
-      title: Open navigation
-      bounds: { width: 12, depth: 10 }
-      visibility_radius: 6
-      robot: { x: 1, z: 1, yaw: 0 }
+      title: 人形庭院
+      bounds: { width: 18, depth: 16 }
+      visibility_radius: 7
+      robot: { x: 2.5, z: 2.5, yaw: 0 }
       obstacles:
-        - id: center_column
-          center: { x: 6, y: 1, z: 5 }
-          size: { x: 1.2, y: 2, z: 1.2 }
-      objects: []
-      zones:
-        - id: arrival_zone
-          color: "#4b83c3"
-          center: { x: 10, y: 0.01, z: 8 }
-          size: { x: 1.5, y: 0.02, z: 1.5 }
-      default_goal:
-        summary: Robot reaches the arrival coordinate.
-        predicates:
-          - type: robot_at
-            target: { x: 10, y: 0, z: 8 }
-            tolerance: 0.3
-
-  fetch_red_block:
-    kind: authored
-    title: Fetch red block
-    scenario:
-      title: Fetch red block
-      bounds: { width: 8, depth: 8 }
-      visibility_radius: 4
-      robot: { x: 0.8, z: 0.8, yaw: 0 }
-      obstacles:
-        - id: barrier_a
-          center: { x: 3, y: 0.6, z: 2.5 }
-          size: { x: 0.8, y: 1.2, z: 2.4 }
+        - id: stone_column
+          center: { x: 8, y: 1.1, z: 7.5 }
+          size: { x: 1.4, y: 2.2, z: 1.4 }
+        - id: low_block
+          center: { x: 12.5, y: 0.35, z: 4.5 }
+          size: { x: 2.2, y: 0.7, z: 1.5 }
       objects:
-        - id: red_block
-          kind: block
-          color: "#d84a4a"
-          position: { x: 2, y: 0.25, z: 1.5 }
-          size: { x: 0.5, y: 0.5, z: 0.5 }
-          portable: true
-        - id: blue_block
-          kind: block
-          color: "#3f6fd8"
-          position: { x: 1, y: 0.25, z: 5 }
+        - id: courtyard_crate
+          kind: crate
+          color: "#bd7844"
+          position: { x: 4.5, y: 0.25, z: 5.5 }
           size: { x: 0.5, y: 0.5, z: 0.5 }
           portable: true
       zones:
-        - id: green_zone
-          color: "#3d9b68"
-          center: { x: 6.5, y: 0.01, z: 6.5 }
-          size: { x: 1.8, y: 0.02, z: 1.8 }
+        - id: courtyard_beacon
+          color: "#50aa85"
+          center: { x: 15, y: 0.01, z: 13 }
+          size: { x: 2, y: 0.02, z: 2 }
       default_goal:
-        summary: Red block rests inside the green zone and is no longer attached to the robot.
+        summary: 自主通过庭院并进入信标区域。
         predicates:
-          - type: object_in_zone
-            object_id: red_block
-            zone_id: green_zone
-            expected: true
-            tolerance: 0.05
-          - type: object_attached
-            object_id: red_block
-            expected: false
-
-  locked_container:
-    kind: authored
-    title: Locked container
-    scenario:
-      title: Locked container
-      bounds: { width: 9, depth: 7 }
-      visibility_radius: 5
-      robot: { x: 0.8, z: 0.8, yaw: 0 }
-      obstacles:
-        - id: divider
-          center: { x: 3.5, y: 0.7, z: 3.3 }
-          size: { x: 0.7, y: 1.4, z: 2.5 }
-      objects:
-        - id: brass_key
-          kind: key
-          color: "#cda349"
-          position: { x: 1.5, y: 0.12, z: 2 }
-          size: { x: 0.45, y: 0.12, z: 0.18 }
-          portable: true
-        - id: locked_box
-          kind: container
-          color: "#68717d"
-          position: { x: 6, y: 0.45, z: 1.5 }
-          size: { x: 1.2, y: 0.9, z: 1 }
-          portable: false
-          locked: true
-          key_id: brass_key
-        - id: red_block
-          kind: block
-          color: "#d84a4a"
-          position: { x: 5.3, y: 0.25, z: 2.35 }
-          size: { x: 0.5, y: 0.5, z: 0.5 }
-          portable: true
-      zones:
-        - id: green_zone
-          color: "#3d9b68"
-          center: { x: 7.5, y: 0.01, z: 5.5 }
-          size: { x: 1.8, y: 0.02, z: 1.8 }
-      affordances:
-        - id: locked_box_key_socket
-          type: keyed_lock
-          container_id: locked_box
-          key_id: brass_key
-          socket:
-            center: { x: 0, y: 0, z: 0.58 }
-            half_extents: { x: 0.24, y: 0.24, z: 0.16 }
-            insertion_axis: { x: 0, y: 0, z: 1 }
-            maximum_axis_angle: 0.4
-      default_goal:
-        summary: Locked box is unlocked and the red block rests unattached inside the green zone.
-        predicates:
-          - type: object_property
-            object_id: locked_box
-            property: locked
-            expected: false
-          - type: object_in_zone
-            object_id: red_block
-            zone_id: green_zone
-            expected: true
-            tolerance: 0.05
-          - type: object_attached
-            object_id: red_block
-            expected: false
+          - type: robot_in_zone
+            zone_id: courtyard_beacon
+            tolerance: 0.2

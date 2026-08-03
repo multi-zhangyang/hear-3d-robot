@@ -1,9 +1,3 @@
-import { isDeepStrictEqual } from "node:util";
-import type {
-  ContextMemoryState,
-  RunCheckpoint,
-  TaskNode
-} from "../domain/schema.js";
 
 /**
  * A mission is a long conversation over one HTTP connection, and connections
@@ -205,67 +199,6 @@ function parseRetryAfter(value: string, now: number): number | null {
     Math.max(0, timestamp - now),
     MAXIMUM_SERVER_RETRY_AFTER_MS
   );
-}
-
-/**
- * A failed opening request has no serialized RunState to resume. It may only
- * be sent again when the model never changed any authoritative mission state.
- * Model-call counters, timestamps, and the raw journal of the opening input are
- * telemetry, so they are deliberately excluded; everything that could affect
- * a later decision remains compared.
- */
-export function canReplayInitialModelRequest(
-  before: RunCheckpoint,
-  after: RunCheckpoint
-): boolean {
-  return isDeepStrictEqual(replayAuthority(before), replayAuthority(after));
-}
-
-function replayAuthority(checkpoint: RunCheckpoint): unknown {
-  return {
-    status: checkpoint.status,
-    root_id: checkpoint.root_id,
-    active_agent_id: checkpoint.active_agent_id,
-    active_agent_ids: checkpoint.active_agent_ids,
-    nodes: Object.fromEntries(Object.entries(checkpoint.nodes).map(([id, node]) => [
-      id,
-      nodeReplayAuthority(node)
-    ])),
-    world: checkpoint.world,
-    inflight_action: checkpoint.inflight_action,
-    inflight_actions: checkpoint.inflight_actions,
-    committed_actions: checkpoint.committed_actions,
-    spatial_memory: checkpoint.spatial_memory,
-    context_memory: contextReplayAuthority(checkpoint.context_memory),
-    checker: checkpoint.checker,
-    final_output: checkpoint.final_output,
-    error: checkpoint.error
-  };
-}
-
-function contextReplayAuthority(memory: ContextMemoryState): unknown {
-  return {
-    total_compactions: memory.total_compactions,
-    last_compacted_at: memory.last_compacted_at,
-    scopes: Object.fromEntries(Object.entries(memory.scopes)
-      .filter(([, scope]) => scope.compaction_count > 0 || scope.summary !== null)
-      .map(([id, scope]) => [id, {
-        compaction_count: scope.compaction_count,
-        summary: scope.summary,
-        summary_origin: scope.summary_origin,
-        summary_world_revision: scope.summary_world_revision,
-        summary_voxel_revision: scope.summary_voxel_revision,
-        last_compacted_at: scope.last_compacted_at
-      }]))
-  };
-}
-
-function nodeReplayAuthority(node: TaskNode): TaskNode {
-  return {
-    ...node,
-    model_calls_used: 0,
-    updated_at: "1970-01-01T00:00:00.000Z"
-  };
 }
 
 /** Walks `cause` and aggregate `errors` links, guarding against cycles. */

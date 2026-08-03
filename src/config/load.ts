@@ -11,6 +11,7 @@ import {
 } from "../domain/schema.js";
 import { compactorInputTokenLimit } from "../runtime/context-budget.js";
 import { assertScenarioIntegrity } from "../runtime/goal-validation.js";
+import { assertHumanoidGoalSupported } from "../runtime/humanoid-checker.js";
 import { materializeScenario } from "../world/world-generator.js";
 
 const bundledConfigDirectory = fileURLToPath(new URL("../../config/", import.meta.url));
@@ -24,6 +25,7 @@ const ProviderConfigSchema = z.object({
   baseUrl: z.url(),
   model: z.string().min(1),
   apiKey: z.string().min(1),
+  requestTimeoutMs: z.number().int().min(5_000).max(10 * 60_000).optional(),
   temperature: z.number().min(0).max(2),
   maxOutputTokens: z.number().int().positive(),
   contextWindowTokens: z.number().int().positive(),
@@ -63,7 +65,7 @@ export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
  */
 export interface RuntimeCatalog {
   templates: Record<string, ScenarioTemplate>;
-  materialize(scenarioId: string, seed: number, motionSeed?: number): Scenario;
+  materialize(scenarioId: string, seed: number): Scenario;
 }
 
 export interface ServerConfig {
@@ -84,6 +86,7 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
     baseUrl: env.AI_BASE_URL,
     model: env.AI_MODEL,
     apiKey: env.AI_API_KEY,
+    requestTimeoutMs: numberFromEnv(env.AI_REQUEST_TIMEOUT_MS, 90_000),
     temperature: numberFromEnv(env.AI_TEMPERATURE, 0.2),
     // Bound unproductive generations while leaving enough room for model
     // reasoning and the resulting tool call, both of which consume this budget.
@@ -131,15 +134,18 @@ export async function loadRuntimeCatalog(
   // template — one whose entities cannot fit the terrain it asks for — here
   // rather than on the operator's first run.
   for (const [scenarioId, template] of Object.entries(templates)) {
-    assertScenarioIntegrity(scenarioId, materializeScenario(template, 0, 0));
+    const scenario = materializeScenario(template, 0);
+    assertScenarioIntegrity(scenarioId, scenario);
+    assertHumanoidGoalSupported(scenario.default_goal, scenario);
   }
   return {
     templates,
-    materialize(scenarioId, seed, motionSeed) {
+    materialize(scenarioId, seed) {
       const template = templates[scenarioId];
       if (!template) throw new Error(`Unknown scenario: ${scenarioId}`);
-      const scenario = materializeScenario(template, seed, motionSeed);
+      const scenario = materializeScenario(template, seed);
       assertScenarioIntegrity(scenarioId, scenario);
+      assertHumanoidGoalSupported(scenario.default_goal, scenario);
       return scenario;
     }
   };

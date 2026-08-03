@@ -33,7 +33,7 @@ export function GameShell(props: GameShellProps): React.JSX.Element {
       <header className="game-header">
         <div className="game-brand" aria-label="HEAR">
           <span className="brand-cube" aria-hidden="true"><i /><i /><i /></span>
-          <span><b>HEAR</b><small>自主体素世界</small></span>
+          <span><b>HEAR</b><small>具身智能世界</small></span>
         </div>
         <div className="game-toolbar">{props.toolbar}</div>
         <div className="system-controls">

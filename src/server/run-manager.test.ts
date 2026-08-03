@@ -4,21 +4,21 @@ import { basename, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { loadRuntimeCatalog, type ProviderConfig } from "../config/load.js";
 import type { JsonValue } from "../domain/schema.js";
-import type { RuntimeEvent, RuntimeEventSink } from "../harness/runtime-context.js";
+import type { RuntimeEvent, RuntimeEventSink } from "../runtime/events.js";
 import type { MutationFence } from "../persistence/mutation-fence.js";
 import { RunStore } from "../persistence/run-store.js";
 import { RunManager } from "./run-manager.js";
 
 const missionRunner = vi.hoisted(() => ({
-  startMission: vi.fn(),
-  resumeMission: vi.fn()
+  startHumanoidMission: vi.fn(),
+  resumeHumanoidMission: vi.fn()
 }));
 
-vi.mock("../runtime/mission-runner.js", () => missionRunner);
+vi.mock("../runtime/humanoid-mission-runner.js", () => missionRunner);
 
 const FIXTURE = resolve(
   process.cwd(),
-  "tests/fixtures/runs/20000101T000000Z_fetch_red_block_00000000"
+  "tests/fixtures/runs/20260802T204346Z_humanoid_courtyard_8071d876"
 );
 const TEST_PROVIDER: ProviderConfig = {
   protocol: "openai_compatible",
@@ -34,6 +34,17 @@ const TEST_PROVIDER: ProviderConfig = {
 };
 
 describe("RunManager event and process lifecycle", () => {
+  it("loads a complete humanoid run without a legacy compatibility path", async () => {
+    const { runsDir, runId } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const manager = new RunManager({ runsDir, catalog, provider: TEST_PROVIDER });
+
+    const details = await manager.details(runId, { actions: 1, provider: 1, framework: 1 });
+    expect(details.definition.runtime).toBe("humanoid_g1");
+    expect(details.checkpoint).toMatchObject({ version: 4, runtime: "humanoid_g1" });
+    expect(missionRunner.resumeHumanoidMission).not.toHaveBeenCalled();
+  });
+
   it("takes one fenced details cut so a matching journal record cannot be skipped by its cursor", async () => {
     const { runsDir, runId, store } = await copiedFixture();
     const catalog = await loadRuntimeCatalog();
@@ -261,8 +272,8 @@ describe("RunManager event and process lifecycle", () => {
     const catalog = await loadRuntimeCatalog();
     const checkpoint = await store.readCheckpoint();
     expect(checkpoint.active_agent_ids).toEqual([]);
-    expect(checkpoint.inflight_actions).toEqual({});
-    expect(checkpoint.spatial_memory).toEqual([]);
+    expect(checkpoint.pending_lifecycle_events).toEqual([]);
+    expect(checkpoint.world_checkpoint.version).toBe(1);
     expect(Object.values(checkpoint.nodes).every(
       (node) => Array.isArray(node.evidence_requirements)
     )).toBe(true);
@@ -387,7 +398,7 @@ describe("RunManager event and process lifecycle", () => {
     const cursorIndex = entries.length - 3;
     let emit: RuntimeEventSink | undefined;
     let finishMission!: (value: { runId: string; runDir: string; output: string }) => void;
-    missionRunner.startMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
+    missionRunner.startHumanoidMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
       emit = input.eventSink;
       return new Promise((resolveMission) => {
         finishMission = resolveMission;
@@ -431,7 +442,7 @@ describe("RunManager event and process lifecycle", () => {
       scan.mockRestore();
       finishMission({ runId, runDir: store.runDir, output: "done" });
       await manager.drain();
-      missionRunner.startMission.mockReset();
+      missionRunner.startHumanoidMission.mockReset();
     }
   });
 
@@ -442,7 +453,7 @@ describe("RunManager event and process lifecycle", () => {
     const cursorIndex = entries.length - 3;
     let emit: RuntimeEventSink | undefined;
     let finishMission!: (value: { runId: string; runDir: string; output: string }) => void;
-    missionRunner.startMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
+    missionRunner.startHumanoidMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
       emit = input.eventSink;
       return new Promise((resolveMission) => {
         finishMission = resolveMission;
@@ -481,7 +492,7 @@ describe("RunManager event and process lifecycle", () => {
       scan.mockRestore();
       finishMission({ runId, runDir: store.runDir, output: "done" });
       await manager.drain();
-      missionRunner.startMission.mockReset();
+      missionRunner.startHumanoidMission.mockReset();
     }
   });
 
@@ -492,7 +503,7 @@ describe("RunManager event and process lifecycle", () => {
     const cursorIndex = entries.length - 3;
     let emit: RuntimeEventSink | undefined;
     let finishMission!: (value: { runId: string; runDir: string; output: string }) => void;
-    missionRunner.startMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
+    missionRunner.startHumanoidMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
       emit = input.eventSink;
       return new Promise((resolveMission) => {
         finishMission = resolveMission;
@@ -533,7 +544,7 @@ describe("RunManager event and process lifecycle", () => {
       scan.mockRestore();
       finishMission({ runId, runDir: store.runDir, output: "done" });
       await manager.drain();
-      missionRunner.startMission.mockReset();
+      missionRunner.startHumanoidMission.mockReset();
     }
   });
 
@@ -544,7 +555,7 @@ describe("RunManager event and process lifecycle", () => {
     const cursorIndex = entries.length - 3;
     let emit: RuntimeEventSink | undefined;
     let finishMission!: (value: { runId: string; runDir: string; output: string }) => void;
-    missionRunner.startMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
+    missionRunner.startHumanoidMission.mockImplementationOnce((input: { eventSink?: RuntimeEventSink }) => {
       emit = input.eventSink;
       return new Promise((resolveMission) => {
         finishMission = resolveMission;
@@ -587,7 +598,7 @@ describe("RunManager event and process lifecycle", () => {
       scan.mockRestore();
       finishMission({ runId, runDir: store.runDir, output: "done" });
       await manager.drain();
-      missionRunner.startMission.mockReset();
+      missionRunner.startHumanoidMission.mockReset();
     }
   });
 });

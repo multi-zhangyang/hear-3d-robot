@@ -5,7 +5,7 @@ import {
   agentIdFromModelPayload,
   recordAgentInvocationTransportInterruption
 } from "./agent-scope.js";
-import type { HarnessRuntimeContext } from "./runtime-context.js";
+import type { ModelTelemetryRuntime } from "./context-runtime.js";
 import { modelResponseDisposition } from "./sdk-events.js";
 
 const MAX_CONSECUTIVE_NO_DECISION_RESPONSES = 4;
@@ -19,7 +19,7 @@ const MAX_ROOT_CONSECUTIVE_NO_DECISION_RESPONSES = 3;
  */
 export function withModelTelemetry(
   model: Model,
-  runtime: HarnessRuntimeContext,
+  runtime: ModelTelemetryRuntime,
   boundAgentId: string,
   onModelResponseCompleted?: (agentId: string) => void | Promise<void>
 ): Model {
@@ -59,7 +59,7 @@ export function withModelTelemetry(
 
 async function* claimAndStream(
   model: Model,
-  runtime: HarnessRuntimeContext,
+  runtime: ModelTelemetryRuntime,
   decisionGuard: ModelDecisionGuard,
   boundAgentId: string,
   request: Parameters<Model["getStreamedResponse"]>[0],
@@ -105,7 +105,7 @@ function assertModelBinding(boundAgentId: string, requestAgentId: string): void 
  * resetting the counter. This guard counts every response without a tool
  * decision, never supplies a decision and never swaps models.
  */
-export class ModelDecisionGuard {
+class ModelDecisionGuard {
   readonly #consecutive = new Map<string, number>();
 
   constructor(

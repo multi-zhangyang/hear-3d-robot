@@ -1,7 +1,8 @@
 import { basename } from "node:path";
 import type { ProviderConfig, RuntimeCatalog } from "../config/load.js";
-import type { Goal, JsonValue, RunCheckpoint } from "../domain/schema.js";
-import type { RuntimeEvent, RuntimeEventSink } from "../harness/runtime-context.js";
+import type { Goal, JsonValue } from "../domain/schema.js";
+import type { AnyRunCheckpoint } from "../domain/run-checkpoint.js";
+import type { RuntimeEvent, RuntimeEventSink } from "../runtime/events.js";
 import type { MutationFence } from "../persistence/mutation-fence.js";
 import {
   createLifecycleEvent,
@@ -18,13 +19,16 @@ import {
   runtimeEventCursor,
   runtimeEventCursorMatches
 } from "../persistence/event-cursor.js";
-import { resumeMission, startMission } from "../runtime/mission-runner.js";
+import {
+  resumeHumanoidMission,
+  startHumanoidMission
+} from "../runtime/humanoid-mission-runner.js";
 
 export interface RunListItem {
   run_id: string;
   scenario_id: string | null;
   mission: string | null;
-  status: RunCheckpoint["status"] | "local_artifact";
+  status: AnyRunCheckpoint["status"] | "local_artifact";
   created_at: string | null;
   updated_at: string | null;
   error: string | null;
@@ -71,7 +75,7 @@ export class RunManager {
     let recovered = 0;
     for (const directory of directories) {
       let store: RunStore;
-      let checkpoint: RunCheckpoint;
+      let checkpoint: AnyRunCheckpoint;
       try {
         store = await RunStore.open(directory, this.#storeOptions());
         checkpoint = await store.readCheckpoint();
@@ -125,7 +129,7 @@ export class RunManager {
     const controller = new AbortController();
     const created = deferred<string>();
     const sink = this.#sink(created.resolve);
-    const operation = startMission({
+    const operation = startHumanoidMission({
       runsDir: this.#runsDir,
       mission: input.mission,
       scenarioId: input.scenarioId,
@@ -143,12 +147,14 @@ export class RunManager {
   async resume(runId: string): Promise<string> {
     const provider = this.#requireProvider();
     this.#assertCapacity();
+    const runDir = resolveRunDirectory(this.#runsDir, runId);
+    await RunStore.open(runDir, this.#storeOptions());
     this.#launching = true;
     const controller = new AbortController();
     const created = deferred<string>();
     const sink = this.#sink(created.resolve);
-    const operation = resumeMission({
-      runDir: resolveRunDirectory(this.#runsDir, runId),
+    const operation = resumeHumanoidMission({
+      runDir,
       catalog: this.#catalog,
       provider,
       eventSink: sink,
@@ -309,7 +315,7 @@ export class RunManager {
     framework: number;
   }): Promise<{
     definition: RunStore["definition"];
-    checkpoint: RunCheckpoint;
+    checkpoint: AnyRunCheckpoint;
     actions: JsonValue[];
     provider: JsonValue[];
     framework: JsonValue[];
@@ -492,7 +498,7 @@ export class RunManager {
   }
 
   async #trackLaunch(
-    operation: ReturnType<typeof startMission>,
+    operation: ReturnType<typeof startHumanoidMission>,
     created: Deferred<string>,
     controller: AbortController
   ): Promise<string> {

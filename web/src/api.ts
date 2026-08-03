@@ -1,11 +1,12 @@
 import type {
   Bootstrap,
   Goal,
-  RunDetails,
+  HumanoidRunDetails,
   RunListItem,
   RuntimeEvent,
   StreamState
 } from "./types";
+import { isHumanoidRunDetails } from "./types";
 import {
   eventStreamFailureDecision,
   eventStreamRetryDelay
@@ -88,7 +89,7 @@ export async function getRun(
     providerLimit?: number;
     frameworkLimit?: number;
   } = {}
-): Promise<RunDetails> {
+): Promise<HumanoidRunDetails> {
   const query = new URLSearchParams();
   if (options.actionLimit !== undefined) {
     query.set("actions", String(Math.min(5000, Math.max(1, options.actionLimit))));
@@ -100,15 +101,16 @@ export async function getRun(
     query.set("framework", String(Math.min(5000, Math.max(1, options.frameworkLimit))));
   }
   const suffix = query.size > 0 ? `?${query.toString()}` : "";
-  const details = await request<RunDetails>(`/api/runs/${encodeURIComponent(runId)}${suffix}`, {
+  const details = await request<HumanoidRunDetails>(`/api/runs/${encodeURIComponent(runId)}${suffix}`, {
     ...(options.signal ? { signal: options.signal } : {})
   });
-  const actions = recentEntries(details.actions, options.actionLimit);
   const provider = recentEntries(details.provider, options.providerLimit);
   const framework = recentEntries(details.framework, options.frameworkLimit);
+  if (!isHumanoidRunDetails(details)) throw new ApiError(409, "该记录不是人形机器人任务");
+  const actions = recentEntries(details.actions, options.actionLimit);
   const committedActions = Object.fromEntries(actions.map((action) => [
-    action.transaction_id,
-    details.checkpoint.committed_actions[action.transaction_id] ?? action
+    action.transactionId,
+    details.checkpoint.committed_actions[action.transactionId] ?? action
   ]));
   return {
     ...details,

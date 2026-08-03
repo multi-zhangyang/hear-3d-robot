@@ -7,8 +7,8 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { z, ZodError } from "zod";
 import type { ProviderConfig, RuntimeCatalog, ServerConfig } from "../config/load.js";
 import { GoalSchema } from "../domain/schema.js";
-import { capabilityCatalog } from "../harness/agents.js";
-import type { RuntimeEvent } from "../harness/runtime-context.js";
+import { HUMANOID_CAPABILITIES } from "../harness/humanoid/agents.js";
+import type { RuntimeEvent } from "../runtime/events.js";
 import { providerIdentity } from "../model/factory.js";
 import type { MutationFence } from "../persistence/mutation-fence.js";
 import {
@@ -100,21 +100,18 @@ export async function createOperatorServer(input: {
       ? { configured: true, ...providerIdentity(input.provider) }
       : { configured: false, error: input.providerError ?? "Provider is not configured" },
     authentication_required: Boolean(input.server.password),
-    capability_catalog: capabilityCatalog(),
-    // A generated world has no coordinates until a seed exists, so the console
-    // is told what a world contains and how large it is, not where anything sits.
-    scenarios: Object.entries(input.catalog.templates).map(([id, template]) => {
+    capability_catalog: [...HUMANOID_CAPABILITIES],
+    scenarios: Object.entries(input.catalog.templates)
+      .map(([id, template]) => {
       const source = template.kind === "authored" ? template.scenario : template.generate;
       return {
         id,
         title: template.title,
         kind: template.kind,
+        runtime: template.runtime,
         extent: template.kind === "authored"
           ? { width: template.scenario.bounds.width, depth: template.scenario.bounds.depth }
-          : {
-              width: template.generate.terrain.size * template.generate.terrain.cell,
-              depth: template.generate.terrain.size * template.generate.terrain.cell
-            },
+          : structuredClone(template.generate.bounds),
         objects: source.objects.map(({ id: objectId, kind, color }) => ({ id: objectId, kind, color })),
         zones: source.zones.map(({ id: zoneId, color }) => ({ id: zoneId, color })),
         suggested_goal: source.default_goal
@@ -126,7 +123,8 @@ export async function createOperatorServer(input: {
 
   app.post("/api/runs", async (request, reply) => {
     const body = StartRunInput.parse(request.body);
-    if (!input.catalog.templates[body.scenario_id]) {
+    const template = input.catalog.templates[body.scenario_id];
+    if (!template) {
       return reply.code(404).send({ error: `Unknown scenario: ${body.scenario_id}` });
     }
     const runId = await manager.start({

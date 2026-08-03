@@ -10,10 +10,10 @@ describe("RunStore journal windows", () => {
   it("clears only the replaceable SDK agent state", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-state-"));
     const catalog = await loadRuntimeCatalog();
-    const scenario = catalog.materialize("open_navigation", 0);
+    const scenario = catalog.materialize("humanoid_courtyard", 0);
     const store = await RunStore.create(runsDir, {
       mission: "Rotate one SDK branch",
-      scenarioId: "open_navigation",
+      scenarioId: "humanoid_courtyard",
       scenario,
       goal: scenario.default_goal
     });
@@ -45,10 +45,10 @@ describe("RunStore journal windows", () => {
   it("isolates and clears one SDK session file per concrete worker", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-sessions-"));
     const catalog = await loadRuntimeCatalog();
-    const scenario = catalog.materialize("open_navigation", 0);
+    const scenario = catalog.materialize("humanoid_courtyard", 0);
     const store = await RunStore.create(runsDir, {
       mission: "Persist independent worker sessions",
-      scenarioId: "open_navigation",
+      scenarioId: "humanoid_courtyard",
       scenario,
       goal: scenario.default_goal
     });
@@ -74,10 +74,10 @@ describe("RunStore journal windows", () => {
   it("reads pages and tails without changing journal order", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-"));
     const catalog = await loadRuntimeCatalog();
-    const scenario = catalog.materialize("open_navigation", 0);
+    const scenario = catalog.materialize("humanoid_courtyard", 0);
     const store = await RunStore.create(runsDir, {
       mission: "Inspect journal windows",
-      scenarioId: "open_navigation",
+      scenarioId: "humanoid_courtyard",
       scenario,
       goal: scenario.default_goal
     });
@@ -109,10 +109,10 @@ describe("RunStore journal windows", () => {
   it("serializes concurrent appenders into complete ordered JSONL records", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-concurrent-"));
     const catalog = await loadRuntimeCatalog();
-    const scenario = catalog.materialize("open_navigation", 0);
+    const scenario = catalog.materialize("humanoid_courtyard", 0);
     const store = await RunStore.create(runsDir, {
       mission: "Write a durable concurrent journal",
-      scenarioId: "open_navigation",
+      scenarioId: "humanoid_courtyard",
       scenario,
       goal: scenario.default_goal
     });
@@ -130,10 +130,10 @@ describe("RunStore journal windows", () => {
   it("serializes one journal across independently opened store instances", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-shared-journal-"));
     const catalog = await loadRuntimeCatalog();
-    const scenario = catalog.materialize("open_navigation", 0);
+    const scenario = catalog.materialize("humanoid_courtyard", 0);
     const store = await RunStore.create(runsDir, {
       mission: "Share one indexed journal safely",
-      scenarioId: "open_navigation",
+      scenarioId: "humanoid_courtyard",
       scenario,
       goal: scenario.default_goal
     });
@@ -159,10 +159,10 @@ describe("RunStore journal windows", () => {
   it("revalidates disk state after a data-ahead partial append is repaired elsewhere", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-stale-index-"));
     const catalog = await loadRuntimeCatalog();
-    const scenario = catalog.materialize("open_navigation", 0);
+    const scenario = catalog.materialize("humanoid_courtyard", 0);
     const store = await RunStore.create(runsDir, {
       mission: "Recover a writer after a partial journal append",
-      scenarioId: "open_navigation",
+      scenarioId: "humanoid_courtyard",
       scenario,
       goal: scenario.default_goal
     });
@@ -200,10 +200,10 @@ describe("RunStore journal windows", () => {
   it("reopens indexed journals and repairs an unterminated crash tail before appending", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-recovery-"));
     const catalog = await loadRuntimeCatalog();
-    const scenario = catalog.materialize("open_navigation", 0);
+    const scenario = catalog.materialize("humanoid_courtyard", 0);
     const store = await RunStore.create(runsDir, {
       mission: "Recover a durable journal index",
-      scenarioId: "open_navigation",
+      scenarioId: "humanoid_courtyard",
       scenario,
       goal: scenario.default_goal
     });

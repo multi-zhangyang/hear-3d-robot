@@ -1,9 +1,5 @@
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { RunCheckpointSchema } from "../domain/schema.js";
 import {
-  canReplayInitialModelRequest,
   ConsecutiveTransportRecovery,
   isTransportInterruption,
   transportRetryPlan
@@ -11,9 +7,8 @@ import {
 
 describe("isTransportInterruption", () => {
   it("recognizes the socket drop that ended a real mission mid-stream", () => {
-    // Recorded verbatim from runs/20260726T130935Z_fetch_red_block_a4fa67c3,
-    // which lost its connection after three committed actions. `fetch` reports
-    // it as a bare TypeError and hides the reason one level down in `cause`.
+    // A mid-stream socket drop is surfaced as a bare TypeError; the transport
+    // reason is carried one level down in `cause`.
     const error = Object.assign(new TypeError("terminated"), {
       cause: Object.assign(new Error("other side closed"), {
         name: "SocketError",
@@ -106,68 +101,6 @@ describe("isTransportInterruption", () => {
     expect(isTransportInterruption(error)).toBe(false);
   });
 
-  it("retries an opening request only while mission authority is unchanged", async () => {
-    const checkpoint = RunCheckpointSchema.parse(JSON.parse(await readFile(resolve(
-      "tests/fixtures/runs/20000101T000000Z_fetch_red_block_00000000/checkpoint.json"
-    ), "utf8")));
-    const telemetryOnly = structuredClone(checkpoint);
-    telemetryOnly.total_model_calls += 1;
-    const root = telemetryOnly.nodes[telemetryOnly.root_id];
-    if (!root) throw new Error("Fixture hierarchy root is missing");
-    root.model_calls_used += 1;
-    root.updated_at = new Date().toISOString();
-    telemetryOnly.updated_at = root.updated_at;
-
-    expect(canReplayInitialModelRequest(checkpoint, telemetryOnly)).toBe(true);
-
-    const inputJournalChanged = structuredClone(telemetryOnly);
-    inputJournalChanged.context_memory = {
-      ...inputJournalChanged.context_memory,
-      active_scope_id: inputJournalChanged.root_id,
-      active_estimated_tokens: 120,
-      scopes: {
-        [inputJournalChanged.root_id]: {
-          scope_id: inputJournalChanged.root_id,
-          agent_id: inputJournalChanged.root_id,
-          agent_name: "Mission Coordinator",
-          raw_item_count: 1,
-          raw_chain_hash: "a".repeat(64),
-          compacted_item_count: 0,
-          retained_item_count: 1,
-          retained_chain_hash: "a".repeat(64),
-          active_estimated_tokens: 120,
-          compaction_count: 0,
-          summary: null,
-          summary_origin: null,
-          summary_world_revision: null,
-          summary_voxel_revision: null,
-          last_compacted_at: null
-        }
-      }
-    };
-    expect(canReplayInitialModelRequest(checkpoint, inputJournalChanged)).toBe(true);
-
-    const actionChanged = structuredClone(telemetryOnly);
-    const receipt = Object.values(actionChanged.committed_actions)[0];
-    if (!receipt) throw new Error("Fixture action receipt is missing");
-    actionChanged.committed_actions[`${receipt.transaction_id}:new`] = {
-      ...receipt,
-      transaction_id: `${receipt.transaction_id}:new`
-    };
-    expect(canReplayInitialModelRequest(checkpoint, actionChanged)).toBe(false);
-
-    const worldChanged = structuredClone(telemetryOnly);
-    worldChanged.world.world_revision += 1;
-    expect(canReplayInitialModelRequest(checkpoint, worldChanged)).toBe(false);
-
-    const hierarchyChanged = structuredClone(telemetryOnly);
-    hierarchyChanged.nodes[hierarchyChanged.root_id]!.steps_used += 1;
-    expect(canReplayInitialModelRequest(checkpoint, hierarchyChanged)).toBe(false);
-
-    const compacted = structuredClone(inputJournalChanged);
-    compacted.context_memory.total_compactions = 1;
-    expect(canReplayInitialModelRequest(checkpoint, compacted)).toBe(false);
-  });
 });
 
 describe("transportRetryPlan", () => {

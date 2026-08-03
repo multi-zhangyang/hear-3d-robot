@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import type { ActionReceipt } from "../types";
-import { presentAction, shortTime, type ActionCategory } from "./presenter";
+import type { HumanoidActionReceipt } from "../types";
+import { presentAction, receiptFrames, shortTime, type ActionCategory } from "./presenter";
 
 const FILTERS: Array<{ key: "all" | ActionCategory; label: string }> = [
   { key: "all", label: "全部" },
@@ -10,15 +10,15 @@ const FILTERS: Array<{ key: "all" | ActionCategory; label: string }> = [
   { key: "verify", label: "目标检查" }
 ];
 
-export function RobotTrailView({ actions }: { actions: ActionReceipt[] }): React.JSX.Element {
+export function RobotTrailView({ actions }: { actions: HumanoidActionReceipt[] }): React.JSX.Element {
   const [filter, setFilter] = useState<(typeof FILTERS)[number]["key"]>("all");
   const items = useMemo(
     () => actions.map(presentAction).reverse().filter((item) => filter === "all" || item.category === filter),
     [actions, filter]
   );
-  const moved = actions.filter((action) => action.accepted && action.frame_count > 0).length;
+  const moved = actions.filter((action) => action.accepted && receiptFrames(action) > 0).length;
   const blocked = actions.filter((action) => !action.accepted).length;
-  const physicalFrames = actions.reduce((sum, action) => sum + Math.max(0, action.frame_count), 0);
+  const physicalFrames = actions.reduce((sum, action) => sum + Math.max(0, receiptFrames(action)), 0);
 
   return (
     <section className="robot-trail-view" aria-label="机器人行动历程">

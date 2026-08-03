@@ -1,11 +1,11 @@
 import { useMemo } from "react";
 import { latestProviderActivity } from "../stream-state";
-import type { RunCheckpoint } from "../types";
+import type { HumanoidRunCheckpoint } from "../types";
 import { missionResultLabel } from "../ui-text";
 import { presentFramework, shortTime } from "./presenter";
 
 interface ActivityViewProps {
-  checkpoint: RunCheckpoint;
+  checkpoint: HumanoidRunCheckpoint;
   framework: unknown[];
   provider: unknown[];
 }

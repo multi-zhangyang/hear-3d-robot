@@ -5,7 +5,14 @@ import { E2E_RUNS_DIR } from "./e2e-runs.js";
 
 const UPDATE_README_SCREENSHOTS = process.env.HEAR_UPDATE_SCREENSHOTS === "1";
 
-test("渲染自主体素世界与实时机器人界面", async ({ page }, testInfo) => {
+test("渲染自主人形世界与实时层级智能体界面", async ({ page }, testInfo) => {
+  test.setTimeout(180_000);
+  const humanoidMeshes = new Set<string>();
+  page.on("request", (request) => {
+    if (/\/humanoid\/g1\/meshes\/[^/]+\.STL$/i.test(request.url())) {
+      humanoidMeshes.add(request.url());
+    }
+  });
   await access(resolve(E2E_RUNS_DIR, ".operator.lock"));
   await page.goto("/");
   const passwordInput = page.getByLabel("操作密码");
@@ -15,140 +22,85 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
     await page.getByRole("button", { name: /登\s*录/ }).click();
   }
 
-  const mission = page.locator('section[aria-label="实时任务"], section[aria-label="任务回顾"]');
+  const mission = page.locator("section.humanoid-mission-world");
   await expect(mission).toBeVisible({ timeout: 25_000 });
-  const missionMode = await mission.getAttribute("aria-label");
-  expect(["实时任务", "任务回顾"]).toContain(missionMode);
-  const modelLamp = page.locator(".model-lamp");
-  if (testInfo.project.name === "desktop") await expect(modelLamp).toBeVisible();
-  await expect(page.getByText("模型已连接", { exact: true })).toHaveCount(0);
-  if (missionMode === "任务回顾") {
-    await expect(modelLamp).toHaveText("模型已响应");
-    await expect(page.getByLabel("当前智能体状态")).toContainText("历史记录");
+  const label = await mission.getAttribute("aria-label");
+  if (label !== "实时人形任务" && label !== "人形任务回顾") {
+    throw new Error(`Unexpected humanoid mission mode: ${label ?? "missing"}`);
   }
+  await assertHumanoidOperator(page, testInfo.project.name, label, humanoidMeshes);
+});
+
+async function assertHumanoidOperator(
+  page: Page,
+  project: string,
+  missionMode: "实时人形任务" | "人形任务回顾",
+  meshes: ReadonlySet<string>
+): Promise<void> {
+  const worldMode = missionMode === "实时人形任务" ? "实时人形世界" : "人形世界回顾";
+  await expect(page.locator(`section[aria-label="${worldMode}"]`)).toBeVisible();
+  const canvas = page.locator("canvas.humanoid-canvas");
+  await expect(canvas).toBeVisible({ timeout: 90_000 });
+  await page.waitForFunction(() => {
+    const element = document.querySelector("canvas.humanoid-canvas");
+    return element instanceof HTMLCanvasElement && element.width > 200 && element.height > 200;
+  });
+  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
+    expect.stringMatching(/create-humanoid-stage/),
+    expect.stringMatching(/three~/)
+  ]));
+  await expect.poll(() => meshes.size).toBeGreaterThan(20);
+
+  const hierarchy = page.getByLabel("层级智能体执行状态");
+  await expect(hierarchy).toBeVisible();
+  const agentChain = hierarchy.locator(".humanoid-agent-chain");
+  for (const name of ["自主协调智能体", "人形感知哨兵", "全身运动参考智能体", "人形物理执行智能体"]) {
+    await expect(agentChain.getByText(name, { exact: true })).toBeVisible();
+  }
+  await expect(page.getByLabel("人形身体通道")).toContainText("双足运动");
+  const physics = page.getByLabel("人形物理状态");
+  if (project === "desktop") await expect(physics).toBeVisible();
+  await expect(physics).toContainText("任务约束 · YAHMP · MuJoCo");
+  await expect(page.getByText("左脚", { exact: true })).toBeAttached();
+  await expect(page.getByText("右脚", { exact: true })).toBeAttached();
+  await expect(page.getByText("直立", { exact: true })).toBeAttached();
+  await expect(page.locator(".graphics-error")).toHaveCount(0);
+
+  const camera = page.getByRole("group", { name: "观察视角" });
+  for (const name of ["跟随", "世界", "头部"]) {
+    const button = camera.getByRole("button", { name, exact: true });
+    await button.click();
+    await expect(button).toHaveAttribute("aria-pressed", "true");
+  }
+  await camera.getByRole("button", { name: "跟随", exact: true }).click();
+  await page.getByRole("button", { name: "复位视角", exact: true }).click();
 
   const hotbar = page.getByRole("navigation", { name: "工作区" });
   await expect(hotbar).toBeVisible();
   for (const name of ["世界", "智能体流", "行动历程", "输出"]) {
     await expect(hotbar.getByRole("button", { name, exact: true })).toBeVisible();
   }
+  if (project === "mobile") {
+    await assertMobileHudLayout(page, camera, hotbar);
+  }
+  const panels = [
+    ["2", "智能体流面板", /AgentFlowView/, "实时层级智能体流", "hierarchy.png"],
+    ["3", "行动历程面板", /RobotTrailView/, "机器人行动历程", "actions.png"],
+    ["4", "智能体输出面板", /ActivityView/, "模型输出", "logs.png"]
+  ] as const;
+  for (const [key, region, deferred, content, screenshot] of panels) {
+    await page.keyboard.press(key);
+    await expect(page.getByRole("region", { name: region })).toBeVisible();
+    await expect(page.getByLabel(content)).toBeVisible();
+    await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
+      expect.stringMatching(deferred)
+    ]));
+    if (project === "desktop") await captureReadmeScreenshot(page, screenshot);
+    await page.keyboard.press("Escape");
+  }
   await expect(hotbar.getByRole("button", { name: "世界" })).toHaveAttribute("aria-current", "page");
-  await expect(page.locator(".ant-pro-layout")).toHaveCount(0);
+  await captureReadmeScreenshot(page, project === "desktop" ? "mission.png" : "mobile.png");
 
-  await expect(page.getByLabel("当前智能体状态")).toBeVisible();
-  await expect(page.getByLabel("当前智能体层级路径")).toBeVisible();
-  await expect(page.getByLabel("机器人身体通道租约")).toBeVisible();
-  await expect(page.getByLabel("世界运动状态")).toBeVisible();
-  await expect(page.getByLabel("机器人朝向")).toBeVisible();
-  await expect(page.locator(".world-state-strip")).toBeVisible();
-  await expect(page.getByText(missionMode === "实时任务" ? "自主运行中" : "任务回顾 · 已完成", { exact: true }))
-    .toBeVisible();
-
-  const canvas = page.locator("canvas.three-canvas");
-  await expect(canvas).toBeVisible();
-  await expect(page.getByText("3D 场景不可用", { exact: false })).toHaveCount(0);
-  await page.waitForFunction(() => {
-    const element = document.querySelector("canvas.three-canvas");
-    return element instanceof HTMLCanvasElement && element.width > 200 && element.height > 200;
-  });
-  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
-    expect.stringMatching(/create-stage/),
-    expect.stringMatching(/three~/)
-  ]));
-  expect(await loadedDeferredChunks(page)).not.toEqual(expect.arrayContaining([
-    expect.stringMatching(/AgentFlowView|ActivityView|RobotTrailView|MissionModal/)
-  ]));
-
-  const stageMode = missionMode === "实时任务" ? "实时机器人世界" : "机器人任务回顾";
-  await expect(page.locator(`section[aria-label="${stageMode}"]`)).toBeVisible();
-  await expect(page.locator(".playback-controls")).toHaveCount(0);
-  await expect(page.getByLabel("上一帧")).toHaveCount(0);
-  await expect(page.getByLabel("下一帧")).toHaveCount(0);
-
-  const cameraControls = page.getByRole("group", { name: "相机模式" });
-  const chase = cameraControls.getByRole("button", { name: "跟随视角", exact: true });
-  const firstPerson = cameraControls.getByRole("button", { name: "第一人称视角", exact: true });
-  const world = cameraControls.getByRole("button", { name: "全局视角", exact: true });
-  await expect(chase).toHaveAttribute("aria-pressed", "true");
-  await firstPerson.click();
-  await expect(firstPerson).toHaveAttribute("aria-pressed", "true");
-  await expect(page.locator(".sensor-reticle")).toBeVisible();
-  if (testInfo.project.name === "desktop") {
-    await expect(page.getByLabel("第一人称视角交互")).toHaveText("单击进入视角");
-    const box = await canvas.boundingBox();
-    expect(box).not.toBeNull();
-    await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height / 2);
-    await expect(page.getByLabel("第一人称视角交互")).toHaveText("移动鼠标观察 · ESC 退出");
-    await page.evaluate(() => document.exitPointerLock());
-    await expect(page.getByLabel("第一人称视角交互")).toHaveText("单击进入视角");
-  } else {
-    await expect(page.getByLabel("第一人称视角交互")).toHaveText("拖动屏幕观察");
-    await expect.poll(() => canvas.evaluate((element) => getComputedStyle(element).touchAction)).toBe("none");
-  }
-  await world.click();
-  await expect(world).toHaveAttribute("aria-pressed", "true");
-  if (testInfo.project.name === "mobile") {
-    await chase.click();
-    await expect(chase).toHaveAttribute("aria-pressed", "true");
-  }
-
-  const selectedTarget = page.getByLabel("已选择的世界目标");
-  if (await selectedTarget.count() === 0) {
-    const box = await canvas.boundingBox();
-    expect(box).not.toBeNull();
-    const pickCandidates: Array<readonly [number, number]> = testInfo.project.name === "mobile"
-      ? [[0.5, 0.5], [0.47, 0.46], [0.53, 0.46], [0.47, 0.54], [0.53, 0.54]]
-      : [[0.5, 0.56], [0.66, 0.62], [0.34, 0.68], [0.76, 0.72]];
-    for (const [x, y] of pickCandidates) {
-      await canvas.click({ position: { x: box!.width * x, y: box!.height * y } });
-      if (await selectedTarget.count() > 0) break;
-    }
-  }
-  await expect(selectedTarget).toBeVisible();
-  await expect(selectedTarget.locator("small")).not.toHaveText("不可用");
-  await page.getByRole("button", { name: "清除已选目标" }).click();
-  await expect(selectedTarget).toHaveCount(0);
-
-  if (testInfo.project.name === "desktop") await chase.click();
-  await expect(chase).toHaveAttribute("aria-pressed", "true");
-  await captureReadmeScreenshot(page, testInfo.project.name === "desktop" ? "mission.png" : "mobile.png");
-
-  // Panels sit over the still-running world. Numeric shortcuts and Escape are
-  // the primary game interaction, so exercise those instead of the old tabs.
-  await page.keyboard.press("2");
-  await expect(page.getByRole("region", { name: "智能体流面板" })).toBeVisible();
-  await expect(page.getByLabel("实时层级智能体流")).toBeVisible();
-  await expect(page.getByLabel("智能体执行流")).toBeVisible();
-  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
-    expect.stringMatching(/AgentFlowView/)
-  ]));
-  await expect(canvas).toBeVisible();
-  if (testInfo.project.name === "desktop") await captureReadmeScreenshot(page, "hierarchy.png");
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("region", { name: "智能体流面板" })).toHaveCount(0);
-  await page.keyboard.press("3");
-  await expect(page.getByRole("region", { name: "行动历程面板" })).toBeVisible();
-  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
-    expect.stringMatching(/RobotTrailView/)
-  ]));
-  await expect(page.getByLabel("机器人行动历程")).toBeVisible();
-  if (testInfo.project.name === "desktop") await captureReadmeScreenshot(page, "actions.png");
-  await page.keyboard.press("Escape");
-  await page.keyboard.press("4");
-  await expect(page.getByRole("region", { name: "智能体输出面板" })).toBeVisible();
-  await expect(page.getByLabel("模型输出")).toBeVisible();
-  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
-    expect.stringMatching(/ActivityView/)
-  ]));
-  await expect(page.getByLabel(/\d+ 次模型调用/)).toBeVisible();
-  if (missionMode === "任务回顾") {
-    await expect(page.getByLabel("模型流状态")).toContainText("模型已响应");
-  }
-  if (testInfo.project.name === "desktop") await captureReadmeScreenshot(page, "logs.png");
-  await page.keyboard.press("Escape");
-  await expect(hotbar.getByRole("button", { name: "世界" })).toHaveAttribute("aria-current", "page");
-
-  await page.getByRole("button", { name: "适配相机范围", exact: true }).click();
   const graphics = await canvas.evaluate((element): {
     backend: string | null;
     available: boolean;
@@ -160,12 +112,7 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
     }
     const backend = element.dataset.renderBackend ?? null;
     if (backend === "webgpu") {
-      return {
-        backend,
-        available: "gpu" in navigator,
-        contextLost: false,
-        error: null
-      };
+      return { backend, available: "gpu" in navigator, contextLost: false, error: null };
     }
     const context = element.getContext("webgl2") ?? element.getContext("webgl");
     if (!context) return { backend, available: false, contextLost: true, error: null };
@@ -181,24 +128,12 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
   expect(graphics.available).toBe(true);
   expect(graphics.contextLost).toBe(false);
   expect(graphics.error).toBeNull();
-  await expect(page.locator(".graphics-error")).toHaveCount(0);
 
-  const canvasBox = await canvas.boundingBox();
-  expect(canvasBox).not.toBeNull();
-  const renderedPng = await canvas.screenshot({
-    animations: "disabled",
-    style: ".world-hud { visibility: hidden !important; }"
-  });
-  const solidPng = await captureSolidReference(
-    page,
-    canvasBox!.width,
-    canvasBox!.height
-  );
-  expect(
-    renderedPng.byteLength,
-    `3D canvas PNG should be more complex than a solid frame (${renderedPng.byteLength} vs ${solidPng.byteLength} bytes)`
-  ).toBeGreaterThan(solidPng.byteLength * 2);
-
+  const box = await canvas.boundingBox();
+  expect(box).not.toBeNull();
+  const rendered = await canvas.screenshot({ animations: "disabled" });
+  const solid = await captureSolidReference(page, box!.width, box!.height);
+  expect(rendered.byteLength).toBeGreaterThan(solid.byteLength * 2);
   const viewport = await page.evaluate(() => ({
     clientWidth: document.documentElement.clientWidth,
     clientHeight: document.documentElement.clientHeight,
@@ -207,17 +142,43 @@ test("渲染自主体素世界与实时机器人界面", async ({ page }, testIn
   }));
   expect(viewport.scrollWidth).toBeLessThanOrEqual(viewport.clientWidth + 1);
   expect(viewport.scrollHeight).toBeLessThanOrEqual(viewport.clientHeight + 1);
+  await page.screenshot({ path: `test-results/operator-${project}.png`, fullPage: true });
+}
 
-  await page.screenshot({
-    path: `test-results/operator-${testInfo.project.name}.png`,
-    fullPage: true
-  });
-});
+async function assertMobileHudLayout(
+  page: Page,
+  camera: ReturnType<Page["getByRole"]>,
+  hotbar: ReturnType<Page["getByRole"]>
+): Promise<void> {
+  const goal = page.getByLabel("目标与长期记忆");
+  await expect(goal).toBeVisible();
+  const boxes = await Promise.all([goal, camera, hotbar].map((locator) => locator.boundingBox()));
+  expect(boxes.every((box) => box !== null)).toBe(true);
+  const [goalBox, cameraBox, hotbarBox] = boxes;
+  expect(overlapArea(goalBox!, cameraBox!)).toBe(0);
+  expect(overlapArea(goalBox!, hotbarBox!)).toBe(0);
+  expect(overlapArea(cameraBox!, hotbarBox!)).toBe(0);
+  expect(goalBox!.y).toBeGreaterThanOrEqual(0);
+  expect(goalBox!.y + goalBox!.height).toBeLessThanOrEqual(
+    await page.evaluate(() => document.documentElement.clientHeight)
+  );
+}
+
+function overlapArea(
+  left: { x: number; y: number; width: number; height: number },
+  right: { x: number; y: number; width: number; height: number }
+): number {
+  const width = Math.max(0, Math.min(left.x + left.width, right.x + right.width)
+    - Math.max(left.x, right.x));
+  const height = Math.max(0, Math.min(left.y + left.height, right.y + right.height)
+    - Math.max(left.y, right.y));
+  return width * height;
+}
 
 async function loadedDeferredChunks(page: Page): Promise<string[]> {
   return page.evaluate(() => performance.getEntriesByType("resource")
     .map((entry) => new URL(entry.name).pathname.split("/").at(-1) ?? "")
-    .filter((name) => /three~|create-stage|AgentFlowView|ActivityView|RobotTrailView|MissionModal/.test(name)));
+    .filter((name) => /three~|create-humanoid-stage|AgentFlowView|ActivityView|RobotTrailView|MissionModal/.test(name)));
 }
 
 async function captureSolidReference(page: Page, width: number, height: number): Promise<Buffer> {

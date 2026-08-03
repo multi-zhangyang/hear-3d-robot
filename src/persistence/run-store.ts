@@ -11,13 +11,19 @@ import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import {
   GoalSchema,
-  RunCheckpointSchema,
   ScenarioSchema,
   type Goal,
   type JsonValue,
-  type RunCheckpoint,
   type Scenario
 } from "../domain/schema.js";
+import {
+  AnyRunCheckpointSchema,
+  type AnyRunCheckpoint
+} from "../domain/run-checkpoint.js";
+import {
+  HumanoidRunCheckpointSchema,
+  type HumanoidRunCheckpoint
+} from "../domain/humanoid-run.js";
 import { z } from "zod";
 import {
   appendIndexedRecordsBuilt,
@@ -39,6 +45,7 @@ const RunDefinitionSchema = z.object({
   scenario_id: z.string().min(1),
   scenario: ScenarioSchema,
   goal: GoalSchema,
+  runtime: z.literal("humanoid_g1"),
   created_at: z.string().datetime()
 });
 const AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -66,7 +73,7 @@ export interface JournalPage {
 }
 
 export interface RunDetailsSnapshot {
-  checkpoint: RunCheckpoint;
+  checkpoint: AnyRunCheckpoint;
   actions: JournalPage;
   provider: JournalPage;
   framework: JournalPage;
@@ -100,7 +107,13 @@ export class RunStore {
 
   static async create(
     runsDir: string,
-    input: { mission: string; scenarioId: string; scenario: Scenario; goal: Goal },
+    input: {
+      mission: string;
+      scenarioId: string;
+      scenario: Scenario;
+      goal: Goal;
+      runtime?: RunDefinition["runtime"];
+    },
     options: RunStoreOptions = {}
   ): Promise<RunStore> {
     const runId = createRunId(input.scenarioId);
@@ -112,6 +125,7 @@ export class RunStore {
       scenario_id: input.scenarioId,
       scenario: structuredClone(input.scenario),
       goal: structuredClone(input.goal),
+      runtime: input.runtime ?? "humanoid_g1",
       created_at: new Date().toISOString()
     };
     await runFencedMutation(options.mutationFence, async () => {
@@ -173,17 +187,20 @@ export class RunStore {
     return persisted;
   }
 
-  async writeCheckpoint(checkpoint: RunCheckpoint): Promise<void> {
-    const parsed = RunCheckpointSchema.parse(checkpoint);
+  async writeCheckpoint(checkpoint: AnyRunCheckpoint): Promise<void> {
+    const parsed = AnyRunCheckpointSchema.parse(checkpoint);
+    this.#assertCheckpointRuntime(parsed);
     await this.#runMutation(
       () => atomicJson(resolve(this.runDir, "checkpoint.json"), parsed)
     );
   }
 
-  async readCheckpoint(): Promise<RunCheckpoint> {
-    return RunCheckpointSchema.parse(
-      JSON.parse(await readFile(resolve(this.runDir, "checkpoint.json"), "utf8"))
-    );
+  async readCheckpoint(): Promise<AnyRunCheckpoint> {
+    return this.#readCheckpoint();
+  }
+
+  async readHumanoidCheckpoint(): Promise<HumanoidRunCheckpoint> {
+    return HumanoidRunCheckpointSchema.parse(await this.#readCheckpoint());
   }
 
   async readJournal(name: JournalName): Promise<JsonValue[]> {
@@ -367,10 +384,21 @@ export class RunStore {
     await write;
   }
 
-  async #readCheckpoint(): Promise<RunCheckpoint> {
-    return RunCheckpointSchema.parse(
+  async #readCheckpoint(): Promise<AnyRunCheckpoint> {
+    const checkpoint = AnyRunCheckpointSchema.parse(
       JSON.parse(await readFile(resolve(this.runDir, "checkpoint.json"), "utf8"))
     );
+    this.#assertCheckpointRuntime(checkpoint);
+    return checkpoint;
+  }
+
+  #assertCheckpointRuntime(checkpoint: AnyRunCheckpoint): void {
+    if (checkpoint.runtime !== this.definition.runtime) {
+      throw new Error(
+        `Run checkpoint runtime mismatch: expected ${this.definition.runtime}, `
+        + `received ${checkpoint.runtime}`
+      );
+    }
   }
 
   async #readJournalTail(name: JournalName, limit: number): Promise<JournalPage> {

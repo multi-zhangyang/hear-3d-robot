@@ -42,10 +42,6 @@ export function recordAgentInvocationTransportInterruption(error: Error): boolea
   return true;
 }
 
-export function currentAgentInvocationTransportInterruption(): Error | undefined {
-  return invocationScope.getStore()?.transportInterruption;
-}
-
 export function withAgentInvocation<T>(
   agentId: string,
   operation: () => Promise<T>,

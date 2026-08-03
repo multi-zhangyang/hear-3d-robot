@@ -9,8 +9,9 @@ import { createOperatorServer, EventStreamWriter, runtimeEventRecord } from "./o
 
 const RUN_FIXTURE = resolve(
   process.cwd(),
-  "tests/fixtures/runs/20000101T000000Z_fetch_red_block_00000000"
+  "tests/fixtures/runs/20260802T204346Z_humanoid_courtyard_8071d876"
 );
+const FIXTURE_RUN_ID = "20260802T204346Z_humanoid_courtyard_8071d876";
 
 describe("Operator API", () => {
   it("does not publish a resumable SSE cursor for live-only frames", () => {
@@ -58,24 +59,24 @@ describe("Operator API", () => {
         provider: { configured: false, error: "AI_MODEL is required" }
       });
       expect(bootstrap.json().capability_catalog).toEqual(expect.arrayContaining([
-        "sense_scene",
-        "survey_terrain",
-        "plan_base_path",
-        "execute_base_plan",
-        "set_joint_targets",
-        "set_gripper_target"
+        "observe_humanoid",
+        "plan_whole_body_motion",
+        "execute_whole_body_motion",
+        "plan_humanoid_navigation",
+        "execute_humanoid_navigation"
       ]));
       expect(bootstrap.json().scenarios).toEqual(expect.arrayContaining([
         expect.objectContaining({
-          id: "voxel_expanse",
-          kind: "generated",
-          extent: { width: 80, depth: 80 },
-          objects: expect.arrayContaining([expect.objectContaining({ id: "red_block" })])
+          id: "humanoid_frontier",
+          kind: "procedural",
+          runtime: "humanoid_g1",
+          extent: { width: 36, depth: 36 },
+          objects: expect.arrayContaining([expect.objectContaining({ id: "amber_crate" })])
         }),
         expect.objectContaining({
-          id: "voxel_highlands",
-          kind: "generated",
-          extent: { width: 96, depth: 96 }
+          id: "humanoid_realm",
+          kind: "procedural",
+          extent: { width: 54, depth: 54 }
         })
       ]));
 
@@ -85,7 +86,7 @@ describe("Operator API", () => {
         headers,
         payload: {
           mission: "Reach the arrival coordinate",
-          scenario_id: "open_navigation",
+          scenario_id: "humanoid_courtyard",
           goal: {
             predicates: [
               { type: "robot_at", target: { x: 3, y: 0, z: 1 }, tolerance: 0.25 }
@@ -102,7 +103,7 @@ describe("Operator API", () => {
         headers,
         payload: {
           mission: "Reach the arrival coordinate",
-          scenario_id: "open_navigation",
+          scenario_id: "humanoid_courtyard",
           goal: {
             summary: "Robot reaches the requested coordinate.",
             predicates: [
@@ -136,7 +137,7 @@ describe("Operator API", () => {
     try {
       const response = await app.inject({
         method: "GET",
-        url: "/api/runs/20000101T000000Z_fetch_red_block_00000000?actions=3&provider=4&framework=2"
+        url: `/api/runs/${FIXTURE_RUN_ID}?actions=3&provider=4&framework=2`
       });
       expect(response.statusCode).toBe(200);
       const details = response.json();
@@ -147,21 +148,21 @@ describe("Operator API", () => {
 
       const unknownCursor = await app.inject({
         method: "GET",
-        url: "/api/runs/20000101T000000Z_fetch_red_block_00000000/events?after=unknown"
+        url: `/api/runs/${FIXTURE_RUN_ID}/events?after=unknown`
       });
       expect(unknownCursor.statusCode).toBe(409);
       expect(unknownCursor.json().error).toMatch(/Unknown event cursor/);
 
       const malformedVersionedCursor = await app.inject({
         method: "GET",
-        url: "/api/runs/20000101T000000Z_fetch_red_block_00000000/events?after=v1:not-an-index:broken"
+        url: `/api/runs/${FIXTURE_RUN_ID}/events?after=v1:not-an-index:broken`
       });
       expect(malformedVersionedCursor.statusCode).toBe(409);
       expect(malformedVersionedCursor.json().error).toMatch(/Malformed event cursor/);
 
       const conflictingCursors = await app.inject({
         method: "GET",
-        url: `/api/runs/20000101T000000Z_fetch_red_block_00000000/events?after=${encodeURIComponent(details.event_cursor)}`,
+        url: `/api/runs/${FIXTURE_RUN_ID}/events?after=${encodeURIComponent(details.event_cursor)}`,
         headers: { "last-event-id": "different-cursor" }
       });
       expect(conflictingCursors.statusCode).toBe(400);
@@ -170,7 +171,7 @@ describe("Operator API", () => {
       for (const invalidCursor of ["", "x".repeat(257), "cursor\r\nforged", "cursor\0tail"]) {
         const invalidHeader = await app.inject({
           method: "GET",
-          url: "/api/runs/20000101T000000Z_fetch_red_block_00000000/events",
+          url: `/api/runs/${FIXTURE_RUN_ID}/events`,
           headers: { "last-event-id": invalidCursor }
         });
         expect(invalidHeader.statusCode).toBe(400);
@@ -204,7 +205,7 @@ describe("Operator API", () => {
     try {
       const address = await app.listen({ host: "127.0.0.1", port: 0 });
       const response = await fetch(
-        `${address}/api/runs/20000101T000000Z_fetch_red_block_00000000/events`
+        `${address}/api/runs/${FIXTURE_RUN_ID}/events`
       );
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toContain("text/event-stream");

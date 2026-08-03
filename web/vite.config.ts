@@ -4,6 +4,7 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
+  publicDir: fileURLToPath(new URL("../assets/", import.meta.url)),
   plugins: [react()],
   resolve: {
     alias: [{
@@ -42,12 +43,6 @@ export default defineConfig({
               name: "react",
               test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/,
               priority: 30
-            },
-            {
-              name: "antd",
-              test: /node_modules[\\/](?:antd|@ant-design|@rc-component|rc-[^\\/]+)[\\/]/,
-              priority: 20,
-              entriesAware: true
             },
             {
               name: "vendor",

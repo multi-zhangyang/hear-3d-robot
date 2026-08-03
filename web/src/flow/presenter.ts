@@ -1,4 +1,4 @@
-import type { ActionReceipt, TaskNode } from "../types";
+import type { HumanoidActionReceipt, HumanoidEmbodiedEpisode, TaskNode } from "../types";
 import {
   actionLabel,
   agentNameLabel,
@@ -32,45 +32,44 @@ export interface ModelMoment {
   tone: FeedTone;
 }
 
-const SENSE_ACTIONS = new Set([
-  "read_proprioception",
-  "sense_scene",
-  "survey_terrain",
-  "scan_voxels",
-  "inspect_voxel",
-  "recall_spatial_memory",
-  "inspect_entity",
-  "query_contacts",
-  "inspect_command"
-]);
-const PLAN_ACTIONS = new Set([
-  "plan_base_path",
-  "plan_arm_retraction",
-  "plan_joint_targets",
-  "solve_end_effector_position",
-  "solve_end_effector_pose"
-]);
-const VERIFY_ACTIONS = new Set(["check_mission", "complete_mission"]);
+const HUMANOID_SENSE_ACTIONS = new Set(["observe_humanoid"]);
+const HUMANOID_PLAN_ACTIONS = new Set(["plan_whole_body_motion", "plan_humanoid_navigation"]);
 
-export function presentAction(action: ActionReceipt): PresentedAction {
-  const category: ActionCategory = SENSE_ACTIONS.has(action.name)
+export function presentAction(action: HumanoidActionReceipt): PresentedAction {
+  const name = action.action;
+  const accepted = action.accepted;
+  const channels = action.channels;
+  const category: ActionCategory = HUMANOID_SENSE_ACTIONS.has(name)
     ? "sense"
-    : PLAN_ACTIONS.has(action.name) ? "plan"
-      : VERIFY_ACTIONS.has(action.name) || action.kind === "checker" ? "verify" : "move";
+    : HUMANOID_PLAN_ACTIONS.has(name) ? "plan" : "move";
   return {
-    id: action.transaction_id,
-    at: action.committed_at,
-    agent: agentNameLabel(action.agent_name),
-    title: action.accepted
-      ? actionLabel(action.name)
-      : `${actionLabel(action.name)}被拒绝`,
+    id: action.transactionId,
+    at: action.committedAt,
+    agent: agentNameLabel(action.agentId),
+    title: accepted
+      ? actionLabel(name)
+      : `${actionLabel(name)}被拒绝`,
     detail: actionDetail(action),
-    meta: action.frame_count > 0
-      ? `${action.frame_count.toLocaleString("zh-CN")} 个物理帧`
+    meta: receiptFrames(action) > 0
+      ? `${receiptFrames(action).toLocaleString("zh-CN")} 个物理帧`
       : resultCodeLabel(action.code),
-    tone: action.accepted ? category === "move" ? "active" : "success" : "warning",
+    tone: accepted ? category === "move" ? "active" : "success" : "warning",
     category,
-    channels: action.channels.map(bodyChannelLabel)
+    channels: channels.map(bodyChannelLabel)
+  };
+}
+
+export function presentEmbodiedEpisode(episode: HumanoidEmbodiedEpisode): PresentedAction {
+  return {
+    id: `episode-${episode.sequence}-${episode.transaction_id}`,
+    at: episode.recorded_at,
+    agent: "具身记忆",
+    title: "物理经历已记住",
+    detail: modelOutputLabel(episode.model_summary, 160) ?? "已保存本次物理执行结果。",
+    meta: `${episode.frame_count.toLocaleString("zh-CN")} 个物理帧 · 世界版本 ${episode.world_after_revision}`,
+    tone: episode.fallen ? "warning" : episode.goal_success ? "success" : "neutral",
+    category: "verify",
+    channels: []
   };
 }
 
@@ -215,14 +214,11 @@ function toolStatus(status: string | null): string | null {
 function toolFacts(payload: Record<string, unknown> | null): string[] {
   if (!payload) return [];
   const detail = record(payload.detail);
-  const sampling = record(detail?.movement_sampling);
   const facts: string[] = [];
   const frameCount = numeric(payload.frame_count) ?? numeric(detail?.frame_count);
   if (frameCount !== null && frameCount > 0) {
     facts.push(`${frameCount.toLocaleString("zh-CN")} 个物理帧`);
   }
-  const candidateCount = numeric(sampling?.choice_count);
-  if (candidateCount !== null) facts.push(`${candidateCount} 个可达候选`);
   const target = pointText(payload.target) ?? pointText(detail?.target);
   if (target) facts.push(`目标 ${target}`);
   const checker = record(payload.checker);
@@ -266,24 +262,18 @@ export function shortTime(value: string): string {
   });
 }
 
-function actionDetail(action: ActionReceipt): string {
+function actionDetail(action: HumanoidActionReceipt): string {
+  const name = action.action;
   const input = record(action.input);
-  const detail = record(action.detail);
   if (!action.accepted) {
     return `动作被拒绝：${resultCodeLabel(action.code)}。`;
   }
   const target = pointText(input?.target);
-  if (action.name === "plan_base_path" && target) return `已请求规划前往 ${target} 的可通行路线。`;
-  if (action.name === "navigate_frontier") return "机器人已前往模型选择的探索边界。";
-  if (action.name === "execute_base_plan") return "机器人已沿路线移动。";
-  if (action.name === "survey_terrain") {
-    const sampling = record(detail?.movement_sampling);
-    const count = typeof sampling?.choice_count === "number" ? sampling.choice_count : null;
-    return count === null ? "已更新机器人附近的可见地形。" : `已发现 ${count} 个可达探索边界。`;
-  }
-  if (action.name === "check_mission") {
-    return action.code === "mission_satisfied" ? "所有结构化完成条件均已通过。" : "仍有结构化完成条件尚未满足。";
-  }
+  if (name === "plan_humanoid_navigation" && target) return `已对前往 ${target} 的双足路线完成物理预演。`;
+  if (name === "execute_humanoid_navigation") return "机器人已执行模型选择的双足导航分块。";
+  if (name === "plan_whole_body_motion") return "已对连续全身动作完成 MuJoCo 物理预演。";
+  if (name === "execute_whole_body_motion") return "YAHMP 已在 MuJoCo 中执行连续全身动作。";
+  if (name === "observe_humanoid") return "已更新头部感知、身体姿态、接触、平衡和持久对象状态。";
   if (target) return `目标位置：${target}。`;
   if (action.channels.length > 0) {
     return `使用${action.channels.map(bodyChannelLabel).join("、")}控制通道完成动作。`;
@@ -291,23 +281,16 @@ function actionDetail(action: ActionReceipt): string {
   return resultCodeLabel(action.code);
 }
 
+export function receiptFrames(action: HumanoidActionReceipt): number {
+  return action.frameCount;
+}
+
 function decisionDetail(args: unknown): string {
   const parsed = typeof args === "string" ? parseJson(args) : args;
   const input = record(parsed);
   const target = pointText(input?.target);
   if (target) return `目标 ${target}`;
-  const coordinate = voxelCoordinateText(input?.coordinate);
-  if (coordinate) return `体素坐标 ${coordinate}`;
   return "等待工具回执。";
-}
-
-function voxelCoordinateText(value: unknown): string | null {
-  const coordinate = record(value);
-  if (!coordinate
-    || !Number.isInteger(coordinate.column)
-    || !Number.isInteger(coordinate.level)
-    || !Number.isInteger(coordinate.row)) return null;
-  return `[${coordinate.column}, ${coordinate.level}, ${coordinate.row}]`;
 }
 
 function pointText(value: unknown): string | null {

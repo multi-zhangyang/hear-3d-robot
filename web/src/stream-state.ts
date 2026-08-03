@@ -1,12 +1,13 @@
 import type {
-  ActionReceipt,
-  CheckerResult,
   ContextMemoryState,
+  HumanoidActionReceipt,
+  HumanoidCheckerResult,
+  HumanoidEmbodiedMemoryState,
+  HumanoidWorldSnapshot,
   ProviderActivity,
   RunListItem,
   RuntimeEvent,
-  TaskNode,
-  WorldSnapshot
+  TaskNode
 } from "./types";
 
 export function nextRuntimeEventCursor(
@@ -18,50 +19,12 @@ export function nextRuntimeEventCursor(
   return durable ? event.event_id : current;
 }
 
-export function mergeWorldFrames(
-  current: WorldSnapshot[],
-  incoming: WorldSnapshot[],
+export function upsertHumanoidAction(
+  actions: HumanoidActionReceipt[],
+  receipt: HumanoidActionReceipt,
   limit: number
-): WorldSnapshot[] {
-  if (incoming.length === 0) return current;
-  let next = current;
-  let writable = false;
-  const ensureWritable = (): void => {
-    if (writable) return;
-    next = [...next];
-    writable = true;
-  };
-
-  for (const frame of incoming) {
-    const last = next.at(-1);
-    if (!last || frame.frame > last.frame) {
-      ensureWritable();
-      next.push(frame);
-      continue;
-    }
-    if (frame.frame === last.frame) {
-      ensureWritable();
-      next[next.length - 1] = frame;
-      continue;
-    }
-
-    let lower = 0;
-    let upper = next.length;
-    while (lower < upper) {
-      const middle = (lower + upper) >>> 1;
-      if (next[middle]!.frame < frame.frame) lower = middle + 1;
-      else upper = middle;
-    }
-    ensureWritable();
-    if (next[lower]?.frame === frame.frame) next[lower] = frame;
-    else next.splice(lower, 0, frame);
-  }
-
-  return next.length > limit ? next.slice(-limit) : next;
-}
-
-export function upsertAction(actions: ActionReceipt[], receipt: ActionReceipt, limit: number): ActionReceipt[] {
-  const index = actions.findIndex((action) => action.transaction_id === receipt.transaction_id);
+): HumanoidActionReceipt[] {
+  const index = actions.findIndex((action) => action.transactionId === receipt.transactionId);
   if (index < 0) return appendRecent(actions, receipt, limit);
   const next = [...actions];
   next[index] = receipt;
@@ -109,28 +72,6 @@ export function updateRunListStatus(
     : run);
 }
 
-export function completeRootNode(
-  nodes: Record<string, TaskNode>,
-  rootId: string,
-  finalOutput: string | null,
-  checker: CheckerResult | null,
-  updatedAt: string
-): Record<string, TaskNode> {
-  const root = nodes[rootId];
-  if (!root) return nodes;
-  return {
-    ...nodes,
-    [rootId]: {
-      ...root,
-      status: "completed",
-      ...(finalOutput !== null && checker !== null
-        ? { last_result: { output: finalOutput, checker } }
-        : {}),
-      updated_at: updatedAt
-    }
-  };
-}
-
 export function failOpenNodes(
   nodes: Record<string, TaskNode>,
   error: string,
@@ -167,16 +108,18 @@ export function providerActivityFrom(value: unknown): ProviderActivity | null {
   };
 }
 
-export function worldSnapshotsFrom(value: unknown): WorldSnapshot[] {
-  if (isWorldSnapshot(value)) return [value];
+export function humanoidWorldSnapshotsFrom(value: unknown): HumanoidWorldSnapshot[] {
+  if (isHumanoidWorldSnapshot(value)) return [value];
   const record = asRecord(value);
   if (!record) return [];
-  const candidates: WorldSnapshot[] = [];
+  const candidates: HumanoidWorldSnapshot[] = [];
   for (const key of ["world", "snapshot"] as const) {
-    if (isWorldSnapshot(record[key])) candidates.push(record[key]);
+    if (isHumanoidWorldSnapshot(record[key])) candidates.push(record[key]);
   }
   if (Array.isArray(record.frames)) {
-    for (const frame of record.frames) if (isWorldSnapshot(frame)) candidates.push(frame);
+    for (const frame of record.frames) {
+      if (isHumanoidWorldSnapshot(frame)) candidates.push(frame);
+    }
   }
   return candidates;
 }
@@ -192,19 +135,22 @@ export function taskNodesFrom(value: unknown): Record<string, TaskNode> | null {
   return record as unknown as Record<string, TaskNode>;
 }
 
-export function actionReceiptFrom(value: unknown): ActionReceipt | null {
+export function humanoidActionReceiptFrom(value: unknown): HumanoidActionReceipt | null {
   const record = asRecord(value);
-  if (!record || typeof record.transaction_id !== "string" || typeof record.agent_id !== "string"
-    || typeof record.agent_name !== "string"
-    || typeof record.name !== "string" || typeof record.accepted !== "boolean"
-    || typeof record.code !== "string") return null;
-  return record as unknown as ActionReceipt;
+  if (!record || typeof record.transactionId !== "string"
+    || typeof record.agentId !== "string" || typeof record.action !== "string"
+    || typeof record.fingerprint !== "string" || typeof record.accepted !== "boolean"
+    || typeof record.code !== "string" || !Array.isArray(record.channels)) return null;
+  return record as unknown as HumanoidActionReceipt;
 }
 
-export function checkerFrom(value: unknown): CheckerResult | null {
+export function humanoidCheckerFrom(value: unknown): HumanoidCheckerResult | null {
   const record = asRecord(value);
-  if (!record || typeof record.success !== "boolean" || !Array.isArray(record.checks)) return null;
-  return record as unknown as CheckerResult;
+  if (!record || typeof record.success !== "boolean"
+    || typeof record.worldFrame !== "number"
+    || typeof record.worldRevision !== "number"
+    || !Array.isArray(record.checks)) return null;
+  return record as unknown as HumanoidCheckerResult;
 }
 
 export function contextMemoryFrom(value: unknown): ContextMemoryState | null {
@@ -218,15 +164,34 @@ export function contextMemoryFrom(value: unknown): ContextMemoryState | null {
   return record as unknown as ContextMemoryState;
 }
 
-export function isWorldSnapshot(value: unknown): value is WorldSnapshot {
+export function embodiedMemoryFrom(value: unknown): HumanoidEmbodiedMemoryState | null {
   const record = asRecord(value);
+  if (!record || record.version !== 1
+    || typeof record.total_episodes !== "number"
+    || typeof record.pruned_episodes !== "number"
+    || !Array.isArray(record.recent_episodes)) return null;
+  for (const episode of record.recent_episodes) {
+    const candidate = asRecord(episode);
+    if (!candidate || typeof candidate.sequence !== "number"
+      || typeof candidate.transaction_id !== "string"
+      || typeof candidate.model_summary !== "string"
+      || typeof candidate.recorded_at !== "string") return null;
+  }
+  return record as unknown as HumanoidEmbodiedMemoryState;
+}
+
+function isHumanoidWorldSnapshot(value: unknown): value is HumanoidWorldSnapshot {
+  const record = asRecord(value);
+  const robot = asRecord(record?.robot);
   return record !== null
     && typeof record.frame === "number"
-    && typeof record.simulated_time === "number"
-    && asRecord(record.robot) !== null
-    && Array.isArray(record.objects)
-    && Array.isArray(record.zones)
-    && Array.isArray(record.obstacles);
+    && typeof record.worldRevision === "number"
+    && robot !== null
+    && typeof robot.simulatedTime === "number"
+    && asRecord(robot.rootPosition) !== null
+    && asRecord(robot.links) !== null
+    && asRecord(robot.objects) !== null
+    && asRecord(record.navigation) !== null;
 }
 
 export function asRecord(value: unknown): Record<string, unknown> | null {

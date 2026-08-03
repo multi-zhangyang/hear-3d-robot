@@ -1,12 +1,11 @@
 import type {
-  BodyChannel,
   Goal,
   GoalPredicate,
-  RunCheckpoint,
+  HumanoidBodyChannel,
+  HumanoidRunCheckpoint,
   RunListItem,
   StreamState,
-  TaskNode,
-  VoxelMaterial
+  TaskNode
 } from "./types";
 
 const RUN_STATUS: Record<RunListItem["status"], string> = {
@@ -34,231 +33,82 @@ const STREAM_STATUS: Record<StreamState, string> = {
   disconnected: "已断开"
 };
 
-const BODY_CHANNEL: Record<BodyChannel, string> = {
-  base: "底盘",
-  head: "传感头",
-  arm: "机械臂",
-  gripper: "夹爪"
+const BODY_CHANNEL: Record<HumanoidBodyChannel, string> = {
+  locomotion: "双足运动",
+  torso: "躯干",
+  left_arm: "左臂",
+  right_arm: "右臂"
 };
 
 const ACTION_LABELS: Record<string, string> = {
-  read_proprioception: "读取机器人本体状态",
-  sense_scene: "观察可见世界",
-  survey_terrain: "勘察附近地形",
-  scan_voxels: "扫描可见方块",
-  inspect_voxel: "检查体素方块",
-  recall_spatial_memory: "检索空间记忆",
-  inspect_entity: "检查世界实体",
-  query_contacts: "检查物理接触",
-  plan_base_path: "规划底盘路线",
-  plan_arm_retraction: "规划机械臂收拢",
-  plan_joint_targets: "规划关节路径",
-  solve_end_effector_position: "求解机械臂位置",
-  solve_end_effector_pose: "求解机械臂姿态",
-  inspect_command: "检查运动指令",
-  navigate_frontier: "前往探索边界",
-  execute_base_plan: "执行底盘运动",
-  execute_joint_plan: "执行关节运动",
-  drive_base: "调整底盘运动",
-  set_head_target: "调整传感头",
-  set_joint_targets: "调整机器人关节",
-  set_gripper_target: "调整夹爪",
-  break_voxel: "破坏体素方块",
-  place_voxel: "放置体素方块",
-  check_mission: "检查任务目标",
-  complete_mission: "提交任务完成结果",
-  delegate_agent: "委派下级智能体",
-  complete_assignment: "提交分配结果",
+  observe_humanoid: "感知人形世界",
+  plan_whole_body_motion: "规划全身动作",
+  execute_whole_body_motion: "执行全身动作",
+  plan_humanoid_navigation: "规划双足路线",
+  execute_humanoid_navigation: "执行双足导航",
+  delegate_humanoid_sentry: "委派感知哨兵",
+  delegate_motion_reference: "委派运动参考智能体",
+  delegate_physics_executor: "委派物理执行智能体",
+  complete_autonomous_cycle: "完成自主循环",
   tool: "工具"
-};
-
-const PHASE_LABELS: Record<string, string> = {
-  idle: "空闲",
-  active: "执行中",
-  starting: "启动中",
-  running: "运行中",
-  planned: "已规划",
-  planning: "规划中",
-  queued: "排队中",
-  executing: "执行中",
-  completed: "已完成",
-  blocked: "已阻塞",
-  stopped: "已停止",
-  stopping: "停止中",
-  interrupted: "已暂停",
-  consumed: "已使用",
-  stale: "已失效",
-  accepted: "已接受",
-  rejected: "已拒绝"
 };
 
 const RESULT_CODES: Record<string, string> = {
   accepted: "已接受",
-  action_reused: "已复用有效动作回执",
-  ambiguous_frontier_choice: "探索边界选择不唯一",
-  arm_retraction_not_required: "机械臂无需收拢",
-  arm_retraction_options: "已生成机械臂收拢方案",
-  arm_retraction_unavailable: "没有可用的机械臂收拢方案",
-  arm_trajectory_unavailable: "没有可用的机械臂轨迹",
-  attached_object_missing: "已抓取物体不存在",
-  authority_denied: "动作权限校验未通过",
-  base_angular_velocity_limit: "底盘角速度超出限制",
-  base_duration_limit: "底盘运动时长超出限制",
-  base_linear_velocity_limit: "底盘线速度超出限制",
-  base_motion_blocked: "底盘运动受阻",
-  base_motion_completed: "底盘运动已完成",
-  base_path_collision: "底盘路线存在碰撞",
-  mission_satisfied: "任务条件已满足",
-  mission_incomplete: "任务条件尚未全部满足",
-  base_path_planned: "底盘路线已规划",
-  base_path_unavailable: "没有可用的底盘路线",
-  base_plan_completed: "底盘运动已完成",
-  body_channel_busy: "身体通道正忙",
-  child_agent_blocked: "下级智能体已阻塞",
-  child_agent_failed: "下级智能体执行失败",
-  command_completed: "运动指令已完成",
-  command_interrupted: "运动指令已中断",
-  command_state: "运动指令状态已读取",
-  contact_state: "物理接触状态已读取",
-  empty_joint_target: "关节目标为空",
-  end_effector_solution: "已求得末端执行器解",
-  end_effector_verification_failed: "末端执行器目标验证失败",
-  end_effector_verified: "末端执行器目标已验证",
-  entity_not_visible: "目标实体不可见",
-  entity_state: "实体状态已读取",
-  grasp_slipped: "抓取物已滑脱",
-  grasp_unstable: "抓取状态不稳定",
-  gripper_force_limit: "夹爪力度超出限制",
-  gripper_joint_limit: "夹爪关节超出限制",
-  gripper_motion_blocked: "夹爪运动受阻",
-  gripper_motion_timeout: "夹爪运动超时",
-  gripper_target_reached: "夹爪已到达目标",
-  frontier_plan_missing_id: "探索路线缺少执行标识",
-  head_joint_limit: "传感头关节超出限制",
-  head_motion_blocked: "传感头运动受阻",
-  head_motion_timeout: "传感头运动超时",
-  head_target_reached: "传感头已到达目标",
-  ik_not_converged: "逆运动学求解未收敛",
-  ik_residual_too_large: "逆运动学残差过大",
-  ik_solution_outside_limits: "逆运动学解超出关节限制",
-  ik_solver_error: "逆运动学求解失败",
-  ik_trajectory_endpoint_blocked: "机械臂轨迹终点受阻",
-  invalid_base_face_point: "底盘朝向目标无效",
-  invalid_base_velocity: "底盘速度无效",
-  invalid_end_effector_target: "末端执行器目标无效",
-  invalid_gripper_force: "夹爪力度无效",
-  invalid_gripper_motion_options: "夹爪运动参数无效",
-  invalid_head_motion_options: "传感头运动参数无效",
-  invalid_joint_velocity: "关节速度无效",
-  invalid_motion_duration: "运动时长无效",
-  invalid_planning_transaction: "规划回执无效",
-  invalid_survey_frontier: "地形勘察候选无效",
-  invalid_survey_transaction: "地形勘察回执无效",
-  invalid_skill_input: "动作输入无效",
-  joint_limit: "关节超出限制",
-  joint_motion_blocked: "关节运动受阻",
-  joint_plan_completed: "关节运动已完成",
-  joint_target_plan: "关节路线已规划",
-  joint_targets_reached: "关节已到达目标",
-  joint_trajectory_blocked: "关节轨迹受阻",
-  keyed_lock_transition: "钥匙锁状态已更新",
-  navigation_projection_failed: "导航投影失败",
-  plan_already_consumed: "规划已被使用",
-  planning_receipt_missing_plan: "规划回执缺少路线",
-  planning_transaction_not_granted: "规划回执未授权给当前智能体",
-  proprioception: "机器人本体状态已读取",
-  repeated_accepted_action: "检测到重复的已接受动作",
-  repeated_denied_action: "检测到重复的已拒绝动作",
-  robot_link_state_unavailable: "机器人连杆状态不可用",
-  scene_observation: "场景观察已完成",
-  scene_observed: "场景观察已完成",
-  spatial_memory_context_unavailable: "当前智能体无可用空间记忆上下文",
-  spatial_memory_recalled: "空间记忆已读取",
-  stale_plan_revision: "规划对应的世界版本已失效",
-  stale_survey_revision: "地形勘察对应的世界版本已失效",
-  survey_transaction_not_granted: "地形勘察回执未授权给当前智能体",
-  target_out_of_bounds: "目标超出世界边界",
-  terrain_survey: "地形勘察已完成",
-  terrain_unavailable: "地形数据不可用",
-  unknown_arm_plan: "机械臂规划不存在",
-  unknown_base_plan: "底盘规划不存在",
-  unknown_entity: "目标实体不存在",
-  unknown_planning_transaction: "规划回执不存在",
-  unknown_frontier_choice: "探索边界选择不存在",
-  unknown_survey_transaction: "地形勘察回执不存在",
-  unknown_skill: "请求的机器人动作不存在",
-  unknown_tool: "请求的智能体工具不存在",
-  unsupported_keyed_lock_geometry: "钥匙锁几何结构不受支持",
-  voxel_boundary_protected: "世界边界方块受保护",
-  voxel_broken: "体素方块已破坏",
-  voxel_chunk_unloaded: "体素分块尚未加载",
-  voxel_edit_failed: "体素方块修改失败",
-  voxel_empty: "目标体素为空",
-  voxel_interaction_ready: "体素交互条件已就绪",
-  voxel_interaction_surface_unavailable: "体素交互表面不可用",
-  voxel_not_visible: "目标体素不可见",
-  voxel_occupied: "目标体素已被占用",
-  voxel_out_of_bounds: "目标体素超出世界边界",
-  voxel_out_of_reach: "目标体素超出机器人可达范围",
-  voxel_placed: "体素方块已放置",
-  voxel_placement_blocked: "体素放置受阻",
-  voxel_scan: "体素扫描已完成",
-  voxel_state: "体素状态已读取",
-  voxel_unsupported: "目标体素缺少支撑",
-  voxel_world_unavailable: "体素世界不可用"
+  humanoid_observed: "人形世界状态已感知",
+  whole_body_plan_validated: "全身动作已通过物理预演",
+  whole_body_plan_rejected: "全身动作未通过物理预演",
+  humanoid_route_validated: "双足路线已通过物理预演",
+  humanoid_route_rejected: "没有可行的双足路线",
+  motion_completed: "全身动作已完成",
+  motion_failed: "全身动作执行失败",
+  navigation_completed: "双足导航分块已完成",
+  navigation_blocked: "双足导航受阻",
+  plan_stale: "动作计划已失效",
+  planning_receipt_missing: "缺少规划回执",
+  planning_receipt_action_mismatch: "规划回执与执行动作不匹配",
+  planning_receipt_rejected: "规划回执未被物理预演接受",
+  planning_receipt_missing_plan: "规划回执缺少动作计划",
+  invalid_tool_input: "动作输入无效",
+  invalid_reference: "全身运动参考无效",
+  environment_contact: "动作产生未授权环境接触",
+  fallen: "机器人在物理预演中失去平衡",
+  required_contact_missing: "动作缺少要求的物理接触",
+  unknown_contact_object: "接触目标不存在",
+  contact_object_not_currently_visible: "接触目标当前不可见",
+  unsupported_finish: "动作结束状态不受支持"
 };
 
 const SCENARIO_LABELS: Record<string, string> = {
-  voxel_expanse: "体素原野",
-  voxel_highlands: "体素高地",
-  voxel_survey: "体素勘察",
-  voxel_realm: "体素疆域",
-  open_navigation: "开放导航",
-  fetch_red_block: "红色方块搬运",
-  locked_container: "锁定容器"
-};
-
-const MATERIAL_LABELS: Record<VoxelMaterial | "ground" | "air", string> = {
-  grass: "草方块",
-  dirt: "泥土方块",
-  stone: "石头方块",
-  sand: "沙方块",
-  placed: "已放置方块",
-  ground: "地面",
-  air: "空"
+  humanoid_frontier: "人形方块边境",
+  humanoid_realm: "人形方块疆域",
+  humanoid_courtyard: "人形庭院"
 };
 
 const AGENT_NAMES: Record<string, string> = {
-  "mission coordinator": "任务协调智能体",
-  "mission supervisor": "任务监督智能体",
-  "capability worker": "能力执行智能体",
-  "movement supervisor": "运动监督智能体",
-  "movement leaf": "运动执行智能体",
-  "exploration supervisor": "探索监督智能体",
-  "exploration worker": "探索执行智能体",
-  "terrain surveyor": "地形勘察智能体",
-  "movement executor": "运动执行智能体",
-  "frontier mover": "探索边界智能体",
-  "observe and unblock": "观察解阻智能体",
-  "exploration agent": "探索智能体",
-  "block manipulator": "方块操作智能体",
-  "carry and release": "搬运释放智能体",
-  "nav to green zone": "目标区导航智能体",
-  "scene observer": "场景观察智能体",
-  navigator: "导航智能体"
+  "humanoid coordinator": "自主协调智能体",
+  "humanoid sentry": "人形感知哨兵",
+  "humanoid motion reference": "全身运动参考智能体",
+  "humanoid executor": "人形物理执行智能体"
+};
+
+const CHINESE_AGENT_NAMES: Record<string, string> = {
+  "人形自主协调智能体": "自主协调智能体"
 };
 
 const ENTITY_NAMES: Record<string, string> = {
-  red_block: "红色方块",
-  blue_block: "蓝色方块",
-  amber_block: "琥珀色方块",
-  green_zone: "绿色目标区",
-  arrival_zone: "到达区域",
-  locked_box: "锁定容器",
-  brass_key: "黄铜钥匙",
-  barrier_a: "障碍物 A",
-  center_column: "中央立柱",
-  divider: "隔断"
+  amber_crate: "琥珀木箱",
+  blue_crate: "蓝色木箱",
+  copper_crate: "铜色木箱",
+  moss_crate: "苔绿色木箱",
+  violet_crate: "紫色木箱",
+  courtyard_crate: "庭院木箱",
+  frontier_beacon: "边境信标区",
+  distant_beacon: "远方信标区",
+  rest_clearing: "休整区",
+  courtyard_beacon: "庭院信标区",
+  stone_column: "石柱",
+  low_block: "低矮障碍"
 };
 
 export function runStatusLabel(status: RunListItem["status"]): string {
@@ -273,16 +123,28 @@ export function streamStatusLabel(status: StreamState): string {
   return STREAM_STATUS[status];
 }
 
-export function bodyChannelLabel(channel: BodyChannel): string {
+export function bodyChannelLabel(channel: HumanoidBodyChannel): string {
   return BODY_CHANNEL[channel];
+}
+
+export function motionGeneratorLabel(implementation: string): string {
+  const normalized = implementation.toLowerCase();
+  if (normalized === "task_space_constraints") return "任务约束";
+  if (normalized.includes("ardy")) return "ARDY";
+  if (normalized.includes("motionbricks")) return "MotionBricks";
+  if (normalized.includes("omg")) return "OMG";
+  return "运动生成器";
+}
+
+export function humanoidControllerLabel(implementation: string): string {
+  const normalized = implementation.toLowerCase();
+  if (normalized === "yahmp_onnx") return "YAHMP";
+  if (normalized.includes("sonic")) return "SONIC";
+  return "全身控制器";
 }
 
 export function actionLabel(value: string): string {
   return ACTION_LABELS[value] ?? "未识别动作";
-}
-
-export function phaseLabel(value: string): string {
-  return PHASE_LABELS[value] ?? "状态未知";
 }
 
 export function resultCodeLabel(value: string): string {
@@ -294,39 +156,30 @@ export function scenarioLabel(id: string | null, fallback?: string): string {
   return fallback?.trim() || id || "未知场景";
 }
 
-export function materialLabel(material: VoxelMaterial | "ground" | "air" | null): string {
-  return MATERIAL_LABELS[material ?? "air"];
-}
-
 export function agentNameLabel(name: string): string {
-  const normalized = name.trim().toLowerCase().replaceAll("_", " ").replace(/\s+/g, " ");
+  if (/[㐀-鿿]/u.test(name)) return CHINESE_AGENT_NAMES[name] ?? name;
+  const normalized = name.trim().toLowerCase().replaceAll("_", " ").replaceAll("-", " ")
+    .replace(/\s+/gu, " ");
   const exact = AGENT_NAMES[normalized];
   if (exact) return exact;
   for (const [base, label] of Object.entries(AGENT_NAMES)) {
-    const match = normalized.match(new RegExp(`^${escapeRegExp(base)} (\\d+)$`));
+    const match = normalized.match(new RegExp(`^${escapeRegExp(base)} (\\d+)$`, "u"));
     if (match) return `${label} ${match[1]}`;
   }
-  if (/[\u3400-\u9fff]/.test(name)) return name;
-  const suffix = normalized.match(/(?:^| )(\d+)$/)?.[1];
+  const suffix = normalized.match(/(?:^| )(\d+)$/u)?.[1];
   return suffix ? `专项智能体 ${suffix}` : "专项智能体";
 }
 
 export function entityLabel(id: string): string {
   if (ENTITY_NAMES[id]) return ENTITY_NAMES[id];
-  return /[\u3400-\u9fff]/.test(id) ? id : "场景实体";
-}
-
-function propertyLabel(value: "locked" | "enabled"): string {
-  return value === "locked" ? "锁定" : "启用";
+  return /[㐀-鿿]/u.test(id) ? id : "场景实体";
 }
 
 export function nodePurposeLabel(node: TaskNode, goal: Goal): string {
   if (node.depth === 0) return goalSummaryLabel(goal);
-  if (node.may_delegate) return "协调下级智能体 · 汇总证据";
+  if (node.may_delegate) return "协调下级智能体 · 汇总物理回执";
   const capabilities = [...new Set(node.capabilities.map(actionLabel))].slice(0, 3);
-  return capabilities.length > 0
-    ? capabilities.join(" · ")
-    : "执行当前分配";
+  return capabilities.length > 0 ? capabilities.join(" · ") : "执行当前分配";
 }
 
 export function nodeResultLabel(node: TaskNode): string | null {
@@ -408,38 +261,23 @@ export function predicateLabel(predicate: GoalPredicate): string {
       return `到达坐标 ${position(predicate.target)}`;
     case "robot_in_zone":
       return `进入区域 ${entityLabel(predicate.zone_id)}`;
-    case "terrain_explored":
-      return `自主探索并绘制 ${(predicate.minimum_fraction * 100).toFixed(0)}% 的未知地形`;
-    case "voxel_at":
-      return `坐标 [${predicate.coordinate.column}, ${predicate.coordinate.level}, ${predicate.coordinate.row}] 为${materialLabel(predicate.material)}`;
     case "object_in_zone":
       return `${entityLabel(predicate.object_id)}${predicate.expected ? "位于" : "离开"}区域 ${entityLabel(predicate.zone_id)}`;
     case "object_at":
       return `将${entityLabel(predicate.object_id)}移动到 ${position(predicate.target)}`;
-    case "object_property":
-      return `${entityLabel(predicate.object_id)}的“${propertyLabel(predicate.property)}”状态为${predicate.expected ? "真" : "假"}`;
-    case "object_attached":
-      return `${entityLabel(predicate.object_id)}${predicate.expected ? "已被夹爪抓取" : "已从夹爪释放"}`;
   }
 }
 
-export function missionResultLabel(checkpoint: RunCheckpoint): string | null {
+export function missionResultLabel(checkpoint: HumanoidRunCheckpoint): string | null {
   if (checkpoint.status === "starting" || checkpoint.status === "running") {
     return "任务正在由层级智能体自主执行。";
   }
   if (checkpoint.status === "succeeded") {
-    const exploration = checkpoint.goal.predicates.find((predicate) => predicate.type === "terrain_explored");
-    if (exploration && checkpoint.world.explored.total > 0) {
-      const { seen, total } = checkpoint.world.explored;
-      const percent = seen / total * 100;
-      return `机器人已自主探索 ${seen.toLocaleString("zh-CN")}/${total.toLocaleString("zh-CN")} 个地形单元（${percent.toFixed(2)}%），结构化任务检查已通过。`;
-    }
     const passed = checkpoint.checker?.checks.filter((check) => check.passed).length ?? 0;
-    const total = checkpoint.goal.predicates.length;
-    return `${passed}/${total} 项结构化任务条件已通过，任务完成。`;
+    return `${passed}/${checkpoint.goal.predicates.length} 项任务条件已通过。`;
   }
-  if (checkpoint.status === "interrupted") return "任务已暂停，可在条件恢复后继续运行。";
-  return "任务未完成，请根据错误信息重新规划或恢复运行。";
+  if (checkpoint.status === "interrupted") return "任务已暂停，可继续运行。";
+  return "任务未完成。";
 }
 
 export function runOptionLabel(run: RunListItem): string {

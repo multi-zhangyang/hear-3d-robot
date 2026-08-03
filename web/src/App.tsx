@@ -11,31 +11,32 @@ import {
   stopRun,
   subscribeToRun
 } from "./api";
-import { MissionWorkspace } from "./MissionWorkspace";
+import { HumanoidMissionWorkspace } from "./humanoid/HumanoidMissionWorkspace";
+import { MissionModal } from "./MissionModal";
 import { GameShell, type ModelConnectionState, type Workspace } from "./game/GameShell";
 import { OverlayPanel } from "./game/OverlayPanel";
 import { CenteredSpin, FailureAlert, Login, RunStatus } from "./Shell";
-import { reduceRunDetails } from "./run-details-reducer";
-import { AuthoritativeFrameBuffer } from "./stage/authoritative-frame-buffer";
+import { reduceHumanoidRunDetails } from "./humanoid-run-details-reducer";
+import { HumanoidFrameBuffer } from "./stage/humanoid-frame-buffer";
 import {
   asRecord,
   isAbortError,
   latestProviderActivity,
   nextRuntimeEventCursor,
   providerActivityFrom,
+  humanoidWorldSnapshotsFrom,
   upsertRuntimeJournalEntry,
-  updateRunListStatus,
-  worldSnapshotsFrom
+  updateRunListStatus
 } from "./stream-state";
 import type {
   Bootstrap,
   Goal,
+  HumanoidRunDetails,
+  HumanoidWorldSnapshot,
   ProviderActivity,
-  RunDetails,
   RunListItem,
   RuntimeEvent,
-  StreamState,
-  WorldSnapshot
+  StreamState
 } from "./types";
 import { UiButton } from "./ui/Button";
 import { DeferredBoundary } from "./ui/DeferredBoundary";
@@ -49,13 +50,6 @@ interface LoadRunOptions {
   preserveStream?: boolean;
 }
 
-const loadMissionModal = () => import("./MissionModal");
-const warmMissionModal = (): void => {
-  void loadMissionModal().catch(() => undefined);
-};
-const MissionModal = lazy(() => loadMissionModal().then((module) => ({
-  default: module.MissionModal
-})));
 const ActivityView = lazy(() => import("./flow/ActivityView").then((module) => ({
   default: module.ActivityView
 })));
@@ -70,7 +64,7 @@ export function App(): React.JSX.Element {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
   const [runs, setRuns] = useState<RunListItem[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [details, setDetails] = useState<RunDetails | null>(null);
+  const [details, setDetails] = useState<HumanoidRunDetails | null>(null);
   const [framework, setFramework] = useState<unknown[]>([]);
   const [workspace, setWorkspace] = useState<Workspace>("world");
   const [loading, setLoading] = useState(true);
@@ -89,9 +83,9 @@ export function App(): React.JSX.Element {
   const eventCursorRef = useRef<{ runId: string; eventId?: string } | null>(null);
   const loadGenerationRef = useRef(0);
   const loadAbortRef = useRef<AbortController | null>(null);
-  const frameBufferRef = useRef<AuthoritativeFrameBuffer | null>(null);
-  frameBufferRef.current ??= new AuthoritativeFrameBuffer();
-  const frameBuffer = frameBufferRef.current;
+  const humanoidFrameBufferRef = useRef<HumanoidFrameBuffer | null>(null);
+  humanoidFrameBufferRef.current ??= new HumanoidFrameBuffer();
+  const humanoidFrameBuffer = humanoidFrameBufferRef.current;
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const showError = useCallback((value: string): void => {
@@ -110,7 +104,7 @@ export function App(): React.JSX.Element {
   const loadRun = useCallback(async (
     runId: string,
     options: LoadRunOptions = {}
-  ): Promise<RunDetails | null> => {
+  ): Promise<HumanoidRunDetails | null> => {
     const generation = options.preserveStream
       ? loadGenerationRef.current
       : loadGenerationRef.current + 1;
@@ -137,7 +131,7 @@ export function App(): React.JSX.Element {
         runId,
         ...(nextDetails.event_cursor ? { eventId: nextDetails.event_cursor } : {})
       };
-      frameBuffer.reset(nextDetails.checkpoint.world);
+      humanoidFrameBuffer.reset(nextDetails.checkpoint.world);
       setFramework(nextDetails.framework);
       setProviderActivity(latestProviderActivity(nextDetails.provider));
       setRuns((current) => updateRunListStatus(
@@ -161,7 +155,7 @@ export function App(): React.JSX.Element {
         if (!options.preserveStream) setLoading(false);
       }
     }
-  }, [frameBuffer]);
+  }, [humanoidFrameBuffer]);
 
   const refreshRuns = useCallback(async (preferredId?: string): Promise<void> => {
     const nextRuns = await getRuns();
@@ -209,10 +203,10 @@ export function App(): React.JSX.Element {
     if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
   }, []);
 
-  const appendWorldFrames = useCallback((incoming: WorldSnapshot[]): void => {
+  const appendHumanoidFrames = useCallback((incoming: HumanoidWorldSnapshot[]): void => {
     if (incoming.length === 0) return;
-    frameBuffer.push(incoming);
-  }, [frameBuffer]);
+    humanoidFrameBuffer.push(incoming);
+  }, [humanoidFrameBuffer]);
 
   const handleRuntimeEvent = useCallback((runId: string, event: RuntimeEvent): void => {
     if (selectedRunRef.current !== runId) return;
@@ -237,29 +231,25 @@ export function App(): React.JSX.Element {
       if (activity) setProviderActivity(activity);
     }
 
-    const worlds = worldSnapshotsFrom(event.data);
-    if (worlds.length > 0) appendWorldFrames(worlds);
+    const humanoidWorlds = humanoidWorldSnapshotsFrom(event.data);
+    if (humanoidWorlds.length > 0) appendHumanoidFrames(humanoidWorlds);
     const terminalEvent = event.type === "run_succeeded"
       || event.type === "run_failed"
       || event.type === "run_interrupted";
-    const reducerWorlds = terminalEvent && worlds.length === 0 && frameBuffer.latest
-      ? [frameBuffer.latest]
-      : worlds;
-
-    // The stage and its local HUD consume high-frequency physics batches from
-    // the imperative buffer. Folding a frame-only event through App state would
-    // reconcile the entire shell and every open agent panel for no semantic UI
-    // change. Receipt, hierarchy and terminal events still update durable React
-    // state below their much lower event cadence.
-    if (event.type !== "world_frames") {
-      setDetails((current) => current === null ? current : reduceRunDetails({
+    setDetails((current) => {
+      if (current === null) return current;
+      if (event.type === "humanoid_world_frame") return current;
+      const reducerWorlds = terminalEvent && humanoidWorlds.length === 0 && humanoidFrameBuffer.latest
+        ? [humanoidFrameBuffer.latest]
+        : humanoidWorlds;
+      return reduceHumanoidRunDetails({
         details: current,
         event,
         worlds: reducerWorlds,
         historical: false,
         limits: { actions: ACTION_HISTORY_LIMIT, provider: PROVIDER_HISTORY_LIMIT }
-      }));
-    }
+      });
+    });
 
     // The run list is a sibling of the details, not part of them, so terminal
     // transitions still have to be mirrored onto it here.
@@ -281,7 +271,7 @@ export function App(): React.JSX.Element {
       setStoppingRunId((currentId) => currentId === runId ? null : currentId);
       setStreamState("inactive");
     }
-  }, [appendWorldFrames, frameBuffer]);
+  }, [appendHumanoidFrames, humanoidFrameBuffer]);
 
   useEffect(() => {
     if (authRequired) {
@@ -380,31 +370,23 @@ export function App(): React.JSX.Element {
     const previousError = details.checkpoint.error;
     const optimisticAt = new Date().toISOString();
     setResuming(true);
-    setDetails((current) => current && current.definition.run_id === selectedRunId
-      ? {
-          ...current,
-          checkpoint: {
-            ...current.checkpoint,
-            status: "starting",
-            error: null,
-            updated_at: optimisticAt
-          }
-        }
-      : current);
+    setDetails((current) => updateDetailsStatus(
+      current,
+      selectedRunId,
+      "starting",
+      null,
+      optimisticAt
+    ));
     setRuns((current) => updateRunListStatus(current, selectedRunId, "starting", null, optimisticAt));
     try {
       await resumeRun(selectedRunId);
     } catch {
-      setDetails((current) => current && current.definition.run_id === selectedRunId
-        ? {
-            ...current,
-            checkpoint: {
-              ...current.checkpoint,
-              status: previousStatus,
-              error: previousError
-            }
-          }
-        : current);
+      setDetails((current) => updateDetailsStatus(
+        current,
+        selectedRunId,
+        previousStatus,
+        previousError
+      ));
       setRuns((current) => updateRunListStatus(
         current,
         selectedRunId,
@@ -529,8 +511,6 @@ export function App(): React.JSX.Element {
               <UiButton
                 tone="primary"
                 disabled={missionControlsBusy || activeRun !== undefined || !bootstrap.provider.configured}
-                onFocus={warmMissionModal}
-                onPointerEnter={warmMissionModal}
                 onClick={() => setMissionOpen(true)}
               >
                 <b aria-hidden="true">＋</b>新建任务
@@ -559,8 +539,6 @@ export function App(): React.JSX.Element {
               <UiButton
                 tone="primary"
                 disabled={missionControlsBusy || activeRun !== undefined || !bootstrap.provider.configured}
-                onFocus={warmMissionModal}
-                onPointerEnter={warmMissionModal}
                 onClick={() => setMissionOpen(true)}
               >
                 <b aria-hidden="true">＋</b>新建任务
@@ -570,7 +548,7 @@ export function App(): React.JSX.Element {
             <WorkspaceView
               workspace={workspace}
               details={details}
-              frameBuffer={frameBuffer}
+              humanoidFrameBuffer={humanoidFrameBuffer}
               framework={framework}
               streamState={streamState}
               onClose={() => setWorkspace("world")}
@@ -579,15 +557,13 @@ export function App(): React.JSX.Element {
         </div>
         {missionOpen && (
           <DeferredBoundary resetKey="mission-open" modal>
-            <Suspense fallback={<ModalLoading />}>
-              <MissionModal
-                open
-                scenarios={bootstrap.scenarios}
-                submitting={submitting}
-                onCancel={() => setMissionOpen(false)}
-                onSubmit={createMission}
-              />
-            </Suspense>
+            <MissionModal
+              open
+              scenarios={bootstrap.scenarios}
+              submitting={submitting}
+              onCancel={() => setMissionOpen(false)}
+              onSubmit={createMission}
+            />
           </DeferredBoundary>
         )}
     </GameShell>
@@ -596,17 +572,17 @@ export function App(): React.JSX.Element {
 
 function WorkspaceView(props: {
   workspace: Workspace;
-  details: RunDetails;
-  frameBuffer: AuthoritativeFrameBuffer;
+  details: HumanoidRunDetails;
+  humanoidFrameBuffer: HumanoidFrameBuffer;
   framework: unknown[];
   streamState: StreamState;
   onClose: () => void;
 }): React.JSX.Element {
   const world = (
-    <MissionWorkspace
+    <HumanoidMissionWorkspace
       key={props.details.definition.run_id}
       details={props.details}
-      frameBuffer={props.frameBuffer}
+      frameBuffer={props.humanoidFrameBuffer}
       streamState={props.streamState}
     />
   );
@@ -660,14 +636,6 @@ function PanelLoading(): React.JSX.Element {
   );
 }
 
-function ModalLoading(): React.JSX.Element {
-  return (
-    <div className="modal-loading" role="status" aria-label="正在加载任务表单">
-      <PanelLoading />
-    </div>
-  );
-}
-
 function modelConnectionState(
   configured: boolean,
   status: string | null,
@@ -680,4 +648,23 @@ function modelConnectionState(
   if (status === "usable_stream") return runIsActive ? "active" : "verified";
   if (status === "contacted" || status === "streaming_text") return runIsActive ? "active" : "ready";
   return "ready";
+}
+
+function updateDetailsStatus(
+  details: HumanoidRunDetails | null,
+  runId: string,
+  status: HumanoidRunDetails["checkpoint"]["status"],
+  error: string | null,
+  updatedAt?: string
+): HumanoidRunDetails | null {
+  if (!details || details.definition.run_id !== runId) return details;
+  return {
+    ...details,
+    checkpoint: {
+      ...details.checkpoint,
+      status,
+      error,
+      ...(updatedAt ? { updated_at: updatedAt } : {})
+    }
+  };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ActionReceipt, Goal, RunCheckpoint, TaskNode } from "../types";
+import type { Goal, HumanoidActionReceipt, HumanoidRunCheckpoint, TaskNode } from "../types";
 import {
   agentNameLabel,
   goalSummaryLabel,
@@ -7,11 +7,17 @@ import {
   nodeStatusLabel,
   runStatusLabel
 } from "../ui-text";
-import { nodeOutput, presentAction, presentFramework, shortTime } from "./presenter";
+import {
+  nodeOutput,
+  presentAction,
+  presentEmbodiedEpisode,
+  presentFramework,
+  shortTime
+} from "./presenter";
 
 interface AgentFlowViewProps {
-  checkpoint: RunCheckpoint;
-  actions: ActionReceipt[];
+  checkpoint: HumanoidRunCheckpoint;
+  actions: HumanoidActionReceipt[];
   framework: unknown[];
 }
 
@@ -29,20 +35,21 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
   const selected = checkpoint.nodes[selectedId] ?? checkpoint.nodes[checkpoint.root_id] ?? nodes[0];
   const feed = useMemo(() => [
     ...props.actions.map((action) => ({ ...presentAction(action), kind: "action" as const })),
+    ...checkpoint.embodied_memory.recent_episodes.map((episode) => ({
+      ...presentEmbodiedEpisode(episode),
+      kind: "memory" as const
+    })),
     ...presentFramework(props.framework).map((moment) => ({ ...moment, kind: "thought" as const, meta: "模型输出" }))
   ].sort((left, right) => right.at.localeCompare(left.at)).slice(0, 24), [props.actions, props.framework]);
   const passed = checkpoint.checker?.checks.filter((check) => check.passed).length ?? 0;
   const total = checkpoint.goal.predicates.length;
-  const tracksExploration = checkpoint.goal.predicates.some((predicate) => predicate.type === "terrain_explored");
-  const progress = tracksExploration && checkpoint.world.explored.total > 0
-    ? checkpoint.world.explored.seen / checkpoint.world.explored.total
-    : total > 0 ? passed / total : 0;
+  const progress = total > 0 ? passed / total : 0;
   const contextMemory = checkpoint.context_memory;
-  const contextLoad = contextMemory
-    ? Math.min(1, contextMemory.active_estimated_tokens / contextMemory.compact_trigger_tokens)
-    : 0;
-  const activeCount = checkpoint.active_agent_ids?.length
-    ?? nodes.filter((node) => node.status === "active").length;
+  const contextLoad = Math.min(
+    1,
+    contextMemory.active_estimated_tokens / contextMemory.compact_trigger_tokens
+  );
+  const activeCount = checkpoint.active_agent_ids.length;
 
   return (
     <section className="agent-flow-view" aria-label="实时层级智能体流">
@@ -54,23 +61,21 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
           <p>{goalSummaryLabel(checkpoint.goal)}</p>
         </div>
         <div className="flow-hero-metrics">
-          {contextMemory && (
-            <div
-              className="context-memory-card"
-              style={{ "--context-load": `${Math.round(contextLoad * 100)}%` } as React.CSSProperties}
-              aria-label={`当前上下文估算为 ${contextMemory.active_estimated_tokens} 个令牌`}
-            >
-              <span>上下文</span>
-              <strong>{compactTokens(contextMemory.active_estimated_tokens)}</strong>
-              <small>{contextMemory.total_compactions > 0
-                ? `已压缩 ${contextMemory.total_compactions} 次`
-                : "实时记忆"}</small>
-              <i />
-            </div>
-          )}
+          <div
+            className="context-memory-card"
+            style={{ "--context-load": `${Math.round(contextLoad * 100)}%` } as React.CSSProperties}
+            aria-label={`当前上下文估算为 ${contextMemory.active_estimated_tokens} 个令牌`}
+          >
+            <span>上下文</span>
+            <strong>{compactTokens(contextMemory.active_estimated_tokens)}</strong>
+            <small>{contextMemory.total_compactions > 0
+              ? `已压缩 ${contextMemory.total_compactions} 次`
+              : "实时记忆"}</small>
+            <i />
+          </div>
           <div className="flow-progress" style={{ "--flow-progress": `${Math.min(100, progress * 100)}%` } as React.CSSProperties}>
             <strong>{formatPercent(progress)}</strong>
-            <span>{tracksExploration ? "地形探索率" : "目标进度"}</span>
+            <span>目标进度</span>
           </div>
         </div>
       </header>
@@ -120,7 +125,9 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
               <div className="flow-empty">等待模型决策</div>
             ) : feed.map((item) => (
               <article className={`execution-item ${item.tone}`} key={item.id}>
-                <span className="execution-mark">{item.kind === "thought" ? "✦" : actionGlyph(item.category)}</span>
+                <span className="execution-mark">{item.kind === "thought"
+                  ? "✦"
+                  : item.kind === "memory" ? "◇" : actionGlyph(item.category)}</span>
                 <div className="execution-copy">
                   <div><b>{item.title}</b><time>{shortTime(item.at)}</time></div>
                   <span>{item.agent}</span>
@@ -170,7 +177,7 @@ function actionGlyph(category: string): string {
   return "✓";
 }
 
-function isLive(status: RunCheckpoint["status"]): boolean {
+function isLive(status: HumanoidRunCheckpoint["status"]): boolean {
   return status === "starting" || status === "running";
 }
 

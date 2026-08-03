@@ -1,0 +1,199 @@
+.humanoid-mission-world,
+.humanoid-stage {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+}
+
+.humanoid-stage .three-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.humanoid-stage-bar {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  z-index: 6;
+  display: flex;
+  gap: 8px;
+  transform: translateX(-50%);
+}
+
+.camera-switch,
+.fit-world {
+  padding: 5px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 13px;
+  background: rgba(11, 17, 23, .76);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .24);
+  backdrop-filter: blur(16px);
+}
+
+.camera-switch button,
+.fit-world {
+  min-height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 9px;
+  color: #8f9ca7;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.camera-switch button.active {
+  color: #dffbf5;
+  background: rgba(74, 213, 184, .17);
+}
+
+.fit-world { color: #b9c4cc; }
+
+.humanoid-physics-strip {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  z-index: 5;
+  display: flex;
+  gap: 18px;
+  padding: 11px 14px;
+  border: 1px solid rgba(255, 255, 255, .09);
+  border-radius: 14px;
+  color: #d7e0e5;
+  background: rgba(10, 15, 20, .72);
+  backdrop-filter: blur(15px);
+}
+
+.humanoid-physics-strip span { display: grid; gap: 2px; }
+.humanoid-physics-strip small { color: #788791; font-size: 9px; letter-spacing: .08em; }
+.humanoid-physics-strip b { font-size: 12px; font-weight: 630; }
+.humanoid-physics-strip.danger { border-color: rgba(225, 83, 97, .5); }
+
+.humanoid-agent-hud,
+.humanoid-state-hud,
+.humanoid-goal-hud {
+  position: absolute;
+  z-index: 4;
+  background: linear-gradient(150deg, rgba(15, 22, 28, .9), rgba(10, 15, 20, .78));
+  backdrop-filter: blur(20px) saturate(1.18);
+}
+
+.humanoid-agent-hud {
+  top: 18px;
+  left: 18px;
+  width: min(322px, calc(100vw - 36px));
+  padding: 17px;
+}
+
+.humanoid-agent-hud > header,
+.humanoid-state-hud > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #a5b0b8;
+  font-size: 11px;
+}
+
+.humanoid-agent-hud > header small { margin-left: auto; color: #61717b; }
+.humanoid-agent-focus { display: grid; gap: 4px; margin: 14px 0 12px; }
+.humanoid-agent-focus span { color: #e9f2f4; font-size: 18px; font-weight: 650; }
+.humanoid-agent-focus strong { color: #72ddc6; font-size: 12px; font-weight: 560; }
+
+.humanoid-agent-chain { display: grid; gap: 5px; }
+.humanoid-agent-chain > div {
+  display: grid;
+  grid-template-columns: 8px 1fr auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 39px;
+  padding: 6px 9px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .025);
+}
+.humanoid-agent-chain > div.current { border-color: rgba(82, 224, 195, .25); background: rgba(58, 191, 164, .075); }
+.humanoid-agent-chain > div > i { width: 6px; height: 6px; border-radius: 50%; background: #52606a; }
+.humanoid-agent-chain > div.active > i { background: #55dfc2; box-shadow: 0 0 10px rgba(85, 223, 194, .75); }
+.humanoid-agent-chain span { display: grid; gap: 1px; }
+.humanoid-agent-chain b { color: #ccd6db; font-size: 11px; font-weight: 600; }
+.humanoid-agent-chain small { color: #65747e; font-size: 9px; }
+.humanoid-agent-chain em { color: #5f717b; font-size: 10px; font-style: normal; }
+
+.humanoid-channel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 12px; }
+.humanoid-channel-grid span { display: flex; align-items: center; gap: 7px; color: #63727c; font-size: 10px; }
+.humanoid-channel-grid i { width: 13px; height: 3px; border-radius: 3px; background: #303c44; }
+.humanoid-channel-grid span.active { color: #c8eee6; }
+.humanoid-channel-grid span.active i { background: #4dd7ba; box-shadow: 0 0 8px rgba(77, 215, 186, .55); }
+
+.humanoid-state-hud {
+  top: 18px;
+  right: 18px;
+  width: 238px;
+  padding: 16px;
+}
+.humanoid-state-hud > header b { margin-left: auto; color: #72818b; font-size: 10px; }
+.humanoid-state-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 14px 0; }
+.humanoid-state-grid span { display: grid; gap: 2px; padding: 9px; border-radius: 10px; background: rgba(255, 255, 255, .03); }
+.humanoid-state-grid small { color: #687781; font-size: 9px; }
+.humanoid-state-grid b { color: #cbd5da; font-size: 13px; }
+.humanoid-state-grid span.active b { color: #64ddc5; }
+.balance-track { height: 3px; overflow: hidden; border-radius: 3px; background: #263139; }
+.balance-track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #e3b958, #51d8ba); }
+.humanoid-state-hud footer { display: flex; justify-content: space-between; margin-top: 11px; color: #72818b; font-size: 10px; }
+.humanoid-state-hud footer b { color: #85dec9; font-weight: 600; }
+
+.humanoid-goal-hud {
+  left: 18px;
+  bottom: 18px;
+  width: min(322px, calc(100vw - 36px));
+  padding: 15px 17px;
+}
+.humanoid-goal-title { display: flex; align-items: baseline; justify-content: space-between; color: #80909a; font-size: 10px; }
+.humanoid-goal-title b { color: #dce5e8; font-size: 15px; }
+.humanoid-goal-list { display: grid; gap: 7px; margin: 9px 0 12px; }
+.humanoid-goal-list span { display: flex; gap: 8px; color: #a8b4ba; font-size: 11px; }
+.humanoid-goal-list i { width: 7px; height: 7px; margin-top: 3px; border: 1px solid #4d5b64; border-radius: 50%; }
+.humanoid-goal-list i.passed { border-color: #4fdbbd; background: #4fdbbd; box-shadow: 0 0 8px rgba(79, 219, 189, .45); }
+.memory-meter { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; }
+.memory-meter > span { display: flex; gap: 6px; align-items: baseline; }
+.memory-meter small { color: #65747d; font-size: 9px; }
+.memory-meter b { color: #aebbc1; font-size: 10px; }
+.memory-meter > i { height: 3px; overflow: hidden; border-radius: 3px; background: #273139; }
+.memory-meter em { display: block; height: 100%; background: #4bcdb2; }
+
+@media (max-width: 860px) {
+  .humanoid-state-hud { top: auto; right: 12px; bottom: 74px; width: 210px; }
+  .humanoid-agent-hud { top: 12px; left: 12px; }
+  .humanoid-goal-hud { left: 12px; bottom: 12px; }
+  .humanoid-physics-strip { display: none; }
+}
+
+@media (max-width: 620px) {
+  .humanoid-agent-hud { width: calc(100vw - 24px); }
+  .humanoid-agent-chain { grid-template-columns: 1fr 1fr; }
+  .humanoid-agent-focus { margin: 9px 0; }
+  .humanoid-state-hud { display: none; }
+  .humanoid-goal-hud {
+    right: 12px;
+    bottom: calc(152px + env(safe-area-inset-bottom, 0px));
+    width: auto;
+    padding: 10px 12px;
+  }
+  .humanoid-goal-list {
+    margin: 6px 0 8px;
+  }
+  .humanoid-goal-list span {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .humanoid-stage-bar {
+    top: auto;
+    right: 12px;
+    bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+    left: auto;
+    transform: none;
+  }
+}

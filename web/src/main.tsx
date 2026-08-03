@@ -10,6 +10,7 @@ import "./styles/activity.css";
 import "./styles/agent-flow.css";
 import "./styles/game-shell.css";
 import "./styles/game-world.css";
+import "./styles/humanoid-world.css";
 import "./styles/journey.css";
 import "./styles/mission-modal.css";
 

@@ -6,27 +6,23 @@ test.use({
   hasTouch: true
 });
 
-test("移动端触摸拖拽环视且轻触仍可选取", async ({ page }, testInfo) => {
+test("移动端触摸拖拽观察真实人形世界", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
   test.skip(testInfo.project.name !== "mobile", "移动触摸回归只运行一次");
   await openRecordedRun(page);
-  const canvas = page.locator("canvas.three-canvas");
+  const canvas = page.locator("canvas.humanoid-canvas");
   await expect(canvas).toBeVisible({ timeout: 90_000 });
   await page.waitForFunction(() => {
-    const element = document.querySelector("canvas.three-canvas");
+    const element = document.querySelector("canvas.humanoid-canvas");
     return element instanceof HTMLCanvasElement && element.width > 200 && element.height > 200;
   });
   expect(await page.evaluate(() => navigator.maxTouchPoints)).toBeGreaterThan(0);
 
-  await page.getByRole("button", { name: "第一人称视角", exact: true }).click();
-  await expect(page.getByRole("button", { name: "第一人称视角", exact: true }))
+  await expect(page.getByRole("button", { name: "跟随", exact: true }))
     .toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByLabel("第一人称视角交互")).toHaveText("拖动屏幕观察");
   await expect.poll(() => canvas.evaluate((element) => getComputedStyle(element).touchAction))
     .toBe("none");
 
-  const selection = page.getByLabel("已选择的世界目标");
-  await expect(selection).toHaveCount(0);
   const box = await canvas.boundingBox();
   expect(box).not.toBeNull();
   await settleRendering(page);
@@ -48,22 +44,7 @@ test("移动端触摸拖拽环视且轻触仍可选取", async ({ page }, testIn
     await settleRendering(page);
     const turned = await page.screenshot({ clip: viewClip, animations: "disabled" });
     expect(turned.equals(before)).toBe(false);
-    await expect(selection).toHaveCount(0);
-
-    const candidates: Array<readonly [number, number]> = [
-      [0.5, 0.7],
-      [0.35, 0.72],
-      [0.65, 0.72],
-      [0.5, 0.58],
-      [0.25, 0.8],
-      [0.75, 0.8]
-    ];
-    for (const [x, y] of candidates) {
-      await tapTouch(session, box!.x + box!.width * x, box!.y + box!.height * y);
-      if (await selection.isVisible().catch(() => false)) break;
-    }
-    await expect(selection).toBeVisible();
-    await expect(selection.locator("small")).not.toHaveText("不可用");
+    await expect(page.locator(".graphics-error")).toHaveCount(0);
   } finally {
     await session.detach();
   }
@@ -76,7 +57,7 @@ async function openRecordedRun(page: Page): Promise<void> {
     await password.fill(process.env.HEAR_E2E_PASSWORD ?? "hear-e2e-local");
     await page.getByRole("button", { name: /登\s*录/ }).click();
   }
-  await expect(page.locator('section[aria-label="实时任务"], section[aria-label="任务回顾"]'))
+  await expect(page.locator("section.humanoid-mission-world"))
     .toBeVisible({ timeout: 25_000 });
 }
 
@@ -105,13 +86,5 @@ async function dragTouch(
       }]
     });
   }
-  await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-}
-
-async function tapTouch(session: CDPSession, x: number, y: number): Promise<void> {
-  await session.send("Input.dispatchTouchEvent", {
-    type: "touchStart",
-    touchPoints: [{ x, y, id: 2 }]
-  });
   await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
 }

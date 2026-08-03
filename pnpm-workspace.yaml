@@ -3,6 +3,4 @@ packages:
 
 allowBuilds:
   esbuild: true
-
-patchedDependencies:
-  closed-chain-ik@0.0.3: patches/closed-chain-ik@0.0.3.patch
+  protobufjs: false

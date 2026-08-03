@@ -1,8 +1,6 @@
 import * as RecastNavigation from "recast-navigation";
 import * as RecastGenerators from "recast-navigation/generators";
 import type { Scenario, Vec3 } from "../domain/schema.js";
-import { ROBOT_SPEC } from "./robot-model.js";
-import { staticSolids, type TerrainBox } from "./terrain.js";
 
 interface RecastNavMesh {
   destroy(): void;
@@ -107,7 +105,20 @@ export interface NavigationBuildScope {
     minimum: Pick<Vec3, "x" | "z">;
     maximum: Pick<Vec3, "x" | "z">;
   };
-  terrainSolids: TerrainBox[];
+  terrainSolids: NavigationSolid[];
+}
+
+interface NavigationSolid {
+  center: Vec3;
+  size: Vec3;
+}
+
+export interface NavigationAgentProfile {
+  radius: number;
+  height: number;
+  maximumClimb: number;
+  maximumSlopeDegrees: number;
+  maximumTargetProjection: number;
 }
 
 let recastInitialization: Promise<void> | undefined;
@@ -116,16 +127,12 @@ const NAVIGATION_CELL_SIZE = 0.1;
 const NAVIGATION_CELL_HEIGHT = 0.05;
 const NAVIGATION_TILE_SIZE = 32;
 const NAVIGATION_OBSTACLE_SKIN = NAVIGATION_CELL_SIZE;
-const MAX_TARGET_PROJECTION_DISTANCE = 0.15;
-const ROBOT_CLEARANCE_HEIGHT = Math.max(
-  ROBOT_SPEC.torso.centerHeight + ROBOT_SPEC.torso.halfExtents.y,
-  ROBOT_SPEC.sensorHead.centerHeight + ROBOT_SPEC.sensorHead.halfExtents.y
-);
 
 export class NavigationMesh {
   readonly #navMesh: RecastNavMesh;
   readonly #tileCache: RecastTileCache;
   readonly #query: RecastNavMeshQuery;
+  readonly #profile: NavigationAgentProfile;
   readonly #obstacles = new Map<string, {
     descriptor: NavigationObstacle;
     handle: RecastTileCacheObstacle;
@@ -133,19 +140,22 @@ export class NavigationMesh {
 
   static async create(
     scenario: Scenario,
-    scope?: NavigationBuildScope
+    scope?: NavigationBuildScope,
+    profile?: NavigationAgentProfile
   ): Promise<NavigationMesh> {
+    if (!profile) throw new Error("Navigation agent profile is required");
     recastInitialization ??= recastApi.init();
     await recastInitialization;
     const solids = scope
       ? [...scenario.obstacles, ...scope.terrainSolids]
-      : staticSolids(scenario);
+      : scenario.obstacles;
     const region = scope?.region ?? {
       minimum: { x: 0, z: 0 },
       maximum: { x: scenario.bounds.width, z: scenario.bounds.depth }
     };
     const geometry = worldGeometry(scenario, solids, region);
     const maximumGeometryHeight = worldGeometryHeight(scenario, solids, region);
+    const navigationProfile = validatedProfile(profile);
     const generated = recastGeneratorsApi.generateTileCache(
       geometry.positions,
       geometry.indices,
@@ -153,12 +163,10 @@ export class NavigationMesh {
         cs: NAVIGATION_CELL_SIZE,
         ch: NAVIGATION_CELL_HEIGHT,
         tileSize: NAVIGATION_TILE_SIZE,
-        walkableSlopeAngle: 45,
-        walkableHeight: Math.ceil(ROBOT_CLEARANCE_HEIGHT / NAVIGATION_CELL_HEIGHT),
-        walkableClimb: 0,
-        walkableRadius: Math.ceil(
-          ROBOT_SPEC.base.footprintRadius / NAVIGATION_CELL_SIZE
-        ),
+        walkableSlopeAngle: navigationProfile.maximumSlopeDegrees,
+        walkableHeight: Math.ceil(navigationProfile.height / NAVIGATION_CELL_HEIGHT),
+        walkableClimb: Math.floor(navigationProfile.maximumClimb / NAVIGATION_CELL_HEIGHT),
+        walkableRadius: Math.ceil(navigationProfile.radius / NAVIGATION_CELL_SIZE),
         maxSimplificationError: 1.1,
         mergeRegionArea: 12,
         maxVertsPerPoly: 6,
@@ -170,7 +178,7 @@ export class NavigationMesh {
           [region.minimum.x, -0.1, region.minimum.z],
           [
             region.maximum.x,
-            maximumGeometryHeight + ROBOT_CLEARANCE_HEIGHT,
+            maximumGeometryHeight + navigationProfile.height,
             region.maximum.z
           ]
         ]
@@ -179,7 +187,7 @@ export class NavigationMesh {
       throw new Error(`Navigation mesh generation failed: ${generated.error}`);
     }
     try {
-      return new NavigationMesh(generated.navMesh, generated.tileCache);
+      return new NavigationMesh(generated.navMesh, generated.tileCache, navigationProfile);
     } catch (error) {
       generated.tileCache.destroy();
       generated.navMesh.destroy();
@@ -187,11 +195,20 @@ export class NavigationMesh {
     }
   }
 
-  private constructor(navMesh: RecastNavMesh, tileCache: RecastTileCache) {
+  private constructor(
+    navMesh: RecastNavMesh,
+    tileCache: RecastTileCache,
+    profile: NavigationAgentProfile
+  ) {
     this.#navMesh = navMesh;
     this.#tileCache = tileCache;
     this.#query = new recastApi.NavMeshQuery(navMesh, { maxNodes: 4096 });
-    this.#query.defaultQueryHalfExtents = { x: 0.8, y: 2.2, z: 0.8 };
+    this.#profile = profile;
+    this.#query.defaultQueryHalfExtents = {
+      x: Math.max(0.8, profile.radius * 2),
+      y: Math.max(2.2, profile.height * 1.5),
+      z: Math.max(0.8, profile.radius * 2)
+    };
   }
 
   plan(start: Vec3, target: Vec3, obstacles: readonly NavigationObstacle[]): NavigationPlan {
@@ -203,9 +220,9 @@ export class NavigationMesh {
       throw new Error(`Navigation target has no walkable projection: requested=${formatPoint(target)}`);
     }
     const projectionDistance = planarDistance(targetResult.point, target);
-    if (projectionDistance > MAX_TARGET_PROJECTION_DISTANCE) {
+    if (projectionDistance > this.#profile.maximumTargetProjection) {
       throw new Error(
-        `Navigation target projection exceeds ${MAX_TARGET_PROJECTION_DISTANCE.toFixed(2)}m: `
+        `Navigation target projection exceeds ${this.#profile.maximumTargetProjection.toFixed(2)}m: `
         + `requested=${formatPoint(target)}, projected=${formatPoint(targetResult.point)}, `
         + `distance=${projectionDistance.toFixed(3)}m`
       );
@@ -269,7 +286,8 @@ export class NavigationMesh {
         };
         const projected = this.#query.findClosestPoint({ x: candidate.x, y: 0, z: candidate.z });
         if (!projected.success) continue;
-        if (planarDistance(projected.point, candidate) > MAX_TARGET_PROJECTION_DISTANCE) continue;
+        if (planarDistance(projected.point, candidate)
+          > this.#profile.maximumTargetProjection) continue;
         poses.push({
           position: { x: projected.point.x, y: around.y, z: projected.point.z },
           radius,
@@ -304,7 +322,8 @@ export class NavigationMesh {
       if (found.length >= limit) break;
       const projected = this.#query.findClosestPoint({ x: candidate.x, y: 0, z: candidate.z });
       if (!projected.success) continue;
-      if (planarDistance(projected.point, candidate) > MAX_TARGET_PROJECTION_DISTANCE) continue;
+      if (planarDistance(projected.point, candidate)
+        > this.#profile.maximumTargetProjection) continue;
       found.push({
         requested: candidate,
         point: { x: projected.point.x, y: candidate.y, z: projected.point.z }
@@ -332,7 +351,10 @@ export class NavigationMesh {
 
     for (const [id, descriptor] of requested) {
       if (this.#obstacles.has(id)) continue;
-      const navigationHalfExtents = expandedObstacleHalfExtents(descriptor.halfExtents);
+      const navigationHalfExtents = expandedObstacleHalfExtents(
+        descriptor.halfExtents,
+        this.#profile.radius
+      );
       let added = this.#tileCache.addBoxObstacle(
         descriptor.center,
         navigationHalfExtents,
@@ -390,7 +412,7 @@ interface Geometry {
 
 function worldGeometry(
   scenario: Scenario,
-  solids: TerrainBox[],
+  solids: NavigationSolid[],
   region: NavigationBuildScope["region"]
 ): Geometry {
   const geometry: Geometry = { positions: [], indices: [] };
@@ -432,7 +454,7 @@ function deindexGeometry(geometry: Geometry): Geometry {
 
 function worldGeometryHeight(
   scenario: Scenario,
-  solids: TerrainBox[],
+  solids: NavigationSolid[],
   region: NavigationBuildScope["region"]
 ): number {
   let maximum = 0;
@@ -531,13 +553,33 @@ function validatedObstacle(obstacle: NavigationObstacle): NavigationObstacle {
   };
 }
 
-function expandedObstacleHalfExtents(halfExtents: Vec3): Vec3 {
-  const planarExpansion = ROBOT_SPEC.base.footprintRadius + NAVIGATION_OBSTACLE_SKIN;
+function expandedObstacleHalfExtents(halfExtents: Vec3, agentRadius: number): Vec3 {
+  const planarExpansion = agentRadius + NAVIGATION_OBSTACLE_SKIN;
   return {
     x: halfExtents.x + planarExpansion,
     y: halfExtents.y,
     z: halfExtents.z + planarExpansion
   };
+}
+
+function validatedProfile(profile: NavigationAgentProfile): NavigationAgentProfile {
+  const values = [
+    profile.radius,
+    profile.height,
+    profile.maximumClimb,
+    profile.maximumSlopeDegrees,
+    profile.maximumTargetProjection
+  ];
+  if (values.some((value) => !Number.isFinite(value))
+    || profile.radius <= 0
+    || profile.height <= 0
+    || profile.maximumClimb < 0
+    || profile.maximumSlopeDegrees <= 0
+    || profile.maximumSlopeDegrees > 90
+    || profile.maximumTargetProjection < 0) {
+    throw new Error("Invalid navigation agent profile");
+  }
+  return { ...profile };
 }
 
 function sameObstacle(left: NavigationObstacle, right: NavigationObstacle): boolean {

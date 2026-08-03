@@ -1,249 +1,190 @@
 import { describe, expect, it } from "vitest";
 import {
-  actionReceiptFrom,
   appendRecent,
-  checkerFrom,
-  completeRootNode,
+  contextMemoryFrom,
   failOpenNodes,
-  isWorldSnapshot,
+  humanoidActionReceiptFrom,
+  humanoidCheckerFrom,
+  humanoidWorldSnapshotsFrom,
   latestProviderActivity,
-  mergeWorldFrames,
   nextRuntimeEventCursor,
   taskNodesFrom,
   updateRunListStatus,
-  upsertRuntimeJournalEntry,
-  upsertAction,
-  worldSnapshotsFrom
+  upsertHumanoidAction,
+  upsertRuntimeJournalEntry
 } from "./stream-state";
-import type { ActionReceipt, TaskNode, WorldSnapshot } from "./types";
-
-/**
- * These reducers are the whole SSE ingest path: every frame, receipt, and node
- * the console shows passes through them, out of order and possibly duplicated,
- * from a live run that cannot be replayed. A silent mistake here shows up as a
- * console that disagrees with the run journal.
- */
-
-function frame(index: number): WorldSnapshot {
-  return {
-    frame: index,
-    simulated_time: index / 60,
-    robot: {},
-    objects: [],
-    zones: [],
-    obstacles: []
-  } as unknown as WorldSnapshot;
-}
-
-function receipt(transactionId: string, code: string): ActionReceipt {
-  return {
-    transaction_id: transactionId,
-    agent_id: "agent_1",
-    agent_name: "Motion controller",
-    name: "execute_base_plan",
-    accepted: code === "base_plan_completed",
-    code
-  } as unknown as ActionReceipt;
-}
-
-function node(id: string, status: TaskNode["status"]): TaskNode {
-  return { id, name: id, status, child_ids: [] } as unknown as TaskNode;
-}
-
-describe("mergeWorldFrames", () => {
-  it("appends in-order frames without copying the array when nothing changes", () => {
-    const current = [frame(1), frame(2)];
-    expect(mergeWorldFrames(current, [], 10)).toBe(current);
-  });
-
-  it("orders late frames by frame number rather than arrival order", () => {
-    const merged = mergeWorldFrames([frame(1), frame(4)], [frame(2), frame(3)], 10);
-    expect(merged.map((entry) => entry.frame)).toEqual([1, 2, 3, 4]);
-  });
-
-  it("replaces a frame that arrives twice instead of duplicating it", () => {
-    const revised = { ...frame(2), simulated_time: 99 };
-    const merged = mergeWorldFrames([frame(1), frame(2), frame(3)], [revised], 10);
-    expect(merged.map((entry) => entry.frame)).toEqual([1, 2, 3]);
-    expect(merged[1]?.simulated_time).toBe(99);
-  });
-
-  it("replaces the newest frame when the same frame number is re-sent", () => {
-    const revised = { ...frame(3), simulated_time: 42 };
-    const merged = mergeWorldFrames([frame(1), frame(3)], [revised], 10);
-    expect(merged).toHaveLength(2);
-    expect(merged.at(-1)?.simulated_time).toBe(42);
-  });
-
-  it("keeps only the most recent frames once the limit is exceeded", () => {
-    const merged = mergeWorldFrames([], [frame(1), frame(2), frame(3), frame(4)], 2);
-    expect(merged.map((entry) => entry.frame)).toEqual([3, 4]);
-  });
-
-  it("does not mutate the array it was given", () => {
-    const current = [frame(1), frame(3)];
-    mergeWorldFrames(current, [frame(2)], 10);
-    expect(current.map((entry) => entry.frame)).toEqual([1, 3]);
-  });
-});
+import type {
+  HumanoidActionReceipt,
+  HumanoidWorldSnapshot,
+  RuntimeEvent,
+  TaskNode
+} from "./types";
 
 describe("runtime event cursor", () => {
   it("does not advance past a live-only physics frame", () => {
-    const liveFrame = {
-      event_id: "live-frame",
-      run_id: "run",
-      type: "world_frames",
-      at: "2026-07-30T00:00:00.000Z",
-      data: {},
-      durable: false
-    };
-    expect(nextRuntimeEventCursor("durable-event", liveFrame)).toBe("durable-event");
+    const event = runtimeEvent("world_frames", { frames: [] }, false);
+    expect(nextRuntimeEventCursor("durable-before", event)).toBe("durable-before");
   });
 
-  it("advances for durable and legacy journal events", () => {
-    const event = {
-      event_id: "committed",
-      run_id: "run",
-      type: "action_committed",
-      at: "2026-07-30T00:00:00.000Z",
-      data: {}
-    };
-    expect(nextRuntimeEventCursor("older", { ...event, durable: true })).toBe("committed");
-    expect(nextRuntimeEventCursor("older", event)).toBe("committed");
-    expect(nextRuntimeEventCursor("older", {
-      ...event,
-      cursor: `v1:7:${"a".repeat(64)}`
-    })).toBe(`v1:7:${"a".repeat(64)}`);
+  it("prefers a versioned cursor and supports older durable records", () => {
+    const current = runtimeEvent("run_started", {}, true);
+    expect(nextRuntimeEventCursor(undefined, current)).toBe(current.event_id);
+    expect(nextRuntimeEventCursor(undefined, { ...current, cursor: "v1:0:proof" }))
+      .toBe("v1:0:proof");
   });
 });
 
-describe("upsertAction", () => {
-  it("replaces a receipt in place when the same transaction is revised", () => {
-    const actions = [receipt("t1", "base_path_planned"), receipt("t2", "base_path_planned")];
-    const next = upsertAction(actions, receipt("t1", "base_plan_completed"), 10);
-    expect(next).toHaveLength(2);
-    expect(next[0]).toMatchObject({ transaction_id: "t1", code: "base_plan_completed" });
-    expect(actions[0]?.code).toBe("base_path_planned");
+describe("bounded live state", () => {
+  it("replaces a humanoid receipt with the same transaction", () => {
+    const first = receipt("tx-1", "motion_planned");
+    const revised = receipt("tx-1", "motion_completed");
+    const next = upsertHumanoidAction([first], revised, 10);
+    expect(next).toEqual([revised]);
+    expect(next).not.toBe([first]);
   });
 
-  it("appends an unseen transaction", () => {
-    const next = upsertAction([receipt("t1", "base_path_planned")], receipt("t2", "denied"), 10);
-    expect(next.map((entry) => entry.transaction_id)).toEqual(["t1", "t2"]);
-  });
-});
-
-describe("appendRecent", () => {
-  it("drops the oldest entry once the limit is reached", () => {
-    expect(appendRecent([1, 2, 3], 4, 3)).toEqual([2, 3, 4]);
-  });
-
-  it("grows until the limit", () => {
+  it("bounds append-only activity", () => {
+    expect(appendRecent([1, 2], 3, 2)).toEqual([2, 3]);
     expect(appendRecent([1], 2, 3)).toEqual([1, 2]);
   });
-});
 
-describe("runtime journal merge", () => {
-  it("merges a details-tail record and its later SSE event exactly once", () => {
-    const fromDetails = {
-      status: "contacted",
-      runtime_event_id: "event-1",
-      at: "2026-07-30T00:00:00.000Z"
-    };
-    const fromStream = structuredClone(fromDetails);
-    const merged = upsertRuntimeJournalEntry([fromDetails], fromStream, 10);
-
-    expect(merged).toEqual([fromStream]);
-    expect(merged).toHaveLength(1);
-  });
-
-  it("keeps distinct records bounded and preserves legacy append semantics", () => {
-    const current = [{ runtime_event_id: "event-1" }];
-    expect(upsertRuntimeJournalEntry(current, { runtime_event_id: "event-2" }, 2))
-      .toEqual([{ runtime_event_id: "event-1" }, { runtime_event_id: "event-2" }]);
-    expect(upsertRuntimeJournalEntry(["legacy"], "legacy", 2)).toEqual(["legacy", "legacy"]);
+  it("deduplicates a details tail and its matching SSE domain event", () => {
+    const before: unknown[] = [
+      { status: "contacted", runtime_event_id: "event-1" }
+    ];
+    const update = { status: "usable_stream", runtime_event_id: "event-1" };
+    expect(upsertRuntimeJournalEntry(before, update, 10)).toEqual([update]);
+    expect(upsertRuntimeJournalEntry(before, { status: "other" }, 2)).toHaveLength(2);
   });
 });
 
-describe("run and node reducers", () => {
+describe("run projections", () => {
   it("updates only the addressed run", () => {
-    const runs = [
-      { run_id: "a", status: "running", error: null, updated_at: "t0" },
-      { run_id: "b", status: "running", error: null, updated_at: "t0" }
-    ] as Parameters<typeof updateRunListStatus>[0];
-    const next = updateRunListStatus(runs, "b", "failed", "boom", "t1");
-    expect(next[0]).toMatchObject({ run_id: "a", status: "running" });
-    expect(next[1]).toMatchObject({ run_id: "b", status: "failed", error: "boom", updated_at: "t1" });
+    const runs = [{
+      run_id: "run-1",
+      scenario_id: "humanoid_courtyard",
+      mission: "walk",
+      status: "running" as const,
+      created_at: null,
+      updated_at: null,
+      error: null
+    }];
+    expect(updateRunListStatus(runs, "run-1", "succeeded", null, "now")[0])
+      .toMatchObject({ status: "succeeded", updated_at: "now" });
+    expect(updateRunListStatus(runs, "other", "failed", "error", "now")).toEqual(runs);
   });
 
-  it("attaches the final result to the root node only when both output and checker exist", () => {
-    const nodes = { root: node("root", "active") };
-    const withResult = completeRootNode(nodes, "root", "done", { success: true, checks: [] } as never, "t1");
-    expect(withResult.root).toMatchObject({ status: "completed", updated_at: "t1" });
-    expect(withResult.root?.last_result).toMatchObject({ output: "done" });
+  it("fails open hierarchy nodes without rewriting settled nodes", () => {
+    const active = node("active", "active");
+    const complete = node("complete", "completed");
+    const next = failOpenNodes({ active, complete }, "physics stopped", "now");
+    expect(next.active).toMatchObject({ status: "failed", last_result: { error: "physics stopped" } });
+    expect(next.complete).toBe(complete);
+  });
+});
 
-    const withoutChecker = completeRootNode(nodes, "root", "done", null, "t1");
-    expect(withoutChecker.root?.status).toBe("completed");
-    expect(withoutChecker.root?.last_result).toBeUndefined();
+describe("humanoid payload guards", () => {
+  it("finds the newest provider activity", () => {
+    expect(latestProviderActivity([{}, { status: "contacted", at: "earlier" }, {
+      status: "usable_stream",
+      at: "latest",
+      source: "model"
+    }])).toEqual({ status: "usable_stream", at: "latest", source: "model" });
   });
 
-  it("leaves the map untouched when the root id is unknown", () => {
-    const nodes = { root: node("root", "active") };
-    expect(completeRootNode(nodes, "missing", "done", null, "t1")).toBe(nodes);
+  it("extracts only authoritative humanoid snapshots", () => {
+    const first = frame(1);
+    const second = frame(2);
+    expect(humanoidWorldSnapshotsFrom({ frames: [first, { frame: 3 }, second] }))
+      .toEqual([first, second]);
+    expect(humanoidWorldSnapshotsFrom({ snapshot: first })).toEqual([first]);
   });
 
-  it("fails every still-open node and leaves settled ones alone", () => {
-    const nodes = {
-      a: node("a", "ready"),
-      b: node("b", "active"),
-      c: node("c", "waiting"),
-      d: node("d", "completed")
+  it("rejects malformed hierarchy, action and checker records", () => {
+    expect(taskNodesFrom({ root: node("root", "active") })).not.toBeNull();
+    expect(taskNodesFrom({ root: { id: "root" } })).toBeNull();
+    expect(humanoidActionReceiptFrom(receipt("tx", "humanoid_observed"))).not.toBeNull();
+    expect(humanoidActionReceiptFrom({ transactionId: "tx" })).toBeNull();
+    expect(humanoidCheckerFrom({ success: true, worldFrame: 1, worldRevision: 1, checks: [] }))
+      .not.toBeNull();
+    expect(humanoidCheckerFrom({ success: true, checks: [] })).toBeNull();
+  });
+
+  it("accepts only a structured context memory envelope", () => {
+    const memory = {
+      version: 1,
+      context_window_tokens: 65_536,
+      compact_trigger_tokens: 40_000,
+      active_estimated_tokens: 12_000,
+      total_compactions: 2,
+      scopes: {}
     };
-    const failed = failOpenNodes(nodes, "run aborted", "t2");
-    expect(failed.a?.status).toBe("failed");
-    expect(failed.b?.status).toBe("failed");
-    expect(failed.c?.status).toBe("failed");
-    expect(failed.d).toBe(nodes.d);
-    expect(failed.a?.last_result).toMatchObject({ error: "run aborted" });
+    expect(contextMemoryFrom(memory)).toEqual(memory);
+    expect(contextMemoryFrom({ ...memory, scopes: [] })).toBeNull();
   });
 });
 
-describe("payload guards", () => {
-  it("finds the newest provider activity, ignoring unrelated entries", () => {
-    expect(latestProviderActivity([
-      { status: "ok", at: "t0", source: "model" },
-      { unrelated: true },
-      { status: "error", at: "t1", source: "model" },
-      "not an object"
-    ])).toMatchObject({ status: "error", at: "t1" });
-    expect(latestProviderActivity([{ unrelated: true }])).toBeNull();
-  });
+function frame(index: number): HumanoidWorldSnapshot {
+  return {
+    frame: index,
+    worldRevision: index,
+    robot: {
+      simulatedTime: index / 50,
+      rootPosition: { x: 0, y: 0, z: 0 },
+      links: {},
+      objects: {}
+    },
+    navigation: {}
+  } as unknown as HumanoidWorldSnapshot;
+}
 
-  it("extracts world snapshots from every shape the stream sends", () => {
-    expect(worldSnapshotsFrom(frame(1))).toHaveLength(1);
-    expect(worldSnapshotsFrom({ world: frame(1) })).toHaveLength(1);
-    expect(worldSnapshotsFrom({ snapshot: frame(1) })).toHaveLength(1);
-    expect(worldSnapshotsFrom({ frames: [frame(1), frame(2), { bogus: true }] })).toHaveLength(2);
-    expect(worldSnapshotsFrom("nonsense")).toEqual([]);
-  });
+function receipt(transactionId: string, code: string): HumanoidActionReceipt {
+  return {
+    transactionId,
+    agentId: "humanoid-executor",
+    action: "execute_whole_body_motion",
+    input: {},
+    fingerprint: "fingerprint",
+    accepted: true,
+    code,
+    worldBeforeRevision: 0,
+    worldAfterRevision: 1,
+    frameCount: 10,
+    channels: ["locomotion"],
+    detail: {},
+    committedAt: "2026-08-02T00:00:00.000Z"
+  };
+}
 
-  it("rejects a snapshot missing any required field", () => {
-    expect(isWorldSnapshot(frame(1))).toBe(true);
-    expect(isWorldSnapshot({ ...frame(1), objects: undefined })).toBe(false);
-    expect(isWorldSnapshot({ ...frame(1), robot: null })).toBe(false);
-    expect(isWorldSnapshot(null)).toBe(false);
-  });
+function node(id: string, status: TaskNode["status"]): TaskNode {
+  return {
+    id,
+    name: id,
+    parent_id: null,
+    child_ids: [],
+    objective: "execute",
+    success_criteria: [],
+    evidence_requirements: [],
+    goal_predicate_indexes: [],
+    capabilities: [],
+    may_delegate: false,
+    references: [],
+    depth: 0,
+    status,
+    steps_used: 0,
+    model_calls_used: 0,
+    created_at: "2026-08-02T00:00:00.000Z",
+    updated_at: "2026-08-02T00:00:00.000Z"
+  };
+}
 
-  it("rejects a node map when any node is malformed", () => {
-    expect(taskNodesFrom({ a: node("a", "active") })).not.toBeNull();
-    expect(taskNodesFrom({ a: { id: "a", name: "a", status: "active" } })).toBeNull();
-    expect(taskNodesFrom([node("a", "active")])).toBeNull();
-  });
-
-  it("rejects a receipt or checker payload missing its identifying fields", () => {
-    expect(actionReceiptFrom(receipt("t1", "ok"))).not.toBeNull();
-    expect(actionReceiptFrom({ ...receipt("t1", "ok"), accepted: "yes" })).toBeNull();
-    expect(actionReceiptFrom({ ...receipt("t1", "ok"), transaction_id: undefined })).toBeNull();
-    expect(checkerFrom({ success: true, checks: [] })).not.toBeNull();
-    expect(checkerFrom({ success: true })).toBeNull();
-  });
-});
+function runtimeEvent(type: string, data: unknown, durable?: boolean): RuntimeEvent {
+  return {
+    event_id: `${type}-event`,
+    run_id: "humanoid-run",
+    type,
+    at: "2026-08-02T00:00:00.000Z",
+    data,
+    ...(durable === undefined ? {} : { durable })
+  };
+}

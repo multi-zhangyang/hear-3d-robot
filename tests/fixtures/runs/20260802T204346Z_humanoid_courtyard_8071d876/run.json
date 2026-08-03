@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "run_id": "20260802T204346Z_humanoid_courtyard_8071d876",
+  "mission": "观察当前庭院，规划并执行安全的双足路线，到达前方坐标后用物理回执完成任务。",
+  "scenario_id": "humanoid_courtyard",
+  "scenario": {
+    "title": "人形庭院",
+    "bounds": {
+      "width": 18,
+      "depth": 16
+    },
+    "visibility_radius": 7,
+    "robot": {
+      "x": 2.5,
+      "z": 2.5,
+      "yaw": 0
+    },
+    "obstacles": [
+      {
+        "id": "stone_column",
+        "center": {
+          "x": 8,
+          "y": 1.1,
+          "z": 7.5
+        },
+        "size": {
+          "x": 1.4,
+          "y": 2.2,
+          "z": 1.4
+        }
+      },
+      {
+        "id": "low_block",
+        "center": {
+          "x": 12.5,
+          "y": 0.35,
+          "z": 4.5
+        },
+        "size": {
+          "x": 2.2,
+          "y": 0.7,
+          "z": 1.5
+        }
+      }
+    ],
+    "objects": [
+      {
+        "id": "courtyard_crate",
+        "kind": "crate",
+        "color": "#bd7844",
+        "position": {
+          "x": 4.5,
+          "y": 0.25,
+          "z": 5.5
+        },
+        "size": {
+          "x": 0.5,
+          "y": 0.5,
+          "z": 0.5
+        },
+        "portable": true
+      }
+    ],
+    "zones": [
+      {
+        "id": "courtyard_beacon",
+        "color": "#50aa85",
+        "center": {
+          "x": 15,
+          "y": 0.01,
+          "z": 13
+        },
+        "size": {
+          "x": 2,
+          "y": 0.02,
+          "z": 2
+        }
+      }
+    ],
+    "default_goal": {
+      "summary": "自主通过庭院并进入信标区域。",
+      "predicates": [
+        {
+          "type": "robot_in_zone",
+          "zone_id": "courtyard_beacon",
+          "tolerance": 0.2
+        }
+      ]
+    },
+    "seed": 887679499
+  },
+  "goal": {
+    "summary": "双足移动到前方目标",
+    "predicates": [
+      {
+        "type": "robot_at",
+        "target": {
+          "x": 2.5,
+          "y": 0,
+          "z": 4.5
+        },
+        "tolerance": 0.35
+      }
+    ]
+  },
+  "runtime": "humanoid_g1",
+  "created_at": "2026-08-02T20:43:46.837Z"
+}

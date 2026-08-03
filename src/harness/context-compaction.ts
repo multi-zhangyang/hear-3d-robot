@@ -13,7 +13,7 @@ import {
 } from "../domain/schema.js";
 import type { ProviderConfig } from "../config/load.js";
 import type { FileSession } from "../persistence/file-session.js";
-import type { HarnessRuntimeContext } from "./runtime-context.js";
+import type { LongRunContextRuntime } from "./context-runtime.js";
 import { compactorInputTokenLimit } from "../runtime/context-budget.js";
 import { agentIdFromModelPayload, agentInvocationMarker } from "./agent-scope.js";
 import {
@@ -52,7 +52,7 @@ interface RecoveredHistory {
  * and nested workers never inherit each other's compressed working memory.
  */
 export class LongRunContextManager {
-  readonly #runtime: HarnessRuntimeContext;
+  readonly #runtime: LongRunContextRuntime;
   readonly #createGenerator: (agentId: string) => ContextSummaryGenerator;
   readonly #generators = new Map<string, ContextSummaryGenerator>();
   readonly #config: ProviderConfig;
@@ -64,7 +64,7 @@ export class LongRunContextManager {
   #state: ContextMemoryState;
 
   constructor(input: {
-    runtime: HarnessRuntimeContext;
+    runtime: LongRunContextRuntime;
     createGenerator: (agentId: string) => ContextSummaryGenerator;
     provider: ProviderConfig;
     sessionForAgent?: (agentId: string) => FileSession;
@@ -73,7 +73,7 @@ export class LongRunContextManager {
     this.#createGenerator = input.createGenerator;
     this.#config = input.provider;
     this.#sessionForAgent = input.sessionForAgent;
-    const persisted = input.runtime.checkpoint.context_memory;
+    const persisted = input.runtime.contextMemory();
     this.#state = ContextMemoryStateSchema.parse({
       ...persisted,
       context_window_tokens: input.provider.contextWindowTokens,
@@ -248,7 +248,6 @@ export class LongRunContextManager {
       summary: null,
       summary_origin: null,
       summary_world_revision: null,
-      summary_voxel_revision: null,
       last_compacted_at: null
     };
     this.#state.scopes[node.id] = created;
@@ -467,7 +466,6 @@ export class LongRunContextManager {
         scope.summary = null;
         scope.summary_origin = null;
         scope.summary_world_revision = null;
-        scope.summary_voxel_revision = null;
         scope.last_compacted_at = null;
       }
     }
@@ -533,23 +531,23 @@ export class LongRunContextManager {
       targetCut
     )) {
       const sourceItems = modelData.input.slice(scope.compacted_item_count, cut);
+      const receipts = this.#runtime.contextReceipts();
       const transactionIds = relevantTransactionIds(
-        this.#runtime.checkpoint,
+        receipts,
         scope.summary,
         sourceItems
       );
-      const checkpoint = this.#runtime.checkpoint;
-      const currentWorldRevision = checkpoint.world.world_revision;
+      const { worldRevision: currentWorldRevision } = this.#runtime.contextWorldIdentity();
       const request: ContextSummaryRequest = {
         priorSummary: scope.summary,
         sourceItems,
         authority,
         acceptedTransactionIds: transactionIds.filter((transactionId) =>
-          checkpoint.committed_actions[transactionId]?.accepted === true
-            && checkpoint.committed_actions[transactionId]?.world_revision === currentWorldRevision
+          receipts[transactionId]?.accepted === true
+            && receipts[transactionId]?.worldRevision === currentWorldRevision
         ),
         blockerTransactionIds: transactionIds.filter((transactionId) =>
-          checkpoint.committed_actions[transactionId]?.world_revision === currentWorldRevision
+          receipts[transactionId]?.worldRevision === currentWorldRevision
         ),
         maxInputTokens,
         ...(this.#runtime.signal ? { signal: this.#runtime.signal } : {})
@@ -622,13 +620,12 @@ export class LongRunContextManager {
     }
 
     const completedAt = new Date().toISOString();
-    const world = this.#runtime.checkpoint.world;
+    const world = this.#runtime.contextWorldIdentity();
     scope.compacted_item_count = cut;
     scope.compaction_count += 1;
     scope.summary = generated.summary;
     scope.summary_origin = generated.origin;
-    scope.summary_world_revision = world.world_revision;
-    scope.summary_voxel_revision = world.voxels?.revision ?? null;
+    scope.summary_world_revision = world.worldRevision;
     scope.last_compacted_at = completedAt;
     this.#state.total_compactions += 1;
     this.#state.last_compacted_at = completedAt;
@@ -666,8 +663,7 @@ export class LongRunContextManager {
         compactor_input_limit_tokens: maxInputTokens,
         retained_items: modelData.input.length - cut,
         active_estimated_tokens: scope.active_estimated_tokens,
-        world_revision: world.world_revision,
-        voxel_revision: world.voxels?.revision ?? null,
+        world_revision: world.worldRevision,
         summary_origin: generated.origin,
         summary: generated.summary,
         usage: generated.usage,
@@ -711,8 +707,7 @@ export class LongRunContextManager {
       "Only accepted receipts and the current harness state prove facts. Re-observe before physical execution when revisions differ.",
       `MODEL CHECKPOINT: ${JSON.stringify(scope.summary)}`,
       `CHECKPOINT REVISION: ${JSON.stringify({
-        world_revision: scope.summary_world_revision,
-        voxel_revision: scope.summary_voxel_revision
+        world_revision: scope.summary_world_revision
       })}`
     ].join("\n");
     return {
@@ -738,28 +733,25 @@ export class LongRunContextManager {
     reason: string[];
     dropped_stale_transaction_ids: string[];
     world_revision: number;
-    voxel_revision: number | null;
     summary: ContextScopeState["summary"];
     at: string;
   } | undefined {
     const forceFreshRebase = this.#freshTurnRebaseScopes.delete(scope.scope_id);
     if (!scope.summary) return undefined;
-    const checkpoint = this.#runtime.checkpoint;
-    const currentWorldRevision = checkpoint.world.world_revision;
-    const currentVoxelRevision = checkpoint.world.voxels?.revision ?? null;
+    const receipts = this.#runtime.contextReceipts();
+    const { worldRevision: currentWorldRevision } = this.#runtime.contextWorldIdentity();
     const evidenceIds = summaryTransactionIds(scope.summary);
     const staleIds = evidenceIds.filter((transactionId) =>
-      checkpoint.committed_actions[transactionId]?.world_revision !== currentWorldRevision
+      receipts[transactionId]?.worldRevision !== currentWorldRevision
     );
-    const revisionChanged = scope.summary_world_revision !== currentWorldRevision
-      || scope.summary_voxel_revision !== currentVoxelRevision;
+    const revisionChanged = scope.summary_world_revision !== currentWorldRevision;
     if (!forceFreshRebase && !revisionChanged && staleIds.length === 0) return undefined;
 
     const currentIds = evidenceIds.filter((transactionId) =>
-      checkpoint.committed_actions[transactionId]?.world_revision === currentWorldRevision
+      receipts[transactionId]?.worldRevision === currentWorldRevision
     );
     const acceptedIds = currentIds.filter((transactionId) =>
-      checkpoint.committed_actions[transactionId]?.accepted === true
+      receipts[transactionId]?.accepted === true
     );
     const reasons = [
       ...(forceFreshRebase ? ["fresh_sdk_turn"] : []),
@@ -772,7 +764,6 @@ export class LongRunContextManager {
       blockerTransactionIds: currentIds
     });
     scope.summary_world_revision = currentWorldRevision;
-    scope.summary_voxel_revision = currentVoxelRevision;
     return {
       type: "context_checkpoint_rebased",
       scope_id: scope.scope_id,
@@ -780,7 +771,6 @@ export class LongRunContextManager {
       reason: reasons,
       dropped_stale_transaction_ids: staleIds,
       world_revision: currentWorldRevision,
-      voxel_revision: currentVoxelRevision,
       summary: scope.summary,
       at: new Date().toISOString()
     };
@@ -930,12 +920,12 @@ function asRecord(value: JsonValue): Record<string, JsonValue> {
 }
 
 function relevantTransactionIds(
-  checkpoint: HarnessRuntimeContext["checkpoint"],
+  receipts: Record<string, { accepted: boolean; worldRevision: number }>,
   priorSummary: ContextScopeState["summary"],
   sourceItems: AgentInputItem[]
 ): string[] {
   const source = JSON.stringify({ priorSummary, sourceItems });
-  return Object.keys(checkpoint.committed_actions).filter((transactionId) =>
+  return Object.keys(receipts).filter((transactionId) =>
     source.includes(transactionId)
   );
 }
@@ -969,5 +959,3 @@ function compactionFailureUsage(error: unknown): ContextSummaryResult["usage"] |
 function json(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
-
-export { sequencePrefixIndex };
