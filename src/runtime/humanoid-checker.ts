@@ -1,7 +1,27 @@
 import type { Goal, JsonValue, Scenario } from "../domain/schema.js";
-import type { HumanoidCheckerResult } from "../domain/humanoid-run.js";
+import { goalSha256 } from "../domain/goal-identity.js";
+import {
+  HumanoidGoalProgressSchema,
+  type HumanoidCheckerResult,
+  type HumanoidGoalProgress
+} from "../domain/humanoid-run.js";
+import {
+  humanoidEndEffectorBody,
+  humanoidEndEffectorPosition
+} from "../world/humanoid/end-effectors.js";
 import type { HumanoidWorldSnapshot } from "../world/humanoid/world.js";
 import { GoalValidationError } from "./goal-validation.js";
+
+interface PredicateEvaluation {
+  name: string;
+  satisfied: boolean;
+  actual: Record<string, unknown>;
+}
+
+export interface HumanoidGoalAdvance {
+  progress: HumanoidGoalProgress;
+  checker: HumanoidCheckerResult;
+}
 
 export function assertHumanoidGoalSupported(goal: Goal, scenario: Scenario): void {
   for (const predicate of goal.predicates) {
@@ -24,16 +44,174 @@ export function assertHumanoidGoalSupported(goal: Goal, scenario: Scenario): voi
   }
 }
 
+export function createHumanoidGoalProgress(
+  goal: Goal,
+  world: Pick<HumanoidWorldSnapshot, "frame" | "worldRevision">
+): HumanoidGoalProgress {
+  return HumanoidGoalProgressSchema.parse({
+    version: 1,
+    goal_sha256: goalSha256(goal),
+    predicate_count: goal.predicates.length,
+    last_world_frame: world.frame,
+    last_world_revision: world.worldRevision,
+    predicate_streaks: goal.predicates.map(() => 0)
+  });
+}
+
+export function assertHumanoidGoalProgressIntegrity(
+  goal: Goal,
+  world: Pick<HumanoidWorldSnapshot, "frame" | "worldRevision">,
+  rawProgress: HumanoidGoalProgress
+): void {
+  const progress = assertProgressIdentity(goal, rawProgress);
+  if (progress.last_world_frame !== world.frame
+    || progress.last_world_revision !== world.worldRevision) {
+    throw new Error(
+      "Humanoid goal progress is not aligned with the authoritative world frame"
+    );
+  }
+}
+
+export function inspectHumanoidGoal(
+  goal: Goal,
+  scenario: Scenario,
+  world: HumanoidWorldSnapshot,
+  rawProgress: HumanoidGoalProgress
+): HumanoidCheckerResult {
+  const progress = assertProgressIdentity(goal, rawProgress);
+  assertHumanoidGoalProgressIntegrity(goal, world, progress);
+  return checkerResult(
+    goal,
+    world,
+    evaluatePredicates(goal, scenario, world),
+    progress
+  );
+}
+
+export function advanceHumanoidGoal(
+  goal: Goal,
+  scenario: Scenario,
+  world: HumanoidWorldSnapshot,
+  rawProgress: HumanoidGoalProgress
+): HumanoidGoalAdvance {
+  const previous = assertProgressIdentity(goal, rawProgress);
+  const sameFrame = world.frame === previous.last_world_frame
+    && world.worldRevision === previous.last_world_revision;
+  if (sameFrame) {
+    return {
+      progress: structuredClone(previous),
+      checker: inspectHumanoidGoal(goal, scenario, world, previous)
+    };
+  }
+  if (world.frame <= previous.last_world_frame
+    || world.worldRevision <= previous.last_world_revision) {
+    throw new Error("Humanoid goal progress cannot move backward or advance partially");
+  }
+
+  const evaluations = evaluatePredicates(goal, scenario, world);
+  const contiguous = world.frame === previous.last_world_frame + 1
+    && world.worldRevision === previous.last_world_revision + 1;
+  const predicateStreaks = goal.predicates.map((predicate, index) => {
+    if (predicate.type !== "end_effector_at") return 0;
+    if (!evaluations[index]!.satisfied) return 0;
+    const prior = contiguous ? previous.predicate_streaks[index]! : 0;
+    return Math.min(prior + 1, predicate.stable_frames);
+  });
+  const progress = HumanoidGoalProgressSchema.parse({
+    version: 1,
+    goal_sha256: previous.goal_sha256,
+    predicate_count: previous.predicate_count,
+    last_world_frame: world.frame,
+    last_world_revision: world.worldRevision,
+    predicate_streaks: predicateStreaks
+  });
+  return {
+    progress,
+    checker: checkerResult(goal, world, evaluations, progress)
+  };
+}
+
+/**
+ * Backward-compatible instantaneous view. New temporal predicates remain
+ * fail-closed unless the caller supplies persisted physical-frame progress.
+ */
 export function checkHumanoidGoal(
   goal: Goal,
   scenario: Scenario,
-  world: HumanoidWorldSnapshot
+  world: HumanoidWorldSnapshot,
+  progress: HumanoidGoalProgress = createHumanoidGoalProgress(goal, world)
 ): HumanoidCheckerResult {
-  const checks = goal.predicates.map((predicate, index) => {
+  return inspectHumanoidGoal(goal, scenario, world, progress);
+}
+
+function assertProgressIdentity(
+  goal: Goal,
+  rawProgress: HumanoidGoalProgress
+): HumanoidGoalProgress {
+  const progress = HumanoidGoalProgressSchema.parse(rawProgress);
+  if (progress.goal_sha256 !== goalSha256(goal)) {
+    throw new Error("Humanoid goal progress belongs to another goal");
+  }
+  if (progress.predicate_count !== goal.predicates.length) {
+    throw new Error("Humanoid goal progress predicate count does not match the goal");
+  }
+  for (let index = 0; index < goal.predicates.length; index += 1) {
+    const predicate = goal.predicates[index]!;
+    const streak = progress.predicate_streaks[index]!;
+    if (predicate.type === "end_effector_at") {
+      if (streak > predicate.stable_frames) {
+        throw new Error(`Humanoid goal predicate ${index} has an impossible stability streak`);
+      }
+    } else if (streak !== 0) {
+      throw new Error(`Humanoid goal predicate ${index} cannot carry temporal progress`);
+    }
+  }
+  return progress;
+}
+
+function checkerResult(
+  goal: Goal,
+  world: HumanoidWorldSnapshot,
+  evaluations: readonly PredicateEvaluation[],
+  progress: HumanoidGoalProgress
+): HumanoidCheckerResult {
+  const checks = evaluations.map((evaluation, index) => {
+    const predicate = goal.predicates[index]!;
+    if (predicate.type !== "end_effector_at") {
+      return check(evaluation.name, evaluation.satisfied, evaluation.actual);
+    }
+    const currentStableFrames = progress.predicate_streaks[index]!;
+    return check(
+      evaluation.name,
+      evaluation.satisfied && currentStableFrames >= predicate.stable_frames,
+      {
+        ...evaluation.actual,
+        satisfied: evaluation.satisfied,
+        current_stable_frames: currentStableFrames,
+        required_stable_frames: predicate.stable_frames
+      }
+    );
+  });
+  return {
+    success: checks.every((entry) => entry.passed),
+    goal,
+    worldFrame: world.frame,
+    worldRevision: world.worldRevision,
+    checks,
+    checkedAt: new Date().toISOString()
+  };
+}
+
+function evaluatePredicates(
+  goal: Goal,
+  scenario: Scenario,
+  world: HumanoidWorldSnapshot
+): PredicateEvaluation[] {
+  return goal.predicates.map((predicate, index) => {
     const name = `${index + 1}:${predicate.type}`;
     if (predicate.type === "robot_at") {
       const distance = planarDistance(world.robot.rootPosition, predicate.target);
-      return check(name, distance <= predicate.tolerance, {
+      return evaluation(name, distance <= predicate.tolerance, {
         distance,
         tolerance: predicate.tolerance,
         position: world.robot.rootPosition,
@@ -47,7 +225,7 @@ export function checkHumanoidGoal(
           <= zone.size.x / 2 + predicate.tolerance
         && Math.abs(world.robot.rootPosition.z - zone.center.z)
           <= zone.size.z / 2 + predicate.tolerance;
-      return check(name, inside, {
+      return evaluation(name, inside, {
         zone_id: predicate.zone_id,
         robot_position: world.robot.rootPosition,
         zone_center: zone?.center ?? null,
@@ -62,7 +240,7 @@ export function checkHumanoidGoal(
       const zone = scenario.zones.find((candidate) => candidate.id === predicate.zone_id);
       const inside = object !== undefined && descriptor !== undefined && zone !== undefined
         && objectInsideZone(object.position, descriptor.size, zone, predicate.tolerance);
-      return check(
+      return evaluation(
         name,
         object !== undefined && zone !== undefined && inside === predicate.expected,
         {
@@ -81,7 +259,7 @@ export function checkHumanoidGoal(
     if (predicate.type === "object_at") {
       const object = world.robot.objects[predicate.object_id];
       const distance = object ? distance3(object.position, predicate.target) : null;
-      return check(name, distance !== null && distance <= predicate.tolerance, {
+      return evaluation(name, distance !== null && distance <= predicate.tolerance, {
         object_id: predicate.object_id,
         position: object?.position ?? null,
         target: predicate.target,
@@ -89,20 +267,37 @@ export function checkHumanoidGoal(
         tolerance: predicate.tolerance
       });
     }
+    if (predicate.type === "end_effector_at") {
+      const position = humanoidEndEffectorPosition(
+        world.robot,
+        predicate.end_effector,
+        predicate.frame
+      );
+      const distance = position ? distance3(position, predicate.target) : null;
+      return evaluation(name, distance !== null && distance <= predicate.tolerance, {
+        end_effector: predicate.end_effector,
+        body: humanoidEndEffectorBody(predicate.end_effector),
+        frame: predicate.frame,
+        position,
+        target: predicate.target,
+        distance,
+        tolerance: predicate.tolerance
+      });
+    }
     return assertNever(predicate);
   });
-  return {
-    success: checks.every((entry) => entry.passed),
-    goal,
-    worldFrame: world.frame,
-    worldRevision: world.worldRevision,
-    checks,
-    checkedAt: new Date().toISOString()
-  };
 }
 
 function assertNever(value: never): never {
   throw new Error(`Unsupported humanoid goal predicate: ${JSON.stringify(value)}`);
+}
+
+function evaluation(
+  name: string,
+  satisfied: boolean,
+  actual: Record<string, unknown>
+): PredicateEvaluation {
+  return { name, satisfied, actual };
 }
 
 function check(name: string, passed: boolean, actual: unknown): {

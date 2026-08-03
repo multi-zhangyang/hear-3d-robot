@@ -5,6 +5,7 @@ import {
   failOpenNodes,
   humanoidActionReceiptFrom,
   humanoidCheckerFrom,
+  humanoidGoalProgressFrom,
   humanoidWorldSnapshotsFrom,
   latestProviderActivity,
   nextRuntimeEventCursor,
@@ -108,6 +109,22 @@ describe("humanoid payload guards", () => {
     expect(humanoidCheckerFrom({ success: true, worldFrame: 1, worldRevision: 1, checks: [] }))
       .not.toBeNull();
     expect(humanoidCheckerFrom({ success: true, checks: [] })).toBeNull();
+  });
+
+  it("accepts only aligned nonnegative goal stability arrays", () => {
+    const progress = {
+      version: 1,
+      goal_sha256: "a".repeat(64),
+      predicate_count: 2,
+      last_world_frame: 4,
+      last_world_revision: 4,
+      predicate_streaks: [0, 3]
+    };
+    expect(humanoidGoalProgressFrom(progress)).toEqual(progress);
+    expect(humanoidGoalProgressFrom({ ...progress, predicate_streaks: [0] }))
+      .toBeNull();
+    expect(humanoidGoalProgressFrom({ ...progress, predicate_streaks: [0, -1] }))
+      .toBeNull();
   });
 
   it("accepts only a structured context memory envelope", () => {

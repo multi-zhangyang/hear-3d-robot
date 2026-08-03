@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { ScenarioSchema, type JsonValue } from "../../domain/schema.js";
+import {
+  HUMANOID_END_EFFECTORS,
+  ScenarioSchema,
+  type JsonValue
+} from "../../domain/schema.js";
+import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.js";
 import { HumanoidWorld } from "../../world/humanoid/world.js";
+import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
 import { HumanoidActionRuntime } from "./runtime.js";
 
 const scenario = ScenarioSchema.parse({
@@ -23,6 +29,89 @@ const scenario = ScenarioSchema.parse({
 });
 
 describe("HumanoidActionRuntime", () => {
+  it("bounds completed transaction history while preserving recent idempotency", async () => {
+    const lightweight = lightweightObservationWorld();
+    const runtime = new HumanoidActionRuntime(lightweight.world);
+    const transactionCount = 30_000;
+
+    for (let index = 0; index < transactionCount; index += 1) {
+      await runtime.invoke(
+        "observe_humanoid",
+        {},
+        `bounded-observation-${index}`,
+        "perception-agent"
+      );
+    }
+
+    const retained = Array.from({ length: transactionCount }, (_, index) => (
+      runtime.receipt(`bounded-observation-${index}`)
+    )).filter((receipt) => receipt !== undefined);
+    expect(retained).toHaveLength(MAX_CHECKPOINT_ACTION_RECEIPTS);
+    expect(runtime.receipt("bounded-observation-0")).toBeUndefined();
+    expect(runtime.receipt(`bounded-observation-${transactionCount - 1}`)).toBeDefined();
+
+    const callsBeforeRecentRetry = lightweight.observationCalls();
+    await runtime.invoke(
+      "observe_humanoid",
+      {},
+      `bounded-observation-${transactionCount - 1}`,
+      "perception-agent"
+    );
+    expect(lightweight.observationCalls()).toBe(callsBeforeRecentRetry);
+
+    await runtime.invoke(
+      "observe_humanoid",
+      {},
+      "bounded-observation-0",
+      "perception-agent"
+    );
+    expect(lightweight.observationCalls()).toBe(callsBeforeRecentRetry + 1);
+  }, 20_000);
+
+  it("keeps an accepted current plan outside the recent receipt window", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    const runtime = new HumanoidActionRuntime(world);
+    try {
+      const input = motionPlan("protected-current-motion", runtime.snapshot(), 0.01);
+      const plan = await runtime.invoke(
+        "plan_whole_body_motion",
+        input,
+        "protected-current-plan",
+        "motion-agent"
+      );
+      expect(plan.accepted).toBe(true);
+
+      for (let index = 0; index < MAX_CHECKPOINT_ACTION_RECEIPTS + 8; index += 1) {
+        await runtime.invoke(
+          "observe_humanoid",
+          {},
+          `later-observation-${index}`,
+          "perception-agent"
+        );
+      }
+
+      expect(runtime.receipt(plan.transactionId)).toEqual(plan);
+      expect(await runtime.invoke(
+        "plan_whole_body_motion",
+        input,
+        plan.transactionId,
+        "motion-agent"
+      )).toEqual(plan);
+      const execution = await runtime.invoke(
+        "execute_whole_body_motion",
+        { planning_transaction_id: plan.transactionId },
+        "protected-current-execution",
+        "executor-agent"
+      );
+      expect(execution).toMatchObject({
+        accepted: true,
+        code: "motion_completed"
+      });
+    } finally {
+      await world.dispose();
+    }
+  }, 30_000);
+
   it("emits authoritative, idempotent receipts for whole-body and navigation actions", async () => {
     const world = await HumanoidWorld.create(scenario);
     const frames: number[] = [];
@@ -47,6 +136,21 @@ describe("HumanoidActionRuntime", () => {
       const observationDetail = record(observation.detail);
       expect(Object.keys(record(observationDetail.joints))).toHaveLength(29);
       expect(record(observationDetail.key_links).head_link).toBeDefined();
+      expect(record(observationDetail.key_links).pelvis).toBeDefined();
+      expect(record(observationDetail.end_effectors)).toEqual(Object.fromEntries(
+        HUMANOID_END_EFFECTORS.map((endEffector) => [endEffector, {
+          world_position: humanoidEndEffectorPosition(
+            world.snapshot().robot,
+            endEffector,
+            "world"
+          ),
+          pelvis_relative_position: humanoidEndEffectorPosition(
+            world.snapshot().robot,
+            endEffector,
+            "pelvis"
+          )
+        }])
+      ));
       expect(record(observationDetail.sensor).id).toBe("head_sensor");
       expect(observationDetail.object_tokens).toEqual([]);
       expect(runtime.receipt("observe-1")).toEqual(observation);
@@ -124,6 +228,9 @@ describe("HumanoidActionRuntime", () => {
       expect(executed.frameCount).toBeGreaterThan(0);
       expect(executed.worldAfterRevision).toBeGreaterThan(executed.worldBeforeRevision);
       expect(frames).toHaveLength(executed.frameCount);
+      expect(world.checkpoint().reference.jointTrackingWeights?.every((value) => (
+        value === 0
+      ))).toBe(true);
 
       const stale = await runtime.invoke(
         "execute_whole_body_motion",
@@ -149,6 +256,8 @@ describe("HumanoidActionRuntime", () => {
             predicates: [{
               type: "root_near_point",
               body: null,
+              end_effector: null,
+              frame: null,
               object_id: null,
               zone_id: null,
               target: candidateTarget,
@@ -186,7 +295,7 @@ describe("HumanoidActionRuntime", () => {
         "candidate-plan",
         "motion-agent"
       );
-      expect(candidatePlan).toMatchObject({
+      expect(candidatePlan, JSON.stringify(candidatePlan.detail)).toMatchObject({
         accepted: true,
         code: "whole_body_candidates_validated"
       });
@@ -289,4 +398,43 @@ function record(value: JsonValue | undefined): Record<string, JsonValue> {
     throw new Error("Expected a JSON object");
   }
   return value;
+}
+
+function lightweightObservationWorld(): {
+  world: HumanoidWorld;
+  observationCalls: () => number;
+} {
+  let observationCalls = 0;
+  const world = {
+    snapshot: () => ({ frame: 0, worldRevision: 0 }),
+    consumablePlanIds: () => [],
+    observe: () => {
+      observationCalls += 1;
+      return {
+        frame: 0,
+        worldRevision: 0,
+        sensor: {
+          position: { x: 0, y: 1, z: 0 },
+          rotation: { x: 0, y: 0, z: 0, w: 1 },
+          maximumRange: 1,
+          horizontalFieldOfView: 1,
+          verticalFieldOfView: 1
+        },
+        robot: {
+          controller: {},
+          rootPosition: { x: 0, y: 0, z: 0 },
+          rootRotation: { x: 0, y: 0, z: 0, w: 1 },
+          fallen: false,
+          balance: {},
+          feet: {},
+          joints: {},
+          links: {},
+          contacts: []
+        },
+        objectTokens: [],
+        navigation: {}
+      };
+    }
+  } as unknown as HumanoidWorld;
+  return { world, observationCalls: () => observationCalls };
 }

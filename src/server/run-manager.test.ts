@@ -41,7 +41,14 @@ describe("RunManager event and process lifecycle", () => {
 
     const details = await manager.details(runId, { actions: 1, provider: 1, framework: 1 });
     expect(details.definition.runtime).toBe("humanoid_g1");
-    expect(details.checkpoint).toMatchObject({ version: 4, runtime: "humanoid_g1" });
+    expect(details.checkpoint).toMatchObject({
+      version: 5,
+      runtime: "humanoid_g1",
+      goal_progress: {
+        predicate_count: 1,
+        predicate_streaks: [0]
+      }
+    });
     expect(missionRunner.resumeHumanoidMission).not.toHaveBeenCalled();
   });
 

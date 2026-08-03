@@ -221,6 +221,50 @@ describe("HumanoidWorld", () => {
     }
   }, 30_000);
 
+  it("prunes old-revision orphan motions before checkpoint recovery", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    let resumed: HumanoidWorld | undefined;
+    try {
+      const orphan = await world.planWholeBodyMotion({
+        id: "old-revision-orphan",
+        intent: "保持平衡并轻微转动躯干",
+        duration_seconds: 0.4,
+        keyframes: [
+          { at_seconds: 0 },
+          { at_seconds: 0.4, torso_yaw: 0.02 }
+        ]
+      });
+      const selected = await world.planWholeBodyMotion({
+        id: "selected-current-motion",
+        intent: "保持平衡并完成当前躯干动作",
+        duration_seconds: 0.4,
+        keyframes: [
+          { at_seconds: 0 },
+          { at_seconds: 0.4, torso_yaw: 0.04 }
+        ]
+      });
+      expect(orphan.accepted).toBe(true);
+      expect(selected.accepted).toBe(true);
+      expect(world.consumablePlanIds()).toEqual([
+        orphan.planId,
+        selected.planId
+      ]);
+
+      const executed = await world.executeWholeBodyMotion(selected.planId);
+      expect(executed.accepted).toBe(true);
+      expect(world.consumablePlanIds()).toEqual([]);
+      const checkpoint = world.checkpoint();
+      expect(checkpoint.motions).toEqual([]);
+
+      resumed = await HumanoidWorld.create(scenario, checkpoint);
+      expect(resumed.consumablePlanIds()).toEqual([]);
+      expect(resumed.checkpoint().motions).toEqual([]);
+    } finally {
+      await resumed?.dispose();
+      await world.dispose();
+    }
+  }, 30_000);
+
   it("selects the first physically feasible model-ranked whole-body candidate", async () => {
     const world = await HumanoidWorld.create(scenario);
     try {

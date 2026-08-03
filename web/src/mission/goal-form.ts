@@ -4,11 +4,10 @@ export const predicateOptions = [
   { value: "robot_at", label: "机器人到达坐标" },
   { value: "robot_in_zone", label: "机器人进入区域" },
   { value: "object_in_zone", label: "物体位于区域" },
-  { value: "object_at", label: "物体到达坐标" }
+  { value: "object_at", label: "物体到达坐标" },
+  { value: "end_effector_at", label: "末端到达位置" }
 ] satisfies Array<{
-  value: Extract<GoalPredicate, {
-    type: "robot_at" | "robot_in_zone" | "object_in_zone" | "object_at";
-  }>["type"];
+  value: GoalPredicate["type"];
   label: string;
 }>;
 
@@ -20,7 +19,17 @@ export function emptyPredicate(type: GoalPredicate["type"]): GoalPredicate {
   if (type === "object_in_zone") {
     return { type, object_id: "", zone_id: "", expected: true, tolerance: 0.05 };
   }
-  return { type, object_id: "", target: { x: 0, y: 0, z: 0 }, tolerance: 0.1 };
+  if (type === "object_at") {
+    return { type, object_id: "", target: { x: 0, y: 0, z: 0 }, tolerance: 0.1 };
+  }
+  return {
+    type,
+    end_effector: "left_wrist",
+    frame: "pelvis",
+    target: { x: 0, y: 0, z: 0 },
+    tolerance: 0.05,
+    stable_frames: 5
+  };
 }
 
 export function validGoal(goal: Goal): boolean {
@@ -49,6 +58,14 @@ function validPredicate(predicate: GoalPredicate): boolean {
     return predicate.object_id.length > 0
       && predicate.zone_id.length > 0
       && predicate.tolerance >= 0;
+  }
+  if (predicate.type === "end_effector_at") {
+    return finiteVec3(predicate.target)
+      && predicate.tolerance > 0
+      && predicate.tolerance <= 5
+      && Number.isInteger(predicate.stable_frames)
+      && predicate.stable_frames >= 1
+      && predicate.stable_frames <= 500;
   }
   return predicate satisfies never;
 }

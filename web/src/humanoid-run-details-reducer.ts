@@ -12,6 +12,7 @@ import {
   failOpenNodes,
   humanoidActionReceiptFrom,
   humanoidCheckerFrom,
+  humanoidGoalProgressFrom,
   taskNodesFrom,
   upsertHumanoidAction,
   upsertRuntimeJournalEntry
@@ -122,6 +123,33 @@ export function reduceHumanoidRunDetails(input: HumanoidReducerInput): HumanoidR
         ...next,
         checkpoint: { ...next.checkpoint, embodied_memory: memory, updated_at: event.at }
       } : next;
+    }
+
+    case "humanoid_world_frame": {
+      const checker = humanoidCheckerFrom(data?.checker);
+      const progress = humanoidGoalProgressFrom(data?.goal_progress);
+      const frame = next.checkpoint.world.frame;
+      const revision = next.checkpoint.world.worldRevision;
+      const alignedChecker = checker
+        && checker.worldFrame === frame
+        && checker.worldRevision === revision
+        ? checker
+        : null;
+      const alignedProgress = progress
+        && progress.last_world_frame === frame
+        && progress.last_world_revision === revision
+        ? progress
+        : null;
+      if (!alignedChecker && !alignedProgress) return next;
+      return {
+        ...next,
+        checkpoint: {
+          ...next.checkpoint,
+          checker: alignedChecker ?? next.checkpoint.checker,
+          ...(alignedProgress ? { goal_progress: alignedProgress } : {}),
+          updated_at: event.at
+        }
+      };
     }
 
     case "humanoid_action_committed": {

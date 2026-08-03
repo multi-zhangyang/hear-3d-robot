@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { Vec3Schema } from "../../domain/schema.js";
+import {
+  HumanoidEndEffectorSchema,
+  Vec3Schema
+} from "../../domain/schema.js";
 import { HUMANOID_BODY_NAMES } from "../../world/humanoid/model.js";
 import {
   duplicateHumanoidMotionCandidateIndexes,
@@ -11,6 +14,7 @@ import {
 const PredicateTypeSchema = z.enum([
   "root_near_point",
   "body_near_point",
+  "end_effector_near_point",
   "body_contact_object",
   "object_near_point",
   "object_in_zone"
@@ -20,6 +24,10 @@ const ModelMotionPredicateSchema = z.object({
   type: PredicateTypeSchema,
   body: z.enum(HUMANOID_BODY_NAMES).nullable()
     .describe("仅身体谓词使用，否则填 null"),
+  end_effector: HumanoidEndEffectorSchema.nullable()
+    .describe("仅末端谓词使用，否则填 null"),
+  frame: z.enum(["world", "pelvis"]).nullable()
+    .describe("仅末端谓词使用，否则填 null"),
   object_id: z.string().trim().min(1).nullable()
     .describe("仅物体谓词使用，否则填 null"),
   zone_id: z.string().trim().min(1).nullable()
@@ -125,6 +133,8 @@ type ModelMotionOption = z.infer<typeof ModelMotionOptionSchema>;
 
 const PREDICATE_VALUE_FIELDS = [
   "body",
+  "end_effector",
+  "frame",
   "object_id",
   "zone_id",
   "target",
@@ -187,6 +197,15 @@ function normalizePredicate(predicate: ModelMotionPredicate): unknown {
       tolerance_m: predicate.tolerance_m
     };
   }
+  if (predicate.type === "end_effector_near_point") {
+    return {
+      type: predicate.type,
+      end_effector: predicate.end_effector,
+      frame: predicate.frame,
+      target: predicate.target,
+      tolerance_m: predicate.tolerance_m
+    };
+  }
   if (predicate.type === "body_contact_object") {
     return {
       type: predicate.type,
@@ -236,6 +255,14 @@ function requiredPredicateFields(
   if (type === "root_near_point") return new Set(["target", "tolerance_m"]);
   if (type === "body_near_point") {
     return new Set(["body", "target", "tolerance_m"]);
+  }
+  if (type === "end_effector_near_point") {
+    return new Set([
+      "end_effector",
+      "frame",
+      "target",
+      "tolerance_m"
+    ]);
   }
   if (type === "body_contact_object") {
     return new Set(["body", "object_id", "minimum_normal_force"]);

@@ -1,4 +1,8 @@
-import type { JsonValue } from "../../domain/schema.js";
+import {
+  HUMANOID_END_EFFECTORS,
+  type JsonValue
+} from "../../domain/schema.js";
+import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.js";
 import type { HumanoidBodyChannel } from "../../world/humanoid/motion-plan.js";
 import {
   type HumanoidFrameSink,
@@ -10,6 +14,7 @@ import {
   HumanoidActionInputs,
   type HumanoidActionName
 } from "./actions.js";
+import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
 import { normalizeHumanoidMotionCandidateBatchInput } from "./motion-candidate-input.js";
 
 type HumanoidPlanningActionName = "plan_whole_body_motion"
@@ -48,6 +53,7 @@ export class HumanoidActionRuntime {
     promise: Promise<HumanoidActionReceipt>;
   }>();
   readonly #planChannels = new Map<string, HumanoidBodyChannel[]>();
+  readonly #inFlightTransactions = new Set<string>();
 
   constructor(world: HumanoidWorld, options: HumanoidActionRuntimeOptions = {}) {
     this.#world = world;
@@ -77,6 +83,7 @@ export class HumanoidActionRuntime {
         }
       }
     }
+    this.#pruneTransactionHistory();
   }
 
   snapshot(): HumanoidWorldSnapshot {
@@ -108,6 +115,7 @@ export class HumanoidActionRuntime {
       }
       return structuredClone(await existing.promise);
     }
+    this.#inFlightTransactions.add(normalizedTransactionId);
     const promise = this.#invokeOnce(
       name,
       rawInput,
@@ -123,6 +131,41 @@ export class HumanoidActionRuntime {
         this.#transactions.delete(normalizedTransactionId);
       }
       throw error;
+    } finally {
+      this.#inFlightTransactions.delete(normalizedTransactionId);
+      this.#pruneTransactionHistory();
+    }
+  }
+
+  #pruneTransactionHistory(): void {
+    const activePlanIds = new Set(this.#world.consumablePlanIds());
+    const protectedTransactions = new Set(this.#inFlightTransactions);
+    for (const [transactionId, receipt] of this.#receipts) {
+      const planId = planIdFromReceipt(receipt);
+      if (receipt.accepted
+        && isPlanningAction(receipt.action)
+        && planId !== undefined
+        && activePlanIds.has(planId)) {
+        protectedTransactions.add(transactionId);
+      }
+    }
+    const recentTransactions = new Set(
+      [...this.#receipts.keys()].slice(-MAX_CHECKPOINT_ACTION_RECEIPTS)
+    );
+    for (const transactionId of this.#receipts.keys()) {
+      if (!recentTransactions.has(transactionId)
+        && !protectedTransactions.has(transactionId)) {
+        this.#receipts.delete(transactionId);
+      }
+    }
+    for (const transactionId of this.#transactions.keys()) {
+      if (!this.#receipts.has(transactionId)
+        && !protectedTransactions.has(transactionId)) {
+        this.#transactions.delete(transactionId);
+      }
+    }
+    for (const planId of this.#planChannels.keys()) {
+      if (!activePlanIds.has(planId)) this.#planChannels.delete(planId);
     }
   }
 
@@ -244,6 +287,22 @@ export class HumanoidActionRuntime {
       );
       if (!reference.accepted) return reference.result;
       const channels = this.#planChannels.get(reference.planId) ?? [];
+      if (!this.#world.consumablePlanIds().includes(reference.planId)) {
+        this.#planChannels.delete(reference.planId);
+        return {
+          accepted: false,
+          code: "plan_stale",
+          channels,
+          detail: {
+            planning_transaction_id: input.planning_transaction_id,
+            planning_action: reference.planningAction,
+            ...reference.candidateSelection,
+            plan_id: reference.planId,
+            automatic_actuation: false,
+            reason: "validated plan is no longer consumable at the current world revision"
+          }
+        };
+      }
       const result = await this.#world.executeWholeBodyMotion(reference.planId, this.#frameSink);
       this.#planChannels.delete(reference.planId);
       return {
@@ -287,6 +346,21 @@ export class HumanoidActionRuntime {
       ["plan_humanoid_navigation"]
     );
     if (!reference.accepted) return reference.result;
+    if (!this.#world.consumablePlanIds().includes(reference.planId)) {
+      this.#planChannels.delete(reference.planId);
+      return {
+        accepted: false,
+        code: "plan_stale",
+        channels: ["locomotion"],
+        detail: {
+          planning_transaction_id: input.planning_transaction_id,
+          planning_action: reference.planningAction,
+          plan_id: reference.planId,
+          automatic_actuation: false,
+          reason: "validated route is no longer consumable at the current world revision"
+        }
+      };
+    }
     const result = await this.#world.executeNavigation(reference.planId, this.#frameSink);
     this.#planChannels.delete(reference.planId);
     return {
@@ -384,6 +458,17 @@ export class HumanoidActionRuntime {
   }
 }
 
+function isPlanningAction(action: HumanoidActionName): action is HumanoidPlanningActionName {
+  return action === "plan_whole_body_motion"
+    || action === "plan_whole_body_motion_candidates"
+    || action === "plan_humanoid_navigation";
+}
+
+function planIdFromReceipt(receipt: HumanoidActionReceipt): string | undefined {
+  const planId = jsonObject(receipt.detail)?.plan_id;
+  return typeof planId === "string" && planId ? planId : undefined;
+}
+
 function modelObservation(snapshot: HumanoidWorldObservation): unknown {
   const robot = snapshot.robot;
   return {
@@ -407,6 +492,7 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
     feet: robot.feet,
     joints: robot.joints,
     key_links: Object.fromEntries([
+      "pelvis",
       "head_link",
       "torso_link",
       "left_ankle_roll_link",
@@ -416,6 +502,13 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
     ].flatMap((name) => robot.links[name as keyof typeof robot.links]
       ? [[name, robot.links[name as keyof typeof robot.links]]]
       : [])),
+    end_effectors: Object.fromEntries(HUMANOID_END_EFFECTORS.map((endEffector) => [
+      endEffector,
+      {
+        world_position: humanoidEndEffectorPosition(robot, endEffector, "world"),
+        pelvis_relative_position: humanoidEndEffectorPosition(robot, endEffector, "pelvis")
+      }
+    ])),
     object_tokens: snapshot.objectTokens.map((token) => ({
       id: token.id,
       role: token.role,

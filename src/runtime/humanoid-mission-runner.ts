@@ -8,6 +8,10 @@ import {
 import type { ProviderConfig, RuntimeCatalog } from "../config/load.js";
 import type { Goal } from "../domain/schema.js";
 import { LongRunContextManager } from "../harness/context-compaction.js";
+import type {
+  ModelProgressSnapshot,
+  ModelTelemetryRuntime
+} from "../harness/context-runtime.js";
 import {
   AgentsSdkContextSummaryGenerator,
   isContextCompactionInterruption
@@ -184,6 +188,12 @@ async function executeHumanoidMission(input: {
       onModelResponseCompleted: () => onModelResponseCompleted(agentId)
     })
   });
+  const modelTelemetryRuntime: ModelTelemetryRuntime = {
+    rootAgentId: input.runtime.rootAgentId,
+    activeNode: (agentId) => input.runtime.activeNode(agentId),
+    recordModelCallStarted: (agentId) => input.runtime.recordModelCallStarted(agentId),
+    modelProgressSnapshot: () => humanoidModelProgressSnapshot(input.runtime)
+  };
 
   const persistAgentEvent = async (
     agentId: string,
@@ -195,7 +205,7 @@ async function executeHumanoidMission(input: {
   const hierarchy = createHumanoidAgentHierarchy({
     createModel: (agentId) => withModelTelemetry(
       createConfiguredModel(input.provider),
-      input.runtime,
+      modelTelemetryRuntime,
       agentId,
       onModelResponseCompleted
     ),
@@ -292,6 +302,7 @@ async function executeHumanoidMission(input: {
             recovery_attempt: decisionRecoveries,
             maximum_recoveries: MAX_MODEL_DECISION_RECOVERIES,
             error: error.message,
+            ...(error.evidence ? { stall_evidence: error.evidence } : {}),
             automatic_actuation: false
           }, error.agentId);
           serializedState = undefined;
@@ -338,6 +349,27 @@ async function executeHumanoidMission(input: {
     }
     throw error;
   }
+}
+
+function humanoidModelProgressSnapshot(
+  runtime: HumanoidRunRuntime
+): ModelProgressSnapshot {
+  const checkpoint = runtime.checkpoint;
+  return {
+    worldRevision: checkpoint.world.worldRevision,
+    cycleIndex: checkpoint.cycle_index,
+    checkerSuccess: checkpoint.checker?.success ?? false,
+    receipts: Object.values(checkpoint.committed_actions).map((receipt) => ({
+      transactionId: receipt.transactionId,
+      agentId: receipt.agentId,
+      action: receipt.action,
+      accepted: receipt.accepted,
+      code: receipt.code,
+      worldBeforeRevision: receipt.worldBeforeRevision,
+      worldAfterRevision: receipt.worldAfterRevision,
+      frameCount: receipt.frameCount
+    }))
+  };
 }
 
 async function persistStreamEvent(
@@ -389,6 +421,12 @@ function assertCycleOutput(output: string | undefined): asserts output is string
 
 function humanoidCheckpointFingerprint(checkpoint: {
   world: { frame: number; worldRevision: number };
+  goal_progress: {
+    goal_sha256: string;
+    last_world_frame: number;
+    last_world_revision: number;
+    predicate_streaks: number[];
+  };
   committed_actions: Record<string, unknown>;
   context_memory: { total_compactions: number };
   cycle_index: number;
@@ -396,6 +434,7 @@ function humanoidCheckpointFingerprint(checkpoint: {
   return createHash("sha256").update(JSON.stringify({
     frame: checkpoint.world.frame,
     worldRevision: checkpoint.world.worldRevision,
+    goalProgress: checkpoint.goal_progress,
     committedActions: Object.keys(checkpoint.committed_actions).sort(),
     totalCompactions: checkpoint.context_memory.total_compactions,
     cycleIndex: checkpoint.cycle_index

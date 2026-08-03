@@ -6,7 +6,10 @@ import {
   HUMANOID_JOINT_NAMES,
   YAHMP_POLICY
 } from "./model.js";
-import type { HumanoidReference } from "./reference.js";
+import {
+  assertHumanoidReference,
+  type HumanoidReference
+} from "./reference.js";
 import type {
   HumanoidControllerDescriptor,
   HumanoidControllerState,
@@ -18,6 +21,8 @@ import type {
 const POLICY_PATH = fileURLToPath(
   new URL("../../../assets/humanoid/controllers/g1_yahmp.onnx", import.meta.url)
 );
+
+const EXPLICIT_TRACKING_STIFFNESS = 240;
 
 const YahmpControllerStatePayloadSchema = z.object({
   previous_action: z.array(z.number().finite()).length(HUMANOID_JOINT_NAMES.length),
@@ -82,13 +87,21 @@ export class YahmpController implements HumanoidWholeBodyController {
       throw new Error("YAHMP returned an invalid whole-body action tensor");
     }
     this.#previousAction = action.slice();
+    const stiffness = Float64Array.from(YAHMP_POLICY.stiffness, (value, index) => {
+      const target = Math.max(value, EXPLICIT_TRACKING_STIFFNESS);
+      return value + (target - value) * reference.jointTrackingWeights[index]!;
+    });
     return {
       kind: "joint_position_pd",
       positions: Float64Array.from(action, (value, index) => (
-        reference.jointPositions[index]! + value * YAHMP_POLICY.actionScale[index]!
+        reference.jointPositions[index]!
+        + value * YAHMP_POLICY.actionScale[index]!
+          * (1 - reference.jointTrackingWeights[index]!)
       )),
-      stiffness: Float64Array.from(YAHMP_POLICY.stiffness),
-      damping: Float64Array.from(YAHMP_POLICY.damping)
+      stiffness,
+      damping: Float64Array.from(YAHMP_POLICY.damping, (value, index) => (
+        value * Math.sqrt(stiffness[index]! / YAHMP_POLICY.stiffness[index]!)
+      ))
     };
   }
 
@@ -133,6 +146,7 @@ export class YahmpController implements HumanoidWholeBodyController {
     state: HumanoidPolicyState,
     reference: HumanoidReference
   ): Float32Array {
+    assertHumanoidReference(reference);
     if (state.jointPositions.length !== HUMANOID_JOINT_NAMES.length
       || state.jointVelocities.length !== HUMANOID_JOINT_NAMES.length) {
       throw new Error("Humanoid policy state has an invalid joint count");

@@ -41,8 +41,11 @@ test("原生任务编辑器保持完整目标建模与键盘交互", async ({ pa
   await dialog.getByLabel("确认完成条件").check();
   await expect(start).toBeEnabled();
 
-  await dialog.getByLabel("添加完成条件").selectOption("robot_at");
+  await dialog.getByLabel("添加完成条件").selectOption("end_effector_at");
   await expect(dialog.locator(".predicate-row")).toHaveCount(2);
+  await expect(dialog.getByLabel("关键部位")).toHaveValue("left_wrist");
+  await expect(dialog.getByLabel("坐标系")).toHaveValue("pelvis");
+  await expect(dialog.getByLabel("连续稳定帧")).toHaveValue("5");
   await expect(start).toBeDisabled();
   await dialog.getByRole("button", { name: "删除条件 2" }).click();
   await dialog.getByLabel("确认完成条件").check();

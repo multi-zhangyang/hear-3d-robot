@@ -7,6 +7,7 @@ import {
   modelOutputLabel,
   motionGeneratorLabel,
   nodeResultLabel,
+  predicateLabel,
   resultCodeLabel
 } from "./ui-text";
 import type { TaskNode } from "./types";
@@ -45,6 +46,17 @@ describe("中文界面文案", () => {
     expect(motionGeneratorLabel("unknown_backend")).toBe("运动生成器");
     expect(humanoidControllerLabel("yahmp_onnx")).toBe("YAHMP");
     expect(humanoidControllerLabel("sonic_onnx")).toBe("SONIC");
+  });
+
+  it("完整显示具名末端的三维目标", () => {
+    expect(predicateLabel({
+      type: "end_effector_at",
+      end_effector: "right_wrist",
+      frame: "pelvis",
+      target: { x: -0.25, y: 0.3, z: 0.15 },
+      tolerance: 0.05,
+      stable_frames: 5
+    })).toBe("右手腕到达骨盆相对 [-0.25, 0.30, 0.15]");
   });
 
   it("从结构化模型结果中只展示真实摘要", () => {

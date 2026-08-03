@@ -23,6 +23,22 @@ describe("goal validation", () => {
           object_id: "courtyard_crate",
           target: { x: 4.5, y: 0.25, z: 5.5 },
           tolerance: 0.1
+        },
+        {
+          type: "end_effector_at",
+          end_effector: "left_wrist",
+          frame: "world",
+          target: { x: 3, y: 1, z: 3 },
+          tolerance: 0.05,
+          stable_frames: 4
+        },
+        {
+          type: "end_effector_at",
+          end_effector: "right_ankle",
+          frame: "pelvis",
+          target: { x: -0.1, y: -0.7, z: 0.15 },
+          tolerance: 0.04,
+          stable_frames: 3
         }
       ]
     }, scenario)).not.toThrow();
@@ -59,5 +75,29 @@ describe("goal validation", () => {
         tolerance: 0
       }]
     }, scenario)).toThrow("Unknown zone: missing_zone");
+
+    expect(() => assertGoalSupported({
+      summary: "越界末端目标",
+      predicates: [{
+        type: "end_effector_at",
+        end_effector: "right_wrist",
+        frame: "world",
+        target: { x: -0.1, y: 1, z: 2 },
+        tolerance: 0.05,
+        stable_frames: 3
+      }]
+    }, scenario)).toThrow("End-effector world target is outside the world bounds");
+
+    expect(() => assertGoalSupported({
+      summary: "骨盆相对坐标允许负值",
+      predicates: [{
+        type: "end_effector_at",
+        end_effector: "right_wrist",
+        frame: "pelvis",
+        target: { x: -0.25, y: -0.1, z: 0.1 },
+        tolerance: 0.05,
+        stable_frames: 3
+      }]
+    }, scenario)).not.toThrow();
   });
 });

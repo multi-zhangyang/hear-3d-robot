@@ -1,6 +1,7 @@
 import type {
   Bootstrap,
   GoalPredicate,
+  HumanoidEndEffector,
   Vec3
 } from "../types";
 import { entityLabel } from "../ui-text";
@@ -11,6 +12,24 @@ interface PredicateFieldsProps {
   scenario: Bootstrap["scenarios"][number];
   onChange: (predicate: GoalPredicate) => void;
 }
+
+const END_EFFECTOR_OPTIONS: Array<{
+  value: HumanoidEndEffector;
+  label: string;
+}> = [
+  { value: "left_wrist", label: "左手腕" },
+  { value: "right_wrist", label: "右手腕" },
+  { value: "left_ankle", label: "左脚踝" },
+  { value: "right_ankle", label: "右脚踝" }
+];
+
+const END_EFFECTOR_FRAME_OPTIONS: Array<{
+  value: "pelvis" | "world";
+  label: string;
+}> = [
+  { value: "pelvis", label: "骨盆相对" },
+  { value: "world", label: "世界坐标" }
+];
 
 export function PredicateFields(props: PredicateFieldsProps): React.JSX.Element {
   const { predicate, scenario, onChange } = props;
@@ -108,6 +127,45 @@ export function PredicateFields(props: PredicateFieldsProps): React.JSX.Element 
       </FieldStack>
     );
   }
+  if (predicate.type === "end_effector_at") {
+    return (
+      <FieldStack>
+        <div className="mission-field-pair">
+          <SelectControl
+            label="关键部位"
+            value={predicate.end_effector}
+            options={END_EFFECTOR_OPTIONS}
+            onChange={(end_effector) => onChange({ ...predicate, end_effector })}
+          />
+          <SelectControl
+            label="坐标系"
+            value={predicate.frame}
+            options={END_EFFECTOR_FRAME_OPTIONS}
+            onChange={(frame) => onChange({ ...predicate, frame })}
+          />
+        </div>
+        <CoordinateInput
+          label={predicate.frame === "pelvis" ? "骨盆相对坐标" : "世界坐标"}
+          value={predicate.target}
+          onChange={(target) => onChange({ ...predicate, target })}
+        />
+        <div className="mission-field-pair mission-field-pair-compact">
+          <ToleranceInput
+            value={predicate.tolerance}
+            onChange={(tolerance) => onChange({ ...predicate, tolerance })}
+          />
+          <NumberControl
+            label="连续稳定帧"
+            min={1}
+            max={500}
+            step={1}
+            value={predicate.stable_frames}
+            onChange={(stable_frames) => onChange({ ...predicate, stable_frames })}
+          />
+        </div>
+      </FieldStack>
+    );
+  }
   return predicate satisfies never;
 }
 
@@ -116,12 +174,13 @@ function FieldStack(props: { children: React.ReactNode }): React.JSX.Element {
 }
 
 function CoordinateInput(props: {
+  label?: string;
   value: Vec3;
   onChange: (value: Vec3) => void;
 }): React.JSX.Element {
   return (
     <fieldset className="mission-coordinate-field">
-      <legend>目标坐标</legend>
+      <legend>{props.label ?? "目标坐标"}</legend>
       <div className="mission-coordinate-grid">
         {(["x", "y", "z"] as const).map((axis) => (
           <NumberControl
@@ -152,19 +211,19 @@ function ToleranceInput(props: {
   );
 }
 
-function SelectControl(props: {
+function SelectControl<T extends string>(props: {
   label: string;
-  value: string;
+  value: T;
   placeholder?: string;
-  options: Array<{ value: string; label: string }>;
-  onChange: (value: string) => void;
+  options: Array<{ value: T; label: string }>;
+  onChange: (value: T) => void;
 }): React.JSX.Element {
   return (
     <label className="mission-control">
       <span>{props.label}</span>
       <select
         value={props.value}
-        onChange={(event) => props.onChange(event.currentTarget.value)}
+        onChange={(event) => props.onChange(event.currentTarget.value as T)}
       >
         {props.placeholder && <option value="">{props.placeholder}</option>}
         {props.options.map((option) => (

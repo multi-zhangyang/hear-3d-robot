@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import {
+  HumanoidReferenceStateSchema,
+  hydrateHumanoidReference,
   humanoidMotionArtifactSha256,
   humanoidMotionArtifactSummary,
   serializeHumanoidReference,
   type HumanoidMotionArtifact
 } from "./motion-artifact.js";
+import { HUMANOID_JOINT_NAMES } from "./model.js";
 import { neutralHumanoidReference } from "./reference.js";
 
 describe("humanoid motion artifact identity", () => {
@@ -19,6 +23,47 @@ describe("humanoid motion artifact identity", () => {
     expect(humanoidMotionArtifactSha256(repeated)).toBe(hash);
     expect(humanoidMotionArtifactSha256(changed)).not.toBe(hash);
     expect(humanoidMotionArtifactSummary(artifact).sha256).toBe(hash);
+  });
+
+  it("serializes tracking weights and restores them exactly", () => {
+    const reference = neutralHumanoidReference();
+    reference.jointTrackingWeights[3] = 0.4;
+    reference.jointTrackingWeights[15] = 1;
+
+    const serialized = serializeHumanoidReference(reference);
+    const hydrated = hydrateHumanoidReference(serialized);
+
+    expect(serialized.jointTrackingWeights).toEqual([...reference.jointTrackingWeights]);
+    expect([...hydrated.jointTrackingWeights]).toEqual([...reference.jointTrackingWeights]);
+  });
+
+  it("explicitly migrates legacy references to autonomous residual authority", () => {
+    const legacy = serializeHumanoidReference(neutralHumanoidReference());
+    delete legacy.jointTrackingWeights;
+    const encoded = JSON.stringify(legacy);
+
+    const parsed = HumanoidReferenceStateSchema.parse(legacy);
+    const hydrated = hydrateHumanoidReference(parsed);
+
+    expect(JSON.stringify(parsed)).toBe(encoded);
+    expect([...hydrated.jointTrackingWeights]).toEqual(
+      Array.from({ length: HUMANOID_JOINT_NAMES.length }, () => 0)
+    );
+  });
+
+  it("preserves legacy artifact hashes while rejecting invalid new weights", () => {
+    const legacy = motionArtifact();
+    for (const frame of legacy.frames) delete frame.reference.jointTrackingWeights;
+    const expectedLegacyHash = createHash("sha256")
+      .update(JSON.stringify(legacy))
+      .digest("hex");
+    expect(humanoidMotionArtifactSha256(legacy)).toBe(expectedLegacyHash);
+
+    const invalid = serializeHumanoidReference(neutralHumanoidReference());
+    invalid.jointTrackingWeights![0] = 1.01;
+    expect(() => HumanoidReferenceStateSchema.parse(invalid)).toThrow();
+    invalid.jointTrackingWeights = new Array(HUMANOID_JOINT_NAMES.length - 1).fill(0);
+    expect(() => HumanoidReferenceStateSchema.parse(invalid)).toThrow();
   });
 });
 

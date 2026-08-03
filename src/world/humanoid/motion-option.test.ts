@@ -15,8 +15,20 @@ import {
 const robot: HumanoidMotionOptionRobotSnapshot = {
   rootPosition: { x: 1, y: 0.8, z: 2 },
   links: {
+    pelvis: {
+      position: { x: 1, y: 0.8, z: 2 },
+      rotation: {
+        x: 0,
+        y: Math.SQRT1_2,
+        z: 0,
+        w: Math.SQRT1_2
+      }
+    },
     left_wrist_yaw_link: {
       position: { x: 1.2, y: 1.1, z: 2.4 }
+    },
+    right_wrist_yaw_link: {
+      position: { x: 1.4, y: 1.1, z: 1.8 }
     }
   },
   contacts: [{
@@ -78,7 +90,7 @@ const contract: HumanoidMotionOptionContract = {
 };
 
 describe("humanoid motion option detector", () => {
-  it("validates all five physical predicate contracts and stable steps", () => {
+  it("validates physical predicate contracts and stable steps", () => {
     expect(HumanoidMotionOptionContractSchema.parse(contract)).toEqual({
       ...contract,
       phases: null
@@ -103,6 +115,82 @@ describe("humanoid motion option detector", () => {
         tolerance_m: 0.1
       }]
     })).toThrow();
+  });
+
+  it("evaluates named end effectors in world and pelvis frames", () => {
+    const endEffectorContract: HumanoidMotionOptionContract = {
+      option_id: "right-hand-frame-check",
+      stable_steps: 2,
+      predicates: [
+        {
+          type: "end_effector_near_point",
+          end_effector: "right_wrist",
+          frame: "world",
+          target: { x: 1.4, y: 1.1, z: 1.8 },
+          tolerance_m: 0.001
+        },
+        {
+          type: "end_effector_near_point",
+          end_effector: "right_wrist",
+          frame: "pelvis",
+          target: { x: 0.2, y: 0.3, z: 0.4 },
+          tolerance_m: 0.001
+        }
+      ]
+    };
+
+    const detection = detectHumanoidMotionOption(endEffectorContract, {
+      snapshot: robot,
+      observableObjects: [],
+      zones: []
+    });
+
+    expect(detection.allSatisfied).toBe(true);
+    expect(detection.evidence).toEqual([
+      expect.objectContaining({
+        type: "end_effector_near_point",
+        frame: "world",
+        endEffector: "right_wrist",
+        actualPosition: { x: 1.4, y: 1.1, z: 1.8 },
+        status: "satisfied"
+      }),
+      expect.objectContaining({
+        type: "end_effector_near_point",
+        frame: "pelvis",
+        endEffector: "right_wrist",
+        actualPosition: {
+          x: expect.closeTo(0.2, 10),
+          y: expect.closeTo(0.3, 10),
+          z: expect.closeTo(0.4, 10)
+        },
+        status: "satisfied"
+      })
+    ]);
+  });
+
+  it("fails closed when a pelvis-relative frame cannot be observed", () => {
+    const endEffectorContract: HumanoidMotionOptionContract = {
+      option_id: "missing-pelvis-frame",
+      stable_steps: 1,
+      predicates: [{
+        type: "end_effector_near_point",
+        end_effector: "left_wrist",
+        frame: "pelvis",
+        target: { x: 0, y: 0, z: 0 },
+        tolerance_m: 0.1
+      }]
+    };
+    const detection = detectHumanoidMotionOption(endEffectorContract, {
+      snapshot: { ...robot, links: { left_wrist_yaw_link: robot.links.left_wrist_yaw_link! } },
+      observableObjects: [],
+      zones: []
+    });
+
+    expect(detection.status).toBe("uncertain");
+    expect(detection.evidence[0]).toMatchObject({
+      actualPosition: null,
+      reason: "end_effector_snapshot_missing"
+    });
   });
 
   it("accepts only bounded predicate-index condition ASTs", () => {

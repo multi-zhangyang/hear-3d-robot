@@ -28,12 +28,22 @@ export const QuaternionSchema = z.object({
 }).strict();
 export type Quaternion = z.infer<typeof QuaternionSchema>;
 
+export const HUMANOID_END_EFFECTORS = [
+  "left_wrist",
+  "right_wrist",
+  "left_ankle",
+  "right_ankle"
+] as const;
+
+export const HumanoidEndEffectorSchema = z.enum(HUMANOID_END_EFFECTORS);
+export type HumanoidEndEffector = z.infer<typeof HumanoidEndEffectorSchema>;
+
 const Size3Schema = Vec3Schema.refine(
   ({ x, y, z: depth }) => x > 0 && y > 0 && depth > 0,
   "size components must be positive"
 );
 
-const GoalPredicateSchema = z.discriminatedUnion("type", [
+export const GoalPredicateSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("robot_at"),
     target: Vec3Schema,
@@ -56,8 +66,17 @@ const GoalPredicateSchema = z.discriminatedUnion("type", [
     object_id: z.string().trim().min(1),
     target: Vec3Schema,
     tolerance: z.number().finite().positive()
+  }).strict(),
+  z.object({
+    type: z.literal("end_effector_at"),
+    end_effector: HumanoidEndEffectorSchema,
+    frame: z.enum(["world", "pelvis"]),
+    target: Vec3Schema,
+    tolerance: z.number().finite().positive().max(5),
+    stable_frames: z.number().int().min(1).max(500)
   }).strict()
 ]);
+export type GoalPredicate = z.infer<typeof GoalPredicateSchema>;
 
 export const GoalSchema = z.object({
   summary: z.string().trim().min(1),

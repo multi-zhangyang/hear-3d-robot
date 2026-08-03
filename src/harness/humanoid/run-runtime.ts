@@ -18,7 +18,11 @@ import {
   reconcileLifecycleOutbox
 } from "../../persistence/lifecycle-outbox.js";
 import type { RuntimeEvent, RuntimeEventSink } from "../../runtime/events.js";
-import { checkHumanoidGoal } from "../../runtime/humanoid-checker.js";
+import {
+  advanceHumanoidGoal,
+  assertHumanoidGoalProgressIntegrity,
+  inspectHumanoidGoal
+} from "../../runtime/humanoid-checker.js";
 import type { HumanoidWorld, HumanoidWorldSnapshot } from "../../world/humanoid/world.js";
 import type { LongRunContextRuntime } from "../context-runtime.js";
 import {
@@ -67,6 +71,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#goal = structuredClone(input.goal);
     this.#world = input.world;
     this.#checkpoint = reconcileHumanoidHierarchyCapabilities(input.checkpoint);
+    assertHumanoidGoalProgressIntegrity(
+      this.#goal,
+      this.#world.snapshot(),
+      this.#checkpoint.goal_progress
+    );
     this.#eventSink = input.eventSink ?? (() => undefined);
     this.#signal = input.signal;
     this.#actions = new HumanoidActionRuntime(this.#world, {
@@ -288,7 +297,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   contextAnchor(agentId: string): JsonValue {
     const node = this.activeNode(agentId);
     const world = this.#world.snapshot();
-    const checker = checkHumanoidGoal(this.#goal, this.#store.definition.scenario, world);
+    const checker = inspectHumanoidGoal(
+      this.#goal,
+      this.#store.definition.scenario,
+      world,
+      this.#checkpoint.goal_progress
+    );
     const recentReceipts = Object.values(this.#checkpoint.committed_actions)
       .slice(-16)
       .map((receipt) => ({
@@ -321,7 +335,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         this.#checkpoint.embodied_memory
       ).map((episode) => ({
         ...episode,
-        historical_only: episode.world_after_revision !== world.worldRevision
+        historical_only: true
       })),
       active_agent: {
         id: node.id,
@@ -444,10 +458,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     } catch {
       cycle = output;
     }
-    const checker = checkHumanoidGoal(
+    const checker = inspectHumanoidGoal(
       this.#goal,
       this.#store.definition.scenario,
-      this.#world.snapshot()
+      this.#world.snapshot(),
+      this.#checkpoint.goal_progress
     );
     const world = this.#world.snapshot();
     const evidence = previousCycleEvidence(cycle);
@@ -554,13 +569,25 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   async #recordFrame(frame: HumanoidWorldSnapshot): Promise<void> {
-    this.#signal?.throwIfAborted();
+    const advanced = advanceHumanoidGoal(
+      this.#goal,
+      this.#store.definition.scenario,
+      frame,
+      this.#checkpoint.goal_progress
+    );
     this.#checkpoint.world = structuredClone(frame);
+    this.#checkpoint.goal_progress = advanced.progress;
+    this.#checkpoint.checker = advanced.checker;
     if (frame.frame % FRAME_CHECKPOINT_INTERVAL === 0) {
       this.#checkpoint.world_checkpoint = this.#world.checkpoint();
       await this.#persist();
     }
-    await this.emit("humanoid_world_frame", json({ world: frame }), randomUUID(), false);
+    this.#signal?.throwIfAborted();
+    await this.emit("humanoid_world_frame", json({
+      world: frame,
+      checker: advanced.checker,
+      goal_progress: advanced.progress
+    }), randomUUID(), false);
   }
 
   async #commitReceipt(receipt: HumanoidActionReceipt): Promise<void> {
@@ -571,10 +598,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#checkpoint.committed_actions[receipt.transactionId] = structuredClone(receipt);
     this.#checkpoint.world = this.#world.snapshot();
     this.#checkpoint.world_checkpoint = this.#world.checkpoint();
-    this.#checkpoint.checker = checkHumanoidGoal(
+    this.#checkpoint.checker = inspectHumanoidGoal(
       this.#goal,
       this.#store.definition.scenario,
-      this.#checkpoint.world
+      this.#checkpoint.world,
+      this.#checkpoint.goal_progress
     );
     await this.#persist();
     const runtimeEventId = randomUUID();
@@ -665,6 +693,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#checkpoint.world = this.#world.snapshot();
       this.#checkpoint.world_checkpoint = this.#world.checkpoint();
     }
+    assertHumanoidGoalProgressIntegrity(
+      this.#goal,
+      this.#checkpoint.world,
+      this.#checkpoint.goal_progress
+    );
     this.#checkpoint.updated_at = new Date().toISOString();
     await this.#store.writeCheckpoint(this.#checkpoint);
   }

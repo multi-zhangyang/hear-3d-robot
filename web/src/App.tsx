@@ -238,7 +238,6 @@ export function App(): React.JSX.Element {
       || event.type === "run_interrupted";
     setDetails((current) => {
       if (current === null) return current;
-      if (event.type === "humanoid_world_frame") return current;
       const reducerWorlds = terminalEvent && humanoidWorlds.length === 0 && humanoidFrameBuffer.latest
         ? [humanoidFrameBuffer.latest]
         : humanoidWorlds;

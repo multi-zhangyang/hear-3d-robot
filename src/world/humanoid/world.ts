@@ -63,6 +63,7 @@ import {
 } from "./object-memory.js";
 import {
   neutralHumanoidReference,
+  releaseReferenceTracking,
   targetReference,
   type HumanoidReference
 } from "./reference.js";
@@ -330,6 +331,10 @@ export class HumanoidWorld {
     });
   }
 
+  consumablePlanIds(): string[] {
+    return [...this.#motions.keys(), ...this.#routes.keys()];
+  }
+
   async planWholeBodyMotion(rawPlan: HumanoidMotionPlan): Promise<WholeBodyPlanReceipt> {
     const plan = HumanoidMotionPlanSchema.parse(rawPlan);
     if (this.#motions.has(plan.id)) throw new Error(`Duplicate humanoid motion plan: ${plan.id}`);
@@ -504,6 +509,7 @@ export class HumanoidWorld {
         stored.option.terminationReason = "motion_goal_unmet";
       }
       const receipt = this.#motionOptionReceipt(stored, 0);
+      this.#reference = releaseReferenceTracking(this.#reference);
       this.#motions.delete(planId);
       return receipt;
     }
@@ -698,7 +704,7 @@ export class HumanoidWorld {
           }
         }
       }
-      await this.#commitFrame(frameSink);
+      await this.#commitFrame(frameSink, undefined, { motionPlanId: planId });
       if (stored.option && isTerminalMotionOption(stored.option)) break;
     }
     if (stored.option) {
@@ -719,7 +725,7 @@ export class HumanoidWorld {
             : "Motion option exhausted its verified horizon before physical success"
         });
       }
-      this.#reference = lastReference;
+      this.#reference = releaseReferenceTracking(lastReference);
       const receipt = this.#motionOptionReceipt(stored, frames, failures);
       this.#motions.delete(planId);
       return receipt;
@@ -735,7 +741,7 @@ export class HumanoidWorld {
         constraints: missingContacts
       });
     }
-    this.#reference = lastReference;
+    this.#reference = releaseReferenceTracking(lastReference);
     this.#motions.delete(planId);
     return this.#receipt(
       failures.length === 0,
@@ -830,7 +836,7 @@ export class HumanoidWorld {
     this.#navigationState.status = "executing";
     const run = await this.#followRoute(stored.plan, this.#reference, async (snapshot, index) => {
       this.#navigationState.waypointIndex = index;
-      await this.#commitFrame(frameSink, snapshot);
+      await this.#commitFrame(frameSink, snapshot, { routePlanId: planId });
     });
     this.#reference = run.reference;
     this.#routes.delete(planId);
@@ -999,11 +1005,36 @@ export class HumanoidWorld {
 
   async #commitFrame(
     sink?: HumanoidFrameSink,
-    _snapshot?: HumanoidSimulationSnapshot
+    _snapshot?: HumanoidSimulationSnapshot,
+    activePlan: { motionPlanId?: string; routePlanId?: string } = {}
   ): Promise<void> {
     this.#frame += 1;
     this.#worldRevision += 1;
+    this.#pruneUnconsumablePlans(activePlan);
     await sink?.(this.snapshot());
+  }
+
+  #pruneUnconsumablePlans(activePlan: {
+    motionPlanId?: string;
+    routePlanId?: string;
+  }): void {
+    for (const [planId, stored] of this.#motions) {
+      if (planId === activePlan.motionPlanId) continue;
+      const expectedRevision = stored.createdRevision + stored.progress.nextFrameIndex;
+      if (expectedRevision !== this.#worldRevision) this.#motions.delete(planId);
+    }
+    for (const [planId, stored] of this.#routes) {
+      if (planId === activePlan.routePlanId) continue;
+      if (stored.createdRevision !== this.#worldRevision) this.#routes.delete(planId);
+    }
+    const navigationPlanId = this.#navigationState.planId;
+    if (navigationPlanId
+      && navigationPlanId !== activePlan.routePlanId
+      && !this.#routes.has(navigationPlanId)) {
+      this.#navigationState.planId = null;
+      this.#navigationState.status = "blocked";
+      this.#navigationState.waypointIndex = null;
+    }
   }
 
   #dynamicNavigationObstacles(): NavigationObstacle[] {

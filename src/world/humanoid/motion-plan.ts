@@ -68,7 +68,7 @@ const HumanoidEndEffectorTargetSchema = z.object({
   position: Vec3Schema.describe("末端目标位置；world 为世界坐标，pelvis 为相对骨盆坐标"),
   frame: z.enum(["world", "pelvis"]),
   tolerance_m: z.number().finite().min(0.01).max(0.12)
-    .describe("末端位置容差，单位米")
+    .describe("该关键帧在真实 MuJoCo 跟踪后的物理验收容差，单位米；应依据任务精度和已有跟踪误差选择，不是 IK 数值求解误差")
 }).strict();
 
 const HumanoidContactConstraintSchema = z.object({

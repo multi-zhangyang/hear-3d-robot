@@ -9,6 +9,7 @@ import {
   Vec3Schema
 } from "./schema.js";
 import { HUMANOID_ACTION_NAMES } from "./humanoid-action.js";
+import { goalSha256 } from "./goal-identity.js";
 import { HumanoidWorldCheckpointSchema } from "../world/humanoid/checkpoint.js";
 import { HumanoidWorldSnapshotSchema } from "../world/humanoid/snapshot-schema.js";
 
@@ -51,6 +52,25 @@ const HumanoidCheckerResultSchema = z.object({
   }).strict()),
   checkedAt: z.string().datetime()
 }).strict();
+
+export const HumanoidGoalProgressSchema = z.object({
+  version: z.literal(1),
+  goal_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  predicate_count: z.number().int().positive(),
+  last_world_frame: z.number().int().nonnegative(),
+  last_world_revision: z.number().int().nonnegative(),
+  predicate_streaks: z.array(z.number().int().min(0).max(500))
+}).strict().superRefine((progress, context) => {
+  if (progress.predicate_streaks.length !== progress.predicate_count) {
+    context.addIssue({
+      code: "custom",
+      path: ["predicate_streaks"],
+      message: "Humanoid goal progress must contain one streak per predicate"
+    });
+  }
+});
+
+export type HumanoidGoalProgress = z.infer<typeof HumanoidGoalProgressSchema>;
 
 export const HumanoidEmbodiedEpisodeSchema = z.object({
   sequence: z.number().int().positive(),
@@ -159,8 +179,7 @@ export const EmptyHumanoidEmbodiedMemoryState: HumanoidEmbodiedMemoryState = {
   recent_episodes: []
 };
 
-export const HumanoidRunCheckpointSchema = z.object({
-  version: z.literal(4),
+const HumanoidRunCheckpointCommonShape = {
   runtime: z.literal("humanoid_g1"),
   run_id: z.string().min(1),
   scenario_id: z.string().min(1),
@@ -185,7 +204,103 @@ export const HumanoidRunCheckpointSchema = z.object({
   error: z.string().nullable(),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime()
+} as const;
+
+export const HumanoidRunCheckpointV4Schema = z.object({
+  version: z.literal(4),
+  ...HumanoidRunCheckpointCommonShape
 }).strict();
 
-export type HumanoidRunCheckpoint = z.infer<typeof HumanoidRunCheckpointSchema>;
+export type HumanoidRunCheckpointV4 = z.infer<
+  typeof HumanoidRunCheckpointV4Schema
+>;
+
+export const HumanoidRunCheckpointV5Schema = z.object({
+  version: z.literal(5),
+  ...HumanoidRunCheckpointCommonShape,
+  goal_progress: HumanoidGoalProgressSchema
+}).strict().superRefine((checkpoint, context) => {
+  const progress = checkpoint.goal_progress;
+  if (progress.goal_sha256 !== goalSha256(checkpoint.goal)) {
+    context.addIssue({
+      code: "custom",
+      path: ["goal_progress", "goal_sha256"],
+      message: "Humanoid goal progress does not belong to the checkpoint goal"
+    });
+  }
+  if (progress.predicate_count !== checkpoint.goal.predicates.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["goal_progress", "predicate_count"],
+      message: "Humanoid goal progress predicate count does not match the goal"
+    });
+  }
+  checkpoint.goal.predicates.forEach((predicate, index) => {
+    const streak = progress.predicate_streaks[index];
+    if (streak === undefined) return;
+    if (predicate.type === "end_effector_at") {
+      if (streak > predicate.stable_frames) {
+        context.addIssue({
+          code: "custom",
+          path: ["goal_progress", "predicate_streaks", index],
+          message: "Humanoid end-effector stability exceeds its goal requirement"
+        });
+      }
+    } else if (streak !== 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["goal_progress", "predicate_streaks", index],
+        message: "An instantaneous goal predicate cannot carry stability progress"
+      });
+    }
+  });
+  if (checkpoint.world.frame !== checkpoint.world_checkpoint.frame
+    || checkpoint.world.worldRevision !== checkpoint.world_checkpoint.worldRevision) {
+    context.addIssue({
+      code: "custom",
+      path: ["world_checkpoint"],
+      message: "Humanoid world snapshot and physical checkpoint are not aligned"
+    });
+  }
+  if (progress.last_world_frame !== checkpoint.world.frame
+    || progress.last_world_revision !== checkpoint.world.worldRevision) {
+    context.addIssue({
+      code: "custom",
+      path: ["goal_progress"],
+      message: "Humanoid goal progress is not aligned with the authoritative world frame"
+    });
+  }
+});
+
+export type HumanoidRunCheckpoint = z.infer<
+  typeof HumanoidRunCheckpointV5Schema
+>;
+
+function migrateHumanoidRunCheckpointV4(
+  checkpoint: HumanoidRunCheckpointV4
+): HumanoidRunCheckpoint {
+  const { version: _version, ...source } = checkpoint;
+  return HumanoidRunCheckpointV5Schema.parse({
+    version: 5,
+    ...source,
+    goal_progress: {
+      version: 1,
+      goal_sha256: goalSha256(checkpoint.goal),
+      predicate_count: checkpoint.goal.predicates.length,
+      last_world_frame: checkpoint.world.frame,
+      last_world_revision: checkpoint.world.worldRevision,
+      predicate_streaks: checkpoint.goal.predicates.map(() => 0)
+    }
+  });
+}
+
+export const HumanoidRunCheckpointSchema = z.union([
+  HumanoidRunCheckpointV5Schema,
+  HumanoidRunCheckpointV4Schema
+]).transform((checkpoint): HumanoidRunCheckpoint => (
+  checkpoint.version === 5
+    ? checkpoint
+    : migrateHumanoidRunCheckpointV4(checkpoint)
+));
+
 export type HumanoidCheckerResult = z.infer<typeof HumanoidCheckerResultSchema>;

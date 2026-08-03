@@ -277,6 +277,8 @@ export function predicateLabel(predicate: GoalPredicate): string {
       return `${entityLabel(predicate.object_id)}${predicate.expected ? "位于" : "离开"}区域 ${entityLabel(predicate.zone_id)}`;
     case "object_at":
       return `将${entityLabel(predicate.object_id)}移动到 ${position(predicate.target)}`;
+    case "end_effector_at":
+      return `${endEffectorLabel(predicate.end_effector)}到达${predicate.frame === "pelvis" ? "骨盆相对" : "世界"} ${position3(predicate.target)}`;
   }
 }
 
@@ -298,6 +300,19 @@ export function runOptionLabel(run: RunListItem): string {
 
 function position(point: { x: number; z: number }): string {
   return `[${point.x.toFixed(1)}, ${point.z.toFixed(1)}]`;
+}
+
+function position3(point: { x: number; y: number; z: number }): string {
+  return `[${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)}]`;
+}
+
+function endEffectorLabel(
+  endEffector: Extract<GoalPredicate, { type: "end_effector_at" }>["end_effector"]
+): string {
+  if (endEffector === "left_wrist") return "左手腕";
+  if (endEffector === "right_wrist") return "右手腕";
+  if (endEffector === "left_ankle") return "左脚踝";
+  return "右脚踝";
 }
 
 function escapeRegExp(value: string): string {

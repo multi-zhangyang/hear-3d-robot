@@ -81,6 +81,33 @@ describe("model-facing humanoid motion candidate input", () => {
     })).toThrow();
   });
 
+  it("normalizes explicit pelvis-relative end-effector predicates", () => {
+    const input = HumanoidMotionCandidateBatchInputSchema.parse({
+      objective: "将右手移动到骨盆前方",
+      termination: {
+        option_id: "right-hand-relative-reach",
+        predicates: [predicate("end_effector_near_point", {
+          end_effector: "right_wrist",
+          frame: "pelvis",
+          target: { x: 0.25, y: 0.3, z: 0.15 },
+          tolerance_m: 0.04
+        })],
+        stable_steps: 4,
+        phases: null
+      },
+      candidates: candidates()
+    });
+
+    expect(normalizeHumanoidMotionCandidateBatchInput(input)
+      .termination.predicates[0]).toEqual({
+        type: "end_effector_near_point",
+        end_effector: "right_wrist",
+        frame: "pelvis",
+        target: { x: 0.25, y: 0.3, z: 0.15 },
+        tolerance_m: 0.04
+      });
+  });
+
   it("rejects candidates that differ only by labels before normalization", () => {
     const first = candidates()[0]!;
     const parsed = HumanoidMotionCandidateBatchInputSchema.safeParse({
@@ -119,9 +146,11 @@ describe("model-facing humanoid motion candidate input", () => {
 });
 
 function predicate(
-  type: "root_near_point" | "body_near_point",
+  type: "root_near_point" | "body_near_point" | "end_effector_near_point",
   values: Partial<{
     body: "pelvis" | "left_ankle_roll_link";
+    end_effector: "left_wrist" | "right_wrist" | "left_ankle" | "right_ankle";
+    frame: "world" | "pelvis";
     target: { x: number; y: number; z: number };
     tolerance_m: number;
   }>
@@ -129,6 +158,8 @@ function predicate(
   return {
     type,
     body: values.body ?? null,
+    end_effector: values.end_effector ?? null,
+    frame: values.frame ?? null,
     object_id: null,
     zone_id: null,
     target: values.target ?? null,

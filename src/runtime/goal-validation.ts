@@ -1,4 +1,9 @@
-import type { Goal, Scenario } from "../domain/schema.js";
+import {
+  GoalPredicateSchema,
+  type Goal,
+  type GoalPredicate,
+  type Scenario
+} from "../domain/schema.js";
 
 export class GoalValidationError extends Error {
   readonly statusCode = 400;
@@ -14,9 +19,18 @@ export function assertScenarioIntegrity(scenarioId: string, scenario: Scenario):
 }
 
 export function assertGoalSupported(goal: Goal, scenario: Scenario): void {
-  for (const predicate of goal.predicates) {
+  const predicates: GoalPredicate[] = goal.predicates.map((predicate) => (
+    GoalPredicateSchema.parse(predicate)
+  ));
+  for (const predicate of predicates) {
     if (predicate.type === "robot_at") {
       assertPointInBounds(predicate.target, scenario, "Robot target");
+      continue;
+    }
+    if (predicate.type === "end_effector_at") {
+      if (predicate.frame === "world") {
+        assertEndEffectorWorldTargetInBounds(predicate.target, scenario);
+      }
       continue;
     }
     if (predicate.type === "robot_in_zone") {
@@ -37,6 +51,17 @@ export function assertGoalSupported(goal: Goal, scenario: Scenario): void {
       assertPointInBounds(predicate.target, scenario, `Target for ${predicate.object_id}`);
       continue;
     }
+  }
+}
+
+function assertEndEffectorWorldTargetInBounds(
+  point: { x: number; y: number; z: number },
+  scenario: Scenario
+): void {
+  if (point.x < 0 || point.z < 0 || point.y < 0
+    || point.x > scenario.bounds.width
+    || point.z > scenario.bounds.depth) {
+    throw new GoalValidationError("End-effector world target is outside the world bounds");
   }
 }
 

@@ -13,12 +13,17 @@ import {
   hydrateHumanoidReference,
   serializeHumanoidReference
 } from "./motion-artifact.js";
+import { HUMANOID_JOINT_INDEX, HUMANOID_JOINT_NAMES } from "./model.js";
 import { neutralHumanoidReference } from "./reference.js";
 import { inverseQuaternion, rotateVector, subtract } from "../geometry.js";
 import {
   HumanoidSimulation,
   type HumanoidSimulationSnapshot
 } from "./simulation.js";
+import {
+  humanoidEndEffectorJointIndexes,
+  humanoidEndEffectorTrackingJointIndexes
+} from "./task-space-targets.js";
 
 const optionScenario = ScenarioSchema.parse({
   title: "Option precondition field",
@@ -325,6 +330,125 @@ describe("humanoid whole-body motion", () => {
       expect(unreachable.validation.failures).toContainEqual(
         expect.objectContaining({ code: "invalid_reference" })
       );
+    } finally {
+      await simulation.dispose();
+    }
+  }, 30_000);
+
+  it("executes an interpolated right-hand target through the real controller and physics", async () => {
+    const simulation = await HumanoidSimulation.create();
+    try {
+      const neutral = neutralHumanoidReference();
+      for (let index = 0; index < 100; index += 1) await simulation.step(neutral);
+      const before = simulation.snapshot();
+      const initialWristWorld = before.links.right_wrist_yaw_link.position;
+      const initialWristInPelvis = rotateVector(
+        inverseQuaternion(before.links.pelvis.rotation),
+        subtract(initialWristWorld, before.links.pelvis.position)
+      );
+      const target = {
+        ...initialWristInPelvis,
+        y: initialWristInPelvis.y + 0.08,
+        z: initialWristInPelvis.z + 0.06
+      };
+      const tolerance = 0.06;
+      const initialError = Math.hypot(
+        initialWristInPelvis.x - target.x,
+        initialWristInPelvis.y - target.y,
+        initialWristInPelvis.z - target.z
+      );
+      expect(initialError).toBeGreaterThan(tolerance);
+
+      const prepared = await prepareHumanoidMotion(simulation, {
+        id: "physical-right-hand-target",
+        intent: "抬起右手到新的任务空间目标",
+        duration_seconds: 1.6,
+        keyframes: [
+          { at_seconds: 0 },
+          {
+            at_seconds: 1.6,
+            right_hand: {
+              frame: "pelvis",
+              position: target,
+              tolerance_m: tolerance
+            }
+          }
+        ]
+      }, neutral);
+
+      expect(prepared.artifact).not.toBeNull();
+      expect(
+        prepared.validation.feasible,
+        JSON.stringify(prepared.validation.failures)
+      ).toBe(true);
+      expect(prepared.validation.failures).toEqual([]);
+      const frames = prepared.artifact!.frames;
+      expect(frames.length).toBeGreaterThan(0);
+      const rightArmIndexes = new Set(
+        humanoidEndEffectorJointIndexes("right_wrist_yaw_link")
+      );
+      const rightHandTrackingIndexes = new Set(
+        humanoidEndEffectorTrackingJointIndexes("right_wrist_yaw_link")
+      );
+      const wristFrameIndexes = new Set([
+        "waist_yaw_joint",
+        "waist_roll_joint",
+        "waist_pitch_joint"
+      ].map((joint) => HUMANOID_JOINT_INDEX.get(joint)!));
+      expect(rightArmIndexes.size).toBe(6);
+      expect(wristFrameIndexes.size).toBe(3);
+      expect(rightHandTrackingIndexes.size).toBe(9);
+      expect([...rightArmIndexes].every((index) => rightHandTrackingIndexes.has(index))).toBe(true);
+      expect([...wristFrameIndexes].every((index) => (
+        rightHandTrackingIndexes.has(index)
+      ))).toBe(true);
+      const middle = hydrateHumanoidReference(frames[Math.floor(frames.length / 2)]!.reference);
+      const finalReference = hydrateHumanoidReference(frames.at(-1)!.reference);
+      for (let index = 0; index < HUMANOID_JOINT_NAMES.length; index += 1) {
+        if (rightHandTrackingIndexes.has(index)) {
+          expect(middle.jointTrackingWeights[index]).toBeGreaterThan(0);
+          expect(middle.jointTrackingWeights[index]).toBeLessThan(1);
+          expect(finalReference.jointTrackingWeights[index]).toBe(1);
+        } else {
+          expect(middle.jointTrackingWeights[index]).toBe(0);
+          expect(finalReference.jointTrackingWeights[index]).toBe(0);
+        }
+      }
+      expect(finalReference.jointTrackingWeights[
+        HUMANOID_JOINT_INDEX.get("right_wrist_yaw_joint")!
+      ]).toBe(0);
+
+      let executedFrames = 0;
+      for (const frame of frames) {
+        await simulation.step(hydrateHumanoidReference(frame.reference));
+        executedFrames += 1;
+      }
+      const after = simulation.snapshot();
+      const finalWristWorld = after.links.right_wrist_yaw_link.position;
+      const finalWristInPelvis = rotateVector(
+        inverseQuaternion(after.links.pelvis.rotation),
+        subtract(finalWristWorld, after.links.pelvis.position)
+      );
+      const finalError = Math.hypot(
+        finalWristInPelvis.x - target.x,
+        finalWristInPelvis.y - target.y,
+        finalWristInPelvis.z - target.z
+      );
+
+      expect(executedFrames).toBe(frames.length);
+      expect(executedFrames).toBeGreaterThan(0);
+      expect(Math.hypot(
+        finalWristWorld.x - initialWristWorld.x,
+        finalWristWorld.y - initialWristWorld.y,
+        finalWristWorld.z - initialWristWorld.z
+      )).toBeGreaterThan(0.03);
+      expect(finalError).toBeLessThan(initialError);
+      expect(finalError).toBeLessThanOrEqual(tolerance);
+      expect(after.fallen).toBe(false);
+      expect(after.balance.upright).toBeGreaterThan(0.9);
+      expect(after.feet.left.touching).toBe(true);
+      expect(after.feet.right.touching).toBe(true);
+      expect(after.balance.support).toBe("double");
     } finally {
       await simulation.dispose();
     }

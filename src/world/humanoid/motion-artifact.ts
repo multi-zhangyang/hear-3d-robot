@@ -1,12 +1,20 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
-import type { HumanoidReference } from "./reference.js";
+import { HUMANOID_JOINT_NAMES } from "./model.js";
+import {
+  assertHumanoidReference,
+  type HumanoidReference
+} from "./reference.js";
 
-const FiniteArraySchema = z.array(z.number().finite());
+const FiniteJointArraySchema = z.array(z.number().finite())
+  .length(HUMANOID_JOINT_NAMES.length);
+const JointTrackingWeightsSchema = z.array(z.number().finite().min(0).max(1))
+  .length(HUMANOID_JOINT_NAMES.length);
 
 export const HumanoidReferenceStateSchema = z.object({
-  jointPositions: FiniteArraySchema,
-  jointVelocities: FiniteArraySchema,
+  jointPositions: FiniteJointArraySchema,
+  jointVelocities: FiniteJointArraySchema,
+  jointTrackingWeights: JointTrackingWeightsSchema.optional(),
   rootVelocity: z.tuple([z.number().finite(), z.number().finite()]),
   rootYawVelocity: z.number().finite(),
   rootHeight: z.number().finite(),
@@ -53,9 +61,11 @@ export type HumanoidMotionArtifact = z.infer<typeof HumanoidMotionArtifactSchema
 export function serializeHumanoidReference(
   reference: HumanoidReference
 ): HumanoidReferenceState {
+  assertHumanoidReference(reference);
   return HumanoidReferenceStateSchema.parse({
     jointPositions: [...reference.jointPositions],
     jointVelocities: [...reference.jointVelocities],
+    jointTrackingWeights: [...reference.jointTrackingWeights],
     rootVelocity: [...reference.rootVelocity],
     rootYawVelocity: reference.rootYawVelocity,
     rootHeight: reference.rootHeight,
@@ -68,15 +78,20 @@ export function hydrateHumanoidReference(
   state: HumanoidReferenceState
 ): HumanoidReference {
   const parsed = HumanoidReferenceStateSchema.parse(state);
-  return {
+  const reference: HumanoidReference = {
     jointPositions: Float64Array.from(parsed.jointPositions),
     jointVelocities: Float64Array.from(parsed.jointVelocities),
+    jointTrackingWeights: parsed.jointTrackingWeights
+      ? Float64Array.from(parsed.jointTrackingWeights)
+      : new Float64Array(HUMANOID_JOINT_NAMES.length),
     rootVelocity: parsed.rootVelocity,
     rootYawVelocity: parsed.rootYawVelocity,
     rootHeight: parsed.rootHeight,
     rootRoll: parsed.rootRoll,
     rootPitch: parsed.rootPitch
   };
+  assertHumanoidReference(reference);
+  return reference;
 }
 
 export function humanoidMotionArtifactSummary(

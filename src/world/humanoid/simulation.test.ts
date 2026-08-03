@@ -8,6 +8,10 @@ import {
   targetReference
 } from "./reference.js";
 import { HumanoidSimulation } from "./simulation.js";
+import {
+  humanoidEndEffectorJointIndexes,
+  humanoidEndEffectorTrackingJointIndexes
+} from "./task-space-targets.js";
 import type {
   HumanoidControllerDescriptor,
   HumanoidControllerState,
@@ -75,6 +79,22 @@ describe("HumanoidSimulation", () => {
       expect(Array.from(footSolution.reference.jointPositions.slice(6))).toEqual(
         Array.from(neutral.jointPositions.slice(6))
       );
+      const leftLegIndexes = new Set(
+        humanoidEndEffectorJointIndexes("left_ankle_roll_link")
+      );
+      const leftLegTrackingIndexes = new Set(
+        humanoidEndEffectorTrackingJointIndexes("left_ankle_roll_link")
+      );
+      expect(leftLegIndexes.size).toBe(5);
+      expect(leftLegTrackingIndexes).toEqual(leftLegIndexes);
+      for (let index = 0; index < HUMANOID_JOINT_NAMES.length; index += 1) {
+        expect(footSolution.reference.jointTrackingWeights[index]).toBe(
+          leftLegTrackingIndexes.has(index) ? 1 : 0
+        );
+      }
+      expect(footSolution.reference.jointTrackingWeights[
+        HUMANOID_JOINT_INDEX.get("left_ankle_roll_joint")!
+      ]).toBe(0);
 
       const raised = targetReference(neutral, {
         joints: {
@@ -212,6 +232,37 @@ describe("HumanoidSimulation", () => {
       await expect(simulation.step(neutralHumanoidReference())).rejects.toThrow(
         "non-finite or negative PD parameters"
       );
+    } finally {
+      await simulation.dispose();
+    }
+  });
+
+  it("rejects malformed task-space tracking weights before controller inference", async () => {
+    const controller = new ContractController();
+    const simulation = await HumanoidSimulation.create({
+      controllerFactory: async () => controller
+    });
+    try {
+      const neutral = neutralHumanoidReference();
+      await expect(simulation.step({
+        ...neutral,
+        jointTrackingWeights: new Float64Array(HUMANOID_JOINT_NAMES.length - 1)
+      })).rejects.toThrow("invalid joint count");
+
+      const nonFinite = neutral.jointTrackingWeights.slice();
+      nonFinite[0] = Number.NaN;
+      await expect(simulation.step({
+        ...neutral,
+        jointTrackingWeights: nonFinite
+      })).rejects.toThrow("invalid left_hip_pitch_joint tracking weight");
+
+      const outOfRange = neutral.jointTrackingWeights.slice();
+      outOfRange[0] = 1.01;
+      await expect(simulation.step({
+        ...neutral,
+        jointTrackingWeights: outOfRange
+      })).rejects.toThrow("invalid left_hip_pitch_joint tracking weight");
+      expect(controller.inferenceCount).toBe(0);
     } finally {
       await simulation.dispose();
     }

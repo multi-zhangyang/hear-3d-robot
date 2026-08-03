@@ -3,6 +3,7 @@ import type {
   HumanoidActionReceipt,
   HumanoidCheckerResult,
   HumanoidEmbodiedMemoryState,
+  HumanoidGoalProgress,
   HumanoidWorldSnapshot,
   ProviderActivity,
   RunListItem,
@@ -151,6 +152,21 @@ export function humanoidCheckerFrom(value: unknown): HumanoidCheckerResult | nul
     || typeof record.worldRevision !== "number"
     || !Array.isArray(record.checks)) return null;
   return record as unknown as HumanoidCheckerResult;
+}
+
+export function humanoidGoalProgressFrom(value: unknown): HumanoidGoalProgress | null {
+  const record = asRecord(value);
+  if (!record || record.version !== 1
+    || typeof record.goal_sha256 !== "string"
+    || !Number.isInteger(record.predicate_count)
+    || !Number.isInteger(record.last_world_frame)
+    || !Number.isInteger(record.last_world_revision)
+    || !Array.isArray(record.predicate_streaks)
+    || record.predicate_streaks.length !== record.predicate_count
+    || !record.predicate_streaks.every((streak) => (
+      typeof streak === "number" && Number.isInteger(streak) && streak >= 0
+    ))) return null;
+  return record as unknown as HumanoidGoalProgress;
 }
 
 export function contextMemoryFrom(value: unknown): ContextMemoryState | null {

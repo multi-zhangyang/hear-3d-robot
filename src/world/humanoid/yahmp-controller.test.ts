@@ -1,0 +1,79 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  HUMANOID_JOINT_NAMES,
+  YAHMP_POLICY
+} from "./model.js";
+import { neutralHumanoidReference } from "./reference.js";
+import type { HumanoidPolicyState } from "./whole-body-controller.js";
+import { YahmpController } from "./yahmp-controller.js";
+
+describe("YAHMP joint tracking authority", () => {
+  it("attenuates policy residuals using each reference tracking weight", async () => {
+    const action = Float32Array.from(
+      { length: HUMANOID_JOINT_NAMES.length },
+      (_, index) => (index + 1) / 100
+    );
+    const session = fakeSession(action);
+    const controller = createController(session);
+    const reference = neutralHumanoidReference();
+    reference.jointTrackingWeights[0] = 0;
+    reference.jointTrackingWeights[1] = 0.25;
+    reference.jointTrackingWeights[2] = 1;
+
+    const command = await controller.infer(policyState(reference.jointPositions), reference);
+
+    for (const index of [0, 1, 2]) {
+      expect(command.positions[index]).toBeCloseTo(
+        reference.jointPositions[index]!
+          + action[index]! * YAHMP_POLICY.actionScale[index]!
+            * (1 - reference.jointTrackingWeights[index]!),
+        12
+      );
+    }
+    expect(command.positions[2]).toBe(reference.jointPositions[2]);
+    expect(command.stiffness[0]).toBe(YAHMP_POLICY.stiffness[0]);
+    expect(command.stiffness[1]).toBeGreaterThan(YAHMP_POLICY.stiffness[1]);
+    expect(command.stiffness[1]).toBeLessThan(command.stiffness[2]!);
+    expect(command.stiffness[2]).toBe(240);
+    expect(command.damping[0]).toBe(YAHMP_POLICY.damping[0]);
+    expect(command.damping[2]).toBeGreaterThan(YAHMP_POLICY.damping[2]);
+    expect(session.run).toHaveBeenCalledOnce();
+    await controller.dispose();
+  });
+
+  it("fails closed before inference when tracking weights are invalid", async () => {
+    const session = fakeSession(new Float32Array(HUMANOID_JOINT_NAMES.length));
+    const controller = createController(session);
+    const reference = neutralHumanoidReference();
+    reference.jointTrackingWeights[0] = Number.NaN;
+
+    await expect(
+      controller.infer(policyState(reference.jointPositions), reference)
+    ).rejects.toThrow("tracking weights");
+    expect(session.run).not.toHaveBeenCalled();
+    await controller.dispose();
+  });
+});
+
+function policyState(jointPositions: Float64Array): HumanoidPolicyState {
+  return {
+    jointPositions: jointPositions.slice(),
+    jointVelocities: new Float64Array(HUMANOID_JOINT_NAMES.length),
+    rootQuaternion: [1, 0, 0, 0],
+    rootAngularVelocity: [0, 0, 0]
+  };
+}
+
+function fakeSession(action: Float32Array) {
+  return {
+    run: vi.fn(async () => ({ actions: { data: action } })),
+    release: vi.fn(async () => undefined)
+  };
+}
+
+function createController(session: ReturnType<typeof fakeSession>): YahmpController {
+  const ConstructibleController = YahmpController as unknown as new (
+    session: ReturnType<typeof fakeSession>
+  ) => YahmpController;
+  return new ConstructibleController(session);
+}

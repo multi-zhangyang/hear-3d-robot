@@ -31,6 +31,46 @@ describe("reduceHumanoidRunDetails", () => {
     expect(stale.checkpoint.world.frame).toBe(4);
   });
 
+  it("projects live physical goal stability from the matching world frame", () => {
+    const world = frame(3);
+    const goal_progress = {
+      version: 1 as const,
+      goal_sha256: "a".repeat(64),
+      predicate_count: 1,
+      last_world_frame: 3,
+      last_world_revision: 3,
+      predicate_streaks: [2]
+    };
+    const checker = {
+      success: false,
+      worldFrame: 3,
+      worldRevision: 3,
+      checks: [{ name: "1:end_effector_at", passed: false, actual: {} }],
+      checkedAt: "2026-08-02T00:00:01.000Z"
+    };
+    const next = reduce(details(), event("humanoid_world_frame", {
+      world,
+      checker,
+      goal_progress
+    }), { worlds: [world] });
+
+    expect(next.checkpoint.world.frame).toBe(3);
+    expect(next.checkpoint.goal_progress).toEqual(goal_progress);
+    expect(next.checkpoint.checker).toEqual(checker);
+
+    const stale = reduce(next, event("humanoid_world_frame", {
+      world: frame(2),
+      checker: { ...checker, worldFrame: 2, worldRevision: 2 },
+      goal_progress: {
+        ...goal_progress,
+        last_world_frame: 2,
+        last_world_revision: 2,
+        predicate_streaks: [1]
+      }
+    }), { worlds: [frame(2)] });
+    expect(stale.checkpoint.goal_progress).toEqual(goal_progress);
+  });
+
   it("commits one receipt exactly once", () => {
     const committed = event("humanoid_action_committed", { receipt: receipt("tx-1") });
     const first = reduce(details(), committed);

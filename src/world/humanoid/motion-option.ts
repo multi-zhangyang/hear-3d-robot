@@ -1,10 +1,17 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
-import { Vec3Schema, type Vec3 } from "../../domain/schema.js";
+import {
+  HumanoidEndEffectorSchema,
+  Vec3Schema,
+  type HumanoidEndEffector,
+  type Quaternion,
+  type Vec3
+} from "../../domain/schema.js";
 import {
   HUMANOID_BODY_NAMES,
   type HumanoidBodyName
 } from "./model.js";
+import { humanoidEndEffectorPosition } from "./end-effectors.js";
 
 const PositionToleranceSchema = z.number().finite().positive().max(5);
 
@@ -17,6 +24,14 @@ const RootNearPointPredicateSchema = z.object({
 const BodyNearPointPredicateSchema = z.object({
   type: z.literal("body_near_point"),
   body: z.enum(HUMANOID_BODY_NAMES),
+  target: Vec3Schema,
+  tolerance_m: PositionToleranceSchema
+}).strict();
+
+const EndEffectorNearPointPredicateSchema = z.object({
+  type: z.literal("end_effector_near_point"),
+  end_effector: HumanoidEndEffectorSchema,
+  frame: z.enum(["world", "pelvis"]),
   target: Vec3Schema,
   tolerance_m: PositionToleranceSchema
 }).strict();
@@ -46,6 +61,7 @@ const ObjectInZonePredicateSchema = z.object({
 const HumanoidMotionOptionPredicateSchema = z.discriminatedUnion("type", [
   RootNearPointPredicateSchema,
   BodyNearPointPredicateSchema,
+  EndEffectorNearPointPredicateSchema,
   BodyContactObjectPredicateSchema,
   ObjectNearPointPredicateSchema,
   ObjectInZonePredicateSchema
@@ -215,7 +231,10 @@ export function humanoidMotionOptionContractSha256(
 
 export interface HumanoidMotionOptionRobotSnapshot {
   rootPosition: Vec3;
-  links: Readonly<Partial<Record<HumanoidBodyName, { position: Vec3 }>>>;
+  links: Readonly<Partial<Record<HumanoidBodyName, {
+    position: Vec3;
+    rotation?: Quaternion;
+  }>>>;
   contacts: ReadonlyArray<{
     normalForce: number;
     firstBody: HumanoidBodyName | null;
@@ -246,6 +265,7 @@ export interface HumanoidMotionOptionDetectorInput {
 type HumanoidMotionOptionTruth =
   "satisfied" | "unsatisfied" | "uncertain";
 type PredicateUncertainty = "body_snapshot_missing"
+  | "end_effector_snapshot_missing"
   | "object_not_observable"
   | "zone_not_found";
 
@@ -270,6 +290,19 @@ type HumanoidMotionOptionPredicateEvidence =
       distanceMeters: number | null;
       toleranceMeters: number;
       reason?: Extract<PredicateUncertainty, "body_snapshot_missing">;
+    }
+  | PredicateEvidenceBase & {
+      type: "end_effector_near_point";
+      endEffector: HumanoidEndEffector;
+      frame: "world" | "pelvis";
+      actualPosition: Vec3 | null;
+      target: Vec3;
+      distanceMeters: number | null;
+      toleranceMeters: number;
+      reason?: Extract<
+        PredicateUncertainty,
+        "end_effector_snapshot_missing"
+      >;
     }
   | PredicateEvidenceBase & {
       type: "body_contact_object";
@@ -614,6 +647,41 @@ function detectPredicate(
       status: distanceMeters <= predicate.tolerance_m ? "satisfied" : "unsatisfied",
       body: predicate.body,
       actualPosition: { ...body.position },
+      target: { ...predicate.target },
+      distanceMeters,
+      toleranceMeters: predicate.tolerance_m
+    };
+  }
+  if (predicate.type === "end_effector_near_point") {
+    const actualPosition = humanoidEndEffectorPosition(
+      snapshot,
+      predicate.end_effector,
+      predicate.frame
+    );
+    if (!actualPosition) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        endEffector: predicate.end_effector,
+        frame: predicate.frame,
+        actualPosition: null,
+        target: { ...predicate.target },
+        distanceMeters: null,
+        toleranceMeters: predicate.tolerance_m,
+        reason: "end_effector_snapshot_missing"
+      };
+    }
+    const distanceMeters = distance(actualPosition, predicate.target);
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: distanceMeters <= predicate.tolerance_m
+        ? "satisfied"
+        : "unsatisfied",
+      endEffector: predicate.end_effector,
+      frame: predicate.frame,
+      actualPosition,
       target: { ...predicate.target },
       distanceMeters,
       toleranceMeters: predicate.tolerance_m

@@ -31,4 +31,23 @@ export interface ModelTelemetryRuntime {
   readonly rootAgentId: string;
   activeNode(agentId?: string): TaskNode;
   recordModelCallStarted(agentId: string): Promise<void>;
+  modelProgressSnapshot?(): ModelProgressSnapshot;
+}
+
+export interface ModelProgressReceipt {
+  transactionId: string;
+  agentId: string;
+  action: string;
+  accepted: boolean;
+  code: string;
+  worldBeforeRevision: number;
+  worldAfterRevision: number;
+  frameCount: number;
+}
+
+export interface ModelProgressSnapshot {
+  worldRevision: number;
+  cycleIndex: number;
+  checkerSuccess: boolean;
+  receipts: ModelProgressReceipt[];
 }

@@ -4,6 +4,12 @@ export interface Vec3 {
   z: number;
 }
 
+export type HumanoidEndEffector =
+  | "left_wrist"
+  | "right_wrist"
+  | "left_ankle"
+  | "right_ankle";
+
 interface Quaternion {
   x: number;
   y: number;
@@ -21,7 +27,15 @@ export type GoalPredicate =
       expected: boolean;
       tolerance: number;
     }
-  | { type: "object_at"; object_id: string; target: Vec3; tolerance: number };
+  | { type: "object_at"; object_id: string; target: Vec3; tolerance: number }
+  | {
+      type: "end_effector_at";
+      end_effector: HumanoidEndEffector;
+      frame: "world" | "pelvis";
+      target: Vec3;
+      tolerance: number;
+      stable_frames: number;
+    };
 
 export interface Goal {
   summary: string;
@@ -181,6 +195,15 @@ export interface HumanoidCheckerResult {
   checkedAt: string;
 }
 
+export interface HumanoidGoalProgress {
+  version: 1;
+  goal_sha256: string;
+  predicate_count: number;
+  last_world_frame: number;
+  last_world_revision: number;
+  predicate_streaks: number[];
+}
+
 export interface HumanoidEmbodiedEpisode {
   sequence: number;
   source_ref?: string;
@@ -250,7 +273,7 @@ export interface HumanoidActionReceipt {
 type RunStatus = "starting" | "running" | "succeeded" | "failed" | "interrupted";
 
 export interface HumanoidRunCheckpoint {
-  version: 4;
+  version: 4 | 5;
   runtime: "humanoid_g1";
   run_id: string;
   scenario_id: string;
@@ -270,6 +293,7 @@ export interface HumanoidRunCheckpoint {
   cycle_index: number;
   total_model_calls: number;
   checker: HumanoidCheckerResult | null;
+  goal_progress?: HumanoidGoalProgress;
   last_cycle: unknown;
   final_output: string | null;
   error: string | null;
@@ -323,7 +347,20 @@ export function isHumanoidRunDetails(value: unknown): value is HumanoidRunDetail
   const checkpoint = details.checkpoint as Record<string, unknown>;
   return definition.runtime === "humanoid_g1"
     && checkpoint.runtime === "humanoid_g1"
-    && checkpoint.version === 4;
+    && (checkpoint.version === 4 || checkpoint.version === 5)
+    && (checkpoint.version !== 5 || isHumanoidGoalProgress(checkpoint.goal_progress));
+}
+
+function isHumanoidGoalProgress(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const progress = value as Record<string, unknown>;
+  return progress.version === 1
+    && typeof progress.goal_sha256 === "string"
+    && typeof progress.predicate_count === "number"
+    && typeof progress.last_world_frame === "number"
+    && typeof progress.last_world_revision === "number"
+    && Array.isArray(progress.predicate_streaks)
+    && progress.predicate_streaks.length === progress.predicate_count;
 }
 
 export interface RunListItem {

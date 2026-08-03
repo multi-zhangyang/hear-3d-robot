@@ -33,6 +33,7 @@ import {
 } from "./yahmp-controller.js";
 import {
   humanoidEndEffectorJointIndexes,
+  humanoidEndEffectorTrackingJointIndexes,
   type HumanoidEndEffectorBody
 } from "./task-space-targets.js";
 import type {
@@ -517,14 +518,21 @@ export class HumanoidSimulation {
     targets: readonly HumanoidEndEffectorTarget[]
   ): HumanoidTaskSpaceSolution {
     const jointPositions = baseline.jointPositions.slice();
+    const jointTrackingWeights = baseline.jointTrackingWeights.slice();
     for (let index = 0; index < jointPositions.length; index += 1) {
       jointPositions[index] = this.#data.qpos[this.#jointPositionAddresses[index]!]!;
+    }
+    for (const target of targets) {
+      for (const index of humanoidEndEffectorTrackingJointIndexes(target.body)) {
+        jointTrackingWeights[index] = 1;
+      }
     }
     return {
       reference: {
         ...baseline,
         jointPositions,
-        jointVelocities: new Float64Array(jointPositions.length)
+        jointVelocities: new Float64Array(jointPositions.length),
+        jointTrackingWeights
       },
       residuals: targets.map((target) => {
         const achieved = this.#linkPosition(target.body);
@@ -585,16 +593,24 @@ export class HumanoidSimulation {
 
   #validateReference(reference: HumanoidReference): void {
     if (reference.jointPositions.length !== HUMANOID_JOINT_NAMES.length
-      || reference.jointVelocities.length !== HUMANOID_JOINT_NAMES.length) {
+      || reference.jointVelocities.length !== HUMANOID_JOINT_NAMES.length
+      || reference.jointTrackingWeights.length !== HUMANOID_JOINT_NAMES.length) {
       throw new Error("Humanoid reference has an invalid joint count");
     }
     for (let index = 0; index < HUMANOID_JOINT_NAMES.length; index += 1) {
       const rangeOffset = this.#jointIds[index]! * 2;
       const value = reference.jointPositions[index]!;
-      if (!Number.isFinite(value)
+      const velocity = reference.jointVelocities[index]!;
+      const trackingWeight = reference.jointTrackingWeights[index]!;
+      if (!Number.isFinite(value) || !Number.isFinite(velocity)
         || value < this.#model.jnt_range[rangeOffset]!
         || value > this.#model.jnt_range[rangeOffset + 1]!) {
         throw new Error(`Humanoid reference exceeds ${HUMANOID_JOINT_NAMES[index]} limits`);
+      }
+      if (!Number.isFinite(trackingWeight) || trackingWeight < 0 || trackingWeight > 1) {
+        throw new Error(
+          `Humanoid reference has an invalid ${HUMANOID_JOINT_NAMES[index]} tracking weight`
+        );
       }
     }
   }

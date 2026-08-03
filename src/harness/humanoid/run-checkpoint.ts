@@ -6,6 +6,7 @@ import {
 } from "../../domain/humanoid-run.js";
 import type { RunStore } from "../../persistence/run-store.js";
 import type { HumanoidWorld } from "../../world/humanoid/world.js";
+import { createHumanoidGoalProgress } from "../../runtime/humanoid-checker.js";
 import {
   HUMANOID_AGENT_IDS,
   HUMANOID_CAPABILITIES
@@ -18,8 +19,9 @@ export function createHumanoidRunCheckpoint(input: {
 }): HumanoidRunCheckpoint {
   const at = new Date().toISOString();
   const rootId = HUMANOID_AGENT_IDS.coordinator;
+  const world = input.world.snapshot();
   return {
-    version: 4,
+    version: 5,
     runtime: "humanoid_g1",
     run_id: input.store.definition.run_id,
     scenario_id: input.store.definition.scenario_id,
@@ -30,8 +32,9 @@ export function createHumanoidRunCheckpoint(input: {
     active_agent_id: rootId,
     active_agent_ids: [rootId],
     nodes: hierarchyNodes(input.store.definition.mission, input.goal, at),
-    world: input.world.snapshot(),
+    world,
     world_checkpoint: input.world.checkpoint(),
+    goal_progress: createHumanoidGoalProgress(input.goal, world),
     committed_actions: {},
     context_memory: structuredClone(EmptyContextMemoryState),
     embodied_memory: structuredClone(EmptyHumanoidEmbodiedMemoryState),

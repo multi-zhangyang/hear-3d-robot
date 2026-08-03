@@ -115,7 +115,12 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
           {checkpoint.goal.predicates.map((predicate, index) => (
             <span key={`${predicate.type}-${index}`}>
               <i className={checkpoint.checker?.checks[index]?.passed ? "passed" : ""} />
-              {predicateLabel(predicate)}
+              <b>{predicateLabel(predicate)}</b>
+              {predicate.type === "end_effector_at" && (
+                <em aria-label="连续稳定帧">
+                  {checkpoint.goal_progress?.predicate_streaks[index] ?? 0}/{predicate.stable_frames}
+                </em>
+              )}
             </span>
           ))}
         </div>

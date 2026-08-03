@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ScenarioSchema } from "../../domain/schema.js";
+import { GoalSchema, ScenarioSchema } from "../../domain/schema.js";
 import type { RuntimeEvent } from "../../runtime/events.js";
 import { RunStore } from "../../persistence/run-store.js";
 import { HumanoidWorld } from "../../world/humanoid/world.js";
@@ -146,6 +146,8 @@ describe("HumanoidRunRuntime", () => {
             predicates: [{
               type: "root_near_point",
               body: null,
+              end_effector: null,
+              frame: null,
               object_id: null,
               zone_id: null,
               target: pendingTarget,
@@ -200,6 +202,18 @@ describe("HumanoidRunRuntime", () => {
         status: "cycle_completed",
         evidence_transaction_ids: [pendingExecution.transactionId]
       }));
+      const anchor = runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator) as {
+        recent_physical_episodes: Array<{
+          transaction_id: string;
+          historical_only: boolean;
+        }>;
+      };
+      expect(anchor.recent_physical_episodes).toEqual([
+        expect.objectContaining({
+          transaction_id: pendingExecution.transactionId,
+          historical_only: true
+        })
+      ]);
       expect(() => runtime.validateCycleEvidence([pendingExecution.transactionId])).toThrow(
         "already consumed"
       );
@@ -367,6 +381,114 @@ describe("HumanoidRunRuntime", () => {
         world: resumedWorld!,
         checkpoint: corrupted
       })).toThrow("fingerprint mismatch");
+    } finally {
+      await resumedWorld?.dispose();
+      await world.dispose();
+    }
+  }, 45_000);
+
+  it("advances end-effector stability only on committed physical frames and preserves it on resume", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-humanoid-goal-progress-"));
+    temporaryDirectories.push(root);
+    const world = await HumanoidWorld.create(scenario);
+    let resumedWorld: HumanoidWorld | undefined;
+    try {
+      const initialWorld = world.snapshot();
+      const goal = GoalSchema.parse({
+        summary: "持续保持左腕世界位置",
+        predicates: [{
+          type: "end_effector_at",
+          end_effector: "left_wrist",
+          frame: "world",
+          target: initialWorld.robot.links.left_wrist_yaw_link.position,
+          tolerance: 5,
+          stable_frames: 500
+        }]
+      });
+      const store = await RunStore.create(root, {
+        mission: "保持左腕末端位置",
+        scenarioId: "humanoid-goal-progress-test",
+        scenario,
+        goal,
+        runtime: "humanoid_g1"
+      });
+      const initial = createHumanoidRunCheckpoint({ store, goal, world });
+      await store.writeCheckpoint(initial);
+      const runtime = new HumanoidRunRuntime({ store, goal, world, checkpoint: initial });
+      await runtime.start(false);
+
+      const beforeReads = runtime.checkpoint.goal_progress;
+      await runtime.invoke(
+        "observe_humanoid",
+        {},
+        "goal-observe-before-1",
+        HUMANOID_AGENT_IDS.sentry
+      );
+      runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator);
+      await runtime.invoke(
+        "observe_humanoid",
+        {},
+        "goal-observe-before-2",
+        HUMANOID_AGENT_IDS.sentry
+      );
+      expect(runtime.checkpoint.goal_progress).toEqual(beforeReads);
+
+      const plan = await runtime.invoke(
+        "plan_whole_body_motion",
+        {
+          id: "goal-progress-hold",
+          intent: "在短物理窗口内保持当前全身参考",
+          duration_seconds: 0.12,
+          keyframes: [{ at_seconds: 0 }, { at_seconds: 0.12 }]
+        },
+        "goal-progress-plan",
+        HUMANOID_AGENT_IDS.motion
+      );
+      expect(plan.accepted).toBe(true);
+      expect(runtime.checkpoint.goal_progress).toEqual(beforeReads);
+
+      const execution = await runtime.invoke(
+        "execute_whole_body_motion",
+        { planning_transaction_id: plan.transactionId },
+        "goal-progress-execute",
+        HUMANOID_AGENT_IDS.executor
+      );
+      expect(execution).toMatchObject({ accepted: true, code: "motion_completed" });
+      expect(execution.frameCount).toBeGreaterThan(0);
+      const afterExecution = runtime.checkpoint.goal_progress;
+      expect(afterExecution).toMatchObject({
+        last_world_frame: runtime.snapshot().frame,
+        last_world_revision: runtime.snapshot().worldRevision,
+        predicate_streaks: [execution.frameCount]
+      });
+
+      runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator);
+      await runtime.invoke(
+        "observe_humanoid",
+        {},
+        "goal-observe-after",
+        HUMANOID_AGENT_IDS.sentry
+      );
+      expect(runtime.checkpoint.goal_progress).toEqual(afterExecution);
+
+      const persisted = await store.readHumanoidCheckpoint();
+      expect(persisted.goal_progress).toEqual(afterExecution);
+      resumedWorld = await HumanoidWorld.create(scenario, persisted.world_checkpoint);
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal,
+        world: resumedWorld,
+        checkpoint: persisted
+      });
+      resumed.contextAnchor(HUMANOID_AGENT_IDS.coordinator);
+      expect(resumed.checkpoint.goal_progress).toEqual(afterExecution);
+      await resumed.invoke(
+        "observe_humanoid",
+        {},
+        "goal-observe-resumed",
+        HUMANOID_AGENT_IDS.sentry
+      );
+      expect(resumed.checkpoint.goal_progress).toEqual(afterExecution);
     } finally {
       await resumedWorld?.dispose();
       await world.dispose();

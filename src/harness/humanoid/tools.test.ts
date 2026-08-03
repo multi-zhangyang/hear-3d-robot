@@ -241,6 +241,8 @@ describe("humanoid Agents SDK tools", () => {
           predicates: [{
             type: "root_near_point",
             body: null,
+            end_effector: null,
+            frame: null,
             object_id: null,
             zone_id: null,
             target: { x: 0, y: 0.76, z: 0.1 },

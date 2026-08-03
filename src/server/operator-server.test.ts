@@ -98,6 +98,52 @@ describe("Operator API", () => {
       });
       expect(invalidGoal.statusCode).toBe(400);
 
+      const invalidEndEffectorGoal = await app.inject({
+        method: "POST",
+        url: "/api/runs",
+        headers,
+        payload: {
+          mission: "Hold a wrist target",
+          scenario_id: "humanoid_courtyard",
+          goal: {
+            summary: "Hold the left wrist target.",
+            predicates: [{
+              type: "end_effector_at",
+              end_effector: "left_wrist",
+              frame: "pelvis",
+              target: { x: 0.25, y: -0.1, z: 0.1 },
+              tolerance: 0.05,
+              stable_frames: 0
+            }]
+          },
+          confirmed: true
+        }
+      });
+      expect(invalidEndEffectorGoal.statusCode).toBe(400);
+
+      const validEndEffectorGoal = await app.inject({
+        method: "POST",
+        url: "/api/runs",
+        headers,
+        payload: {
+          mission: "Hold a wrist target",
+          scenario_id: "humanoid_courtyard",
+          goal: {
+            summary: "Hold the left wrist target.",
+            predicates: [{
+              type: "end_effector_at",
+              end_effector: "left_wrist",
+              frame: "pelvis",
+              target: { x: 0.25, y: -0.1, z: 0.1 },
+              tolerance: 0.05,
+              stable_frames: 4
+            }]
+          },
+          confirmed: true
+        }
+      });
+      expect(validEndEffectorGoal.statusCode).toBe(503);
+
       const start = await app.inject({
         method: "POST",
         url: "/api/runs",
