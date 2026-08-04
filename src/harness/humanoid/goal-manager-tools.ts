@@ -5,12 +5,21 @@ import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import { GoalSchema, type JsonValue } from "../../domain/schema.js";
 import { GOAL_RETIREMENT_STATUSES } from "../../domain/goal-epoch-retirement.js";
 import { invalidToolInputResult } from "../tool-input-recovery.js";
+import {
+  GOAL_HISTORY_PREDICATE_TYPES,
+  GOAL_HISTORY_STATUSES,
+  type GoalHistoryRecallRequest
+} from "./goal-history.js";
 
 const CandidateIdSchema = z.string().regex(/^goal-candidate:[a-f0-9]{64}$/)
   .describe(
     "只能逐字复制 CURRENT HARNESS AUTHORITY 的 existing_goal_candidate_ids；"
     + "不能填写本批 proposal_id，列表为空时依赖必须为空"
   );
+
+const CandidateSequenceSchema = z.number().int().positive().describe(
+  "逐字复制候选提交回执或 CURRENT HARNESS AUTHORITY 中的 candidate_sequence"
+);
 
 const SubmitGoalCandidatesSchema = z.object({
   candidates: z.array(z.object({
@@ -40,9 +49,7 @@ const SubmitGoalCandidatesSchema = z.object({
 });
 
 const SelectGoalCandidateSchema = z.object({
-  candidate_id: CandidateIdSchema.describe(
-    "逐字复制 submit_goal_candidates 成功回执中的 candidate_ids 之一"
-  )
+  candidate_sequence: CandidateSequenceSchema
 }).strict();
 
 const RetireGoalEpochSchema = z.object({
@@ -59,7 +66,58 @@ const RetireGoalEpochSchema = z.object({
   }
 });
 
+const RecallGoalHistorySchema = z.object({
+  candidate_ids: z.array(CandidateIdSchema).max(32).nullable().optional()
+    .describe("精确召回的 Goal candidate 标识"),
+  before_candidate_sequence: z.number().int().positive().nullable().optional()
+    .describe("分页时只返回该 candidate sequence 之前的历史"),
+  statuses: z.array(z.enum(GOAL_HISTORY_STATUSES)).max(GOAL_HISTORY_STATUSES.length)
+    .nullable().optional(),
+  predicate_types: z.array(z.enum(GOAL_HISTORY_PREDICATE_TYPES))
+    .max(GOAL_HISTORY_PREDICATE_TYPES.length).nullable().optional(),
+  object_ids: z.array(z.string().trim().min(1).max(160)).max(32)
+    .nullable().optional(),
+  solid_ids: z.array(z.string().trim().min(1).max(160)).max(32)
+    .nullable().optional(),
+  zone_ids: z.array(z.string().trim().min(1).max(160)).max(32)
+    .nullable().optional(),
+  limit: z.number().int().min(1).max(32)
+}).strict().superRefine((input, context) => {
+  for (const field of [
+    "candidate_ids",
+    "statuses",
+    "predicate_types",
+    "object_ids",
+    "solid_ids",
+    "zone_ids"
+  ] as const) {
+    const values = input[field];
+    if (values && new Set(values).size !== values.length) {
+      context.addIssue({
+        code: "custom",
+        path: [field],
+        message: "Goal history recall values must be unique"
+      });
+    }
+  }
+  if (input.candidate_ids && input.candidate_ids.length > input.limit) {
+    context.addIssue({
+      code: "custom",
+      path: ["limit"],
+      message: "Goal history recall limit must cover every exact candidate identity"
+    });
+  }
+  if (input.candidate_ids?.length && input.before_candidate_sequence != null) {
+    context.addIssue({
+      code: "custom",
+      path: ["before_candidate_sequence"],
+      message: "Exact Goal candidate recall cannot use chronological pagination"
+    });
+  }
+});
+
 export interface GoalManagerRuntime {
+  recallGoalHistory(request: GoalHistoryRecallRequest): Promise<JsonValue>;
   submitGoalCandidates(
     input: z.infer<typeof SubmitGoalCandidatesSchema>,
     authority: GoalToolCallAuthority
@@ -84,6 +142,7 @@ export function createGoalManagerTools(
   runtime: GoalManagerRuntime
 ): Array<FunctionTool<unknown, z.ZodObject, string>> {
   return [
+    goalHistoryTool(runtime),
     goalTool(
       "submit_goal_candidates",
       SubmitGoalCandidatesSchema,
@@ -109,6 +168,34 @@ export function createGoalManagerTools(
       )
     )
   ];
+}
+
+function goalHistoryTool(
+  runtime: GoalManagerRuntime
+): FunctionTool<unknown, typeof RecallGoalHistorySchema, string> {
+  const name = "recall_goal_history";
+  return tool<typeof RecallGoalHistorySchema, unknown, string>({
+    name,
+    description: "只读召回完整 Goal DAG 中未装入当前工作集的候选与结果。可按 candidate、状态、谓词、对象、方块或区域检索；历史结果不能代替当前物理观察。",
+    parameters: RecallGoalHistorySchema,
+    strict: true,
+    timeoutBehavior: "raise_exception",
+    errorFunction: (_context, error) => historicalGoalError(error, name),
+    execute: async (input) => JSON.stringify(await runtime.recallGoalHistory({
+      ...(input.candidate_ids?.length ? { candidate_ids: input.candidate_ids } : {}),
+      ...(input.before_candidate_sequence != null
+        ? { before_candidate_sequence: input.before_candidate_sequence }
+        : {}),
+      ...(input.statuses?.length ? { statuses: input.statuses } : {}),
+      ...(input.predicate_types?.length
+        ? { predicate_types: input.predicate_types }
+        : {}),
+      ...(input.object_ids?.length ? { object_ids: input.object_ids } : {}),
+      ...(input.solid_ids?.length ? { solid_ids: input.solid_ids } : {}),
+      ...(input.zone_ids?.length ? { zone_ids: input.zone_ids } : {}),
+      limit: input.limit
+    }))
+  });
 }
 
 function goalTool(
@@ -156,7 +243,14 @@ function goalToolDescription(name: string): string {
     return "一次提交 2–3 个由当前模型提出的长期任务候选。每个候选必须绑定当前物理证据、可观察谓词、依赖和任务推进关系；Harness 不生成或补充候选。";
   }
   if (name === "select_goal_candidate") {
-    return "从已提交且依赖已完成的候选中显式选择下一 Goal epoch。Harness 不打分、不随机选择，也不提供替代目标。";
+    return "用候选回执中的短序号显式选择一个已提交且依赖已完成的 Goal。短序号与持久候选身份一对一对应；Harness 不打分、不随机选择，也不提供替代目标。";
   }
   return "用当前物理证据将 active Goal 退役为 blocked、abandoned、superseded 或 expired。退役后必须由后续模型调用重新提交并选择，Harness 不自动替换。";
+}
+
+function historicalGoalError(error: unknown, toolName: string): string {
+  const recovered = JSON.parse(
+    invalidToolInputResult(error, toolName)
+  ) as Record<string, unknown>;
+  return JSON.stringify({ ...recovered, historical_only: true });
 }

@@ -5,7 +5,7 @@ import {
   type HumanoidMotionPlan
 } from "./motion-plan.js";
 
-export const DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS = 300;
+export const DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS = 900;
 
 export function humanoidMotionIntentSha256(
   rawPlan: HumanoidMotionPlan

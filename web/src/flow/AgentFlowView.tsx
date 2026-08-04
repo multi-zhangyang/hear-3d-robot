@@ -46,6 +46,7 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
     }
   }, [checkpoint.active_agent_id, checkpoint.nodes, checkpoint.root_id, selectedId]);
   const selected = checkpoint.nodes[selectedId] ?? checkpoint.nodes[checkpoint.root_id] ?? nodes[0];
+  const selectedUsage = selected ? checkpoint.model_usage?.by_agent[selected.id] : undefined;
   const goal = activeCheckpointGoal(checkpoint);
   const selectionLabel = goalSelectionLabel(checkpoint);
   const cycles = useMemo(() => presentAutonomousCycles({
@@ -79,13 +80,19 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
           <div
             className="context-memory-card"
             style={{ "--context-load": `${Math.round(contextUsage.loadFraction * 100)}%` } as React.CSSProperties}
-            aria-label={`当前上下文估算为 ${contextUsage.activeEstimatedTokens} 个令牌`}
+            aria-label={`当前上下文估算为 ${contextUsage.activeEstimatedTokens} 个令牌，上下文窗口为 ${contextUsage.contextWindowTokens} 个令牌，压缩触发线为 ${contextUsage.compactTriggerTokens} 个令牌`}
           >
             <span>上下文</span>
-            <strong>{compactTokens(contextUsage.activeEstimatedTokens)}</strong>
-            <small>{contextMemory.total_compactions > 0
-              ? `已压缩 ${contextMemory.total_compactions} 次`
-              : "实时记忆"}</small>
+            <strong>
+              {compactTokens(contextUsage.activeEstimatedTokens)}
+              <em> / {compactTokens(contextUsage.contextWindowTokens)}</em>
+            </strong>
+            <small>
+              压缩线 {compactTokens(contextUsage.compactTriggerTokens)}
+              {contextMemory.total_compactions > 0
+                ? ` · ${contextMemory.total_compactions} 次`
+                : ""}
+            </small>
             <i />
           </div>
           <div className="flow-progress" style={{ "--flow-progress": `${Math.min(100, progress * 100)}%` } as React.CSSProperties}>
@@ -124,6 +131,9 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
               <p>{nodeOutput(selected) ?? nodePurposeLabel(selected, goal)}</p>
               <div className="agent-output-meta">
                 <span>{selected.model_calls_used} 次模型调用</span>
+                {selectedUsage && selectedUsage.reported_requests > 0 && (
+                  <span>{compactTokens(selectedUsage.total_tokens)} 模型令牌</span>
+                )}
                 <span>{selected.steps_used} 次工具决策</span>
                 <span>{selected.child_ids.length} 个下级角色</span>
               </div>

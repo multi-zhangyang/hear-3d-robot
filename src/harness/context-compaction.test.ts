@@ -85,10 +85,18 @@ describe("LongRunContextManager hierarchy identity", () => {
       store: {},
       activeNode: () => node,
       contextAnchor: () => ({
+        world_frame: 41,
+        world_revision: 41,
+        coordinator_phase: "execute_plan",
         goal_context: { evidence_ref: evidenceRef },
         goal_dag: {
           candidates: { [candidateId]: { status: "proposed" } },
           current_epoch_id: null
+        },
+        execution_authority: {
+          planning_action: "plan_humanoid_navigation",
+          planning_transaction_id: "planning-call-41",
+          executor_action: "execute_humanoid_navigation"
         }
       }),
       contextMemory: () => structuredClone(memory),
@@ -127,6 +135,169 @@ describe("LongRunContextManager hierarchy identity", () => {
     expect(filtered.instructions).toContain(
       `existing_goal_candidate_ids=${JSON.stringify([candidateId])}`
     );
+    expect(filtered.instructions).toContain("current_world_revision=41");
+    expect(filtered.instructions).toContain(
+      'pending_planning_transaction_id="planning-call-41"'
+    );
+    expect(filtered.instructions).toContain(
+      'required_executor_action="execute_humanoid_navigation"'
+    );
+  });
+
+  it("calibrates the provider-neutral estimate from reported input usage", async () => {
+    let memory = structuredClone(EmptyContextMemoryState);
+    const journal: unknown[] = [];
+    const node = taskNode("humanoid-coordinator", "协调");
+    const runtime = {
+      rootAgentId: node.id,
+      signal: undefined,
+      store: {},
+      activeNode: () => node,
+      contextAnchor: () => ({ world_revision: 0 }),
+      contextMemory: () => structuredClone(memory),
+      contextWorldIdentity: () => ({ worldRevision: 0 }),
+      contextReceipts: () => ({}),
+      assertContextSummaryEvidence: () => undefined,
+      async updateContextMemory(state: ContextMemoryState, record?: unknown) {
+        memory = structuredClone(state);
+        if (record !== undefined) journal.push(record);
+      },
+      async recordCompactionModelCall() {},
+      async reconcileCompactionModelCalls() {},
+      async recordProvider() {}
+    } as unknown as LongRunContextRuntime;
+    const manager = new LongRunContextManager({
+      runtime,
+      provider: providerConfig({
+        contextWindowTokens: 8_192,
+        compactTriggerTokens: 7_000
+      }),
+      createGenerator: () => ({
+        async generate() {
+          throw new Error("Compaction was not expected in this test");
+        }
+      })
+    });
+    const request = {
+      modelData: {
+        instructions: `${agentInvocationMarker(node.id)}\nCoordinate.`,
+        input: [{ role: "user", content: "Inspect current state." }] as AgentInputItem[]
+      },
+      agent: { name: node.name, tools: [] }
+    } as never;
+
+    await manager.filter(request);
+    const baseline = manager.snapshot.scopes[node.id]!.active_estimated_tokens;
+    await manager.recordModelInputUsage(node.id, baseline * 2);
+
+    expect(manager.snapshot.scopes[node.id]).toMatchObject({
+      token_estimator_correction_milli: 2_000,
+      active_estimated_tokens: baseline * 2
+    });
+    expect(journal).toContainEqual(expect.objectContaining({
+      type: "context_token_estimator_calibrated",
+      estimated_input_tokens: baseline,
+      reported_input_tokens: baseline * 2,
+      correction_milli: 2_000
+    }));
+
+    await manager.filter(request);
+    expect(manager.snapshot.scopes[node.id]!.active_estimated_tokens)
+      .toBe(baseline * 2);
+  });
+
+  it("rewrites a completed SDK Session from the logical hot tail", async () => {
+    let memory = structuredClone(EmptyContextMemoryState);
+    let worldRevision = 0;
+    const node = taskNode("humanoid-coordinator", "协调");
+    const runtime = {
+      rootAgentId: node.id,
+      signal: undefined,
+      store: {},
+      activeNode: () => node,
+      contextAnchor: () => ({ world_revision: worldRevision }),
+      contextMemory: () => structuredClone(memory),
+      contextWorldIdentity: () => ({ worldRevision }),
+      contextReceipts: () => ({}),
+      assertContextSummaryEvidence: () => undefined,
+      async updateContextMemory(state: ContextMemoryState) {
+        memory = structuredClone(state);
+      },
+      async recordCompactionModelCall() {},
+      async reconcileCompactionModelCalls() {},
+      async recordProvider() {}
+    } as unknown as LongRunContextRuntime;
+    const manager = new LongRunContextManager({
+      runtime,
+      provider: providerConfig({
+        contextWindowTokens: 8_192,
+        compactTriggerTokens: 1_000,
+        compactRecentModelTurns: 1,
+        compactMaxOutputTokens: 120
+      }),
+      createGenerator: () => ({
+        async generate() {
+          worldRevision = 1;
+          return {
+            summary: {
+              mission_state: "继续长期任务。",
+              constraints: [],
+              decisions: [],
+              completed: [],
+              pending: ["保留最新物理状态。"],
+              blockers: [],
+              next_actions: ["继续规划。"]
+            },
+            origin: "model",
+            usage: { requests: 1, inputTokens: 500, outputTokens: 40, totalTokens: 540 }
+          };
+        }
+      })
+    });
+    const physical = [
+      { role: "user", content: "x".repeat(3_000) },
+      { role: "assistant", content: "旧状态已读取。" },
+      { role: "user", content: "保留这一轮。" }
+    ] as AgentInputItem[];
+    const request = {
+      modelData: {
+        instructions: `${agentInvocationMarker(node.id)}\nCoordinate.`,
+        input: physical
+      },
+      agent: { name: node.name, tools: [] }
+    } as never;
+    const filtered = await manager.filter(request);
+    const completion = {
+      role: "assistant",
+      content: "完成当前决策。"
+    } as AgentInputItem;
+    let persisted = [...structuredClone(physical), completion];
+    let replacements = 0;
+    const session = {
+      getItems: async () => structuredClone(persisted),
+      replaceItems: async (items: AgentInputItem[]) => {
+        persisted = structuredClone(items);
+        replacements += 1;
+      }
+    };
+
+    expect(manager.snapshot.scopes[node.id]).toMatchObject({
+      compaction_count: 1,
+      summary_origin: "model",
+      summary_world_revision: 0
+    });
+    await manager.compactSessionHistories(() => session as never);
+
+    expect(replacements).toBe(1);
+    expect(persisted).toEqual([...filtered.input, completion]);
+    await manager.filter({
+      ...request,
+      modelData: { ...request.modelData, input: persisted }
+    });
+    expect(manager.snapshot.scopes[node.id]).toMatchObject({
+      compaction_count: 1,
+      summary_origin: "model"
+    });
   });
 
   it("persists distinct scope budgets and applies one effective compactor envelope", async () => {
@@ -149,7 +320,7 @@ describe("LongRunContextManager hierarchy identity", () => {
       compactMaxOutputTokens: 120
     });
     const compactor = providerConfig({
-      contextWindowTokens: 4_096,
+      contextWindowTokens: 8_192,
       compactTriggerTokens: 2_000,
       compactRecentModelTurns: 2,
       compactMaxOutputTokens: 200,
@@ -244,7 +415,7 @@ describe("LongRunContextManager hierarchy identity", () => {
       agentId: "humanoid-sentry",
       request: {
         maxOutputTokens: 120,
-        maxInputTokens: compactorInputTokenLimit(4_096, 120)
+        maxInputTokens: compactorInputTokenLimit(8_192, 120)
       }
     });
   });

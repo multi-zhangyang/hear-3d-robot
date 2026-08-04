@@ -18,7 +18,7 @@ describe("provider context budget", () => {
     });
     expect(config).toMatchObject({
       contextWindowTokens: 32768,
-      compactTriggerTokens: Math.floor(32768 * 0.275),
+      compactTriggerTokens: Math.floor(32768 * 0.85),
       compactRecentModelTurns: 4,
       compactMaxOutputTokens: 1024
     });
@@ -32,21 +32,21 @@ describe("provider context budget", () => {
     });
 
     expect(config.contextWindowTokens).toBe(262_144);
-    expect(config.compactTriggerTokens).toBe(Math.floor(262_144 * 0.275));
+    expect(config.compactTriggerTokens).toBe(Math.floor(262_144 * 0.85));
     expect(config.maxOutputTokens).toBeUndefined();
     expect(config.compactMaxOutputTokens).toBeUndefined();
     expect(config.agentModels?.executor.maxOutputTokens).toBeUndefined();
     expect(config.agentModels?.compactor.compactMaxOutputTokens).toBeUndefined();
   });
 
-  it("rejects a trigger that leaves no room for model and compactor output", () => {
+  it("rejects a trigger that conflicts with an explicitly configured output limit", () => {
     expect(() => loadProviderConfig({
       ...required,
       AI_CONTEXT_WINDOW_TOKENS: "16000",
-      AI_COMPACT_TRIGGER_TOKENS: "10000",
+      AI_COMPACT_TRIGGER_TOKENS: "11000",
       AI_MAX_OUTPUT_TOKENS: "5000",
       AI_COMPACT_MAX_OUTPUT_TOKENS: "2000"
-    })).toThrow("output reserves");
+    })).toThrow("explicitly configured AI_MAX_OUTPUT_TOKENS");
   });
 
   it("reserves the model window for every turn in a fresh compactor attempt", () => {
@@ -104,14 +104,35 @@ describe("provider context budget", () => {
     });
   });
 
+  it("derives an independent 85% trigger when a role overrides its window", () => {
+    const config = loadProviderConfig({
+      ...required,
+      AI_EXECUTOR_CONTEXT_WINDOW_TOKENS: "131072"
+    });
+
+    expect(config.agentModels?.executor).toMatchObject({
+      contextWindowTokens: 131072,
+      compactTriggerTokens: Math.floor(131072 * 0.85)
+    });
+  });
+
+  it("uses the same 85% high-water mark for every configured window", () => {
+    const config = loadProviderConfig({
+      ...required,
+      AI_CONTEXT_WINDOW_TOKENS: "16000"
+    });
+
+    expect(config.compactTriggerTokens).toBe(Math.floor(16000 * 0.85));
+  });
+
   it("validates every agent profile before the runtime can create a model", () => {
     expect(() => loadProviderConfig({
       ...required,
       AI_SENTRY_CONTEXT_WINDOW_TOKENS: "16000",
-      AI_SENTRY_COMPACT_TRIGGER_TOKENS: "10000",
+      AI_SENTRY_COMPACT_TRIGGER_TOKENS: "11000",
       AI_SENTRY_MAX_OUTPUT_TOKENS: "5000",
       AI_SENTRY_COMPACT_MAX_OUTPUT_TOKENS: "2000"
-    })).toThrow("output reserves");
+    })).toThrow("explicitly configured AI_MAX_OUTPUT_TOKENS");
   });
 });
 

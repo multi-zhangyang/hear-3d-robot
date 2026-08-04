@@ -55,7 +55,11 @@ describe("人形身体通道", () => {
     }));
 
     expect(html).toContain("width:50%");
-    expect(html).toContain("4000");
+    expect(html).toContain(
+      "当前上下文估算为 4000 个令牌，上下文窗口为 32768 个令牌，压缩触发线为 8000 个令牌"
+    );
+    expect(html).toContain("4000 / 3.3万");
+    expect(html).toContain("压缩线 8000");
   });
 
   it("只显示当前物理帧的真实抓取与保持进度", () => {

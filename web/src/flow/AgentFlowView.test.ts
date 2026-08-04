@@ -98,6 +98,12 @@ describe("agent flow context meter", () => {
             last_compacted_at: null
           }
         }
+      },
+      model_usage: {
+        version: 1,
+        total: usageTotals(600),
+        by_agent: { worker: usageTotals(600) },
+        updated_at: "2026-08-03T00:00:02.000Z"
       }
     } as unknown as HumanoidRunCheckpoint;
 
@@ -108,7 +114,12 @@ describe("agent flow context meter", () => {
     }));
 
     expect(html).toContain("--context-load:50%");
-    expect(html).toContain("当前上下文估算为 4000 个令牌");
+    expect(html).toContain(
+      "当前上下文估算为 4000 个令牌，上下文窗口为 32768 个令牌，压缩触发线为 8000 个令牌"
+    );
+    expect(html).toContain("/ 3.3万");
+    expect(html).toContain("压缩线 8000");
+    expect(html).toContain("600 模型令牌");
   });
 
   it("shows the Goal Manager and the live candidate-selection phase", () => {
@@ -187,5 +198,17 @@ function treeNode(
     model_calls_used: 0,
     created_at: createdAt,
     updated_at: createdAt
+  };
+}
+
+function usageTotals(totalTokens: number) {
+  return {
+    requests: 1,
+    reported_requests: 1,
+    input_tokens: Math.max(0, totalTokens - 120),
+    output_tokens: Math.min(120, totalTokens),
+    total_tokens: totalTokens,
+    cached_input_tokens: 0,
+    reasoning_tokens: 0
   };
 }

@@ -42,6 +42,7 @@ const HASH_SEED = "hear-context-ledger-v1";
 interface RecoveredInputState {
   physical: AgentInputItem[];
   logical: AgentInputItem[];
+  sessionRewritePending: boolean;
 }
 
 interface RecoveredHistory {
@@ -65,8 +66,8 @@ export class LongRunContextManager {
   readonly #defaultConfig: ModelProviderConfig;
   readonly #configForAgent: (agentId: string) => ModelProviderConfig;
   readonly #compactorConfig: ModelProviderConfig;
-  readonly #sessionForAgent: ((agentId: string) => FileSession) | undefined;
   readonly #recoveredInputs = new Map<string, RecoveredInputState>();
+  readonly #pendingModelEstimates = new Map<string, number>();
   readonly #freshTurnScopes = new Set<string>();
   readonly #freshTurnRebaseScopes = new Set<string>();
   #memoryPersistence: Promise<void> = Promise.resolve();
@@ -78,14 +79,12 @@ export class LongRunContextManager {
     provider: ProviderConfig;
     configForAgent?: (agentId: string) => ModelProviderConfig;
     compactorProvider?: ModelProviderConfig;
-    sessionForAgent?: (agentId: string) => FileSession;
   }) {
     this.#runtime = input.runtime;
     this.#createGenerator = input.createGenerator;
     this.#defaultConfig = input.provider;
     this.#configForAgent = input.configForAgent ?? (() => this.#defaultConfig);
     this.#compactorConfig = input.compactorProvider ?? input.provider;
-    this.#sessionForAgent = input.sessionForAgent;
     const persisted = input.runtime.contextMemory();
     const defaultSummaryOutputTokens = this.#summaryOutputTokens(this.#defaultConfig);
     this.#state = ContextMemoryStateSchema.parse({
@@ -101,6 +100,33 @@ export class LongRunContextManager {
     return structuredClone(this.#state);
   }
 
+  async recordModelInputUsage(agentId: string, inputTokens: number): Promise<void> {
+    if (!Number.isSafeInteger(inputTokens) || inputTokens <= 0) return;
+    const estimated = this.#pendingModelEstimates.get(agentId);
+    this.#pendingModelEstimates.delete(agentId);
+    const scope = this.#state.scopes[agentId];
+    if (!scope || estimated === undefined || estimated <= 0) return;
+    const observedCorrection = Math.ceil(inputTokens * 1_000 / estimated);
+    if (observedCorrection <= scope.token_estimator_correction_milli) return;
+    const previousCorrection = scope.token_estimator_correction_milli;
+    scope.token_estimator_correction_milli = observedCorrection;
+    scope.active_estimated_tokens = correctedTokenEstimate(
+      estimated,
+      observedCorrection
+    );
+    if (this.#state.active_scope_id === agentId) this.#setActive(scope);
+    await this.#persist(json({
+      type: "context_token_estimator_calibrated",
+      scope_id: scope.scope_id,
+      agent_id: scope.agent_id,
+      estimated_input_tokens: estimated,
+      reported_input_tokens: inputTokens,
+      previous_correction_milli: previousCorrection,
+      correction_milli: observedCorrection,
+      at: new Date().toISOString()
+    }));
+  }
+
   /**
    * Removes only prefixes already represented by a validated compact
    * checkpoint. This runs after the SDK has durably persisted the completed
@@ -110,21 +136,25 @@ export class LongRunContextManager {
     sessionForAgent: (agentId: string) => FileSession
   ): Promise<void> {
     for (const [scopeId, recovered] of this.#recoveredInputs) {
-      const compactedPrefix = recovered.physical.length - recovered.logical.length;
-      if (compactedPrefix <= 0) continue;
+      if (!recovered.sessionRewritePending) continue;
       const session = sessionForAgent(scopeId);
       const persisted = await session.getItems();
       if (isPrefix(recovered.physical, persisted)) {
-        const retained = persisted.slice(compactedPrefix);
+        const retained = [
+          ...structuredClone(recovered.logical),
+          ...structuredClone(persisted.slice(recovered.physical.length))
+        ];
         await session.replaceItems(retained);
         this.#recoveredInputs.set(scopeId, {
           physical: structuredClone(retained),
-          logical: structuredClone(retained)
+          logical: structuredClone(retained),
+          sessionRewritePending: false
         });
       } else if (isPrefix(recovered.logical, persisted)) {
         this.#recoveredInputs.set(scopeId, {
           physical: structuredClone(persisted),
-          logical: structuredClone(persisted)
+          logical: structuredClone(persisted),
+          sessionRewritePending: false
         });
       }
     }
@@ -166,10 +196,14 @@ export class LongRunContextManager {
     ));
     const rawUpdate = this.#recordRawDelta(scope, logicalInput);
     const authority = this.#runtime.contextAnchor(node.id);
-    const rebaseUpdate = this.#rebaseSummary(scope);
+    const contextWorldRevision = this.#runtime.contextWorldIdentity().worldRevision;
+    const rebaseUpdate = this.#rebaseSummary(scope, contextWorldRevision);
 
     let filtered = this.#render(logicalModelData, scope, authority);
-    scope.active_estimated_tokens = estimateModelInputTokens(filtered) + toolTokens;
+    scope.active_estimated_tokens = correctedTokenEstimate(
+      estimateModelInputTokens(filtered) + toolTokens,
+      scope.token_estimator_correction_milli
+    );
     this.#rememberRetainedTail(scope, logicalInput);
     this.#setActive(scope);
     let persisted = rawUpdate !== undefined;
@@ -201,7 +235,8 @@ export class LongRunContextManager {
         authority,
         toolTokens,
         config,
-        summaryOutputTokens
+        summaryOutputTokens,
+        contextWorldRevision
       );
       if (compacted === null) break;
       filtered = compacted.modelData;
@@ -223,7 +258,8 @@ export class LongRunContextManager {
       scope.retained_chain_hash = scope.raw_chain_hash;
       this.#recoveredInputs.set(scope.scope_id, {
         physical: structuredClone(physicalInput),
-        logical: structuredClone(retained)
+        logical: structuredClone(retained),
+        sessionRewritePending: true
       });
       await this.#persist(json({
         type: "context_history_compacted",
@@ -240,7 +276,6 @@ export class LongRunContextManager {
         items: retained,
         at: new Date().toISOString()
       }));
-      await this.#compactPersistedSession(scope.scope_id);
       persisted = true;
     }
 
@@ -252,6 +287,10 @@ export class LongRunContextManager {
         + `above the configured ${hardLimit}-token input limit after compaction`
       );
     }
+    this.#pendingModelEstimates.set(
+      agentId,
+      estimateModelInputTokens(filtered) + toolTokens
+    );
     if (!persisted) await this.#persist();
     return filtered;
   };
@@ -277,6 +316,7 @@ export class LongRunContextManager {
       retained_item_count: 0,
       retained_chain_hash: null,
       active_estimated_tokens: 0,
+      token_estimator_correction_milli: 1_000,
       context_window_tokens: config.contextWindowTokens,
       compact_trigger_tokens: config.compactTriggerTokens,
       compact_recent_model_turns: config.compactRecentModelTurns,
@@ -333,9 +373,9 @@ export class LongRunContextManager {
       ];
       this.#recoveredInputs.set(scope.scope_id, {
         physical: structuredClone(physical),
-        logical: structuredClone(logical)
+        logical: structuredClone(logical),
+        sessionRewritePending: !sameItems(physical, logical)
       });
-      await this.#compactPersistedSession(scope.scope_id);
       return logical;
     }
     const history = recoveredHistory.items;
@@ -347,7 +387,8 @@ export class LongRunContextManager {
     ];
     this.#recoveredInputs.set(scope.scope_id, {
       physical: structuredClone(physical),
-      logical: structuredClone(logical)
+      logical: structuredClone(logical),
+      sessionRewritePending: !sameItems(physical, logical)
     });
     await this.#persist(json({
       type: "context_history_rehydrated",
@@ -452,23 +493,6 @@ export class LongRunContextManager {
     return matched;
   }
 
-  async #compactPersistedSession(scopeId: string): Promise<void> {
-    const sessionForAgent = this.#sessionForAgent;
-    const recovered = this.#recoveredInputs.get(scopeId);
-    if (!sessionForAgent || !recovered) return;
-    const compactedPrefix = recovered.physical.length - recovered.logical.length;
-    if (compactedPrefix <= 0) return;
-    const session = sessionForAgent(scopeId);
-    const persisted = await session.getItems();
-    const physicalStart = sequencePrefixIndex(recovered.physical, persisted);
-    if (physicalStart < 0) return;
-    const remove = Math.min(
-      persisted.length,
-      Math.max(0, compactedPrefix - physicalStart)
-    );
-    if (remove > 0) await session.replaceItems(persisted.slice(remove));
-  }
-
   #recordRawDelta(scope: ContextScopeState, items: AgentInputItem[]): JsonValue | undefined {
     const explicitFreshTurn = this.#freshTurnScopes.delete(scope.scope_id);
     let branch = explicitFreshTurn;
@@ -535,7 +559,8 @@ export class LongRunContextManager {
     authority: JsonValue,
     toolTokens: number,
     config: ModelProviderConfig,
-    summaryOutputTokens: number
+    summaryOutputTokens: number,
+    contextWorldRevision: number
   ): Promise<{ modelData: ModelInputData; journalRecord: JsonValue } | null> {
     const targetCut = chooseCutIndex({
       items: modelData.input,
@@ -545,7 +570,8 @@ export class LongRunContextManager {
       authority,
       toolTokens,
       summaryTokenReserve: summaryOutputTokens,
-      triggerTokens: config.compactTriggerTokens
+      triggerTokens: config.compactTriggerTokens,
+      tokenEstimatorCorrectionMilli: scope.token_estimator_correction_milli
     });
     if (targetCut <= scope.compacted_item_count) return null;
 
@@ -576,17 +602,16 @@ export class LongRunContextManager {
         scope.summary,
         sourceItems
       );
-      const { worldRevision: currentWorldRevision } = this.#runtime.contextWorldIdentity();
       const request: ContextSummaryRequest = {
         priorSummary: scope.summary,
         sourceItems,
         authority,
         acceptedTransactionIds: transactionIds.filter((transactionId) =>
           receipts[transactionId]?.accepted === true
-            && receipts[transactionId]?.worldRevision === currentWorldRevision
+            && receipts[transactionId]?.worldRevision === contextWorldRevision
         ),
         blockerTransactionIds: transactionIds.filter((transactionId) =>
-          receipts[transactionId]?.worldRevision === currentWorldRevision
+          receipts[transactionId]?.worldRevision === contextWorldRevision
         ),
         maxInputTokens,
         maxOutputTokens: summaryOutputTokens,
@@ -652,6 +677,7 @@ export class LongRunContextManager {
         scope_id: scope.scope_id,
         agent_id: node.id,
         error: interruption instanceof Error ? interruption.message : String(interruption),
+        ...(usage ? { usage } : {}),
         recoverable: true,
         raw_history_preserved: true,
         session_trimmed: false
@@ -660,18 +686,20 @@ export class LongRunContextManager {
     }
 
     const completedAt = new Date().toISOString();
-    const world = this.#runtime.contextWorldIdentity();
     scope.compacted_item_count = cut;
     scope.compaction_count += 1;
     scope.summary = generated.summary;
     scope.summary_origin = generated.origin;
-    scope.summary_world_revision = world.worldRevision;
+    scope.summary_world_revision = contextWorldRevision;
     scope.last_compacted_at = completedAt;
     this.#state.total_compactions += 1;
     this.#state.last_compacted_at = completedAt;
 
     const filtered = this.#render(modelData, scope, authority);
-    scope.active_estimated_tokens = estimateModelInputTokens(filtered) + toolTokens;
+    scope.active_estimated_tokens = correctedTokenEstimate(
+      estimateModelInputTokens(filtered) + toolTokens,
+      scope.token_estimator_correction_milli
+    );
     this.#rememberRetainedTail(scope, modelData.input);
     this.#setActive(scope);
 
@@ -705,7 +733,7 @@ export class LongRunContextManager {
         compactor_max_output_tokens: summaryOutputTokens,
         retained_items: modelData.input.length - cut,
         active_estimated_tokens: scope.active_estimated_tokens,
-        world_revision: world.worldRevision,
+        world_revision: contextWorldRevision,
         summary_origin: generated.origin,
         summary: generated.summary,
         usage: generated.usage,
@@ -769,7 +797,8 @@ export class LongRunContextManager {
    * this filter changes no world state and chooses no replacement action.
    */
   #rebaseSummary(
-    scope: ContextScopeState
+    scope: ContextScopeState,
+    currentWorldRevision: number
   ): {
     type: "context_checkpoint_rebased";
     scope_id: string;
@@ -783,7 +812,6 @@ export class LongRunContextManager {
     const forceFreshRebase = this.#freshTurnRebaseScopes.delete(scope.scope_id);
     if (!scope.summary) return undefined;
     const receipts = this.#runtime.contextReceipts();
-    const { worldRevision: currentWorldRevision } = this.#runtime.contextWorldIdentity();
     const evidenceIds = summaryTransactionIds(scope.summary);
     const staleIds = evidenceIds.filter((transactionId) =>
       receipts[transactionId]?.worldRevision !== currentWorldRevision
@@ -870,6 +898,7 @@ function chooseCutIndex(input: {
   toolTokens: number;
   summaryTokenReserve: number;
   triggerTokens: number;
+  tokenEstimatorCorrectionMilli: number;
 }): number {
   const starts = modelTurnStarts(input.items)
     .filter((index) => index > input.alreadyCompacted);
@@ -883,16 +912,21 @@ function chooseCutIndex(input: {
   const target = Math.floor(input.triggerTokens * 0.82);
   for (const cut of boundaries) {
     if (cut <= input.alreadyCompacted) continue;
-    const projected = estimateModelInputTokens({
+    const projected = correctedTokenEstimate(estimateModelInputTokens({
       input: input.items.slice(cut),
       instructions: [
         input.modelData.instructions ?? "",
         JSON.stringify(input.authority)
       ].join("\n")
-    }) + input.toolTokens + input.summaryTokenReserve;
+    }) + input.toolTokens, input.tokenEstimatorCorrectionMilli)
+      + input.summaryTokenReserve;
     if (projected <= target) return cut;
   }
   return input.items.length;
+}
+
+function correctedTokenEstimate(estimate: number, correctionMilli: number): number {
+  return Math.ceil(estimate * correctionMilli / 1_000);
 }
 
 /**
@@ -966,24 +1000,8 @@ function isPrefix(prefix: AgentInputItem[], value: AgentInputItem[]): boolean {
   return prefix.length <= value.length && commonPrefixLength(prefix, value) === prefix.length;
 }
 
-function sequencePrefixIndex(value: AgentInputItem[], prefix: AgentInputItem[]): number {
-  if (prefix.length === 0) return value.length;
-  const maximum = value.length - prefix.length;
-  // Session rows can repeat byte-for-byte across model turns. The persisted
-  // Session is the newest matching branch, so choosing an older occurrence can
-  // trim live rows that merely resemble an archived prefix. Search backwards;
-  // ambiguity then keeps extra context instead of deleting current context.
-  for (let start = maximum; start >= 0; start -= 1) {
-    let matches = true;
-    for (let offset = 0; offset < prefix.length; offset += 1) {
-      if (JSON.stringify(value[start + offset]) !== JSON.stringify(prefix[offset])) {
-        matches = false;
-        break;
-      }
-    }
-    if (matches) return start;
-  }
-  return -1;
+function sameItems(left: AgentInputItem[], right: AgentInputItem[]): boolean {
+  return left.length === right.length && isPrefix(left, right);
 }
 
 function asRecord(value: JsonValue): Record<string, JsonValue> {
@@ -1050,12 +1068,51 @@ function authorityIdentifierBlock(authority: JsonValue): string[] {
   const currentEpochId = typeof goalDAG?.current_epoch_id === "string"
     ? goalDAG.current_epoch_id
     : null;
-  if (!evidenceRef && candidates.length === 0 && currentEpochId === null) return [];
+  const execution = isJsonRecord(authority.execution_authority)
+    ? authority.execution_authority
+    : undefined;
+  const planningTransactionId = typeof execution?.planning_transaction_id === "string"
+    ? execution.planning_transaction_id
+    : undefined;
+  const planningAction = typeof execution?.planning_action === "string"
+    ? execution.planning_action
+    : undefined;
+  const executorAction = typeof execution?.executor_action === "string"
+    ? execution.executor_action
+    : undefined;
+  const worldFrame = typeof authority.world_frame === "number"
+    && Number.isSafeInteger(authority.world_frame)
+    ? authority.world_frame
+    : undefined;
+  const worldRevision = typeof authority.world_revision === "number"
+    && Number.isSafeInteger(authority.world_revision)
+    ? authority.world_revision
+    : undefined;
+  const hasCurrentWorld = worldFrame !== undefined && worldRevision !== undefined;
+  if (!evidenceRef
+    && candidates.length === 0
+    && currentEpochId === null
+    && !planningTransactionId
+    && !hasCurrentWorld) return [];
   return [
     "CURRENT EXACT IDENTIFIERS (copy values character-for-character; never invent aliases)",
+    ...(hasCurrentWorld
+      ? [
+          `current_world_frame=${JSON.stringify(worldFrame)}`,
+          `current_world_revision=${JSON.stringify(worldRevision)}`,
+          `coordinator_phase=${JSON.stringify(authority.coordinator_phase ?? null)}`
+        ]
+      : []),
     `goal_evidence_ref=${JSON.stringify(evidenceRef ?? null)}`,
     `existing_goal_candidate_ids=${JSON.stringify(candidates)}`,
-    `current_goal_epoch_id=${JSON.stringify(currentEpochId)}`
+    `current_goal_epoch_id=${JSON.stringify(currentEpochId)}`,
+    ...(planningTransactionId
+      ? [
+          `pending_planning_action=${JSON.stringify(planningAction ?? null)}`,
+          `pending_planning_transaction_id=${JSON.stringify(planningTransactionId)}`,
+          `required_executor_action=${JSON.stringify(executorAction ?? null)}`
+        ]
+      : [])
   ];
 }
 

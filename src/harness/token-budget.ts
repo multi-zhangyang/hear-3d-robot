@@ -33,9 +33,10 @@ export function estimateToolTokens(tools: readonly BudgetedTool[]): number {
 
 function estimateTextTokens(value: string): number {
   if (value.length === 0) return 0;
-  // Provider-neutral and deliberately conservative: English/JSON normally
-  // average nearer four bytes per token, while CJK stays close to this bound.
-  return Math.max(1, Math.ceil(Buffer.byteLength(value, "utf8") / 3));
+  // Structured tool traffic contains hashes, decimals and JSON punctuation,
+  // which is materially denser than prose for modern tokenizers. This
+  // provider-neutral baseline is calibrated further from reported usage.
+  return Math.max(1, Math.ceil(Buffer.byteLength(value, "utf8") * 4 / 9));
 }
 
 function estimateJsonTokens(value: unknown): number {

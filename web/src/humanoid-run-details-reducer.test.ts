@@ -140,6 +140,20 @@ describe("reduceHumanoidRunDetails", () => {
     };
     const compacted = reduce(focused, event("context_memory_updated", { context_memory }));
     expect(compacted.checkpoint.context_memory).toEqual(context_memory);
+
+    const model_usage = {
+      version: 1 as const,
+      total: usageTotals(600),
+      by_agent: { motion: usageTotals(600) },
+      updated_at: "2026-08-02T00:00:03.000Z"
+    };
+    const metered = reduce(compacted, event("provider_event", {
+      status: "usable_stream",
+      usage: { inputTokens: 480, outputTokens: 120, totalTokens: 600 },
+      model_usage
+    }));
+    expect(metered.checkpoint.model_usage).toEqual(model_usage);
+    expect(metered.provider).toHaveLength(1);
   });
 
   it("projects newly recorded embodied experience into the live checkpoint", () => {
@@ -311,6 +325,18 @@ function emptyScenarioChunks() {
     revision: 0,
     changed_chunk_ids: [],
     chunks: []
+  };
+}
+
+function usageTotals(totalTokens: number) {
+  return {
+    requests: 1,
+    reported_requests: 1,
+    input_tokens: Math.max(0, totalTokens - 120),
+    output_tokens: Math.min(120, totalTokens),
+    total_tokens: totalTokens,
+    cached_input_tokens: 0,
+    reasoning_tokens: 0
   };
 }
 

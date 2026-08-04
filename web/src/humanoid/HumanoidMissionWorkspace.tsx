@@ -168,10 +168,16 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
             </span>
           )}
         </div>
-        <div className="memory-meter">
-          <span><small>上下文</small><b>{compactTokens(contextUsage.activeEstimatedTokens)}</b></span>
+        <div
+          className="memory-meter"
+          aria-label={`当前上下文估算为 ${contextUsage.activeEstimatedTokens} 个令牌，上下文窗口为 ${contextUsage.contextWindowTokens} 个令牌，压缩触发线为 ${contextUsage.compactTriggerTokens} 个令牌`}
+        >
+          <span>
+            <small>上下文</small>
+            <b>{compactTokens(contextUsage.activeEstimatedTokens)} / {compactTokens(contextUsage.contextWindowTokens)}</b>
+          </span>
           <i><em style={{ width: `${contextUsage.loadFraction * 100}%` }} /></i>
-          <small>{context.total_compactions} 次压缩 · {checkpoint.embodied_memory.total_episodes} 段经历</small>
+          <small>压缩线 {compactTokens(contextUsage.compactTriggerTokens)} · {context.total_compactions} 次 · {checkpoint.embodied_memory.total_episodes} 段经历</small>
         </div>
       </section>
     </section>

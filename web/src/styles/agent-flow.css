@@ -109,6 +109,12 @@
 }
 
 .context-memory-card strong { color: #e7f5ee; font-size: 18px; line-height: 1.15; }
+.context-memory-card strong em {
+  color: #8ba199;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 500;
+}
 .context-memory-card small { color: #67cfa4; letter-spacing: 0.02em; text-transform: none; }
 .context-memory-card i {
   position: absolute;

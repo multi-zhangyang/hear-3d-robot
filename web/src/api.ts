@@ -15,6 +15,7 @@ import {
 import { nextRuntimeEventCursor } from "./stream-state";
 
 const PASSWORD_STORAGE_KEY = "hear.password";
+const MAX_EVENT_STREAM_RECORD_CHARACTERS = 8 * 1024 * 1024;
 let password = readStoredPassword();
 
 export class ApiError extends Error {
@@ -284,7 +285,13 @@ async function consumeEvents(
     buffer = buffer.replace(/\r\n/g, "\n");
     const records = buffer.split("\n\n");
     buffer = records.pop() ?? "";
+    if (buffer.length > MAX_EVENT_STREAM_RECORD_CHARACTERS) {
+      throw new SyntaxError("Runtime event stream record exceeds the client limit");
+    }
     for (const record of records) {
+      if (record.length > MAX_EVENT_STREAM_RECORD_CHARACTERS) {
+        throw new SyntaxError("Runtime event stream record exceeds the client limit");
+      }
       const lines = record.split("\n");
       const streamCursor = lines
         .filter((line) => line.startsWith("id:"))

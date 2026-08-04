@@ -172,4 +172,22 @@ describe("run event subscription", () => {
     });
     expect(onEvent).not.toHaveBeenCalled();
   });
+
+  it("stops instead of retaining an unbounded incomplete SSE record", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      `data: ${"x".repeat(8 * 1024 * 1024 + 1)}`,
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    )));
+    const onEvent = vi.fn();
+
+    const failure = new Promise<Error>((resolve) => {
+      subscribeToRun("run-large", onEvent, resolve, undefined, "baseline");
+    });
+
+    await expect(failure).resolves.toMatchObject({
+      name: "SyntaxError",
+      message: "Runtime event stream record exceeds the client limit"
+    });
+    expect(onEvent).not.toHaveBeenCalled();
+  });
 });

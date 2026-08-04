@@ -30,11 +30,21 @@ export async function inspectLiveRunEvidence(input) {
   const missionCompletion = resolveHumanoidMissionCompletion(checkpoint, goalEvidence);
   if (input.requireMissionCompletion) {
     assert.ok(missionCompletion, "Live mission has no durable successful Goal evaluation");
+    assert.equal(checkpoint.active_cycle, null,
+      "Completed live mission retained an active autonomous Cycle");
+    assert.equal(checkpoint.goal_dag.status, "awaiting_model_selection",
+      "Completed live mission retained an active Goal DAG");
+    assert.equal(checkpoint.goal_dag.current_epoch_id, null,
+      "Completed live mission retained an active Goal epoch");
   }
   assert.ok(checkpoint.world.frame > 0, "Live run committed no physical frame");
   assert.ok(checkpoint.world.worldRevision > 0, "Live run committed no world revision");
   assert.equal(checkpoint.world.robot.fallen, false, "Humanoid finished the live run fallen");
   assert.ok(checkpoint.total_model_calls > 0, "Live run recorded no model call");
+  assert.ok(checkpoint.model_usage.total.requests > 0,
+    "Live run recorded no provider usage request");
+  assert.ok(Object.keys(checkpoint.model_usage.by_agent).length > 0,
+    "Live run did not attribute provider usage to an Agent");
 
   const manifestAgents = Object.values(manifest.agents);
   assert.equal(new Set(manifestAgents.map((agent) => agent.agent_id)).size,
@@ -274,6 +284,7 @@ export async function inspectLiveRunEvidence(input) {
     cycle_count: checkpoint.cycle_index,
     completed_goal_count: completedGoalCount,
     model_call_count: startedCalls.length,
+    model_usage: checkpoint.model_usage,
     exercised_agents: exercisedAgents,
     physical_execution_count: executions.length,
     physical_frame_count: physicalFrameCount,

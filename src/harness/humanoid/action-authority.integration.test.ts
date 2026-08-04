@@ -233,10 +233,10 @@ async function activateGoal(runtime: HumanoidRunRuntime): Promise<AgentManifest>
   const submitted = await runtime.submitGoalCandidates(
     proposalInput,
     proposalAuthority
-  ) as { candidate_ids: string[] };
+  ) as { candidates: Array<{ candidate_sequence: number }> };
   runtime.contextAnchor(HUMANOID_AGENT_IDS.goalManager);
   const selectionInput = {
-    candidate_id: submitted.candidate_ids[0]!
+    candidate_sequence: submitted.candidates[0]!.candidate_sequence
   };
   await runtime.selectGoalCandidate(
     selectionInput,

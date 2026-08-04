@@ -134,6 +134,7 @@ describe("context scope budget schema", () => {
     expect(parsed.scopes.worker).not.toHaveProperty("compact_trigger_tokens");
     expect(parsed.scopes.worker).not.toHaveProperty("compact_recent_model_turns");
     expect(parsed.scopes.worker).not.toHaveProperty("compact_max_output_tokens");
+    expect(parsed.scopes.worker.token_estimator_correction_milli).toBe(1_000);
   });
 
   it("accepts only a complete per-agent budget envelope", () => {

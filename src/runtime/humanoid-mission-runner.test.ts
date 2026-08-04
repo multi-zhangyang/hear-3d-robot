@@ -298,7 +298,8 @@ function createManifest(config: ProviderConfig) {
         validateCycleEvidence: () => { throw new Error("outside manifest construction"); }
       } as never,
       createModel: (_agentId, agentProvider) => createConfiguredModel(agentProvider),
-      createSession: (agentId) => new MemorySession({ sessionId: agentId })
+      createSession: (agentId) => new MemorySession({ sessionId: agentId }),
+      callModelInputFilter: ({ modelData }) => modelData
     }),
     provider: config,
     epochId: "11111111-1111-4111-8111-111111111111"

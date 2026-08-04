@@ -9,6 +9,7 @@ import type { HumanoidWorld } from "../../world/humanoid/world.js";
 import { createGoalDAG } from "../../domain/goal-epoch.js";
 import { EmptyActionCommitOutbox } from "../../domain/action-commit-outbox.js";
 import { EmptyActionExecutionLedger } from "../../domain/action-execution-ledger.js";
+import { EmptyModelUsageState } from "../../domain/model-usage.js";
 import {
   HUMANOID_AGENT_IDS,
   HUMANOID_CAPABILITIES
@@ -47,6 +48,7 @@ export function createHumanoidRunCheckpoint(input: {
     pending_lifecycle_events: [],
     cycle_index: 0,
     total_model_calls: 0,
+    model_usage: structuredClone(EmptyModelUsageState),
     checker: null,
     last_cycle: null,
     final_output: null,
@@ -78,6 +80,7 @@ export function reconcileHumanoidHierarchyCapabilities(
       at: checkpoint.updated_at
     });
   goalManager.capabilities = [
+    "recall_goal_history",
     "submit_goal_candidates",
     "select_goal_candidate",
     "retire_goal_epoch"
@@ -131,6 +134,7 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     objective: "根据长期任务、Goal DAG 和当前物理证据提出并显式选择下一阶段目标。",
     criteria: ["候选和选择均绑定真实模型调用、物理证据与恢复身份。"],
     capabilities: [
+      "recall_goal_history",
       "submit_goal_candidates",
       "select_goal_candidate",
       "retire_goal_epoch"

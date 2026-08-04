@@ -123,8 +123,8 @@ export async function createHumanoidStage(
       camera.position.y = controls.target.y + robotHeight * (portrait ? 0.82 : 0.76);
     }
     controls.update();
-    if (portraitFollow) {
-      fitPortraitHudFrame(camera, controls, world.robotBounds(), host);
+    if (mode === "follow") {
+      fitFollowHudFrame(camera, controls, world.robotBounds(), host, portraitFollow);
     }
     previousRoot = root;
     fitted = true;
@@ -215,9 +215,9 @@ export async function createHumanoidStage(
   };
   const resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(host);
-  const mission = host.closest(".humanoid-mission-world");
-  for (const selector of [".humanoid-agent-hud", ".humanoid-goal-hud"]) {
-    const overlay = mission?.querySelector(selector);
+  const shell = host.closest(".game-shell");
+  for (const selector of [".humanoid-agent-hud", ".humanoid-goal-hud", ".game-hotbar"]) {
+    const overlay = shell?.querySelector(selector);
     if (overlay) resizeObserver.observe(overlay);
   }
   const unsubscribe = frameBuffer.subscribe(schedule);
@@ -283,13 +283,14 @@ function quaternion(value: { x: number; y: number; z: number; w: number }): THRE
   return new THREE.Quaternion(value.x, value.y, value.z, value.w);
 }
 
-function fitPortraitHudFrame(
+function fitFollowHudFrame(
   camera: THREE.PerspectiveCamera,
   controls: OrbitControls,
   bounds: THREE.Box3,
-  host: HTMLDivElement
+  host: HTMLDivElement,
+  portrait: boolean
 ): void {
-  const safe = portraitSafeVerticalFrame(host);
+  const safe = followSafeVerticalFrame(host, portrait);
   if (!safe) return;
   const availableHeight = safe.bottom - safe.top;
   const desiredCenter = (safe.top + safe.bottom) / 2;
@@ -309,7 +310,13 @@ function fitPortraitHudFrame(
       );
       continue;
     }
-    const shiftPixels = desiredCenter - (projected.top + projected.bottom) / 2;
+    const shiftPixels = portrait
+      ? desiredCenter - (projected.top + projected.bottom) / 2
+      : projected.top < safe.top
+        ? safe.top - projected.top
+        : projected.bottom > safe.bottom
+          ? safe.bottom - projected.bottom
+          : 0;
     if (Math.abs(shiftPixels) < 0.5) return;
     camera.updateMatrixWorld(true);
     const center = bounds.getCenter(new THREE.Vector3()).applyMatrix4(camera.matrixWorldInverse);
@@ -324,14 +331,24 @@ function fitPortraitHudFrame(
   controls.update();
 }
 
-function portraitSafeVerticalFrame(
-  host: HTMLDivElement
+function followSafeVerticalFrame(
+  host: HTMLDivElement,
+  portrait: boolean
 ): { top: number; bottom: number } | null {
+  const hostRect = host.getBoundingClientRect();
+  if (!portrait) {
+    const hotbar = host.closest(".game-shell")?.querySelector(".game-hotbar");
+    if (!(hotbar instanceof HTMLElement)) return null;
+    const bottom = Math.min(
+      host.clientHeight,
+      hotbar.getBoundingClientRect().top - hostRect.top - 8
+    );
+    return bottom >= 80 ? { top: 0, bottom } : null;
+  }
   const mission = host.closest(".humanoid-mission-world");
   const agent = mission?.querySelector(".humanoid-agent-hud");
   const goal = mission?.querySelector(".humanoid-goal-hud");
   if (!(agent instanceof HTMLElement) || !(goal instanceof HTMLElement)) return null;
-  const hostRect = host.getBoundingClientRect();
   const top = Math.max(0, agent.getBoundingClientRect().bottom - hostRect.top + 6);
   const bottom = Math.min(
     host.clientHeight,

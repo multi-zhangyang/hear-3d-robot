@@ -24,6 +24,10 @@ import { goalSha256 } from "./goal-identity.js";
 import { GoalDAGSchema, createGoalDAG } from "./goal-epoch.js";
 import { ModelDecisionRefSchema } from "./model-call-authority.js";
 import {
+  EmptyModelUsageState,
+  ModelUsageStateSchema
+} from "./model-usage.js";
+import {
   ActiveAutonomousCycleSchema,
   AutonomousCycleRefSchema,
   EmbodiedMemoryIdSchema,
@@ -507,6 +511,7 @@ const HumanoidRunCheckpointBaseShape = {
   pending_lifecycle_events: z.array(RunLifecycleEventSchema),
   cycle_index: z.number().int().nonnegative(),
   total_model_calls: z.number().int().nonnegative(),
+  model_usage: ModelUsageStateSchema.default(EmptyModelUsageState),
   checker: HumanoidCheckerResultSchema.nullable(),
   last_cycle: JsonValueSchema.nullable(),
   final_output: z.string().nullable(),

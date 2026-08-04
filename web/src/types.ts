@@ -274,6 +274,7 @@ export interface ContextScopeState {
   retained_item_count: number;
   retained_chain_hash: string | null;
   active_estimated_tokens: number;
+  token_estimator_correction_milli?: number;
   context_window_tokens?: number;
   compact_trigger_tokens?: number;
   compact_recent_model_turns?: number;
@@ -296,6 +297,23 @@ export interface ContextMemoryState {
   total_compactions: number;
   last_compacted_at: string | null;
   scopes: Record<string, ContextScopeState>;
+}
+
+interface ModelUsageTotals {
+  requests: number;
+  reported_requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cached_input_tokens: number;
+  reasoning_tokens: number;
+}
+
+export interface ModelUsageState {
+  version: 1;
+  total: ModelUsageTotals;
+  by_agent: Record<string, ModelUsageTotals>;
+  updated_at: string | null;
 }
 
 export interface HumanoidCheckerResult {
@@ -550,6 +568,7 @@ export interface HumanoidRunCheckpoint {
   pending_lifecycle_events: unknown[];
   cycle_index: number;
   total_model_calls: number;
+  model_usage?: ModelUsageState;
   checker: HumanoidCheckerResult | null;
   goal_progress?: HumanoidGoalProgress | null;
   active_cycle?: ActiveAutonomousCycle | null;

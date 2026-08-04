@@ -16,6 +16,7 @@ import {
   humanoidActionReceiptFrom,
   humanoidCheckerFrom,
   humanoidGoalProgressFrom,
+  modelUsageFrom,
   taskNodesFrom,
   upsertHumanoidAction,
   upsertRuntimeJournalEntry
@@ -35,9 +36,17 @@ export function reduceHumanoidRunDetails(input: HumanoidReducerInput): HumanoidR
   const data = asRecord(event.data);
   if (event.type === "provider_event") {
     if (input.historical) return details;
+    const modelUsage = modelUsageFrom(data?.model_usage);
     return {
       ...details,
-      provider: upsertRuntimeJournalEntry(details.provider, event.data, input.limits.provider)
+      provider: upsertRuntimeJournalEntry(details.provider, event.data, input.limits.provider),
+      ...(modelUsage ? {
+        checkpoint: {
+          ...details.checkpoint,
+          model_usage: modelUsage,
+          updated_at: event.at
+        }
+      } : {})
     };
   }
   if (input.historical) return details;

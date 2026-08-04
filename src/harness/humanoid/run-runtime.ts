@@ -29,6 +29,12 @@ import {
   modelPayloadSha256,
   type ModelDecisionRef
 } from "../../domain/model-call-authority.js";
+import {
+  addModelUsage,
+  modelUsageDeltaFromProviderEvent,
+  ModelUsageStateSchema,
+  type ModelUsageState
+} from "../../domain/model-usage.js";
 import type { AgentManifest } from "../../domain/agent-manifest.js";
 import {
   actionCommitPayloadSha256,
@@ -91,6 +97,10 @@ import {
   recallHumanoidEmbodiedHistory,
   type HumanoidEmbodiedRecallRequest
 } from "./embodied-recall.js";
+import {
+  recallGoalHistory as recallDurableGoalHistory,
+  type GoalHistoryRecallRequest
+} from "./goal-history.js";
 import {
   assertPendingActionReceipt,
   cycleSummary,
@@ -257,10 +267,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#store.definition.scenario,
       await this.#store.readScenarioChunkDeltaState()
     );
-    const [rawEvidence, rawModelCalls, rawActionIdentities] = await Promise.all([
+    const [rawEvidence, rawModelCalls, rawActionIdentities, providerModelUsage] = await Promise.all([
       this.#store.readJournal("goal_evidence"),
       this.#store.readJournal("model_calls"),
-      this.#store.readJournal("action_identities")
+      this.#store.readJournal("action_identities"),
+      latestProviderModelUsage(this.#store)
     ]);
     const evidence = new Map<string, GoalEvidenceArtifact>();
     for (const rawArtifact of rawEvidence) {
@@ -285,6 +296,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
     this.#actionTransactionIdentities = actionTransactionIdentities;
     this.#actionTransactionIdentitiesLoaded = true;
+    if (providerModelUsage) {
+      this.#checkpoint.model_usage = reconcileModelUsage(
+        this.#checkpoint.model_usage,
+        providerModelUsage
+      );
+    }
     this.#checkpoint.goal_dag = restoreGoalDAG(
       this.#checkpoint.goal_dag,
       this.#goalHarness()
@@ -302,6 +319,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     authority: GoalToolCallAuthority
   ): Promise<JsonValue> {
     return this.#goalStateMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
       if (this.#checkpoint.goal_dag.status !== "awaiting_model_selection") {
         throw new Error("Goal candidates cannot be submitted while a Goal epoch is active");
       }
@@ -310,6 +328,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       await this.#persistGoalEvidence([evidence.ref]);
       let next = this.#checkpoint.goal_dag;
       const candidateIds: string[] = [];
+      const candidateReferences: Array<{
+        candidate_sequence: number;
+        proposal_id: string;
+        candidate_id: string;
+      }> = [];
       for (const candidate of input.candidates) {
         const before = new Set(Object.keys(next.candidates));
         try {
@@ -332,6 +355,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         const created = Object.keys(next.candidates).find((id) => !before.has(id));
         if (!created) throw new Error("Goal candidate proposal produced no durable identity");
         candidateIds.push(created);
+        candidateReferences.push({
+          candidate_sequence: Object.keys(next.candidates).indexOf(created) + 1,
+          proposal_id: candidate.proposal_id,
+          candidate_id: created
+        });
       }
       this.#checkpoint.goal_dag = next;
       this.#checkpoint.goal_progress = null;
@@ -340,6 +368,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       await this.#emitGoalState("candidates_submitted");
       return json({
         status: "goal_candidates_submitted",
+        candidates: candidateReferences,
         candidate_ids: candidateIds,
         goal_dag_state_sha256: next.state_sha256
       });
@@ -351,10 +380,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     authority: GoalToolCallAuthority
   ): Promise<JsonValue> {
     return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      this.#assertRunAcceptsDecisions();
       const selectedBy = this.#goalModelSource(authority, "select_goal_candidate");
-      const candidate = this.#checkpoint.goal_dag.candidates[input.candidate_id];
+      const candidate = Object.values(this.#checkpoint.goal_dag.candidates)[
+        input.candidate_sequence - 1
+      ];
       if (!candidate || candidate.status !== "proposed") {
-        throw new Error(`Goal candidate is unavailable: ${input.candidate_id}`);
+        throw new Error(
+          `Goal candidate sequence is unavailable: ${input.candidate_sequence}`
+        );
       }
       if (candidate.source.model_call_id === selectedBy.model_call_id) {
         throw new Error("Goal selection requires a distinct model response after proposal");
@@ -362,7 +396,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       const evidence = this.#requiredContextGoalEvidence(selectedBy.agent_id);
       await this.#persistGoalEvidence([evidence.ref]);
       const next = selectDomainGoalCandidate(this.#checkpoint.goal_dag, {
-        candidate_id: input.candidate_id,
+        candidate_id: candidate.candidate_id,
         selected_by: selectedBy,
         selection_evidence_refs: [evidence.ref],
         created_world_revision: evidence.artifact.evidence.world_revision
@@ -399,6 +433,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     authority: GoalToolCallAuthority
   ): Promise<JsonValue> {
     return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      this.#assertRunAcceptsDecisions();
       const retiredBy = this.#goalModelSource(authority, "retire_goal_epoch");
       await this.#persistGoalEvidence(input.evidence_refs);
       const artifacts = input.evidence_refs.map((ref) => this.#requiredGoalEvidence(ref));
@@ -463,13 +498,14 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   async ensureAutonomousCycle(): Promise<ActiveAutonomousCycle | undefined> {
     return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      this.#assertRunAcceptsDecisions();
       if (this.#checkpoint.goal_dag.status !== "active") return undefined;
       if (this.#checkpoint.active_cycle) {
         return structuredClone(this.#checkpoint.active_cycle);
       }
       await this.#refreshWorldPersistenceState();
       const cycle = this.#createActiveCycle();
-      await this.#persist(false);
+      await this.#persist();
       await this.#emitCycleStarted(cycle);
       return structuredClone(cycle);
     }));
@@ -511,6 +547,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         decision
       );
       if (durableReceipt) return durableReceipt;
+      this.#assertRunAcceptsDecisions();
       this.#assertDecisionCycleActive(decision);
       this.#physicsClock.throwIfFailed();
       this.#physicalExecution.assertExecutionOwner(transactionId);
@@ -563,6 +600,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
   }
 
+  async recallGoalHistory(request: GoalHistoryRecallRequest): Promise<JsonValue> {
+    this.#assertRunAcceptsDecisions();
+    return recallDurableGoalHistory({
+      goalDAG: this.#checkpoint.goal_dag,
+      currentWorldRevision: this.#world.snapshot().worldRevision,
+      request
+    });
+  }
+
   validateCycleEvidence(
     evidenceTransactionIds: readonly string[]
   ): HumanoidActionReceipt {
@@ -610,6 +656,17 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     return rejectedPlan ? "replan_or_retire" : "plan";
   }
 
+  executorDelegationAvailable(): boolean {
+    const phase = this.coordinatorPhase();
+    if (phase === "execute_plan") return true;
+    if (phase !== "post_execution" && phase !== "complete_cycle") return false;
+    const goal = this.#activeGoal();
+    return goal?.predicates.some((predicate, index) => (
+      predicate.type === "block_removed"
+        && this.#checkpoint.checker?.checks[index]?.passed !== true
+    )) ?? false;
+  }
+
   #validateCycleCausalEvidence(
     evidenceTransactionIds: readonly string[]
   ): HumanoidCycleCausalEvidence {
@@ -639,7 +696,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   contextWorldIdentity(): { worldRevision: number } {
-    return { worldRevision: this.#checkpoint.world.worldRevision };
+    return { worldRevision: this.#world.snapshot().worldRevision };
   }
 
   contextReceipts(): Record<string, { accepted: boolean; worldRevision: number }> {
@@ -656,13 +713,14 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const observation = this.#world.observe();
     const world = this.#world.snapshot();
     const activeGoal = this.#activeGoal();
+    const checkpoint = this.#checkpointForContext(activeGoal, world);
     const result = createHumanoidContextAnchor({
       mission: this.#store.definition.mission,
       runMode: this.#store.definition.run_mode,
       scenarioId: this.#store.definition.scenario_id,
       scenario: this.#scenario,
       missionGoal: this.#missionGoal,
-      checkpoint: this.#checkpoint,
+      checkpoint,
       ...(activeGoal ? { activeGoal } : {}),
       node,
       observation,
@@ -673,6 +731,30 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#rememberGoalEvidence(result.worldEvidence);
     this.#contextGoalEvidenceRefs.set(agentId, result.worldEvidence.evidence.ref);
     return result.anchor;
+  }
+
+  #checkpointForContext(
+    activeGoal: Goal | undefined,
+    world: HumanoidWorldSnapshot
+  ): HumanoidRunCheckpoint {
+    const progress = this.#checkpoint.goal_progress;
+    if (!activeGoal || !progress
+      || (progress.last_world_frame === world.frame
+        && progress.last_world_revision === world.worldRevision)) {
+      return this.#checkpoint;
+    }
+    const projected = advanceHumanoidGoal(
+      activeGoal,
+      this.#scenario,
+      world,
+      progress
+    );
+    return {
+      ...this.#checkpoint,
+      world,
+      goal_progress: projected.progress,
+      checker: projected.checker
+    };
   }
 
   assertContextSummaryEvidence(summary: ContextCompactionSummary): void {
@@ -709,6 +791,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   async recordModelCallStarted(agentId: string): Promise<string> {
     return this.#goalStateMutex.runExclusive(async () => {
       this.#signal?.throwIfAborted();
+      this.#assertRunAcceptsDecisions();
       const cycle = this.#activeCycleRef();
       const record = await this.#requiredModelAuthority().recordStarted(agentId, cycle);
       const node = this.#node(agentId);
@@ -972,6 +1055,19 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       );
       this.#checkpoint.committed_actions = actionWindow.receipts;
 
+      const missionCompleted = checker.success
+        && this.#store.definition.run_mode === "mission"
+        && this.missionGoalCompleted();
+      if (missionCompleted) {
+        this.#continuousPhysicsEnabled = false;
+        this.#stageFinish(
+          "succeeded",
+          output,
+          null,
+          "run_succeeded"
+        );
+      }
+
       await this.#persist();
       await this.#store.append("checker", json(checker));
       await this.emit("embodied_episode_recorded", {
@@ -991,6 +1087,14 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         goal_epoch_completed: checker.success
       });
       if (checker.success) await this.#emitGoalState("epoch_completed");
+      if (missionCompleted) {
+        await reconcileLifecycleOutbox({
+          store: this.#store,
+          checkpoint: this.#checkpoint,
+          persistCheckpoint: () => this.#persist(),
+          eventSink: this.#eventSink
+        });
+      }
       return checker.success;
     }));
   }
@@ -1029,11 +1133,21 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   async recordProvider(event: JsonValue, agentId?: string): Promise<void> {
     const runtimeEventId = randomUUID();
     const cycle = this.#activeCycleRef();
+    const at = new Date().toISOString();
+    const usageDelta = modelUsageDeltaFromProviderEvent(event, agentId);
+    if (usageDelta) {
+      this.#checkpoint.model_usage = addModelUsage(
+        this.#checkpoint.model_usage,
+        usageDelta,
+        at
+      );
+    }
     const record = {
       ...(agentId ? { agent_id: agentId } : {}),
       ...object(event),
       ...(cycle ? { cycle } : {}),
-      at: new Date().toISOString(),
+      ...(usageDelta ? { model_usage: this.#checkpoint.model_usage } : {}),
+      at,
       runtime_event_id: runtimeEventId
     };
     await this.#store.append("provider", json(record));
@@ -1568,8 +1682,34 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     eventType: "run_succeeded" | "run_failed" | "run_interrupted" | "run_paused",
     reason?: string
   ): Promise<void> {
+    if (this.#checkpoint.status === "succeeded" && status !== "succeeded") {
+      await reconcileLifecycleOutbox({
+        store: this.#store,
+        checkpoint: this.#checkpoint,
+        persistCheckpoint: () => this.#persist(),
+        eventSink: this.#eventSink
+      });
+      return;
+    }
     this.#continuousPhysicsEnabled = false;
     await this.#physicsClock.stop();
+    this.#stageFinish(status, output, error, eventType, reason);
+    await this.#persist();
+    await reconcileLifecycleOutbox({
+      store: this.#store,
+      checkpoint: this.#checkpoint,
+      persistCheckpoint: () => this.#persist(),
+      eventSink: this.#eventSink
+    });
+  }
+
+  #stageFinish(
+    status: "succeeded" | "failed" | "interrupted" | "paused",
+    output: string | null,
+    error: string | null,
+    eventType: "run_succeeded" | "run_failed" | "run_interrupted" | "run_paused",
+    reason?: string
+  ): void {
     const at = new Date().toISOString();
     this.#checkpoint.status = status;
     this.#checkpoint.final_output = output;
@@ -1590,13 +1730,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         ...(reason ? { reason } : {})
       }
     }));
-    await this.#persist();
-    await reconcileLifecycleOutbox({
-      store: this.#store,
-      checkpoint: this.#checkpoint,
-      persistCheckpoint: () => this.#persist(),
-      eventSink: this.#eventSink
-    });
+  }
+
+  #assertRunAcceptsDecisions(): void {
+    if (this.#checkpoint.status !== "starting"
+      && this.#checkpoint.status !== "running") {
+      throw new Error(
+        `Humanoid Run cannot accept new model decisions while ${this.#checkpoint.status}`
+      );
+    }
   }
 
   #activeCycleRef(): AutonomousCycleRef | undefined {
@@ -1837,6 +1979,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   async #refreshWorldPersistenceState(): Promise<void> {
     const captured = await this.#world.capturePersistenceState();
+    this.#applyWorldPersistenceState(captured);
+  }
+
+  #applyWorldPersistenceState(
+    captured: Awaited<ReturnType<HumanoidWorld["capturePersistenceState"]>>
+  ): void {
     const activeGoal = this.#activeGoal();
     if (activeGoal && this.#checkpoint.goal_progress) {
       const advanced = advanceHumanoidGoal(
@@ -1856,7 +2004,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   async #persist(refreshWorld = true): Promise<void> {
-    if (refreshWorld) await this.#refreshWorldPersistenceState();
+    if (refreshWorld) {
+      const captured = await this.#world.capturePersistenceState();
+      // Apply and clone in the same continuation. The continuous authority
+      // publisher may advance the display snapshot on the next task, but it
+      // cannot split this persisted world/world-checkpoint cut.
+      this.#applyWorldPersistenceState(captured);
+    }
     this.#assertActiveGoalProgress();
     this.#checkpoint.updated_at = new Date().toISOString();
     const snapshot = structuredClone(this.#checkpoint);
@@ -1866,6 +2020,69 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#checkpointWriteTail = write;
     await write;
   }
+}
+
+const PROVIDER_USAGE_SCAN_PAGE = 256;
+
+async function latestProviderModelUsage(
+  store: RunStore
+): Promise<ModelUsageState | undefined> {
+  const tail = await store.readJournalTail("provider", PROVIDER_USAGE_SCAN_PAGE);
+  let latest = findLatestProviderModelUsage(tail.entries);
+  let before = Math.max(0, tail.total - tail.entries.length);
+  while (!latest && before > 0) {
+    const from = Math.max(0, before - PROVIDER_USAGE_SCAN_PAGE);
+    const page = await store.readJournalPage("provider", from, before - from);
+    latest = findLatestProviderModelUsage(page.entries);
+    before = from;
+  }
+  return latest;
+}
+
+function findLatestProviderModelUsage(
+  records: readonly JsonValue[]
+): ModelUsageState | undefined {
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
+    if (!("model_usage" in record)) continue;
+    return ModelUsageStateSchema.parse(record.model_usage);
+  }
+  return undefined;
+}
+
+function reconcileModelUsage(
+  checkpoint: ModelUsageState,
+  providerJournal: ModelUsageState
+): ModelUsageState {
+  const journalDominates = modelUsageDominates(providerJournal, checkpoint);
+  const checkpointDominates = modelUsageDominates(checkpoint, providerJournal);
+  if (!journalDominates && !checkpointDominates) {
+    throw new Error("Provider journal model usage conflicts with the humanoid checkpoint");
+  }
+  if (journalDominates && !checkpointDominates) return structuredClone(providerJournal);
+  if (checkpointDominates && !journalDominates) return structuredClone(checkpoint);
+  return (providerJournal.updated_at ?? "") > (checkpoint.updated_at ?? "")
+    ? structuredClone(providerJournal)
+    : structuredClone(checkpoint);
+}
+
+function modelUsageDominates(left: ModelUsageState, right: ModelUsageState): boolean {
+  if (!usageTotalsDominate(left.total, right.total)) return false;
+  for (const [agentId, totals] of Object.entries(right.by_agent)) {
+    const candidate = left.by_agent[agentId];
+    if (!candidate || !usageTotalsDominate(candidate, totals)) return false;
+  }
+  return true;
+}
+
+function usageTotalsDominate(
+  left: ModelUsageState["total"],
+  right: ModelUsageState["total"]
+): boolean {
+  return (Object.keys(right) as Array<keyof ModelUsageState["total"]>).every(
+    (key) => left[key] >= right[key]
+  );
 }
 
 function isHumanoidPlanningReceipt(receipt: HumanoidActionReceipt): boolean {

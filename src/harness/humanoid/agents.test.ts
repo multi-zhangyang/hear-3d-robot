@@ -1,12 +1,14 @@
 import {
   MemorySession,
   RunContext,
+  Usage,
   type Model
 } from "@openai/agents";
 import { describe, expect, it } from "vitest";
 import type { ProviderConfig } from "../../config/load.js";
 import type { HumanoidActionReceipt } from "./runtime.js";
 import {
+  HUMANOID_AGENT_TOOL_CONTRACTS,
   createHumanoidAgentHierarchy,
   goalManagerInvocationInput
 } from "./agents.js";
@@ -25,14 +27,47 @@ const provider: ProviderConfig = {
 };
 
 describe("humanoid agent hierarchy", () => {
+  it("renders an exact executor authority envelope", () => {
+    const rendered = HUMANOID_AGENT_TOOL_CONTRACTS.executor.inputBuilder({
+      params: {
+        task: "execute_plan",
+        objective: "执行已接受导航",
+        planning_action: "plan_humanoid_navigation",
+        planning_transaction_id: "planning-call-41",
+        solid_id: null,
+        execution_transaction_id: null
+      }
+    });
+
+    expect(rendered).toContain("CURRENT EXECUTION AUTHORITY");
+    expect(rendered).toContain('"planning_action":"plan_humanoid_navigation"');
+    expect(rendered).toContain('"planning_transaction_id":"planning-call-41"');
+    expect(rendered).toContain("不能改写为内部 plan_id");
+  });
+
   it("places exact live Goal identifiers in every Goal Manager invocation", () => {
     const evidenceRef = `goal-world:19:19:${"a".repeat(64)}`;
     const candidateId = `goal-candidate:${"b".repeat(64)}`;
 
     const rendered = goalManagerInvocationInput("推进长期任务。", {
+      run_mode: "mission",
+      mission_goal: {
+        summary: "进入庭院信标区",
+        predicates: [{
+          type: "robot_in_zone",
+          zone_id: "courtyard_beacon",
+          tolerance: 0.2
+        }]
+      },
       goal_dag: {
         status: "awaiting_model_selection",
-        candidates: { [candidateId]: { status: "proposed" } },
+        candidates: {
+          [candidateId]: {
+            status: "proposed",
+            proposal_id: "mission-navigation",
+            candidate_sequence: 7
+          }
+        },
         current_epoch_id: null
       },
       goal_context: {
@@ -49,7 +84,12 @@ describe("humanoid agent hierarchy", () => {
     });
 
     expect(rendered).toContain(`"current_goal_evidence_ref":"${evidenceRef}"`);
+    expect(rendered).toContain('"run_mode":"mission"');
+    expect(rendered).toContain('"mission_goal":{"summary":"进入庭院信标区"');
     expect(rendered).toContain(`"existing_goal_candidate_ids":["${candidateId}"]`);
+    expect(rendered).toContain(
+      `"candidate_sequence":7,"proposal_id":"mission-navigation","candidate_id":"${candidateId}"`
+    );
     expect(rendered).toContain(
       '"visible_object_ids":["courtyard_crate"],"removable_block_ids":["stone_column"]'
     );
@@ -61,6 +101,7 @@ describe("humanoid agent hierarchy", () => {
     const sessionOwners: string[] = [];
     const models: Model[] = [];
     const recallRequests: unknown[] = [];
+    const goalRecallRequests: unknown[] = [];
     let cycleCompletion = {
       status: "not_ready" as "ready" | "not_ready",
       evidence_transaction_ids: [] as string[],
@@ -76,6 +117,7 @@ describe("humanoid agent hierarchy", () => {
       | "execute_plan"
       | "post_execution"
       | "complete_cycle";
+    let executorDelegationAvailable = false;
     const execution = receipt({
       transactionId: "execute-accepted",
       action: "execute_whole_body_motion",
@@ -87,6 +129,13 @@ describe("humanoid agent hierarchy", () => {
     });
     const runtime = {
       invoke: async () => execution,
+      recallGoalHistory: async (request: unknown) => {
+        goalRecallRequests.push(request);
+        return {
+          historical_only: true,
+          candidates: [{ candidate_id: `goal-candidate:${"a".repeat(64)}` }]
+        };
+      },
       recallEmbodiedHistory: async (request: unknown) => {
         recallRequests.push(request);
         return {
@@ -100,7 +149,8 @@ describe("humanoid agent hierarchy", () => {
         return structuredClone(execution);
       },
       cycleCompletionReadiness: () => structuredClone(cycleCompletion),
-      coordinatorPhase: () => coordinatorPhase
+      coordinatorPhase: () => coordinatorPhase,
+      executorDelegationAvailable: () => executorDelegationAvailable
     } as never;
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
@@ -114,7 +164,8 @@ describe("humanoid agent hierarchy", () => {
       createSession: (agentId) => {
         sessionOwners.push(agentId);
         return new MemorySession({ sessionId: agentId });
-      }
+      },
+      callModelInputFilter: ({ modelData }) => modelData
     });
 
     expect(modelOwners).toEqual([
@@ -143,6 +194,12 @@ describe("humanoid agent hierarchy", () => {
     expect(hierarchy.coordinatorSession).toBe(
       hierarchy.session("humanoid-coordinator")
     );
+    expect(hierarchy.goalManager.tools.map((entry) => entry.name)).toEqual([
+      "recall_goal_history",
+      "submit_goal_candidates",
+      "select_goal_candidate",
+      "retire_goal_epoch"
+    ]);
 
     expect(hierarchy.coordinator.tools.map((entry) => entry.name)).toEqual([
       "recall_embodied_history",
@@ -189,6 +246,36 @@ describe("humanoid agent hierarchy", () => {
       hierarchy.coordinator
     );
     expect(await enabled("delegate_motion_reference")).toBe(true);
+    const invalidExecutorDelegation = await coordinatorTool(
+      "delegate_physics_executor"
+    ).invoke(
+      new RunContext({ runId: "invalid-executor-delegation" }),
+      JSON.stringify({
+        task: "execute_plan",
+        objective: "缺少规划授权",
+        planning_action: "plan_humanoid_navigation",
+        planning_transaction_id: null,
+        solid_id: null,
+        execution_transaction_id: null
+      }),
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "invalid-executor-delegation",
+          name: "delegate_physics_executor",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    );
+    expect(JSON.parse(String(invalidExecutorDelegation))).toMatchObject({
+      accepted: false,
+      code: "invalid_tool_input",
+      tool: "delegate_physics_executor",
+      validation_issues: [expect.objectContaining({
+        path: "planning_transaction_id"
+      })]
+    });
     expect(await enabled("complete_autonomous_cycle")).toBe(false);
     cycleCompletion = {
       status: "ready",
@@ -204,9 +291,17 @@ describe("humanoid agent hierarchy", () => {
     cycleCompletion.observed_after_execution = true;
     coordinatorPhase = "complete_cycle";
     expect(await enabled("delegate_humanoid_sentry")).toBe(false);
+    expect(await enabled("delegate_physics_executor")).toBe(false);
+    executorDelegationAvailable = true;
     expect(await enabled("delegate_physics_executor")).toBe(true);
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
       "object_in_zone、not grasp_verified 与 object_settled_on_support"
+    ));
+    expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
+      "不得改 tolerance、删减谓词或拼接额外条件"
+    ));
+    expect(hierarchy.executor.instructions).toEqual(expect.stringContaining(
+      "plan_humanoid_navigation 调用 execute_humanoid_navigation"
     ));
 
     const coordinatorBehavior = hierarchy.coordinator.toolUseBehavior;
@@ -254,6 +349,26 @@ describe("humanoid agent hierarchy", () => {
     });
     expect(recallRequests).toEqual([{ source_refs: ["episode:7"], limit: 1 }]);
 
+    const goalRecall = hierarchy.goalManager.tools.find(
+      (entry) => entry.name === "recall_goal_history"
+    );
+    if (!goalRecall || goalRecall.type !== "function") {
+      throw new Error("Goal history recall tool is missing");
+    }
+    const candidateId = `goal-candidate:${"a".repeat(64)}`;
+    const recalledGoal = await goalRecall.invoke(
+      new RunContext({ runId: "goal-recall-test" }),
+      JSON.stringify({ candidate_ids: [candidateId], limit: 1 })
+    );
+    expect(JSON.parse(String(recalledGoal))).toMatchObject({
+      historical_only: true,
+      candidates: [{ candidate_id: candidateId }]
+    });
+    expect(goalRecallRequests).toEqual([{
+      candidate_ids: [candidateId],
+      limit: 1
+    }]);
+
     const complete = hierarchy.coordinator.tools.find(
       (entry) => entry.name === "complete_autonomous_cycle"
     );
@@ -285,8 +400,72 @@ describe("humanoid agent hierarchy", () => {
         validateCycleEvidence: () => { throw new Error("outside test"); }
       } as never,
       createModel: () => shared,
-      createSession: (agentId) => new MemorySession({ sessionId: agentId })
+      createSession: (agentId) => new MemorySession({ sessionId: agentId }),
+      callModelInputFilter: ({ modelData }) => modelData
     })).toThrow("cannot share one Model facade");
+  });
+
+  it("applies the long-run input filter inside every Agent-as-tool Runner", async () => {
+    const filteredAgents: string[] = [];
+    const hierarchy = createHumanoidAgentHierarchy({
+      provider,
+      runtime: {
+        contextAnchor: () => ({}),
+        invoke: async (name: string, input: unknown, transactionId: string, agentId: string) => (
+          receipt({
+            transactionId,
+            agentId,
+            action: name as "observe_humanoid",
+            input: input as never,
+            code: "humanoid_observed"
+          })
+        ),
+        recallEmbodiedHistory: async () => ({ historical_only: true }),
+        validateCycleEvidence: () => { throw new Error("outside test"); },
+        cycleCompletionReadiness: () => ({
+          status: "not_ready",
+          evidence_transaction_ids: [],
+          execution_transaction_id: null,
+          observed_after_execution: false,
+          reason: "no execution"
+        }),
+        coordinatorPhase: () => "observe_or_plan"
+      } as never,
+      createModel: (agentId) => agentId === "humanoid-sentry"
+        ? functionCallModel("observe_humanoid")
+        : modelStub(),
+      createSession: (agentId) => new MemorySession({ sessionId: agentId }),
+      callModelInputFilter: ({ modelData, agent }) => {
+        filteredAgents.push(agent.name);
+        return modelData;
+      }
+    });
+    const delegate = hierarchy.coordinator.tools.find(
+      (entry) => entry.name === "delegate_humanoid_sentry"
+    );
+    if (!delegate || delegate.type !== "function") {
+      throw new Error("Sentry delegation tool is missing");
+    }
+
+    const output = await delegate.invoke(
+      new RunContext({ runId: "nested-filter" }),
+      JSON.stringify({ objective: "读取当前物理状态" }),
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "delegate-sentry-filter",
+          name: "delegate_humanoid_sentry",
+          arguments: JSON.stringify({ objective: "读取当前物理状态" }),
+          status: "completed"
+        }
+      }
+    );
+    expect(JSON.parse(String(output))).toMatchObject({
+      agentId: "humanoid-sentry",
+      action: "observe_humanoid",
+      accepted: true
+    });
+    expect(filteredAgents).toEqual(["人形感知哨兵"]);
   });
 
   it("applies each resolved profile to only its owning Agent", () => {
@@ -314,7 +493,8 @@ describe("humanoid agent hierarchy", () => {
         owners.set(agentId, selected.model);
         return modelStub();
       },
-      createSession: (agentId) => new MemorySession({ sessionId: agentId })
+      createSession: (agentId) => new MemorySession({ sessionId: agentId }),
+      callModelInputFilter: ({ modelData }) => modelData
     });
 
     expect(Object.fromEntries(owners)).toEqual({
@@ -340,6 +520,29 @@ function modelStub(): Model {
     },
     getStreamedResponse: () => {
       throw new Error("Model calls are outside this construction test");
+    }
+  } as unknown as Model;
+}
+
+function functionCallModel(toolName: string): Model {
+  return {
+    getResponse: async () => ({
+      responseId: `response-${toolName}`,
+      output: [{
+        type: "function_call",
+        callId: `call-${toolName}`,
+        name: toolName,
+        arguments: "{}"
+      }],
+      usage: new Usage({
+        requests: 1,
+        inputTokens: 100,
+        outputTokens: 10,
+        totalTokens: 110
+      })
+    }),
+    getStreamedResponse: () => {
+      throw new Error("Streaming is outside this test");
     }
   } as unknown as Model;
 }

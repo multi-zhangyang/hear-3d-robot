@@ -11,6 +11,7 @@ import {
 } from "../domain/schema.js";
 import {
   compactorInputTokenLimit,
+  defaultCompactTriggerTokens,
   defaultOutputTokenReserve
 } from "../runtime/context-budget.js";
 import { assertScenarioIntegrity } from "../runtime/goal-validation.js";
@@ -69,13 +70,14 @@ function validateProviderBudget(
   context: z.RefinementCtx
 ): void {
   const fallbackReserve = defaultOutputTokenReserve(config.contextWindowTokens);
-  const reserved = (config.maxOutputTokens ?? fallbackReserve)
-    + (config.compactMaxOutputTokens ?? fallbackReserve);
-  if (config.compactTriggerTokens + reserved >= config.contextWindowTokens) {
+  const exceedsWindow = config.compactTriggerTokens >= config.contextWindowTokens;
+  const exceedsConfiguredOutputHeadroom = config.maxOutputTokens !== undefined
+    && config.compactTriggerTokens + config.maxOutputTokens >= config.contextWindowTokens;
+  if (exceedsWindow || exceedsConfiguredOutputHeadroom) {
     context.addIssue({
       code: "custom",
       path: ["compactTriggerTokens"],
-      message: "AI_COMPACT_TRIGGER_TOKENS plus output reserves must be below AI_CONTEXT_WINDOW_TOKENS"
+      message: "AI_COMPACT_TRIGGER_TOKENS must leave room for any explicitly configured AI_MAX_OUTPUT_TOKENS"
     });
   }
   if (compactorInputTokenLimit(
@@ -119,6 +121,8 @@ export function loadEnvironment(path = resolve(process.cwd(), ".env")): void {
 
 export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): ProviderConfig {
   const contextWindowTokens = numberFromEnv(env.AI_CONTEXT_WINDOW_TOKENS, 262_144);
+  const maxOutputTokens = optionalNumberFromEnv(env.AI_MAX_OUTPUT_TOKENS);
+  const compactMaxOutputTokens = optionalNumberFromEnv(env.AI_COMPACT_MAX_OUTPUT_TOKENS);
   const inherited = ModelProviderConfigSchema.parse({
     protocol: env.AI_PROVIDER,
     baseUrl: env.AI_BASE_URL,
@@ -126,14 +130,14 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
     apiKey: env.AI_API_KEY,
     requestTimeoutMs: numberFromEnv(env.AI_REQUEST_TIMEOUT_MS, 90_000),
     temperature: numberFromEnv(env.AI_TEMPERATURE, 0.2),
-    maxOutputTokens: optionalNumberFromEnv(env.AI_MAX_OUTPUT_TOKENS),
+    maxOutputTokens,
     contextWindowTokens,
     compactTriggerTokens: numberFromEnv(
       env.AI_COMPACT_TRIGGER_TOKENS,
-      Math.floor(contextWindowTokens * 0.275)
+      defaultCompactTriggerTokens(contextWindowTokens)
     ),
     compactRecentModelTurns: numberFromEnv(env.AI_COMPACT_RECENT_MODEL_TURNS, 4),
-    compactMaxOutputTokens: optionalNumberFromEnv(env.AI_COMPACT_MAX_OUTPUT_TOKENS)
+    compactMaxOutputTokens
   });
   const agentModels = Object.fromEntries(AGENT_MODEL_ROLES.map((role) => [
     role,
@@ -224,6 +228,15 @@ function loadAgentModelConfig(
   inherited: ModelProviderConfig
 ): ModelProviderConfig {
   const prefix = `AI_${role.toUpperCase()}_`;
+  const contextWindowTokens = numberFromEnv(
+    env[`${prefix}CONTEXT_WINDOW_TOKENS`],
+    inherited.contextWindowTokens
+  );
+  const maxOutputTokens = optionalNumberFromEnv(
+    env[`${prefix}MAX_OUTPUT_TOKENS`],
+    inherited.maxOutputTokens
+  );
+  const inheritedTriggerWasExplicit = hasText(env.AI_COMPACT_TRIGGER_TOKENS);
   return ModelProviderConfigSchema.parse({
     protocol: stringFromEnv(env[`${prefix}PROVIDER`], inherited.protocol),
     baseUrl: stringFromEnv(env[`${prefix}BASE_URL`], inherited.baseUrl),
@@ -234,17 +247,13 @@ function loadAgentModelConfig(
       inherited.requestTimeoutMs ?? 90_000
     ),
     temperature: numberFromEnv(env[`${prefix}TEMPERATURE`], inherited.temperature),
-    maxOutputTokens: optionalNumberFromEnv(
-      env[`${prefix}MAX_OUTPUT_TOKENS`],
-      inherited.maxOutputTokens
-    ),
-    contextWindowTokens: numberFromEnv(
-      env[`${prefix}CONTEXT_WINDOW_TOKENS`],
-      inherited.contextWindowTokens
-    ),
+    maxOutputTokens,
+    contextWindowTokens,
     compactTriggerTokens: numberFromEnv(
       env[`${prefix}COMPACT_TRIGGER_TOKENS`],
-      inherited.compactTriggerTokens
+      inheritedTriggerWasExplicit
+        ? inherited.compactTriggerTokens
+        : defaultCompactTriggerTokens(contextWindowTokens)
     ),
     compactRecentModelTurns: numberFromEnv(
       env[`${prefix}COMPACT_RECENT_MODEL_TURNS`],
@@ -259,6 +268,10 @@ function loadAgentModelConfig(
 
 function stringFromEnv(value: string | undefined, inherited: string): string {
   return value?.trim() ? value : inherited;
+}
+
+function hasText(value: string | undefined): boolean {
+  return value !== undefined && value.trim() !== "";
 }
 
 function isLoopbackHost(host: string): boolean {

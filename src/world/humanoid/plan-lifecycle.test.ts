@@ -9,7 +9,7 @@ import {
 
 describe("humanoid plan intent lifecycle", () => {
   it("covers planning handoff across independent model turns", () => {
-    expect(DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS).toBeGreaterThanOrEqual(270);
+    expect(DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS).toBeGreaterThanOrEqual(600);
   });
 
   it("keeps the exact model motion intent identity stable", () => {

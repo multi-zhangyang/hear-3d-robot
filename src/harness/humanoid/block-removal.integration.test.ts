@@ -115,6 +115,7 @@ describe("block-removal autonomous transaction", () => {
         }
       });
       await runtime.initializeGoalAutonomy(manifest);
+      expect(runtime.executorDelegationAvailable()).toBe(true);
 
       const removalInput = {
         solid_id: BLOCK_ID,
@@ -178,6 +179,7 @@ describe("block-removal autonomous transaction", () => {
       });
       expect(world.observe().solidTokens.map(({ id }) => id)).not.toContain(BLOCK_ID);
       expect(runtime.checkpoint.checker).toMatchObject({ success: true });
+      expect(runtime.executorDelegationAvailable()).toBe(false);
       expect(events).toEqual(expect.arrayContaining([
         expect.objectContaining({
           type: "humanoid_action_committed",
@@ -211,7 +213,28 @@ describe("block-removal autonomous transaction", () => {
       }))).toBe(true);
 
       const completed = await store.readHumanoidCheckpoint();
+      expect(completed).toMatchObject({
+        status: "succeeded",
+        active_cycle: null,
+        final_output: expect.stringContaining("稳定接触后提交方块拆除事务")
+      });
       expect(completed.goal_dag.status).toBe("awaiting_model_selection");
+      await expect(runtime.recordModelCallStarted(
+        HUMANOID_AGENT_IDS.goalManager
+      )).rejects.toThrow("cannot accept new model decisions while succeeded");
+      await expect(runtime.ensureAutonomousCycle()).rejects.toThrow(
+        "cannot accept new model decisions while succeeded"
+      );
+      await expect(runtime.recallGoalHistory({ limit: 1 })).rejects.toThrow(
+        "cannot accept new model decisions while succeeded"
+      );
+      await expect(runtime.submitGoalCandidates({
+        candidates: []
+      } as never, {
+        tool_call_id: "terminal-goal-submit",
+        tool_name: "submit_goal_candidates",
+        arguments_sha256: "0".repeat(64)
+      })).rejects.toThrow("cannot accept new model decisions while succeeded");
       expect(completed.embodied_memory.recent_episodes.at(-1)).toMatchObject({
         transaction_id: EXECUTION_TRANSACTION_ID,
         goal_success: true,
@@ -264,6 +287,9 @@ describe("block-removal autonomous transaction", () => {
       expect(actions.filter((entry) => field(entry, "transactionId")
         === REMOVAL_TRANSACTION_ID)).toHaveLength(1);
       const durableEvents = await resumedStore.readJournal("events");
+      expect(durableEvents.filter((entry) => (
+        field(entry, "type") === "run_succeeded"
+      ))).toHaveLength(1);
       expect(durableEvents.filter((entry) => (
         field(entry, "type") === "humanoid_action_committed"
           && nestedField(entry, "data", "receipt", "transactionId")
@@ -482,10 +508,10 @@ async function activateGoal(
   const submitted = await runtime.submitGoalCandidates(
     proposalInput,
     proposalAuthority
-  ) as { candidate_ids: string[] };
+  ) as { candidates: Array<{ candidate_sequence: number }> };
   runtime.contextAnchor(HUMANOID_AGENT_IDS.goalManager);
   const selectionInput = {
-    candidate_id: submitted.candidate_ids[0]!
+    candidate_sequence: submitted.candidates[0]!.candidate_sequence
   };
   await runtime.selectGoalCandidate(
     selectionInput,

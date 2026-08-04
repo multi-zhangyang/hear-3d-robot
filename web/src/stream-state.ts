@@ -7,6 +7,7 @@ import type {
   HumanoidEmbodiedMemoryState,
   HumanoidGoalProgress,
   HumanoidWorldSnapshot,
+  ModelUsageState,
   ProviderActivity,
   RunListItem,
   RuntimeEvent,
@@ -211,6 +212,32 @@ export function contextMemoryFrom(value: unknown): ContextMemoryState | null {
     if (!scope || !validContextScopeBudget(scope)) return null;
   }
   return record as unknown as ContextMemoryState;
+}
+
+export function modelUsageFrom(value: unknown): ModelUsageState | null {
+  const record = asRecord(value);
+  const total = asRecord(record?.total);
+  const byAgent = asRecord(record?.by_agent);
+  if (!record || record.version !== 1 || !total || !byAgent
+    || !validModelUsageTotals(total)
+    || !Object.values(byAgent).every((entry) => {
+      const totals = asRecord(entry);
+      return totals !== null && validModelUsageTotals(totals);
+    })) return null;
+  return record as unknown as ModelUsageState;
+}
+
+function validModelUsageTotals(value: Record<string, unknown>): boolean {
+  return [
+    value.requests,
+    value.reported_requests,
+    value.input_tokens,
+    value.output_tokens,
+    value.total_tokens,
+    value.cached_input_tokens,
+    value.reasoning_tokens
+  ].every(nonnegativeInteger)
+    && (value.reported_requests as number) <= (value.requests as number);
 }
 
 function validContextScopeBudget(scope: Record<string, unknown>): boolean {

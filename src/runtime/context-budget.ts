@@ -5,12 +5,17 @@
  */
 export const CONTEXT_COMPACTOR_MAX_ATTEMPTS = 4;
 export const CONTEXT_COMPACTOR_TURNS_PER_ATTEMPT = 2;
+const DEFAULT_CONTEXT_COMPACTION_FRACTION = 0.85;
 
 export function defaultOutputTokenReserve(contextWindowTokens: number): number {
   return Math.min(
     16_384,
     Math.max(4_096, Math.floor(contextWindowTokens * 0.05))
   );
+}
+
+export function defaultCompactTriggerTokens(contextWindowTokens: number): number {
+  return Math.floor(contextWindowTokens * DEFAULT_CONTEXT_COMPACTION_FRACTION);
 }
 
 export function configuredOutputTokenLimit(

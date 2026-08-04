@@ -32,7 +32,10 @@ export function withModelTelemetry(
   model: Model,
   runtime: ModelTelemetryRuntime,
   boundAgentId: string,
-  onModelResponseCompleted?: (agentId: string) => void | Promise<void>
+  onModelResponseCompleted?: (
+    agentId: string,
+    usage: { inputTokens: number }
+  ) => void | Promise<void>
 ): Model {
   const decisionGuard = new ModelDecisionGuard(
     boundAgentId === runtime.rootAgentId
@@ -63,7 +66,7 @@ export function withModelTelemetry(
       } else if (modelCallId) {
         await runtime.recordModelCallFailed?.(modelCallId, agentId);
       }
-      await onModelResponseCompleted?.(agentId);
+      await onModelResponseCompleted?.(agentId, response.usage);
       const hasDecision = decisionGuard.observe(agentId, response.output);
       const progressSnapshot = runtime.modelProgressSnapshot?.();
       if (hasDecision && progressGuard && progressSnapshot) {
@@ -93,7 +96,10 @@ async function* claimAndStream(
   progressGuard: AuthoritativeModelProgressGuard | undefined,
   boundAgentId: string,
   request: Parameters<Model["getStreamedResponse"]>[0],
-  onModelResponseCompleted?: (agentId: string) => void | Promise<void>
+  onModelResponseCompleted?: (
+    agentId: string,
+    usage: { inputTokens: number }
+  ) => void | Promise<void>
 ) {
   const agentId = requestAgentId(request.systemInstructions, runtime.rootAgentId);
   assertModelBinding(boundAgentId, agentId);
@@ -113,7 +119,7 @@ async function* claimAndStream(
           terminalRecorded = true;
         }
         clearAgentInvocationTransportInterruption();
-        await onModelResponseCompleted?.(agentId);
+        await onModelResponseCompleted?.(agentId, event.response.usage);
         const hasDecision = decisionGuard.observe(agentId, event.response.output);
         const progressSnapshot = runtime.modelProgressSnapshot?.();
         if (hasDecision && progressGuard && progressSnapshot) {

@@ -64,7 +64,8 @@ describe("HumanoidRunRuntime", () => {
       scenarioId: "humanoid-runtime-test",
       scenario,
       goal: scenario.default_goal,
-      runtime: "humanoid_g1"
+      runtime: "humanoid_g1",
+      runMode: "continuous"
     });
     const events: RuntimeEvent[] = [];
     const world = await HumanoidWorld.create(scenario);
@@ -96,7 +97,47 @@ describe("HumanoidRunRuntime", () => {
       const goalManifest = await activateGoal(runtime, scenario.default_goal);
 
       await runtime.start(false);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await runtime.recordProvider({
+        status: "usable_stream",
+        usage: {
+          inputTokens: 480,
+          outputTokens: 120,
+          totalTokens: 600,
+          inputTokensDetails: { cached_tokens: 320 },
+          outputTokensDetails: { reasoning_tokens: 40 }
+        }
+      }, HUMANOID_AGENT_IDS.coordinator);
+      expect(runtime.checkpoint.model_usage).toMatchObject({
+        total: {
+          requests: 1,
+          reported_requests: 1,
+          input_tokens: 480,
+          output_tokens: 120,
+          total_tokens: 600,
+          cached_input_tokens: 320,
+          reasoning_tokens: 40
+        },
+        by_agent: {
+          [HUMANOID_AGENT_IDS.coordinator]: { requests: 1, total_tokens: 600 }
+        }
+      });
+      expect((await store.readJournalTail("provider", 1)).entries[0]).toMatchObject({
+        agent_id: HUMANOID_AGENT_IDS.coordinator,
+        model_usage: {
+          total: { requests: 1, total_tokens: 600 }
+        }
+      });
       await runtime.stopContinuousPhysics();
+      await runtime.setActiveAgent(HUMANOID_AGENT_IDS.sentry);
+      const meteredCheckpoint = await store.readHumanoidCheckpoint();
+      expect(meteredCheckpoint.model_usage.total).toMatchObject({
+        requests: 1,
+        total_tokens: 600
+      });
+      expect(meteredCheckpoint.world.frame).toBe(
+        meteredCheckpoint.world_checkpoint.frame
+      );
       const stationaryFrameCount = events.filter(
         (event) => event.type === "humanoid_world_frame"
       ).length;
@@ -141,6 +182,17 @@ describe("HumanoidRunRuntime", () => {
         HUMANOID_AGENT_IDS.motion
       );
       expect(plan.accepted, JSON.stringify(plan)).toBe(true);
+      expect(runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator)).toMatchObject({
+        coordinator_phase: "execute_plan",
+        execution_authority: {
+          task: "execute_plan",
+          planning_action: "plan_whole_body_motion",
+          planning_transaction_id: plan.transactionId,
+          executor_action: "execute_whole_body_motion",
+          accepted_world_revision: plan.worldAfterRevision,
+          remaining_lease_revisions: expect.any(Number)
+        }
+      });
       const executionInput = { planning_transaction_id: plan.transactionId };
       const execution = await invokeModelAction(runtime,
         "execute_whole_body_motion",
@@ -323,18 +375,30 @@ describe("HumanoidRunRuntime", () => {
         recent_physical_episodes: Array<{
           transaction_id: string;
           historical_only: boolean;
+          model_narrative_omitted: boolean;
+          model_summary?: string;
         }>;
       };
       expect(anchor.recent_physical_episodes).toEqual([
         expect.objectContaining({
           transaction_id: pendingExecution.transactionId,
-          historical_only: true
+          historical_only: true,
+          model_narrative_omitted: true
         })
       ]);
+      expect(anchor.recent_physical_episodes[0]).not.toHaveProperty("model_summary");
       expect(() => runtime.validateCycleEvidence([pendingExecution.transactionId])).toThrow(
         "already consumed"
       );
       await activateGoal(runtime, scenario.default_goal);
+      expect(await runtime.recallGoalHistory({
+        statuses: ["completed"],
+        limit: 4
+      })).toMatchObject({
+        historical_only: true,
+        total_matches: 1,
+        candidates: [{ status: "completed", goal: scenario.default_goal }]
+      });
       const rejectedExecution = await invokeModelAction(runtime,
         "execute_whole_body_motion",
         { planning_transaction_id: "missing-historical-plan" },
@@ -597,6 +661,77 @@ describe("HumanoidRunRuntime", () => {
       await world.dispose();
     }
   }, 45_000);
+
+  it("recovers newer cumulative model usage from the provider journal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-model-usage-recovery-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "恢复尚未进入检查点的模型用量",
+      scenarioId: "humanoid-model-usage-recovery",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1",
+      runMode: "continuous"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const manifest = humanoidTestManifest();
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      await runtime.initializeGoalAutonomy(manifest);
+      await runtime.recordProvider({
+        status: "usable_stream",
+        usage: {
+          inputTokens: 900,
+          outputTokens: 100,
+          totalTokens: 1_000
+        }
+      }, HUMANOID_AGENT_IDS.motion);
+      await store.appendMany("provider", Array.from({ length: 300 }, (_, index) => ({
+        status: "non_usage_telemetry",
+        sequence: index
+      })));
+
+      expect((await store.readHumanoidCheckpoint()).model_usage.total.requests).toBe(0);
+
+      const recovered = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: await store.readHumanoidCheckpoint()
+      });
+      await recovered.initializeGoalAutonomy(manifest);
+      expect(recovered.checkpoint.model_usage).toMatchObject({
+        total: {
+          requests: 1,
+          input_tokens: 900,
+          output_tokens: 100,
+          total_tokens: 1_000
+        },
+        by_agent: {
+          [HUMANOID_AGENT_IDS.motion]: { requests: 1, total_tokens: 1_000 }
+        }
+      });
+
+      await recovered.setActiveAgent(HUMANOID_AGENT_IDS.motion);
+      expect((await store.readHumanoidCheckpoint()).model_usage.total).toMatchObject({
+        requests: 1,
+        total_tokens: 1_000
+      });
+    } finally {
+      await world.dispose();
+    }
+  });
 
   it("reconciles a staged action commit without repeating the action", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-action-commit-recovery-"));
@@ -1324,6 +1459,58 @@ describe("HumanoidRunRuntime", () => {
     }
   }, 45_000);
 
+  it("projects a live context anchor across an asynchronous stationary publication", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-humanoid-context-cut-"));
+    temporaryDirectories.push(root);
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const store = await RunStore.create(root, {
+        mission: "读取持续物理世界中的一致上下文",
+        scenarioId: "humanoid-context-cut-test",
+        scenario,
+        goal: scenario.default_goal,
+        runtime: "humanoid_g1"
+      });
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      await activateGoal(runtime, scenario.default_goal);
+      const durableProgress = runtime.checkpoint.goal_progress;
+      const live = await world.advanceStationary();
+      expect(live).not.toBeNull();
+
+      const anchor = runtime.contextAnchor(HUMANOID_AGENT_IDS.sentry) as {
+        world_frame: number;
+        world_revision: number;
+        goal_state: { worldFrame: number; worldRevision: number };
+      };
+
+      expect(anchor).toMatchObject({
+        world_frame: live!.frame,
+        world_revision: live!.worldRevision,
+        goal_state: {
+          worldFrame: live!.frame,
+          worldRevision: live!.worldRevision
+        }
+      });
+      expect(runtime.contextWorldIdentity()).toEqual({
+        worldRevision: live!.worldRevision
+      });
+      expect(runtime.checkpoint.goal_progress).toEqual(durableProgress);
+    } finally {
+      await world.dispose();
+    }
+  }, 45_000);
+
   it("retires only through a recorded Goal Manager response and rejects missing recovery evidence", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-humanoid-goal-retirement-"));
     temporaryDirectories.push(root);
@@ -1487,17 +1674,7 @@ async function activateGoal(
   runtime: HumanoidRunRuntime,
   goal: Goal
 ): Promise<AgentManifest> {
-  const manifest = {
-    epoch_id: "11111111-1111-4111-8111-111111111111",
-    identity_sha256: "a".repeat(64),
-    agents: {
-      goal_manager: { agent_id: HUMANOID_AGENT_IDS.goalManager },
-      coordinator: { agent_id: HUMANOID_AGENT_IDS.coordinator },
-      sentry: { agent_id: HUMANOID_AGENT_IDS.sentry },
-      motion: { agent_id: HUMANOID_AGENT_IDS.motion },
-      executor: { agent_id: HUMANOID_AGENT_IDS.executor }
-    }
-  } as AgentManifest;
+  const manifest = humanoidTestManifest();
   await runtime.initializeGoalAutonomy(manifest);
   runtime.contextAnchor(HUMANOID_AGENT_IDS.goalManager);
   const proposalInput = {
@@ -1528,10 +1705,10 @@ async function activateGoal(
   const submitted = await runtime.submitGoalCandidates(
     proposalInput,
     proposalAuthority
-  ) as { candidate_ids: string[] };
+  ) as { candidates: Array<{ candidate_sequence: number }> };
   runtime.contextAnchor(HUMANOID_AGENT_IDS.goalManager);
   const selectionInput = {
-    candidate_id: submitted.candidate_ids[0]!
+    candidate_sequence: submitted.candidates[0]!.candidate_sequence
   };
   const selectionAuthority = await modelToolAuthority(
     runtime,
@@ -1541,6 +1718,20 @@ async function activateGoal(
   );
   await runtime.selectGoalCandidate(selectionInput, selectionAuthority);
   return manifest;
+}
+
+function humanoidTestManifest(): AgentManifest {
+  return {
+    epoch_id: "11111111-1111-4111-8111-111111111111",
+    identity_sha256: "a".repeat(64),
+    agents: {
+      goal_manager: { agent_id: HUMANOID_AGENT_IDS.goalManager },
+      coordinator: { agent_id: HUMANOID_AGENT_IDS.coordinator },
+      sentry: { agent_id: HUMANOID_AGENT_IDS.sentry },
+      motion: { agent_id: HUMANOID_AGENT_IDS.motion },
+      executor: { agent_id: HUMANOID_AGENT_IDS.executor }
+    }
+  } as AgentManifest;
 }
 
 const actionAuthorities = new Map<string, {

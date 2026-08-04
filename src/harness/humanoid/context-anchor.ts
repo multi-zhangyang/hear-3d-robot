@@ -6,6 +6,7 @@ import type {
 } from "../../domain/schema.js";
 import type { HumanoidRunMode } from "../../domain/run-mode.js";
 import type { HumanoidRunCheckpoint } from "../../domain/humanoid-run.js";
+import { sameAutonomousCycle } from "../../domain/autonomous-cycle.js";
 import { inspectHumanoidGoal } from "../../runtime/humanoid-checker.js";
 import type {
   HumanoidWorldObservation,
@@ -22,6 +23,7 @@ import {
 import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.js";
 import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
 import { createHumanoidAutonomyContext } from "./autonomy-context.js";
+import { goalDAGContextView } from "./goal-dag-context.js";
 
 export interface HumanoidContextAnchorResult {
   anchor: JsonValue;
@@ -67,6 +69,7 @@ export function createHumanoidContextAnchor(input: {
       world_after_revision: receipt.worldAfterRevision,
       frame_count: receipt.frameCount
     }));
+  const executionAuthority = pendingExecutionAuthority(input);
   return {
     worldEvidence,
     anchor: json({
@@ -74,11 +77,12 @@ export function createHumanoidContextAnchor(input: {
       run_mode: input.runMode,
       scenario_id: input.scenarioId,
       mission_goal: input.missionGoal,
-      goal_dag: input.checkpoint.goal_dag,
+      goal_dag: goalDAGContextView(input.checkpoint.goal_dag),
       active_goal: input.activeGoal ?? null,
       active_cycle: input.checkpoint.active_cycle ?? null,
       cycle_completion: input.cycleCompletion,
       coordinator_phase: input.coordinatorPhase,
+      execution_authority: executionAuthority,
       goal_context: {
         evidence_ref: worldEvidence.evidence.ref,
         evidence: worldEvidence.evidence,
@@ -102,9 +106,10 @@ export function createHumanoidContextAnchor(input: {
       goal_state: checker,
       recent_physical_episodes: recentEmbodiedEpisodes(
         input.checkpoint.embodied_memory
-      ).map((episode) => ({
+      ).map(({ model_summary: _modelSummary, ...episode }) => ({
         ...episode,
-        historical_only: true
+        historical_only: true,
+        model_narrative_omitted: true
       })),
       embodied_experience_memory: {
         total: input.checkpoint.embodied_memory.total_experiences,
@@ -130,6 +135,48 @@ export function createHumanoidContextAnchor(input: {
       recent_receipts: recentReceipts
     })
   };
+}
+
+function pendingExecutionAuthority(input: {
+  checkpoint: HumanoidRunCheckpoint;
+  world: HumanoidWorldSnapshot;
+  coordinatorPhase: HumanoidCoordinatorPhase;
+}): JsonValue {
+  const cycle = input.checkpoint.active_cycle;
+  if (input.coordinatorPhase !== "execute_plan" || !cycle) return null;
+  const receipt = Object.values(input.checkpoint.committed_actions).findLast((candidate) => (
+    candidate.accepted
+      && sameAutonomousCycle(candidate.cycle, cycle)
+      && (candidate.action === "plan_whole_body_motion"
+        || candidate.action === "plan_whole_body_motion_candidates"
+        || candidate.action === "plan_humanoid_navigation")
+  ));
+  if (!receipt) return null;
+  const executorAction = receipt.action === "plan_humanoid_navigation"
+    ? "execute_humanoid_navigation"
+    : "execute_whole_body_motion";
+  const detail = record(receipt.detail);
+  const expiresRevision = typeof detail?.expires_revision === "number"
+    && Number.isSafeInteger(detail.expires_revision)
+    ? detail.expires_revision
+    : null;
+  return json({
+    task: "execute_plan",
+    planning_action: receipt.action,
+    planning_transaction_id: receipt.transactionId,
+    executor_action: executorAction,
+    accepted_world_revision: receipt.worldAfterRevision,
+    expires_world_revision: expiresRevision,
+    remaining_lease_revisions: expiresRevision === null
+      ? null
+      : Math.max(0, expiresRevision - input.world.worldRevision)
+  });
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function json(value: unknown): JsonValue {

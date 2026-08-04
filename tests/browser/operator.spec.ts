@@ -5,31 +5,36 @@ import { E2E_RUNS_DIR } from "./e2e-runs.js";
 import { openRecordedOperator } from "./open-recorded-operator.js";
 
 const UPDATE_README_SCREENSHOTS = process.env.HEAR_UPDATE_SCREENSHOTS === "1";
+const DEFERRED_CHUNK = /three~|create-humanoid-stage|WorkspaceView|HumanoidMissionWorkspace|AgentFlowView|ActivityView|RobotTrailView|MissionModal/;
 
 test("渲染自主人形世界与实时层级智能体界面", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
   const humanoidMeshes = new Set<string>();
+  const deferredChunks = new Set<string>();
   page.on("request", (request) => {
     if (/\/humanoid\/g1\/meshes\/[^/]+\.STL$/i.test(request.url())) {
       humanoidMeshes.add(request.url());
     }
+    const name = new URL(request.url()).pathname.split("/").at(-1) ?? "";
+    if (DEFERRED_CHUNK.test(name)) deferredChunks.add(name);
   });
   await access(resolve(E2E_RUNS_DIR, ".operator.lock"));
   const mission = await openRecordedOperator(page, {
-    beforeLogin: async () => expect(await loadedDeferredChunks(page)).toEqual([])
+    beforeLogin: async () => expect([...deferredChunks]).toEqual([])
   });
   const label = await mission.getAttribute("aria-label");
   if (label !== "实时人形任务" && label !== "人形任务回顾") {
     throw new Error(`Unexpected humanoid mission mode: ${label ?? "missing"}`);
   }
-  await assertHumanoidOperator(page, testInfo.project.name, label, humanoidMeshes);
+  await assertHumanoidOperator(page, testInfo.project.name, label, humanoidMeshes, deferredChunks);
 });
 
 async function assertHumanoidOperator(
   page: Page,
   project: string,
   missionMode: "实时人形任务" | "人形任务回顾",
-  meshes: ReadonlySet<string>
+  meshes: ReadonlySet<string>,
+  deferredChunks: ReadonlySet<string>
 ): Promise<void> {
   const worldMode = missionMode === "实时人形任务" ? "实时人形世界" : "人形世界回顾";
   await expect(page.locator(`section[aria-label="${worldMode}"]`)).toBeAttached();
@@ -39,7 +44,7 @@ async function assertHumanoidOperator(
     const element = document.querySelector("canvas.humanoid-canvas");
     return element instanceof HTMLCanvasElement && element.width > 200 && element.height > 200;
   });
-  await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
+  await expect.poll(() => [...deferredChunks]).toEqual(expect.arrayContaining([
     expect.stringMatching(/create-humanoid-stage/),
     expect.stringMatching(/HumanoidMissionWorkspace/),
     expect.stringMatching(/WorkspaceView/),
@@ -116,7 +121,7 @@ async function assertHumanoidOperator(
     await page.keyboard.press(key);
     await expect(page.getByRole("region", { name: region })).toBeVisible();
     await expect(page.getByLabel(content)).toBeVisible();
-    await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
+    await expect.poll(() => [...deferredChunks]).toEqual(expect.arrayContaining([
       expect.stringMatching(deferred)
     ]));
     if (project === "desktop") await captureReadmeScreenshot(page, screenshot);
@@ -225,12 +230,6 @@ function overlapArea(
   const height = Math.max(0, Math.min(left.y + left.height, right.y + right.height)
     - Math.max(left.y, right.y));
   return width * height;
-}
-
-async function loadedDeferredChunks(page: Page): Promise<string[]> {
-  return page.evaluate(() => performance.getEntriesByType("resource")
-    .map((entry) => new URL(entry.name).pathname.split("/").at(-1) ?? "")
-    .filter((name) => /three~|create-humanoid-stage|WorkspaceView|HumanoidMissionWorkspace|AgentFlowView|ActivityView|RobotTrailView|MissionModal/.test(name)));
 }
 
 async function captureSolidReference(page: Page, width: number, height: number): Promise<Buffer> {

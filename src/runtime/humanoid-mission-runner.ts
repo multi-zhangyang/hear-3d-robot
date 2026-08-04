@@ -188,6 +188,7 @@ async function executeHumanoidMission(input: {
     const persistedManifest = await persistedManifestForMission(input);
     const manifestEpochId = persistedManifest?.epoch_id ?? randomUUID();
     const sessions = new Map<string, FileSession>();
+    let activeContextManager: LongRunContextManager | undefined;
     const sessionForAgent = (agentId: string): FileSession => {
       const existing = sessions.get(agentId);
       if (existing) return existing;
@@ -201,7 +202,13 @@ async function executeHumanoidMission(input: {
       sessions.set(agentId, created);
       return created;
     };
-    const onModelResponseCompleted = async (agentId: string): Promise<void> => {
+    const onModelResponseCompleted = async (
+      agentId: string,
+      usage?: { inputTokens: number }
+    ): Promise<void> => {
+      if (usage) {
+        await activeContextManager?.recordModelInputUsage(agentId, usage.inputTokens);
+      }
       const recovered = transportRecovery.responseCompleted();
       if (recovered === 0) return;
       await input.runtime.recordProvider({
@@ -224,7 +231,6 @@ async function executeHumanoidMission(input: {
         humanoidAgentRole(agentId)
       ),
       compactorProvider,
-      sessionForAgent,
       createGenerator: (agentId) => new AgentsSdkContextSummaryGenerator({
         model: createConfiguredModel(compactorProvider),
         temperature: compactorProvider.temperature,
@@ -234,6 +240,7 @@ async function executeHumanoidMission(input: {
         onModelResponseCompleted: () => onModelResponseCompleted(agentId)
       })
     });
+    activeContextManager = contextManager;
     const modelTelemetryRuntime: ModelTelemetryRuntime = {
       rootAgentId: input.runtime.rootAgentId,
       activeNode: (agentId) => input.runtime.activeNode(agentId),
@@ -260,6 +267,7 @@ async function executeHumanoidMission(input: {
         onModelResponseCompleted
       ),
       createSession: sessionForAgent,
+      callModelInputFilter: contextManager.filter,
       provider: input.provider,
       runtime: input.runtime,
       onAgentStream: persistAgentEvent
@@ -369,6 +377,13 @@ async function executeHumanoidMission(input: {
         const completion = assertCycleOutput(output);
         if (completion.status === "cycle_completed") {
           const activeGoalCompleted = await input.runtime.completeCycle(output);
+          if (input.runtime.checkpoint.status === "succeeded") {
+            return {
+              runId: input.runtime.runId,
+              runDir: input.runtime.store.runDir,
+              output
+            };
+          }
           if (humanoidRunShouldFinish({
             mode: input.runtime.store.definition.run_mode,
             activeGoalCompleted,
@@ -596,7 +611,7 @@ function autonomousCycleInput(runtime: HumanoidRunRuntime): string {
     ...(checkpoint.active_cycle
       ? [`循环身份：${checkpoint.active_cycle.cycle_id}`]
       : []),
-    `当前世界：frame=${checkpoint.world.frame}, revision=${checkpoint.world.worldRevision}`,
+    "当前 frame、revision、阶段和待执行 transactionId 只以每次请求重建的 CURRENT HARNESS AUTHORITY 为准；忽略会话中的旧值。",
     "完成一次真实物理执行后，用 accepted 执行回执调用 complete_autonomous_cycle。"
   ].join("\n");
 }

@@ -293,6 +293,7 @@ const ContextScopeStateSchema = z.object({
   retained_item_count: z.number().int().nonnegative().default(0),
   retained_chain_hash: z.string().regex(/^[a-f0-9]{64}$/).nullable().default(null),
   active_estimated_tokens: z.number().int().nonnegative(),
+  token_estimator_correction_milli: z.number().int().positive().default(1_000),
   context_window_tokens: z.number().int().positive().optional(),
   compact_trigger_tokens: z.number().int().positive().optional(),
   compact_recent_model_turns: z.number().int().nonnegative().optional(),
@@ -339,7 +340,7 @@ export type ContextMemoryState = z.infer<typeof ContextMemoryStateSchema>;
 export const EmptyContextMemoryState: ContextMemoryState = {
   version: 1,
   context_window_tokens: 262_144,
-  compact_trigger_tokens: 72_089,
+  compact_trigger_tokens: 222_822,
   compact_recent_model_turns: 4,
   compact_max_output_tokens: 13_107,
   active_scope_id: null,

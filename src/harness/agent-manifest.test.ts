@@ -89,7 +89,7 @@ describe("agent manifest", () => {
       "@openai/agents": "test-sdk",
       "@openai/agents-extensions": "test-bridge"
     });
-    expect(manifest.harness_contract_version).toBe(2);
+    expect(manifest.harness_contract_version).toBe(3);
     expect(manifest.agents.goal_manager.tool_use_behavior).toEqual({
       kind: "harness_callback",
       contract_id: "verified_harness_terminal_status_v1",
@@ -473,7 +473,7 @@ describe("agent manifest", () => {
     });
     expect(first.identity_sha256).toBe(second.identity_sha256);
     expect(first.identity_sha256).toBe(
-      "c37bedd5a47a45aa23e5aafcef0e4fccdd56fc037ab8bbd86287af2bbe1351bc"
+      "fff267bba12a22a9c339a60ccfa540ff8fb8e99ad44bf892b1416179f6528fdb"
     );
   });
 
@@ -519,7 +519,8 @@ function hierarchyFixture(config: ProviderConfig) {
       validateCycleEvidence: () => { throw new Error("outside construction test"); }
     } as never,
     createModel: () => modelStub(),
-    createSession: (agentId) => new MemorySession({ sessionId: agentId })
+    createSession: (agentId) => new MemorySession({ sessionId: agentId }),
+    callModelInputFilter: ({ modelData }) => modelData
   });
 }
 
