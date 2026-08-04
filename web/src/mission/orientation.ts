@@ -1,7 +1,5 @@
-import {
-  Euler,
-  Quaternion as ThreeQuaternion
-} from "three";
+import { Euler } from "three/src/math/Euler.js";
+import { Quaternion as ThreeQuaternion } from "three/src/math/Quaternion.js";
 import type { Quaternion } from "../types";
 
 export interface OrientationDegrees {

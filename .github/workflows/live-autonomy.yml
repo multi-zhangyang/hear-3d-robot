@@ -59,7 +59,6 @@ jobs:
       HEAR_LIVE_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
       HEAR_LIVE_RUN_COUNT: ${{ inputs.run_count }}
       HEAR_LIVE_SEED_STRATEGY: same
-      HEAR_RUNS_DIR: ${{ runner.temp }}/hear-live-runs
     steps:
       - uses: actions/checkout@v7
 
@@ -75,6 +74,7 @@ jobs:
       - name: Run selected real-model suite
         env:
           HEAR_LIVE_SUITE: ${{ inputs.suite }}
+          HEAR_RUNS_DIR: ${{ runner.temp }}/hear-live-runs
           HEAR_LIVE_REPORT_DIR: ${{ runner.temp }}/hear-live-reports
         run: |
           mkdir -p "$HEAR_LIVE_REPORT_DIR"
