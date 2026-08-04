@@ -2,6 +2,10 @@ import type { Quaternion, Vec3 } from "../../domain/schema.js";
 import {
   add,
   inverseQuaternion,
+  multiplyQuaternion,
+  normalizeQuaternion,
+  quaternionAngularDistance,
+  quaternionRotationVector,
   rotateVector,
   scale,
   subtract,
@@ -16,14 +20,43 @@ import {
   type HumanoidJointName
 } from "./model.js";
 import {
+  G1_HAND_CONTACT_SURFACE_NAMES,
+  G1_HAND_JOINT_NAMES,
+  G1_HAND_LINK_NAMES,
+  G1_MORPHOLOGY,
+  g1MujocoBodyName,
+  type G1HandContactSurfaceName,
+  type G1HandJointName,
+  type G1HandLinkName
+} from "./morphology.js";
+import { g1HandContactGeomName } from "./hand-collision-geometry.js";
+import {
   createHumanoidScenePath,
   humanoidModelPath,
+  humanoidSceneSolidGeomName,
   loadHumanoidMujoco,
   removeHumanoidScene,
   type HumanoidSceneObject,
   type HumanoidSceneSolid,
+  type MujocoData,
+  type MujocoModel,
   type MujocoModule
 } from "./mujoco-runtime.js";
+import {
+  configureTorqueControlledBodyActuators,
+  resolveMujocoActuatedJoints,
+  resolveMujocoJoints,
+  type MujocoActuatedJointBinding,
+  type MujocoJointBinding
+} from "./mujoco-joints.js";
+import {
+  G1HandActuator,
+  type G1HandActuatorSnapshot
+} from "./hand-actuator.js";
+import {
+  looksLikeLegacyG129DoFState,
+  migrateLegacyG129DoFState
+} from "./legacy-state-migration.js";
 import {
   neutralHumanoidReference,
   type HumanoidReference
@@ -33,9 +66,13 @@ import {
 } from "./yahmp-controller.js";
 import {
   humanoidEndEffectorJointIndexes,
-  humanoidEndEffectorTrackingJointIndexes,
-  type HumanoidEndEffectorBody
+  humanoidEndEffectorPoseJointIndexes,
+  humanoidEndEffectorTrackingJointIndexes
 } from "./task-space-targets.js";
+import {
+  HUMANOID_TASK_SPACE_SERVO_AUTHORITY,
+  type HumanoidTaskSpaceServoTarget
+} from "./task-space-servo.js";
 import type {
   HumanoidControllerDescriptor,
   HumanoidControllerState,
@@ -44,8 +81,7 @@ import type {
   HumanoidWholeBodyController
 } from "./whole-body-controller.js";
 
-type MujocoModel = InstanceType<MujocoModule["MjModel"]>;
-type MujocoData = InstanceType<MujocoModule["MjData"]>;
+const ORIENTATION_IK_WEIGHT = 0.25;
 
 interface HumanoidLinkSnapshot {
   position: Vec3;
@@ -81,6 +117,10 @@ export interface HumanoidContactSnapshot {
   secondBody: HumanoidBodyName | null;
   firstObject: string | null;
   secondObject: string | null;
+  firstSolid?: string | null | undefined;
+  secondSolid?: string | null | undefined;
+  firstHandLink: G1HandContactSurfaceName | null;
+  secondHandLink: G1HandContactSurfaceName | null;
 }
 
 export interface HumanoidObjectSnapshot extends HumanoidLinkSnapshot {
@@ -98,6 +138,11 @@ export interface HumanoidObjectSensorSnapshot {
   objects: Record<string, HumanoidObjectSnapshot>;
 }
 
+export interface HumanoidSolidSensorSnapshot {
+  sensor: HumanoidObjectSensorSnapshot["sensor"];
+  solids: Record<string, HumanoidSceneSolid>;
+}
+
 interface HumanoidBalanceSnapshot {
   centerOfMass: Vec3;
   support: "none" | "left" | "right" | "double";
@@ -112,10 +157,13 @@ export interface HumanoidSimulationState {
   controls: Float64Array;
   activations: Float64Array;
   accelerationWarmstart: Float64Array;
+  requestedActuatorTorques?: Float64Array;
+  handCommandTargets?: Float64Array;
   controller: HumanoidControllerState;
 }
 
 export interface HumanoidSimulationSnapshot {
+  morphology: typeof G1_MORPHOLOGY;
   simulatedTime: number;
   controller: HumanoidWholeBodyController["descriptor"];
   rootPosition: Vec3;
@@ -125,8 +173,20 @@ export interface HumanoidSimulationSnapshot {
     velocity: number;
     minimum: number;
     maximum: number;
+    effort?: {
+      requestedNewtonMeters: number;
+      appliedNewtonMeters: number;
+      minimumNewtonMeters: number;
+      maximumNewtonMeters: number;
+      requestedUtilization: number;
+      appliedUtilization: number;
+      saturated: boolean;
+    } | undefined;
   }>;
   links: Record<HumanoidBodyName, HumanoidLinkSnapshot>;
+  hands: G1HandActuatorSnapshot & {
+    links: Record<G1HandLinkName, HumanoidLinkSnapshot>;
+  };
   objects: Record<string, HumanoidObjectSnapshot>;
   contactCount: number;
   contacts: HumanoidContactSnapshot[];
@@ -139,12 +199,7 @@ export interface HumanoidSimulationSnapshot {
   fallen: boolean;
 }
 
-export interface HumanoidEndEffectorTarget {
-  body: HumanoidEndEffectorBody;
-  position: Vec3;
-  frame: "world" | "pelvis";
-  tolerance: number;
-}
+export type HumanoidEndEffectorTarget = HumanoidTaskSpaceServoTarget;
 
 export interface HumanoidTaskSpaceSolution {
   reference: HumanoidReference;
@@ -153,6 +208,9 @@ export interface HumanoidTaskSpaceSolution {
     target: Vec3;
     achieved: Vec3;
     error: number;
+    orientationTarget?: Quaternion;
+    orientationAchieved?: Quaternion;
+    orientationError?: number;
   }>;
 }
 
@@ -161,13 +219,25 @@ export class HumanoidSimulation {
   readonly #model: MujocoModel;
   readonly #data: MujocoData;
   readonly #controller: HumanoidWholeBodyController;
+  readonly #bodyJointBindings: readonly MujocoActuatedJointBinding<HumanoidJointName>[];
   readonly #jointIds: number[];
   readonly #jointPositionAddresses: number[];
   readonly #jointVelocityAddresses: number[];
   readonly #actuatorIds: number[];
+  readonly #requestedActuatorTorques: Float64Array;
+  readonly #handCommandTargets = new Float64Array(G1_HAND_JOINT_NAMES.length);
+  #hasRequestedActuatorEvidence = false;
   readonly #bodyIds: number[];
   readonly #bodyNamesById = new Map<number, HumanoidBodyName>();
+  readonly #handBodyIds: number[];
+  readonly #handBodyNamesById = new Map<number, G1HandLinkName>();
+  readonly #handSurfaceNamesByGeomId = new Map<number, G1HandContactSurfaceName>();
+  readonly #handActuator: G1HandActuator;
+  readonly #objectJointBindings: readonly MujocoJointBinding[];
   readonly #objectNamesByBodyId = new Map<number, string>();
+  readonly #objectSizesById = new Map<string, Vec3>();
+  readonly #solidNamesByGeomId = new Map<number, string>();
+  readonly #solidDescriptorsById = new Map<string, HumanoidSceneSolid>();
   readonly #pelvisBodyId: number;
   readonly #headBodyId: number;
   readonly #leftFootBodyId: number;
@@ -220,19 +290,72 @@ export class HumanoidSimulation {
     this.#model = model;
     this.#data = data;
     this.#controller = controller;
-    this.#jointIds = HUMANOID_JOINT_NAMES.map((name) => this.#id("joint", name));
-    this.#jointPositionAddresses = this.#jointIds.map((id) => model.jnt_qposadr[id]!);
-    this.#jointVelocityAddresses = this.#jointIds.map((id) => model.jnt_dofadr[id]!);
-    this.#actuatorIds = this.#jointIds.map((jointId) => this.#actuatorForJoint(jointId));
-    this.#bodyIds = HUMANOID_BODY_NAMES.map((name) => this.#id("body", name));
+    this.#bodyJointBindings = resolveMujocoActuatedJoints(
+      runtime,
+      model,
+      HUMANOID_JOINT_NAMES
+    );
+    configureTorqueControlledBodyActuators(model, this.#bodyJointBindings);
+    this.#jointIds = this.#bodyJointBindings.map((binding) => binding.jointId);
+    this.#jointPositionAddresses = this.#bodyJointBindings.map(
+      (binding) => binding.positionAddress
+    );
+    this.#jointVelocityAddresses = this.#bodyJointBindings.map(
+      (binding) => binding.velocityAddress
+    );
+    this.#actuatorIds = this.#bodyJointBindings.map((binding) => binding.actuatorId);
+    this.#requestedActuatorTorques = new Float64Array(HUMANOID_JOINT_NAMES.length);
+    this.#handActuator = new G1HandActuator(runtime, model, data);
+    this.#bodyIds = HUMANOID_BODY_NAMES.map((name) => (
+      this.#id("body", g1MujocoBodyName(name))
+    ));
     HUMANOID_BODY_NAMES.forEach((name, index) => {
-      this.#bodyNamesById.set(this.#bodyIds[index]!, name);
+      if (name !== "head_link") this.#bodyNamesById.set(this.#bodyIds[index]!, name);
     });
+    this.#handBodyIds = G1_HAND_LINK_NAMES.map((name) => this.#id("body", name));
+    G1_HAND_LINK_NAMES.forEach((name, index) => {
+      this.#handBodyNamesById.set(this.#handBodyIds[index]!, name);
+    });
+    for (const surface of G1_HAND_CONTACT_SURFACE_NAMES) {
+      const geometryId = runtime.mj_name2id(
+        model,
+        runtime.mjtObj.mjOBJ_GEOM.value,
+        g1HandContactGeomName(surface)
+      );
+      if (geometryId < 0) continue;
+      this.#assertHandSurfaceGeometry(surface, geometryId);
+      this.#handSurfaceNamesByGeomId.set(geometryId, surface);
+    }
     (options.objects ?? []).forEach((object, index) => {
       this.#objectNamesByBodyId.set(this.#id("body", `world-object-${index}`), object.id);
+      this.#objectSizesById.set(object.id, { ...object.size });
     });
+    (options.solids ?? []).forEach((solid, index) => {
+      if (this.#solidDescriptorsById.has(solid.id)) {
+        throw new Error(`Duplicate MuJoCo scene solid: ${solid.id}`);
+      }
+      const geometryId = runtime.mj_name2id(
+        model,
+        runtime.mjtObj.mjOBJ_GEOM.value,
+        humanoidSceneSolidGeomName(index, solid.id)
+      );
+      if (geometryId < 0) {
+        throw new Error(`MuJoCo scene solid is missing: ${solid.id}`);
+      }
+      this.#solidNamesByGeomId.set(geometryId, solid.id);
+      this.#solidDescriptorsById.set(solid.id, {
+        id: solid.id,
+        center: { ...solid.center },
+        size: { ...solid.size }
+      });
+    });
+    this.#objectJointBindings = resolveMujocoJoints(
+      runtime,
+      model,
+      (options.objects ?? []).map((_object, index) => `world-object-joint-${index}`)
+    );
     this.#pelvisBodyId = this.#id("body", "pelvis");
-    this.#headBodyId = this.#id("body", "head_link");
+    this.#headBodyId = this.#id("body", g1MujocoBodyName("head_link"));
     this.#leftFootBodyId = this.#id("body", "left_ankle_roll_link");
     this.#rightFootBodyId = this.#id("body", "right_ankle_roll_link");
     this.#spawn = options.spawn ?? {
@@ -261,6 +384,39 @@ export class HumanoidSimulation {
     return { ...this.#controller.descriptor };
   }
 
+  solidIds(): string[] {
+    return [...this.#solidDescriptorsById.keys()].sort();
+  }
+
+  resetController(reference: HumanoidReference): void {
+    this.#validateReference(reference);
+    this.#controller.reset(this.#policyState(), reference);
+  }
+
+  setHandJointTargets(
+    targets: Readonly<Partial<Record<G1HandJointName, number>>>
+  ): HumanoidSimulationSnapshot {
+    this.#handActuator.setTargets(targets);
+    for (const [name, target] of Object.entries(targets)) {
+      const index = G1_HAND_JOINT_NAMES.indexOf(name as G1HandJointName);
+      if (index >= 0 && target !== undefined) this.#handCommandTargets[index] = target;
+    }
+    return this.snapshot();
+  }
+
+  applyHandServoJointTargets(
+    targets: Readonly<Partial<Record<G1HandJointName, number>>>
+  ): HumanoidSimulationSnapshot {
+    this.#handActuator.setTargets(targets);
+    return this.snapshot();
+  }
+
+  handJointCommandTargets(): Record<G1HandJointName, number> {
+    return Object.fromEntries(G1_HAND_JOINT_NAMES.map((name, index) => (
+      [name, this.#handCommandTargets[index]!]
+    ))) as Record<G1HandJointName, number>;
+  }
+
   snapshot(): HumanoidSimulationSnapshot {
     const rootQuaternion = this.#rootQuaternion();
     const links = Object.fromEntries(HUMANOID_BODY_NAMES.map((name, index) => {
@@ -274,13 +430,42 @@ export class HumanoidSimulation {
         angularVelocity: worldVector(this.#data.cvel, bodyId * 6)
       }];
     })) as HumanoidSimulationSnapshot["links"];
+    const handLinks = Object.fromEntries(G1_HAND_LINK_NAMES.map((name, index) => {
+      const bodyId = this.#handBodyIds[index]!;
+      return [name, {
+        position: worldVector(this.#data.xpos, bodyId * 3),
+        rotation: worldQuaternion(this.#data.xquat, bodyId * 4),
+        linearVelocity: worldVector(this.#data.cvel, bodyId * 6 + 3),
+        angularVelocity: worldVector(this.#data.cvel, bodyId * 6)
+      }];
+    })) as Record<G1HandLinkName, HumanoidLinkSnapshot>;
     const joints = Object.fromEntries(HUMANOID_JOINT_NAMES.map((name, index) => {
       const rangeOffset = this.#jointIds[index]! * 2;
+      const actuator = this.#actuatorIds[index]!;
+      const controlRangeOffset = actuator * 2;
+      const effortMinimum = this.#model.actuator_ctrlrange[controlRangeOffset]!;
+      const effortMaximum = this.#model.actuator_ctrlrange[controlRangeOffset + 1]!;
+      const effortLimit = Math.max(Math.abs(effortMinimum), Math.abs(effortMaximum));
+      const requestedEffort = this.#requestedActuatorTorques[index]!;
+      const appliedEffort = this.#data.ctrl[actuator]!;
       return [name, {
         position: this.#data.qpos[this.#jointPositionAddresses[index]!]!,
         velocity: this.#data.qvel[this.#jointVelocityAddresses[index]!]!,
         minimum: this.#model.jnt_range[rangeOffset]!,
-        maximum: this.#model.jnt_range[rangeOffset + 1]!
+        maximum: this.#model.jnt_range[rangeOffset + 1]!,
+        ...(this.#hasRequestedActuatorEvidence
+          ? {
+              effort: {
+                requestedNewtonMeters: requestedEffort,
+                appliedNewtonMeters: appliedEffort,
+                minimumNewtonMeters: effortMinimum,
+                maximumNewtonMeters: effortMaximum,
+                requestedUtilization: Math.abs(requestedEffort) / effortLimit,
+                appliedUtilization: Math.abs(appliedEffort) / effortLimit,
+                saturated: requestedEffort < effortMinimum || requestedEffort > effortMaximum
+              }
+            }
+          : {})
       }];
     })) as HumanoidSimulationSnapshot["joints"];
     const objects = Object.fromEntries([...this.#objectNamesByBodyId].map(([bodyId, id]) => {
@@ -302,13 +487,19 @@ export class HumanoidSimulation {
     const centerOfMass = worldVector(this.#data.subtree_com, this.#pelvisBodyId * 3);
     const supportPoints = [...left.points, ...right.points];
     const nonFootEnvironmentContacts = this.#unsafeEnvironmentContacts(contacts);
+    const hands = this.#handActuator.snapshot();
     return {
+      morphology: {
+        ...G1_MORPHOLOGY,
+        source: { ...G1_MORPHOLOGY.source }
+      },
       simulatedTime: this.#data.time,
       controller: { ...this.#controller.descriptor },
       rootPosition: worldVector(this.#data.qpos, 0),
       rootRotation: worldQuaternion(this.#data.qpos, 3),
       joints,
       links,
+      hands: { ...hands, links: handLinks },
       objects,
       contactCount: this.#data.ncon,
       contacts,
@@ -336,29 +527,81 @@ export class HumanoidSimulation {
       head.position,
       rotateVector(head.rotation, HUMANOID_HEAD_SENSOR.localPosition)
     );
-    const visible = Object.fromEntries(Object.entries(snapshot.objects).filter(([id, object]) => {
-      const delta = subtract(object.position, origin);
-      const distance = vectorLength(delta);
-      if (distance <= 0.001 || distance > maximumRange) return false;
-      const direction = scale(delta, 1 / distance);
-      const local = rotateVector(inverseQuaternion(head.rotation), direction);
-      const horizontal = Math.atan2(local.x, local.z);
-      const vertical = Math.atan2(local.y, Math.hypot(local.x, local.z));
-      if (Math.abs(horizontal) > HUMANOID_HEAD_SENSOR.horizontalFieldOfView / 2
-        || Math.abs(vertical) > HUMANOID_HEAD_SENSOR.verticalFieldOfView / 2) {
-        return false;
-      }
-      return this.#rayObject(origin, direction, distance + 0.02) === id;
-    }));
+    const sensorRotation = normalizeQuaternion(multiplyQuaternion(
+      head.rotation,
+      HUMANOID_HEAD_SENSOR.localRotation
+    ));
+    const visible = Object.fromEntries(Object.entries(snapshot.objects).filter(([id, object]) => (
+      objectVisibilityPoints(object, this.#objectSizesById.get(id)).some((point) => {
+        const delta = subtract(point, origin);
+        const distance = vectorLength(delta);
+        if (distance <= 0.001 || distance > maximumRange) return false;
+        const direction = scale(delta, 1 / distance);
+        const local = rotateVector(inverseQuaternion(sensorRotation), direction);
+        const horizontal = Math.atan2(local.x, local.z);
+        const vertical = Math.atan2(local.y, Math.hypot(local.x, local.z));
+        if (Math.abs(horizontal) > HUMANOID_HEAD_SENSOR.horizontalFieldOfView / 2
+          || Math.abs(vertical) > HUMANOID_HEAD_SENSOR.verticalFieldOfView / 2) {
+          return false;
+        }
+        return this.#rayObject(origin, direction, distance + 0.02) === id;
+      })
+    )));
     return {
       sensor: {
         position: origin,
-        rotation: { ...head.rotation },
+        rotation: sensorRotation,
         maximumRange,
         horizontalFieldOfView: HUMANOID_HEAD_SENSOR.horizontalFieldOfView,
         verticalFieldOfView: HUMANOID_HEAD_SENSOR.verticalFieldOfView
       },
       objects: visible
+    };
+  }
+
+  senseSolids(maximumRange: number): HumanoidSolidSensorSnapshot {
+    if (!Number.isFinite(maximumRange) || maximumRange <= 0) {
+      throw new Error("Humanoid sensor range must be positive");
+    }
+    const snapshot = this.snapshot();
+    const head = snapshot.links.head_link;
+    const origin = add(
+      head.position,
+      rotateVector(head.rotation, HUMANOID_HEAD_SENSOR.localPosition)
+    );
+    const sensorRotation = normalizeQuaternion(multiplyQuaternion(
+      head.rotation,
+      HUMANOID_HEAD_SENSOR.localRotation
+    ));
+    const solids = Object.fromEntries([...this.#solidDescriptorsById].filter(([id, solid]) => (
+      solidVisibilityPoints(solid).some((point) => {
+        const delta = subtract(point, origin);
+        const distance = vectorLength(delta);
+        if (distance <= 0.001 || distance > maximumRange) return false;
+        const direction = scale(delta, 1 / distance);
+        const local = rotateVector(inverseQuaternion(sensorRotation), direction);
+        const horizontal = Math.atan2(local.x, local.z);
+        const vertical = Math.atan2(local.y, Math.hypot(local.x, local.z));
+        if (Math.abs(horizontal) > HUMANOID_HEAD_SENSOR.horizontalFieldOfView / 2
+          || Math.abs(vertical) > HUMANOID_HEAD_SENSOR.verticalFieldOfView / 2) {
+          return false;
+        }
+        return this.#raySolid(origin, direction, distance + 0.02) === id;
+      })
+    )).map(([id, solid]) => [id, {
+      id,
+      center: { ...solid.center },
+      size: { ...solid.size }
+    }]));
+    return {
+      sensor: {
+        position: origin,
+        rotation: sensorRotation,
+        maximumRange,
+        horizontalFieldOfView: HUMANOID_HEAD_SENSOR.horizontalFieldOfView,
+        verticalFieldOfView: HUMANOID_HEAD_SENSOR.verticalFieldOfView
+      },
+      solids
     };
   }
 
@@ -370,6 +613,10 @@ export class HumanoidSimulation {
       controls: Float64Array.from(this.#data.ctrl),
       activations: Float64Array.from(this.#data.act),
       accelerationWarmstart: Float64Array.from(this.#data.qacc_warmstart),
+      ...(this.#hasRequestedActuatorEvidence
+        ? { requestedActuatorTorques: this.#requestedActuatorTorques.slice() }
+        : {}),
+      handCommandTargets: this.#handCommandTargets.slice(),
       controller: this.#controller.captureState()
     };
   }
@@ -379,96 +626,290 @@ export class HumanoidSimulation {
       || state.controller.implementation !== this.#controller.descriptor.implementation) {
       throw new Error("Humanoid controller state does not match the active implementation");
     }
-    copyState(this.#data.qpos, state.positions, "positions");
-    copyState(this.#data.qvel, state.velocities, "velocities");
-    copyState(this.#data.ctrl, state.controls, "controls");
-    copyState(this.#data.act, state.activations, "activations");
-    copyState(
-      this.#data.qacc_warmstart,
-      state.accelerationWarmstart,
-      "acceleration warmstart"
-    );
+    if (state.requestedActuatorTorques
+      && state.requestedActuatorTorques.length !== 0
+      && state.requestedActuatorTorques.length !== HUMANOID_JOINT_NAMES.length) {
+      throw new Error(
+        "Requested actuator torque evidence must contain all 29 body joints"
+      );
+    }
+    if (state.handCommandTargets
+      && state.handCommandTargets.length !== 0
+      && state.handCommandTargets.length !== G1_HAND_JOINT_NAMES.length) {
+      throw new Error("Hand command authority must contain all 14 hand joints");
+    }
+    const current = {
+      positions: Float64Array.from(this.#data.qpos),
+      velocities: Float64Array.from(this.#data.qvel),
+      controls: Float64Array.from(this.#data.ctrl),
+      activations: Float64Array.from(this.#data.act),
+      accelerationWarmstart: Float64Array.from(this.#data.qacc_warmstart)
+    };
+    const restored = looksLikeLegacyG129DoFState({ source: state, target: current })
+      ? migrateLegacyG129DoFState({
+          source: state,
+          target: current,
+          bodyBindings: this.#bodyJointBindings,
+          objectBindings: this.#objectJointBindings
+        })
+      : {
+          positions: state.positions,
+          velocities: state.velocities,
+          controls: state.controls,
+          activations: state.activations,
+          accelerationWarmstart: state.accelerationWarmstart
+        };
+    copyState(this.#data.qpos, restored.positions, "positions");
+    copyState(this.#data.qvel, restored.velocities, "velocities");
+    copyState(this.#data.ctrl, restored.controls, "controls");
+    copyState(this.#data.act, restored.activations, "activations");
+    copyState(this.#data.qacc_warmstart, restored.accelerationWarmstart, "acceleration warmstart");
+    if (state.requestedActuatorTorques
+      && state.requestedActuatorTorques.length > 0) {
+      copyState(
+        this.#requestedActuatorTorques,
+        state.requestedActuatorTorques,
+        "requested actuator torques"
+      );
+      this.#hasRequestedActuatorEvidence = true;
+    } else {
+      this.#requestedActuatorTorques.fill(0);
+      this.#hasRequestedActuatorEvidence = false;
+    }
     this.#data.time = state.time;
     this.#controller.restoreState(state.controller);
+    this.#handActuator.validateCurrentTargets();
+    const restoredHandTargets = state.handCommandTargets
+      && state.handCommandTargets.length > 0
+      ? state.handCommandTargets
+      : Float64Array.from(G1_HAND_JOINT_NAMES, (name) => (
+          this.#handActuator.snapshot().joints[name].target
+        ));
+    this.#handCommandTargets.set(restoredHandTargets);
     this.#runtime.mj_forward(this.#model, this.#data);
   }
 
   solveEndEffectorTargets(
     reference: HumanoidReference,
-    targets: readonly HumanoidEndEffectorTarget[]
+    targets: readonly HumanoidEndEffectorTarget[],
+    options: {
+      initialConfiguration?: "reference" | "current";
+      preserveTrackingWeights?: boolean;
+      maximumReferenceCorrectionRadians?: number;
+    } = {}
   ): HumanoidTaskSpaceSolution {
     if (targets.length === 0) return { reference, residuals: [] };
     if (new Set(targets.map((target) => target.body)).size !== targets.length) {
       throw new Error("A task-space keyframe cannot repeat an end effector");
     }
+    const maximumReferenceCorrectionRadians =
+      options.maximumReferenceCorrectionRadians
+        ?? HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumReferenceCorrectionRadians;
+    if (!Number.isFinite(maximumReferenceCorrectionRadians)
+      || maximumReferenceCorrectionRadians <= 0
+      || maximumReferenceCorrectionRadians
+        > HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumReferenceCorrectionRadians) {
+      throw new Error("Task-space reference correction exceeds servo authority");
+    }
+    targets.forEach(assertEndEffectorTarget);
     const saved = this.captureState();
     try {
-      this.#setReferenceConfiguration(reference);
+      if (options.initialConfiguration === "current") {
+        this.#validateReference(reference);
+        this.#runtime.mj_forward(this.#model, this.#data);
+      } else {
+        this.#setReferenceConfiguration(reference);
+      }
       const pelvis = this.#linkPosition("pelvis");
       const pelvisRotation = worldQuaternion(this.#data.xquat, this.#pelvisBodyId * 4);
       const resolved = targets.map((target) => ({
         ...target,
         position: target.frame === "world"
           ? { ...target.position }
-          : add(pelvis, rotateVector(pelvisRotation, target.position))
+          : add(pelvis, rotateVector(pelvisRotation, target.position)),
+        ...(target.orientation
+          ? {
+              orientation: target.frame === "world"
+                ? normalizeQuaternion(target.orientation)
+                : normalizeQuaternion(multiplyQuaternion(
+                    pelvisRotation,
+                    target.orientation
+                  ))
+            }
+          : {})
       }));
       const jointIndexes = [...new Set(resolved.flatMap((target) => (
-        humanoidEndEffectorJointIndexes(target.body)
+        target.orientation
+          ? humanoidEndEffectorPoseJointIndexes(target.body)
+          : humanoidEndEffectorJointIndexes(target.body)
       )))];
-      const epsilon = 1e-4;
-      for (let iteration = 0; iteration < 96; iteration += 1) {
-        const positions = resolved.map((target) => this.#linkPosition(target.body));
-        const error = resolved.flatMap((target, index) => vectorDifference(
-          target.position,
-          positions[index]!
-        ));
-        if (resolved.every((target, index) => (
-          vectorDistance(target.position, positions[index]!) <= target.tolerance
-        ))) {
-          return this.#taskSpaceSolution(reference, resolved);
-        }
-        const jacobian = Array.from({ length: error.length }, () => (
-          new Array<number>(jointIndexes.length).fill(0)
-        ));
-        for (let column = 0; column < jointIndexes.length; column += 1) {
-          const jointIndex = jointIndexes[column]!;
-          const address = this.#jointPositionAddresses[jointIndex]!;
-          const original = this.#data.qpos[address]!;
-          this.#data.qpos[address] = original + epsilon;
-          this.#runtime.mj_forward(this.#model, this.#data);
-          resolved.forEach((target, targetIndex) => {
-            const perturbed = this.#linkPosition(target.body);
-            const current = positions[targetIndex]!;
-            jacobian[targetIndex * 3]![column] = (perturbed.x - current.x) / epsilon;
-            jacobian[targetIndex * 3 + 1]![column] = (perturbed.y - current.y) / epsilon;
-            jacobian[targetIndex * 3 + 2]![column] = (perturbed.z - current.z) / epsilon;
-          });
-          this.#data.qpos[address] = original;
-          this.#runtime.mj_forward(this.#model, this.#data);
-        }
-        const delta = dampedLeastSquares(jacobian, error, 0.018);
-        for (let column = 0; column < jointIndexes.length; column += 1) {
-          const jointIndex = jointIndexes[column]!;
-          const jointId = this.#jointIds[jointIndex]!;
-          const rangeOffset = jointId * 2;
-          const address = this.#jointPositionAddresses[jointIndex]!;
-          this.#data.qpos[address] = clamp(
-            this.#data.qpos[address]! + clamp(delta[column] ?? 0, -0.14, 0.14),
-            this.#model.jnt_range[rangeOffset]!,
-            this.#model.jnt_range[rangeOffset + 1]!
+      const positionJacobian = new this.#runtime.DoubleBuffer(3 * this.#model.nv);
+      const rotationJacobian = new this.#runtime.DoubleBuffer(3 * this.#model.nv);
+      try {
+        for (let iteration = 0;
+          iteration < HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumIterations;
+          iteration += 1) {
+          const states = resolved.map((target) => ({
+            position: this.#linkPosition(target.body),
+            ...(target.orientation ? { rotation: this.#linkRotation(target.body) } : {})
+          }));
+          if (resolved.every((target, index) => (
+            endEffectorTargetSatisfied(target, states[index]!)
+          ))) {
+            return this.#taskSpaceSolution(
+              reference,
+              resolved,
+              jointIndexes,
+              !options.preserveTrackingWeights,
+              options.initialConfiguration === "current"
+                ? maximumReferenceCorrectionRadians
+                : null
+            );
+          }
+          const error: number[] = [];
+          for (let index = 0; index < resolved.length; index += 1) {
+            const target = resolved[index]!;
+            const state = states[index]!;
+            error.push(...vectorDifference(target.position, state.position));
+            if (target.orientation && state.rotation) {
+              error.push(...vectorValues(
+                quaternionRotationVector(target.orientation, state.rotation),
+                ORIENTATION_IK_WEIGHT
+              ));
+            }
+          }
+          const jacobian = Array.from({ length: error.length }, () => (
+            new Array<number>(jointIndexes.length).fill(0)
+          ));
+          let row = 0;
+          for (const target of resolved) {
+            const bodyIndex = HUMANOID_BODY_NAMES.indexOf(target.body);
+            const bodyId = this.#bodyIds[bodyIndex];
+            if (bodyId === undefined) {
+              throw new Error(`Unknown humanoid task-space body: ${target.body}`);
+            }
+            this.#runtime.mj_jacBody(
+              this.#model,
+              this.#data,
+              positionJacobian,
+              rotationJacobian,
+              bodyId
+            );
+            const positionView = positionJacobian.GetView();
+            const rotationView = rotationJacobian.GetView();
+            for (let axis = 0; axis < 3; axis += 1) {
+              for (let column = 0; column < jointIndexes.length; column += 1) {
+                const dof = this.#jointVelocityAddresses[jointIndexes[column]!]!;
+                jacobian[row + axis]![column] = worldJacobianValue(
+                  positionView,
+                  this.#model.nv,
+                  axis,
+                  dof
+                );
+              }
+            }
+            row += 3;
+            if (target.orientation) {
+              for (let axis = 0; axis < 3; axis += 1) {
+                for (let column = 0; column < jointIndexes.length; column += 1) {
+                  const dof = this.#jointVelocityAddresses[jointIndexes[column]!]!;
+                  jacobian[row + axis]![column] = ORIENTATION_IK_WEIGHT
+                    * worldJacobianValue(rotationView, this.#model.nv, axis, dof);
+                }
+              }
+              row += 3;
+            }
+          }
+          const delta = dampedLeastSquares(
+            jacobian,
+            error,
+            HUMANOID_TASK_SPACE_SERVO_AUTHORITY.damping
           );
+          for (let column = 0; column < jointIndexes.length; column += 1) {
+            const jointIndex = jointIndexes[column]!;
+            const jointId = this.#jointIds[jointIndex]!;
+            const rangeOffset = jointId * 2;
+            const address = this.#jointPositionAddresses[jointIndex]!;
+            this.#data.qpos[address] = clamp(
+              this.#data.qpos[address]! + clamp(
+                delta[column] ?? 0,
+                -HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumJointDeltaRadians,
+                HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumJointDeltaRadians
+              ),
+              this.#model.jnt_range[rangeOffset]!,
+              this.#model.jnt_range[rangeOffset + 1]!
+            );
+          }
+          this.#runtime.mj_forward(this.#model, this.#data);
         }
-        this.#runtime.mj_forward(this.#model, this.#data);
+      } finally {
+        positionJacobian.delete();
+        rotationJacobian.delete();
       }
       const residuals = resolved.map((target) => ({
         body: target.body,
         target: { ...target.position },
         achieved: this.#linkPosition(target.body),
-        error: vectorDistance(target.position, this.#linkPosition(target.body))
+        error: vectorDistance(target.position, this.#linkPosition(target.body)),
+        ...(target.orientation
+          ? {
+              orientationTarget: { ...target.orientation },
+              orientationAchieved: this.#linkRotation(target.body),
+              orientationError: quaternionAngularDistance(
+                target.orientation,
+                this.#linkRotation(target.body)
+              )
+            }
+          : {})
       }));
       throw new Error(`Task-space IK did not converge: ${residuals.map((entry) => (
         `${entry.body}=${entry.error.toFixed(3)}m`
+          + (entry.orientationError === undefined
+            ? ""
+            : `/${entry.orientationError.toFixed(3)}rad`)
       )).join(", ")}`);
+    } finally {
+      this.restoreState(saved);
+    }
+  }
+
+  measureEndEffectorTargets(
+    reference: HumanoidReference,
+    templates: readonly HumanoidEndEffectorTarget[]
+  ): HumanoidEndEffectorTarget[] {
+    if (templates.length === 0) return [];
+    if (new Set(templates.map((target) => target.body)).size !== templates.length) {
+      throw new Error("A task-space servo frame cannot repeat an end effector");
+    }
+    templates.forEach(assertEndEffectorTarget);
+    const saved = this.captureState();
+    try {
+      this.#setReferenceConfiguration(reference);
+      const pelvisPosition = this.#linkPosition("pelvis");
+      const pelvisRotation = this.#linkRotation("pelvis");
+      const inversePelvis = inverseQuaternion(pelvisRotation);
+      return templates.map((template) => {
+        const worldPosition = this.#linkPosition(template.body);
+        const worldOrientation = template.orientation
+          ? this.#linkRotation(template.body)
+          : undefined;
+        return {
+          ...template,
+          position: template.frame === "world"
+            ? worldPosition
+            : rotateVector(inversePelvis, subtract(worldPosition, pelvisPosition)),
+          ...(worldOrientation
+            ? {
+                orientation: template.frame === "world"
+                  ? normalizeQuaternion(worldOrientation)
+                  : normalizeQuaternion(multiplyQuaternion(
+                      inversePelvis,
+                      worldOrientation
+                    ))
+              }
+            : {})
+        };
+      });
     } finally {
       this.restoreState(saved);
     }
@@ -483,6 +924,8 @@ export class HumanoidSimulation {
   #initialize(): void {
     this.#data.qvel.fill(0);
     this.#data.ctrl.fill(0);
+    this.#requestedActuatorTorques.fill(0);
+    this.#hasRequestedActuatorEvidence = false;
     this.#data.qpos[0] = this.#spawn.position.z;
     this.#data.qpos[1] = this.#spawn.position.x;
     this.#data.qpos[2] = this.#spawn.position.y + 0.793;
@@ -493,6 +936,11 @@ export class HumanoidSimulation {
         YAHMP_POLICY.defaultJointPositions[index]!
       );
     }
+    this.#handActuator.holdCurrentPositions();
+    const initialHandState = this.#handActuator.snapshot();
+    G1_HAND_JOINT_NAMES.forEach((name, index) => {
+      this.#handCommandTargets[index] = initialHandState.joints[name].target;
+    });
     this.#runtime.mj_forward(this.#model, this.#data);
     const neutral = neutralHumanoidReference();
     this.#controller.reset(this.#policyState(), neutral);
@@ -513,18 +961,39 @@ export class HumanoidSimulation {
     return worldVector(this.#data.xpos, this.#bodyIds[bodyIndex]! * 3);
   }
 
+  #linkRotation(body: HumanoidBodyName): Quaternion {
+    const bodyIndex = HUMANOID_BODY_NAMES.indexOf(body);
+    if (bodyIndex < 0) throw new Error(`Unknown humanoid task-space body: ${body}`);
+    return worldQuaternion(this.#data.xquat, this.#bodyIds[bodyIndex]! * 4);
+  }
+
   #taskSpaceSolution(
     baseline: HumanoidReference,
-    targets: readonly HumanoidEndEffectorTarget[]
+    targets: readonly HumanoidEndEffectorTarget[],
+    solvedJointIndexes: readonly number[],
+    activateTracking: boolean,
+    correctionLimitRadians: number | null
   ): HumanoidTaskSpaceSolution {
     const jointPositions = baseline.jointPositions.slice();
     const jointTrackingWeights = baseline.jointTrackingWeights.slice();
-    for (let index = 0; index < jointPositions.length; index += 1) {
-      jointPositions[index] = this.#data.qpos[this.#jointPositionAddresses[index]!]!;
+    for (const index of solvedJointIndexes) {
+      const solved = this.#data.qpos[this.#jointPositionAddresses[index]!]!;
+      jointPositions[index] = correctionLimitRadians === null
+        ? solved
+        : clamp(
+            solved,
+            baseline.jointPositions[index]! - correctionLimitRadians,
+            baseline.jointPositions[index]! + correctionLimitRadians
+          );
     }
-    for (const target of targets) {
-      for (const index of humanoidEndEffectorTrackingJointIndexes(target.body)) {
-        jointTrackingWeights[index] = 1;
+    if (activateTracking) {
+      for (const target of targets) {
+        for (const index of humanoidEndEffectorTrackingJointIndexes(
+          target.body,
+          target.orientation !== undefined
+        )) {
+          jointTrackingWeights[index] = 1;
+        }
       }
     }
     return {
@@ -536,11 +1005,24 @@ export class HumanoidSimulation {
       },
       residuals: targets.map((target) => {
         const achieved = this.#linkPosition(target.body);
+        const orientationAchieved = target.orientation
+          ? this.#linkRotation(target.body)
+          : undefined;
         return {
           body: target.body,
           target: { ...target.position },
           achieved,
-          error: vectorDistance(target.position, achieved)
+          error: vectorDistance(target.position, achieved),
+          ...(target.orientation && orientationAchieved
+            ? {
+                orientationTarget: { ...target.orientation },
+                orientationAchieved,
+                orientationError: quaternionAngularDistance(
+                  target.orientation,
+                  orientationAchieved
+                )
+              }
+            : {})
         };
       })
     };
@@ -577,12 +1059,14 @@ export class HumanoidSimulation {
       || [...command.stiffness, ...command.damping].some((value) => value < 0)) {
       throw new Error("Humanoid controller returned non-finite or negative PD parameters");
     }
+    this.#hasRequestedActuatorEvidence = true;
     for (let index = 0; index < HUMANOID_JOINT_NAMES.length; index += 1) {
       const actuator = this.#actuatorIds[index]!;
       const torque = command.stiffness[index]!
         * (command.positions[index]! - this.#data.qpos[this.#jointPositionAddresses[index]!]!)
         - command.damping[index]!
         * this.#data.qvel[this.#jointVelocityAddresses[index]!]!;
+      this.#requestedActuatorTorques[index] = torque;
       const rangeOffset = actuator * 2;
       this.#data.ctrl[actuator] = Math.max(
         this.#model.actuator_ctrlrange[rangeOffset]!,
@@ -615,14 +1099,19 @@ export class HumanoidSimulation {
     }
   }
 
-  #actuatorForJoint(jointId: number): number {
-    for (let actuator = 0; actuator < this.#model.nu; actuator += 1) {
-      if (this.#model.actuator_trnid[actuator * 2] === jointId) return actuator;
-    }
-    throw new Error(`No actuator found for humanoid joint ${jointId}`);
+  #rayObject(origin: Vec3, direction: Vec3, maximumDistance: number): string | null {
+    return this.#raySceneEntity(origin, direction, maximumDistance).objectId;
   }
 
-  #rayObject(origin: Vec3, direction: Vec3, maximumDistance: number): string | null {
+  #raySolid(origin: Vec3, direction: Vec3, maximumDistance: number): string | null {
+    return this.#raySceneEntity(origin, direction, maximumDistance).solidId;
+  }
+
+  #raySceneEntity(
+    origin: Vec3,
+    direction: Vec3,
+    maximumDistance: number
+  ): { objectId: string | null; solidId: string | null } {
     const geometryId = new this.#runtime.IntBuffer(1);
     const normal = new this.#runtime.DoubleBuffer(3);
     try {
@@ -637,22 +1126,30 @@ export class HumanoidSimulation {
         geometryId,
         normal
       );
-      if (distance < 0 || distance > maximumDistance) return null;
+      if (distance < 0 || distance > maximumDistance) {
+        return { objectId: null, solidId: null };
+      }
       const hitGeometry = Number(geometryId.GetView()[0] ?? -1);
-      if (hitGeometry < 0) return null;
+      if (hitGeometry < 0) return { objectId: null, solidId: null };
       const hitBody = this.#model.geom_bodyid[hitGeometry];
-      return hitBody === undefined ? null : this.#objectNamesByBodyId.get(hitBody) ?? null;
+      return {
+        objectId: hitBody === undefined
+          ? null
+          : this.#objectNamesByBodyId.get(hitBody) ?? null,
+        solidId: this.#solidNamesByGeomId.get(hitGeometry) ?? null
+      };
     } finally {
       normal.delete();
       geometryId.delete();
     }
   }
 
-  #id(kind: "body" | "joint", name: string): number {
-    const type = kind === "body"
-      ? this.#runtime.mjtObj.mjOBJ_BODY.value
-      : this.#runtime.mjtObj.mjOBJ_JOINT.value;
-    const id = this.#runtime.mj_name2id(this.#model, type, name);
+  #id(kind: "body", name: string): number {
+    const id = this.#runtime.mj_name2id(
+      this.#model,
+      this.#runtime.mjtObj.mjOBJ_BODY.value,
+      name
+    );
     if (id < 0) throw new Error(`MuJoCo ${kind} is missing: ${name}`);
     return id;
   }
@@ -660,29 +1157,65 @@ export class HumanoidSimulation {
   #contacts(): HumanoidContactSnapshot[] {
     const contacts: HumanoidContactSnapshot[] = [];
     const force = new this.#runtime.DoubleBuffer(6);
+    const nativeContacts = this.#data.contact;
     try {
       for (let index = 0; index < this.#data.ncon; index += 1) {
-        const contact = this.#data.contact.get(index);
+        const contact = nativeContacts.get(index);
         if (!contact) continue;
-        this.#runtime.mj_contactForce(this.#model, this.#data, index, force);
-        contacts.push({
-          position: worldVector(contact.pos, 0),
-          normal: worldVector(contact.frame, 0),
-          normalForce: Math.max(0, Number(force.GetView()[0] ?? 0)),
-          firstBody: this.#bodyNamesById.get(this.#model.geom_bodyid[contact.geom1]!) ?? null,
-          secondBody: this.#bodyNamesById.get(this.#model.geom_bodyid[contact.geom2]!) ?? null,
-          firstObject: this.#objectNamesByBodyId.get(
-            this.#model.geom_bodyid[contact.geom1]!
-          ) ?? null,
-          secondObject: this.#objectNamesByBodyId.get(
-            this.#model.geom_bodyid[contact.geom2]!
-          ) ?? null
-        });
+        try {
+          this.#runtime.mj_contactForce(this.#model, this.#data, index, force);
+          const firstBodyId = this.#model.geom_bodyid[contact.geom1]!;
+          const secondBodyId = this.#model.geom_bodyid[contact.geom2]!;
+          contacts.push({
+            position: worldVector(contact.pos, 0),
+            normal: worldVector(contact.frame, 0),
+            normalForce: Math.max(0, Number(force.GetView()[0] ?? 0)),
+            firstBody: this.#bodyNamesById.get(firstBodyId) ?? null,
+            secondBody: this.#bodyNamesById.get(secondBodyId) ?? null,
+            firstObject: this.#objectNamesByBodyId.get(firstBodyId) ?? null,
+            secondObject: this.#objectNamesByBodyId.get(secondBodyId) ?? null,
+            firstSolid: this.#solidNamesByGeomId.get(contact.geom1) ?? null,
+            secondSolid: this.#solidNamesByGeomId.get(contact.geom2) ?? null,
+            firstHandLink: this.#handContactSurface(contact.geom1, firstBodyId),
+            secondHandLink: this.#handContactSurface(contact.geom2, secondBodyId)
+          });
+        } finally {
+          contact.delete();
+        }
       }
     } finally {
+      nativeContacts.delete();
       force.delete();
     }
     return contacts;
+  }
+
+  #handContactSurface(
+    geometryId: number,
+    bodyId: number
+  ): G1HandContactSurfaceName | null {
+    return this.#handSurfaceNamesByGeomId.get(geometryId)
+      ?? this.#handBodyNamesById.get(bodyId)
+      ?? null;
+  }
+
+  #assertHandSurfaceGeometry(
+    surface: G1HandContactSurfaceName,
+    geometryId: number
+  ): void {
+    const expectedBody = surface.endsWith("_hand_palm_link")
+      ? surface.replace("_hand_palm_link", "_wrist_yaw_link")
+      : surface;
+    const expectedBodyId = this.#runtime.mj_name2id(
+      this.#model,
+      this.#runtime.mjtObj.mjOBJ_BODY.value,
+      expectedBody
+    );
+    if (expectedBodyId < 0 || this.#model.geom_bodyid[geometryId] !== expectedBodyId) {
+      throw new Error(
+        `MuJoCo hand contact geom ${g1HandContactGeomName(surface)} has invalid source body`
+      );
+    }
   }
 
   #unsafeEnvironmentContacts(
@@ -690,7 +1223,9 @@ export class HumanoidSimulation {
   ): HumanoidBodyName[] {
     const bodies = new Set<HumanoidBodyName>();
     for (const contact of contacts) {
-      if ((contact.firstBody === null) === (contact.secondBody === null)) continue;
+      const firstRobot = contact.firstBody !== null || contact.firstHandLink !== null;
+      const secondRobot = contact.secondBody !== null || contact.secondHandLink !== null;
+      if (firstRobot === secondRobot) continue;
       const name = contact.firstBody ?? contact.secondBody;
       if (!name) continue;
       const foot = name === "left_ankle_roll_link" || name === "right_ankle_roll_link";
@@ -790,6 +1325,82 @@ function assertControllerTiming(controller: HumanoidWholeBodyController): void {
     || Math.abs(ratio - Math.round(ratio)) > 1e-9) {
     throw new Error("Humanoid controller declares an invalid timing or actuation contract");
   }
+}
+
+function assertEndEffectorTarget(target: HumanoidEndEffectorTarget): void {
+  if (![target.position.x, target.position.y, target.position.z, target.tolerance]
+    .every(Number.isFinite)
+    || target.tolerance <= 0) {
+    throw new Error("Task-space target must have a finite position and positive tolerance");
+  }
+  const hasOrientation = target.orientation !== undefined;
+  const hasOrientationTolerance = target.orientationTolerance !== undefined;
+  if (hasOrientation !== hasOrientationTolerance) {
+    throw new Error(
+      "Task-space orientation and orientation tolerance must be provided together"
+    );
+  }
+  if (target.orientation) normalizeQuaternion(target.orientation);
+  if (target.orientationTolerance !== undefined
+    && (!Number.isFinite(target.orientationTolerance)
+      || target.orientationTolerance <= 0
+      || target.orientationTolerance > Math.PI)) {
+    throw new Error("Task-space orientation tolerance must be within (0, pi]");
+  }
+}
+
+function objectVisibilityPoints(
+  object: HumanoidObjectSnapshot,
+  size: Vec3 | undefined
+): Vec3[] {
+  if (!size) throw new Error(`Humanoid sensor is missing object size: ${object.id}`);
+  const offsets = [-0.45, 0, 0.45];
+  return offsets.flatMap((x) => offsets.flatMap((y) => offsets.map((z) => add(
+    object.position,
+    rotateVector(object.rotation, {
+      x: x * size.x,
+      y: y * size.y,
+      z: z * size.z
+    })
+  ))));
+}
+
+function solidVisibilityPoints(solid: HumanoidSceneSolid): Vec3[] {
+  const offsets = [-0.45, 0, 0.45];
+  return offsets.flatMap((x) => offsets.flatMap((y) => offsets.map((z) => ({
+    x: solid.center.x + x * solid.size.x,
+    y: solid.center.y + y * solid.size.y,
+    z: solid.center.z + z * solid.size.z
+  }))));
+}
+
+function endEffectorTargetSatisfied(
+  target: HumanoidEndEffectorTarget,
+  state: { position: Vec3; rotation?: Quaternion }
+): boolean {
+  if (vectorDistance(target.position, state.position)
+    > HUMANOID_TASK_SPACE_SERVO_AUTHORITY.positionConvergenceMeters) {
+    return false;
+  }
+  if (!target.orientation) return true;
+  return state.rotation !== undefined
+    && quaternionAngularDistance(target.orientation, state.rotation)
+      <= HUMANOID_TASK_SPACE_SERVO_AUTHORITY.orientationConvergenceRadians;
+}
+
+function vectorValues(value: Vec3, multiplier = 1): number[] {
+  return [value.x * multiplier, value.y * multiplier, value.z * multiplier];
+}
+
+function worldJacobianValue(
+  values: ArrayLike<number>,
+  degreesOfFreedom: number,
+  worldAxis: number,
+  degreeOfFreedom: number
+): number {
+  const mujocoAxis = [1, 2, 0][worldAxis];
+  if (mujocoAxis === undefined) throw new Error(`Invalid world Jacobian axis: ${worldAxis}`);
+  return requiredValue(values, mujocoAxis * degreesOfFreedom + degreeOfFreedom);
 }
 
 function dampedLeastSquares(

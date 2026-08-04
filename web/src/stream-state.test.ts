@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  activeAutonomousCycleFrom,
   appendRecent,
   contextMemoryFrom,
   failOpenNodes,
@@ -85,6 +86,21 @@ describe("run projections", () => {
 });
 
 describe("humanoid payload guards", () => {
+  it("accepts only a complete active autonomous cycle identity", () => {
+    const cycle = {
+      cycle_id: "autonomous-cycle:00000000-0000-4000-8000-000000000001",
+      cycle_index: 1,
+      goal_epoch_id: `goal-epoch:${"a".repeat(64)}`,
+      started_world_frame: 10,
+      started_world_revision: 8,
+      started_at: "2026-08-03T00:00:00.000Z"
+    };
+    expect(activeAutonomousCycleFrom(cycle)).toEqual(cycle);
+    expect(activeAutonomousCycleFrom({ ...cycle, started_world_revision: -1 }))
+      .toBeNull();
+    expect(activeAutonomousCycleFrom({ ...cycle, cycle_id: null })).toBeNull();
+  });
+
   it("finds the newest provider activity", () => {
     expect(latestProviderActivity([{}, { status: "contacted", at: "earlier" }, {
       status: "usable_stream",
@@ -128,16 +144,52 @@ describe("humanoid payload guards", () => {
   });
 
   it("accepts only a structured context memory envelope", () => {
+    const legacyScope = {
+      scope_id: "worker",
+      agent_id: "worker",
+      agent_name: "工作智能体",
+      raw_item_count: 0,
+      raw_chain_hash: null,
+      compacted_item_count: 0,
+      retained_item_count: 0,
+      retained_chain_hash: null,
+      active_estimated_tokens: 12_000,
+      compaction_count: 0,
+      summary: null,
+      summary_origin: null,
+      summary_world_revision: null,
+      last_compacted_at: null
+    };
     const memory = {
       version: 1,
       context_window_tokens: 65_536,
       compact_trigger_tokens: 40_000,
+      compact_recent_model_turns: 4,
+      compact_max_output_tokens: 2_048,
+      active_scope_id: "worker",
       active_estimated_tokens: 12_000,
       total_compactions: 2,
-      scopes: {}
+      last_compacted_at: null,
+      scopes: { worker: legacyScope }
     };
     expect(contextMemoryFrom(memory)).toEqual(memory);
     expect(contextMemoryFrom({ ...memory, scopes: [] })).toBeNull();
+    expect(contextMemoryFrom({
+      ...memory,
+      scopes: {
+        worker: {
+          ...legacyScope,
+          context_window_tokens: 32_768,
+          compact_trigger_tokens: 8_000,
+          compact_recent_model_turns: 2,
+          compact_max_output_tokens: 768
+        }
+      }
+    })).not.toBeNull();
+    expect(contextMemoryFrom({
+      ...memory,
+      scopes: { worker: { ...legacyScope, compact_trigger_tokens: 8_000 } }
+    })).toBeNull();
   });
 });
 

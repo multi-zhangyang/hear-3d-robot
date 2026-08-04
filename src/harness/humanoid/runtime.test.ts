@@ -8,6 +8,8 @@ import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.
 import { HumanoidWorld } from "../../world/humanoid/world.js";
 import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
 import { HumanoidActionRuntime } from "./runtime.js";
+import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
+import { BlockRemovalAuthorityError } from "./block-removal-authority.js";
 
 const scenario = ScenarioSchema.parse({
   title: "Humanoid action field",
@@ -29,6 +31,62 @@ const scenario = ScenarioSchema.parse({
 });
 
 describe("HumanoidActionRuntime", () => {
+  it("exposes only authority-prepared block-removal transactions", async () => {
+    const lightweight = lightweightObservationWorld();
+    const prepared: Array<{
+      solidId: string;
+      executionTransactionId: string;
+    }> = [];
+    const transaction = {
+      version: 1,
+      transaction_id: "remove-1",
+      solid_id: "block-a",
+      block_id: "block-a"
+    } as ScenarioBlockRemovalTransaction;
+    const runtime = new HumanoidActionRuntime(lightweight.world, {
+      prepareBlockRemoval: (input) => {
+        prepared.push(input);
+        return transaction;
+      }
+    });
+
+    const accepted = await runtime.invoke(
+      "remove_world_block",
+      { solid_id: "block-a", execution_transaction_id: "execute-1" },
+      "remove-1",
+      "executor-agent"
+    );
+    expect(accepted).toMatchObject({
+      accepted: true,
+      code: "world_block_removal_authorized",
+      frameCount: 0,
+      detail: { removal_transaction: transaction }
+    });
+    expect(prepared).toMatchObject([{
+      solidId: "block-a",
+      executionTransactionId: "execute-1"
+    }]);
+
+    const rejectedRuntime = new HumanoidActionRuntime(lightweight.world, {
+      prepareBlockRemoval: () => {
+        throw new BlockRemovalAuthorityError(
+          "block_removal_contact_force_insufficient",
+          "contact was too weak"
+        );
+      }
+    });
+    await expect(rejectedRuntime.invoke(
+      "remove_world_block",
+      { solid_id: "block-a", execution_transaction_id: "execute-1" },
+      "remove-2",
+      "executor-agent"
+    )).resolves.toMatchObject({
+      accepted: false,
+      code: "block_removal_contact_force_insufficient",
+      detail: { reason: "contact was too weak" }
+    });
+  });
+
   it("bounds completed transaction history while preserving recent idempotency", async () => {
     const lightweight = lightweightObservationWorld();
     const runtime = new HumanoidActionRuntime(lightweight.world);
@@ -67,6 +125,51 @@ describe("HumanoidActionRuntime", () => {
     );
     expect(lightweight.observationCalls()).toBe(callsBeforeRecentRetry + 1);
   }, 20_000);
+
+  it("retries only the durable commit after execution and fences later actions", async () => {
+    const lightweight = lightweightObservationWorld();
+    let commitAttempts = 0;
+    const runtime = new HumanoidActionRuntime(lightweight.world, {
+      receiptSink: () => {
+        commitAttempts += 1;
+        if (commitAttempts === 1) throw new Error("checkpoint unavailable");
+      }
+    });
+
+    await expect(runtime.invoke(
+      "observe_humanoid",
+      {},
+      "uncertain-commit",
+      "perception-agent"
+    )).rejects.toThrow("checkpoint unavailable");
+    expect(lightweight.observationCalls()).toBe(1);
+
+    await expect(runtime.invoke(
+      "observe_humanoid",
+      {},
+      "later-action",
+      "perception-agent"
+    )).rejects.toThrow("retry transaction uncertain-commit");
+    expect(lightweight.observationCalls()).toBe(1);
+
+    const recovered = await runtime.invoke(
+      "observe_humanoid",
+      {},
+      "uncertain-commit",
+      "perception-agent"
+    );
+    expect(recovered.transactionId).toBe("uncertain-commit");
+    expect(commitAttempts).toBe(2);
+    expect(lightweight.observationCalls()).toBe(1);
+
+    await runtime.invoke(
+      "observe_humanoid",
+      {},
+      "later-action",
+      "perception-agent"
+    );
+    expect(lightweight.observationCalls()).toBe(2);
+  });
 
   it("keeps an accepted current plan outside the recent receipt window", async () => {
     const world = await HumanoidWorld.create(scenario);
@@ -245,7 +348,7 @@ describe("HumanoidActionRuntime", () => {
       const candidateBefore = runtime.snapshot();
       const candidateTarget = {
         ...candidateBefore.robot.rootPosition,
-        z: candidateBefore.robot.rootPosition.z + 0.08
+        z: candidateBefore.robot.rootPosition.z + 0.04
       };
       const candidatePlan = await runtime.invoke(
         "plan_whole_body_motion_candidates",
@@ -259,9 +362,15 @@ describe("HumanoidActionRuntime", () => {
               end_effector: null,
               frame: null,
               object_id: null,
+              solid_id: null,
+              hand_surface: null,
+              hand: null,
+              grasp_contract_sha256: null,
               zone_id: null,
               target: candidateTarget,
-              tolerance_m: 0.035,
+              tolerance_m: 0.03,
+              target_orientation: null,
+              orientation_tolerance_rad: null,
               minimum_normal_force: null,
               expected: null
             }],
@@ -432,6 +541,11 @@ function lightweightObservationWorld(): {
           contacts: []
         },
         objectTokens: [],
+        solidTokens: [],
+        grasp: {
+          contractSha256: "fc1e2d113bb5e5f5f8a75f0faa3efc8bd97ecc18eb41463da09d26bb52cfc193",
+          assessments: []
+        },
         navigation: {}
       };
     }

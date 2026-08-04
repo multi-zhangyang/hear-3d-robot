@@ -87,6 +87,27 @@ export interface NavigationPlan {
   projectionDistance: number;
 }
 
+export type NavigationPlanningFailureCode =
+  | "start_off_mesh"
+  | "target_off_mesh"
+  | "target_projection_exceeded"
+  | "path_not_found";
+
+/**
+ * A valid navigation mesh can still reject a route. Callers may retry these
+ * failures with a wider build scope; mesh generation and tile-cache failures
+ * deliberately remain ordinary errors and must surface immediately.
+ */
+export class NavigationPlanningError extends Error {
+  readonly code: NavigationPlanningFailureCode;
+
+  constructor(code: NavigationPlanningFailureCode, message: string) {
+    super(message);
+    this.name = "NavigationPlanningError";
+    this.code = code;
+  }
+}
+
 export interface StandoffPose {
   position: Vec3;
   radius: number;
@@ -100,11 +121,14 @@ export interface NavigationObstacle {
   yaw: number;
 }
 
+export interface NavigationPlanarRegion {
+  minimum: Pick<Vec3, "x" | "z">;
+  maximum: Pick<Vec3, "x" | "z">;
+}
+
 export interface NavigationBuildScope {
-  region: {
-    minimum: Pick<Vec3, "x" | "z">;
-    maximum: Pick<Vec3, "x" | "z">;
-  };
+  region: NavigationPlanarRegion;
+  walkableRegions?: NavigationPlanarRegion[];
   terrainSolids: NavigationSolid[];
 }
 
@@ -127,12 +151,18 @@ const NAVIGATION_CELL_SIZE = 0.1;
 const NAVIGATION_CELL_HEIGHT = 0.05;
 const NAVIGATION_TILE_SIZE = 32;
 const NAVIGATION_OBSTACLE_SKIN = NAVIGATION_CELL_SIZE;
+const NAVIGATION_MAXIMUM_QUERY_NODES = 8_192;
+const NAVIGATION_MAXIMUM_PATH_POLYGONS = 4_096;
+const NAVIGATION_MAXIMUM_STRAIGHT_PATH_POINTS = 4_096;
+const NAVIGATION_PATH_ENDPOINT_TOLERANCE = NAVIGATION_CELL_SIZE / 2;
+export const NAVIGATION_TILE_WORLD_SIZE = NAVIGATION_CELL_SIZE * NAVIGATION_TILE_SIZE;
 
 export class NavigationMesh {
   readonly #navMesh: RecastNavMesh;
   readonly #tileCache: RecastTileCache;
   readonly #query: RecastNavMeshQuery;
   readonly #profile: NavigationAgentProfile;
+  readonly #walkableRegions: readonly NavigationPlanarRegion[];
   readonly #obstacles = new Map<string, {
     descriptor: NavigationObstacle;
     handle: RecastTileCacheObstacle;
@@ -146,15 +176,21 @@ export class NavigationMesh {
     if (!profile) throw new Error("Navigation agent profile is required");
     recastInitialization ??= recastApi.init();
     await recastInitialization;
-    const solids = scope
-      ? [...scenario.obstacles, ...scope.terrainSolids]
-      : scenario.obstacles;
+    const solids = [...scenario.obstacles, ...(scope?.terrainSolids ?? [])];
     const region = scope?.region ?? {
       minimum: { x: 0, z: 0 },
       maximum: { x: scenario.bounds.width, z: scenario.bounds.depth }
     };
-    const geometry = worldGeometry(scenario, solids, region);
-    const maximumGeometryHeight = worldGeometryHeight(scenario, solids, region);
+    const walkableRegions = validatedWalkableRegions(
+      scope?.walkableRegions ?? [region],
+      region
+    );
+    const geometry = worldGeometry(scenario, solids, walkableRegions);
+    const maximumGeometryHeight = worldGeometryHeight(
+      scenario,
+      solids,
+      walkableRegions
+    );
     const navigationProfile = validatedProfile(profile);
     const generated = recastGeneratorsApi.generateTileCache(
       geometry.positions,
@@ -187,7 +223,12 @@ export class NavigationMesh {
       throw new Error(`Navigation mesh generation failed: ${generated.error}`);
     }
     try {
-      return new NavigationMesh(generated.navMesh, generated.tileCache, navigationProfile);
+      return new NavigationMesh(
+        generated.navMesh,
+        generated.tileCache,
+        navigationProfile,
+        walkableRegions
+      );
     } catch (error) {
       generated.tileCache.destroy();
       generated.navMesh.destroy();
@@ -198,12 +239,16 @@ export class NavigationMesh {
   private constructor(
     navMesh: RecastNavMesh,
     tileCache: RecastTileCache,
-    profile: NavigationAgentProfile
+    profile: NavigationAgentProfile,
+    walkableRegions: readonly NavigationPlanarRegion[]
   ) {
     this.#navMesh = navMesh;
     this.#tileCache = tileCache;
-    this.#query = new recastApi.NavMeshQuery(navMesh, { maxNodes: 4096 });
+    this.#query = new recastApi.NavMeshQuery(navMesh, {
+      maxNodes: NAVIGATION_MAXIMUM_QUERY_NODES
+    });
     this.#profile = profile;
+    this.#walkableRegions = walkableRegions.map((region) => structuredClone(region));
     this.#query.defaultQueryHalfExtents = {
       x: Math.max(0.8, profile.radius * 2),
       y: Math.max(2.2, profile.height * 1.5),
@@ -215,13 +260,22 @@ export class NavigationMesh {
     this.#synchronizeObstacles(obstacles);
     const startResult = this.#query.findClosestPoint({ x: start.x, y: 0, z: start.z });
     const targetResult = this.#query.findClosestPoint({ x: target.x, y: 0, z: target.z });
-    if (!startResult.success) throw new Error("Robot base is not on the navigation mesh");
+    if (!startResult.success) {
+      throw new NavigationPlanningError(
+        "start_off_mesh",
+        "Robot base is not on the navigation mesh"
+      );
+    }
     if (!targetResult.success) {
-      throw new Error(`Navigation target has no walkable projection: requested=${formatPoint(target)}`);
+      throw new NavigationPlanningError(
+        "target_off_mesh",
+        `Navigation target has no walkable projection: requested=${formatPoint(target)}`
+      );
     }
     const projectionDistance = planarDistance(targetResult.point, target);
     if (projectionDistance > this.#profile.maximumTargetProjection) {
-      throw new Error(
+      throw new NavigationPlanningError(
+        "target_projection_exceeded",
         `Navigation target projection exceeds ${this.#profile.maximumTargetProjection.toFixed(2)}m: `
         + `requested=${formatPoint(target)}, projected=${formatPoint(targetResult.point)}, `
         + `distance=${projectionDistance.toFixed(3)}m`
@@ -242,14 +296,34 @@ export class NavigationMesh {
       };
     }
     const result = this.#query.computePath(startResult.point, targetResult.point, {
-      maxPathPolys: 512,
-      maxStraightPathPoints: 512
+      maxPathPolys: NAVIGATION_MAXIMUM_PATH_POLYGONS,
+      maxStraightPathPoints: NAVIGATION_MAXIMUM_STRAIGHT_PATH_POINTS
     });
     if (!result.success || result.path.length < 2) {
-      throw new Error(`No navigation path: ${result.error?.name ?? "empty path"}`);
+      throw new NavigationPlanningError(
+        "path_not_found",
+        `No navigation path: ${result.error?.name ?? "empty path"}`
+      );
     }
+    const computedEndpoint = result.path.at(-1)!;
+    const incompleteDistance = planarDistance(computedEndpoint, targetResult.point);
+    if (incompleteDistance > NAVIGATION_PATH_ENDPOINT_TOLERANCE) {
+      throw new NavigationPlanningError(
+        "path_not_found",
+        "No complete navigation path: "
+        + `partial_endpoint=${formatPoint(computedEndpoint)}, `
+        + `target=${formatPoint(targetResult.point)}, `
+        + `gap=${incompleteDistance.toFixed(3)}m`
+      );
+    }
+    const resolvedStart = {
+      x: startResult.point.x,
+      y: start.y,
+      z: startResult.point.z
+    };
     const waypoints = deduplicate([
       { x: start.x, y: start.y, z: start.z },
+      resolvedStart,
       ...result.path.slice(1, -1).map((point) => ({ x: point.x, y: start.y, z: point.z })),
       resolvedTarget
     ]);
@@ -336,6 +410,7 @@ export class NavigationMesh {
     const requested = new Map<string, NavigationObstacle>();
     for (const obstacle of [...obstacles].sort((left, right) => left.id.localeCompare(right.id))) {
       const descriptor = validatedObstacle(obstacle);
+      if (!navigationObstacleOverlapsRegions(descriptor, this.#walkableRegions)) continue;
       if (requested.has(descriptor.id)) {
         throw new Error(`Duplicate navigation obstacle id: ${descriptor.id}`);
       }
@@ -413,23 +488,26 @@ interface Geometry {
 function worldGeometry(
   scenario: Scenario,
   solids: NavigationSolid[],
-  region: NavigationBuildScope["region"]
+  regions: readonly NavigationPlanarRegion[]
 ): Geometry {
   const geometry: Geometry = { positions: [], indices: [] };
-  appendQuad(
-    geometry,
-    { x: region.minimum.x, y: 0, z: region.minimum.z },
-    { x: region.minimum.x, y: 0, z: region.maximum.z },
-    { x: region.maximum.x, y: 0, z: region.maximum.z },
-    { x: region.maximum.x, y: 0, z: region.minimum.z }
-  );
+  for (const region of regions) {
+    appendQuad(
+      geometry,
+      { x: region.minimum.x, y: 0, z: region.minimum.z },
+      { x: region.minimum.x, y: 0, z: region.maximum.z },
+      { x: region.maximum.x, y: 0, z: region.maximum.z },
+      { x: region.maximum.x, y: 0, z: region.minimum.z }
+    );
+  }
   for (const obstacle of solids) {
-    if (overlapsRegion(obstacle, region)) {
+    if (overlapsAnyRegion(obstacle, regions)) {
       appendBox(geometry, obstacle.center, obstacle.size);
     }
   }
   for (const object of scenario.objects) {
-    if (!object.portable && overlapsRegion({ center: object.position, size: object.size }, region)) {
+    if (!object.portable
+      && overlapsAnyRegion({ center: object.position, size: object.size }, regions)) {
       appendBox(geometry, object.position, object.size);
     }
   }
@@ -455,16 +533,17 @@ function deindexGeometry(geometry: Geometry): Geometry {
 function worldGeometryHeight(
   scenario: Scenario,
   solids: NavigationSolid[],
-  region: NavigationBuildScope["region"]
+  regions: readonly NavigationPlanarRegion[]
 ): number {
   let maximum = 0;
   for (const obstacle of solids) {
-    if (overlapsRegion(obstacle, region)) {
+    if (overlapsAnyRegion(obstacle, regions)) {
       maximum = Math.max(maximum, obstacle.center.y + obstacle.size.y / 2);
     }
   }
   for (const object of scenario.objects) {
-    if (!object.portable && overlapsRegion({ center: object.position, size: object.size }, region)) {
+    if (!object.portable
+      && overlapsAnyRegion({ center: object.position, size: object.size }, regions)) {
       maximum = Math.max(maximum, object.position.y + object.size.y / 2);
     }
   }
@@ -473,12 +552,68 @@ function worldGeometryHeight(
 
 function overlapsRegion(
   box: { center: Vec3; size: Vec3 },
-  region: NavigationBuildScope["region"]
+  region: NavigationPlanarRegion
 ): boolean {
   return box.center.x + box.size.x / 2 >= region.minimum.x
     && box.center.x - box.size.x / 2 <= region.maximum.x
     && box.center.z + box.size.z / 2 >= region.minimum.z
     && box.center.z - box.size.z / 2 <= region.maximum.z;
+}
+
+function overlapsAnyRegion(
+  box: { center: Vec3; size: Vec3 },
+  regions: readonly NavigationPlanarRegion[]
+): boolean {
+  return regions.some((region) => overlapsRegion(box, region));
+}
+
+function validatedWalkableRegions(
+  regions: readonly NavigationPlanarRegion[],
+  bounds: NavigationPlanarRegion
+): NavigationPlanarRegion[] {
+  if (regions.length === 0) {
+    throw new Error("Navigation build scope requires at least one walkable region");
+  }
+  const validate = (region: NavigationPlanarRegion, label: string): void => {
+    const values = [
+      region.minimum.x,
+      region.minimum.z,
+      region.maximum.x,
+      region.maximum.z
+    ];
+    if (!values.every(Number.isFinite)
+      || region.minimum.x >= region.maximum.x
+      || region.minimum.z >= region.maximum.z) {
+      throw new Error(`${label} must have finite positive planar extents`);
+    }
+  };
+  validate(bounds, "Navigation build bounds");
+  return regions.map((region, index) => {
+    validate(region, `Navigation walkable region ${String(index)}`);
+    if (region.minimum.x < bounds.minimum.x
+      || region.minimum.z < bounds.minimum.z
+      || region.maximum.x > bounds.maximum.x
+      || region.maximum.z > bounds.maximum.z) {
+      throw new Error(`Navigation walkable region ${String(index)} exceeds build bounds`);
+    }
+    return structuredClone(region);
+  });
+}
+
+function navigationObstacleOverlapsRegions(
+  obstacle: NavigationObstacle,
+  regions: readonly NavigationPlanarRegion[]
+): boolean {
+  const cosine = Math.abs(Math.cos(obstacle.yaw));
+  const sine = Math.abs(Math.sin(obstacle.yaw));
+  return overlapsAnyRegion({
+    center: obstacle.center,
+    size: {
+      x: 2 * (cosine * obstacle.halfExtents.x + sine * obstacle.halfExtents.z),
+      y: obstacle.halfExtents.y * 2,
+      z: 2 * (sine * obstacle.halfExtents.x + cosine * obstacle.halfExtents.z)
+    }
+  }, regions);
 }
 
 function appendBox(geometry: Geometry, center: Vec3, size: Vec3): void {

@@ -1,4 +1,5 @@
 import { expect, test, type CDPSession, type Page } from "@playwright/test";
+import { openRecordedOperator } from "./open-recorded-operator.js";
 
 test.use({
   viewport: { width: 390, height: 844 },
@@ -9,7 +10,7 @@ test.use({
 test("移动端触摸拖拽观察真实人形世界", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
   test.skip(testInfo.project.name !== "mobile", "移动触摸回归只运行一次");
-  await openRecordedRun(page);
+  await openRecordedOperator(page);
   const canvas = page.locator("canvas.humanoid-canvas");
   await expect(canvas).toBeVisible({ timeout: 90_000 });
   await page.waitForFunction(() => {
@@ -49,17 +50,6 @@ test("移动端触摸拖拽观察真实人形世界", async ({ page }, testInfo)
     await session.detach();
   }
 });
-
-async function openRecordedRun(page: Page): Promise<void> {
-  await page.goto("/");
-  const password = page.getByLabel("操作密码");
-  if (await password.isVisible().catch(() => false)) {
-    await password.fill(process.env.HEAR_E2E_PASSWORD ?? "hear-e2e-local");
-    await page.getByRole("button", { name: /登\s*录/ }).click();
-  }
-  await expect(page.locator("section.humanoid-mission-world"))
-    .toBeVisible({ timeout: 25_000 });
-}
 
 async function settleRendering(page: Page): Promise<void> {
   await page.evaluate(() => new Promise<void>((resolve) => {

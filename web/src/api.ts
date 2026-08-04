@@ -1,6 +1,7 @@
 import type {
   Bootstrap,
   Goal,
+  HumanoidRunMode,
   HumanoidRunDetails,
   RunListItem,
   RuntimeEvent,
@@ -128,6 +129,7 @@ export async function startRun(input: {
   mission: string;
   scenario_id: string;
   goal: Goal;
+  run_mode: HumanoidRunMode;
 }): Promise<string> {
   const result = await request<{ run_id: string }>("/api/runs", {
     method: "POST",

@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { latestProviderActivity } from "../stream-state";
+import { modelActivityLabel, type ModelActivityState } from "../model-activity";
 import type { HumanoidRunCheckpoint } from "../types";
 import { missionResultLabel } from "../ui-text";
 import { presentFramework, shortTime } from "./presenter";
@@ -7,7 +7,7 @@ import { presentFramework, shortTime } from "./presenter";
 interface ActivityViewProps {
   checkpoint: HumanoidRunCheckpoint;
   framework: unknown[];
-  provider: unknown[];
+  modelActivity: ModelActivityState;
 }
 
 export function ActivityView(props: ActivityViewProps): React.JSX.Element {
@@ -17,21 +17,18 @@ export function ActivityView(props: ActivityViewProps): React.JSX.Element {
   );
   const output = missionResultLabel(props.checkpoint);
   const calls = props.checkpoint.total_model_calls;
-  const live = props.checkpoint.status === "starting" || props.checkpoint.status === "running";
-  const activity = latestProviderActivity(props.provider);
-  const usable = activity?.status === "usable_stream";
-  const failed = activity?.status === "no_text"
-    || activity?.status === "transport_interrupted"
-    || activity?.status.includes("error") === true;
-  const state = failed
-    ? "模型调用异常"
-    : live && activity ? "模型调用中"
-      : usable ? "模型已响应" : "模型等待中";
+  const failed = props.modelActivity.phase === "error";
+  const recovering = props.modelActivity.phase === "recovering";
+  const online = props.modelActivity.phase === "active"
+    || props.modelActivity.phase === "verified";
 
   return (
     <section className="activity-view" aria-label="模型输出">
-      <header className={`activity-pulse ${failed ? "failed" : ""}`} aria-label="模型流状态">
-        <span><i className={usable || live && activity ? "online" : ""} />{state}</span>
+      <header
+        className={`activity-pulse ${failed ? "failed" : recovering ? "recovering" : ""}`}
+        aria-label="模型流状态"
+      >
+        <span><i className={online ? "online" : ""} />{modelActivityLabel(props.modelActivity.phase)}</span>
         <strong aria-label={`${calls} 次模型调用`}>{calls}<small>模型调用</small></strong>
       </header>
 

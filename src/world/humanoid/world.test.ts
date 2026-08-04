@@ -1,60 +1,484 @@
 import { describe, expect, it } from "vitest";
 import { loadRuntimeCatalog } from "../../config/load.js";
-import { ScenarioSchema } from "../../domain/schema.js";
-import {
-  humanoidMotionArtifactSha256,
-  serializeHumanoidReference
-} from "./motion-artifact.js";
-import type {
-  HumanoidMotionCandidateBatch,
-  HumanoidMotionGenerator,
-  HumanoidMotionGeneratorInput
-} from "./motion-plan.js";
+import { applyScenarioChunkDeltaMutation } from "../../domain/scenario-chunk-delta.js";
+import { createScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
+import { humanoidMotionArtifactSha256 } from "./motion-artifact.js";
+import type { HumanoidMotionCandidateBatch } from "./motion-plan.js";
 import {
   createHumanoidMotionOptionMonitorState,
   humanoidMotionOptionContractSha256
 } from "./motion-option.js";
 import { humanoidMotionRolloutSha256 } from "./motion-rollout.js";
+import { humanoidMotionIntentSha256 } from "./plan-lifecycle.js";
+import { humanoidMotionContactEvidenceSha256 } from "./motion-contact-evidence.js";
+import { BlockingFirstMotionGenerator } from "./world-motion-generator.test-support.js";
+import {
+  humanoidWorldPerceptionTestScenario as perceptionScenario,
+  humanoidWorldTestScenario as scenario
+} from "./world-scenarios.test-support.js";
 import { HumanoidWorld } from "./world.js";
 
-const scenario = ScenarioSchema.parse({
-  title: "Humanoid field",
-  seed: 7,
-  bounds: { width: 10, depth: 10 },
-  visibility_radius: 6,
-  robot: { x: 1.5, z: 1.5, yaw: 0 },
-  obstacles: [{
-    id: "column",
-    center: { x: 6, y: 1, z: 6 },
-    size: { x: 1, y: 2, z: 1 }
-  }],
-  objects: [],
-  zones: [],
-  default_goal: {
-    summary: "到达开放区域",
-    predicates: [{
-      type: "robot_at",
-      target: { x: 1.5, y: 0, z: 2.2 },
-      tolerance: 0.25
-    }]
-  }
-});
-
-const perceptionScenario = ScenarioSchema.parse({
-  ...scenario,
-  title: "Humanoid perception field",
-  obstacles: [],
-  objects: [{
-    id: "crate",
-    kind: "crate",
-    color: "#8b6b45",
-    position: { x: 1.5, y: 0.15, z: 3.2 },
-    size: { x: 0.3, y: 0.3, z: 0.3 },
-    portable: true
-  }]
-});
-
 describe("HumanoidWorld", () => {
+  it("rebuilds live collision and navigation resources from chunk geometry", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const target = { x: 1.5, y: 0, z: 2.2 };
+      const plannedBefore = await world.planNavigation(target);
+      expect(plannedBefore.accepted, plannedBefore.reason).toBe(true);
+      const before = world.snapshot();
+      const chunks = applyScenarioChunkDeltaMutation(
+        scenario,
+        createScenarioChunkDeltaState(scenario),
+        {
+          type: "create_block",
+          block: {
+            id: "live-target-block",
+            center: { x: target.x, y: 0.5, z: target.z },
+            size: { x: 0.9, y: 1, z: 0.9 },
+            material: "stone",
+            properties: {}
+          }
+        }
+      );
+
+      const synchronized = await world.synchronizeScenarioChunks(scenario, chunks);
+      expect(synchronized).toMatchObject({
+        changed: true,
+        chunkRevision: 1,
+        resourceRebuilt: true,
+        changedDomains: ["geometry"],
+        invalidatedPlanIds: [plannedBefore.planId]
+      });
+      const after = world.snapshot();
+      expect(after.frame).toBe(before.frame);
+      expect(after.worldRevision).toBe(before.worldRevision);
+      expect(after.robot.rootPosition).toEqual(before.robot.rootPosition);
+      expect(world.checkpoint().routes).toEqual([]);
+
+      const plannedAfter = await world.planNavigation(target);
+      expect(plannedAfter.accepted).toBe(false);
+      expect(plannedAfter.reason).toMatch(/projection|path|mesh/i);
+    } finally {
+      await world.dispose();
+    }
+  }, 30_000);
+
+  it("persists navigation carry authority and committed continuation evidence", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    let restored: HumanoidWorld | undefined;
+    try {
+      const planned = await world.planNavigation({ x: 1.5, y: 0, z: 2.2 });
+      expect(planned.accepted, planned.reason).toBe(true);
+      const plannedRoute = world.checkpoint().routes.find(({ id }) => (
+        id === planned.planId
+      ));
+      expect(plannedRoute?.carriedObjectBindings).toMatchObject({
+        protocol: "humanoid-carried-object-binding-set-v1",
+        bindings: []
+      });
+      expect(plannedRoute?.carriedObjectContinuation).toBeNull();
+
+      const executed = await world.executeNavigation(
+        planned.planId,
+        undefined,
+        { retainTerminal: true }
+      );
+      expect(executed.accepted, executed.detail.reason).toBe(true);
+      expect(executed.detail.carry).toMatchObject({
+        binding_set: { bindings: [] },
+        continuation: { continued: true, bindings: [] },
+        unauthorized_contacts: []
+      });
+      const checkpoint = world.checkpoint();
+      const terminalRoute = checkpoint.routes.find(({ id }) => id === planned.planId);
+      expect(terminalRoute?.carriedObjectContinuation).toEqual(
+        executed.detail.carry?.continuation
+      );
+
+      restored = await HumanoidWorld.create(scenario, checkpoint);
+      expect(restored.checkpoint().routes[0]?.carriedObjectBindings).toEqual(
+        terminalRoute?.carriedObjectBindings
+      );
+      expect(restored.checkpoint().routes[0]?.carriedObjectContinuation).toEqual(
+        terminalRoute?.carriedObjectContinuation
+      );
+
+      const tampered = structuredClone(checkpoint);
+      tampered.routes[0]!.carriedObjectContinuation!.binding_set_sha256 = "0".repeat(64);
+      await expect(HumanoidWorld.create(scenario, tampered)).rejects.toThrow(
+        /carry continuation|authority binding/i
+      );
+    } finally {
+      await restored?.dispose();
+      await world.dispose();
+    }
+  }, 30_000);
+
+  it("publishes and restores frame-aligned grasp authority state", async () => {
+    const world = await HumanoidWorld.create(perceptionScenario);
+    let restored: HumanoidWorld | undefined;
+    try {
+      const initial = world.snapshot();
+      const observed = world.observe();
+      expect(initial.frame).toBe(0);
+      expect(initial.grasp.contractSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(initial.grasp.assessments.map(({ object_id, hand, frame }) => (
+        [object_id, hand, frame]
+      ))).toEqual([
+        ["crate", "left", 0],
+        ["crate", "right", 0]
+      ]);
+      expect(observed.grasp).toEqual(initial.grasp);
+      expect(world.checkpoint().graspRegistry.last_frame).toBe(initial.frame);
+
+      const advanced = await world.advanceStationary();
+      expect(advanced?.grasp.assessments.every((assessment) => (
+        assessment.frame === advanced.frame
+      ))).toBe(true);
+      const checkpoint = world.checkpoint();
+      expect(checkpoint.graspRegistry.last_frame).toBe(checkpoint.frame);
+
+      restored = await HumanoidWorld.create(perceptionScenario, checkpoint);
+      expect(restored.snapshot().grasp).toEqual(advanced?.grasp);
+      expect(restored.checkpoint().graspRegistry).toEqual(
+        checkpoint.graspRegistry
+      );
+
+      const wrongFrame = structuredClone(checkpoint);
+      wrongFrame.graspRegistry.last_frame = checkpoint.frame + 1;
+      await expect(HumanoidWorld.create(perceptionScenario, wrongFrame))
+        .rejects.toThrow(/registry frame|registry assessment/);
+    } finally {
+      await restored?.dispose();
+      await world.dispose();
+    }
+  }, 30_000);
+
+  it("rejects untrusted grasp contracts before rollout and isolates preview tracking", async () => {
+    const world = await HumanoidWorld.create(perceptionScenario);
+    try {
+      world.observe();
+      const before = world.checkpoint().graspRegistry;
+      await expect(world.planWholeBodyMotionCandidates(
+        graspCandidateBatch("0".repeat(64))
+      )).rejects.toThrow("contract hash does not match authority");
+      expect(world.checkpoint().graspRegistry).toEqual(before);
+
+      const planned = await world.planWholeBodyMotionCandidates(
+        graspCandidateBatch(world.snapshot().grasp.contractSha256)
+      );
+      expect(planned.accepted).toBe(false);
+      expect(world.checkpoint().graspRegistry).toEqual(before);
+    } finally {
+      await world.dispose();
+    }
+  }, 30_000);
+
+  it("keeps authoritative physics live while a plan waits and revalidates its intent", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = world.snapshot();
+      const streamed: number[] = [];
+      const advanced = await world.advanceStationary((frame) => {
+        streamed.push(frame.frame);
+      });
+
+      expect(advanced).not.toBeNull();
+      expect(advanced!.frame).toBe(initial.frame + 1);
+      expect(advanced!.worldRevision).toBe(initial.worldRevision + 1);
+      expect(advanced!.robot.simulatedTime - initial.robot.simulatedTime).toBeCloseTo(
+        initial.robot.controller.controlStepSeconds,
+        9
+      );
+      expect(advanced!.robot.fallen).toBe(false);
+      expect(streamed).toEqual([advanced!.frame]);
+
+      const plan = await world.planNavigation({ x: 1.5, y: 0, z: 2.2 });
+      expect(plan.accepted, plan.reason).toBe(true);
+      const planned = world.snapshot();
+      const live = await world.advanceStationary();
+      expect(live).not.toBeNull();
+      expect(live!.frame).toBe(planned.frame + 1);
+      expect(live!.worldRevision).toBe(planned.worldRevision + 1);
+      expect(world.consumablePlanIds()).toContain(plan.planId);
+
+      const executed = await world.executeNavigation(plan.planId);
+      expect(executed.accepted, executed.detail.reason).toBe(true);
+      expect(executed.detail.revalidation).toMatchObject({
+        performed: true,
+        accepted: true,
+        intent_sha256: plan.intentSha256,
+        planning_revision: plan.createdRevision,
+        previous_validation_revision: plan.createdRevision,
+        validation_revision: live!.worldRevision,
+        revalidation_count: 1
+      });
+      expect(world.checkpoint().graspRegistry.last_frame).toBe(
+        executed.finalSnapshot.frame
+      );
+    } finally {
+      await world.dispose();
+    }
+  }, 30_000);
+
+  it("advances authority while an isolated motion rollout is still planning", async () => {
+    const generator = new BlockingFirstMotionGenerator();
+    const world = await HumanoidWorld.create(scenario, undefined, {
+      motionGeneratorFactory: async () => generator
+    });
+    try {
+      const planning = world.planWholeBodyMotion({
+        id: "slow-isolated-rollout",
+        intent: "保持平衡并验证规划期间物理继续推进",
+        duration_seconds: 0.1,
+        keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1 }]
+      });
+      await generator.firstCallEntered;
+      const before = world.snapshot();
+      const first = await world.advanceStationary();
+      const second = await world.advanceStationary();
+      expect(first?.worldRevision).toBe(before.worldRevision + 1);
+      expect(second?.worldRevision).toBe(before.worldRevision + 2);
+
+      generator.releaseFirstCall();
+      const planned = await planning;
+      expect(planned.accepted).toBe(true);
+      expect(planned.createdRevision).toBe(before.worldRevision);
+      expect(world.snapshot().worldRevision).toBeGreaterThan(planned.createdRevision);
+
+      const executed = await world.executeWholeBodyMotion(planned.planId);
+      expect(executed.accepted).toBe(true);
+      expect(executed.detail.revalidation).toMatchObject({
+        performed: true,
+        accepted: true,
+        intent_sha256: planned.intentSha256,
+        revalidation_count: 1
+      });
+    } finally {
+      generator.releaseFirstCall();
+      await world.dispose();
+    }
+  }, 30_000);
+
+  it("retains and replays a durable motion terminal until its hash is acknowledged", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    let resumed: HumanoidWorld | undefined;
+    try {
+      const planned = await world.planWholeBodyMotion({
+        id: "durable-motion-terminal",
+        intent: "保持平衡并完成一次短全身姿态调整",
+        duration_seconds: 0.1,
+        keyframes: [
+          { at_seconds: 0 },
+          { at_seconds: 0.1, torso_yaw: 0.01 }
+        ]
+      });
+      expect(planned.accepted).toBe(true);
+      const cuts: number[] = [];
+      const executed = await world.executeWholeBodyMotion(
+        planned.planId,
+        undefined,
+        {
+          retainTerminal: true,
+          persistenceSink: (cut) => {
+            expect(cut.authority.revision).toBe(cut.world.worldRevision);
+            expect(cut.worldCheckpoint.worldRevision).toBe(cut.world.worldRevision);
+            cuts.push(cut.world.worldRevision);
+          }
+        }
+      );
+      expect(executed.terminalResultSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(cuts).toHaveLength(executed.frames);
+      const checkpoint = world.checkpoint();
+      expect(checkpoint.motions[0]!.terminal).toMatchObject({
+        plan_id: planned.planId,
+        total_frames: executed.frames,
+        final_frame: executed.finalSnapshot.frame,
+        final_world_revision: executed.finalSnapshot.worldRevision,
+        result_sha256: executed.terminalResultSha256
+      });
+
+      resumed = await HumanoidWorld.create(scenario, checkpoint);
+      const beforeReplay = resumed.snapshot();
+      const replayed = await resumed.executeWholeBodyMotion(
+        planned.planId,
+        undefined,
+        { retainTerminal: true }
+      );
+      expect(replayed).toMatchObject({
+        accepted: executed.accepted,
+        code: executed.code,
+        frames: 0,
+        terminalResultSha256: executed.terminalResultSha256
+      });
+      expect(resumed.snapshot()).toEqual(beforeReplay);
+      await expect(resumed.acknowledgeWholeBodyMotion(
+        planned.planId,
+        "0".repeat(64)
+      )).rejects.toThrow("acknowledgement mismatch");
+      expect(await resumed.acknowledgeWholeBodyMotion(
+        planned.planId,
+        executed.terminalResultSha256!
+      )).toBe(true);
+      expect(resumed.checkpoint().motions).toEqual([]);
+    } finally {
+      await resumed?.dispose();
+      await world.dispose();
+    }
+  }, 30_000);
+
+  it("resumes navigation after its last durable physical frame", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    let resumed: HumanoidWorld | undefined;
+    try {
+      const start = world.snapshot().robot.rootPosition;
+      const planned = await world.planNavigation({
+        x: start.x,
+        y: 0,
+        z: start.z + 0.8
+      });
+      expect(planned.accepted, planned.reason).toBe(true);
+      let recoveryCheckpoint: ReturnType<HumanoidWorld["checkpoint"]> | undefined;
+      let committedCuts = 0;
+      await expect(world.executeNavigation(
+        planned.planId,
+        undefined,
+        {
+          retainTerminal: true,
+          persistenceSink: (cut) => {
+            committedCuts += 1;
+            if (committedCuts !== 5) return;
+            recoveryCheckpoint = structuredClone(cut.worldCheckpoint);
+            throw new Error("simulated_navigation_process_loss");
+          }
+        }
+      )).rejects.toThrow("simulated_navigation_process_loss");
+      expect(recoveryCheckpoint).toBeDefined();
+      const durableProgress = recoveryCheckpoint!.routes[0]!.progress!;
+      expect(durableProgress.committed_frame_count).toBe(5);
+
+      resumed = await HumanoidWorld.create(scenario, recoveryCheckpoint);
+      expect(resumed.snapshot().navigation).toMatchObject({
+        planId: planned.planId,
+        status: "planned",
+        waypointIndex: durableProgress.waypoint_index
+      });
+      const recoveryCuts: number[] = [];
+      const executed = await resumed.executeNavigation(
+        planned.planId,
+        undefined,
+        {
+          retainTerminal: true,
+          persistenceSink: (cut) => {
+            recoveryCuts.push(cut.world.worldRevision);
+          }
+        }
+      );
+      expect(executed.accepted, executed.detail.reason).toBe(true);
+      expect(recoveryCuts[0]).toBe(recoveryCheckpoint!.worldRevision + 1);
+      expect(executed.frames).toBe(
+        durableProgress.committed_frame_count
+          + executed.finalSnapshot.worldRevision
+          - recoveryCheckpoint!.worldRevision
+      );
+      expect(executed.terminalResultSha256).toMatch(/^[a-f0-9]{64}$/);
+    } finally {
+      await resumed?.dispose();
+      await world.dispose();
+    }
+  }, 45_000);
+
+  it("replays a durable navigation terminal without stepping physics", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    let resumed: HumanoidWorld | undefined;
+    try {
+      const start = world.snapshot().robot.rootPosition;
+      const planned = await world.planNavigation({
+        x: start.x,
+        y: 0,
+        z: start.z + 0.55
+      });
+      expect(planned.accepted, planned.reason).toBe(true);
+      const executed = await world.executeNavigation(
+        planned.planId,
+        undefined,
+        { retainTerminal: true, persistenceSink: () => undefined }
+      );
+      expect(executed.accepted, executed.detail.reason).toBe(true);
+      expect(executed.terminalResultSha256).toMatch(/^[a-f0-9]{64}$/);
+      const checkpoint = world.checkpoint();
+      expect(checkpoint.routes[0]!.terminal).toMatchObject({
+        plan_id: planned.planId,
+        total_frames: executed.frames,
+        final_frame: executed.finalSnapshot.frame,
+        final_world_revision: executed.finalSnapshot.worldRevision,
+        result_sha256: executed.terminalResultSha256
+      });
+
+      resumed = await HumanoidWorld.create(scenario, checkpoint);
+      const beforeReplay = resumed.snapshot();
+      const replayed = await resumed.executeNavigation(
+        planned.planId,
+        undefined,
+        { retainTerminal: true }
+      );
+      expect(replayed).toMatchObject({
+        accepted: executed.accepted,
+        code: executed.code,
+        frames: 0,
+        terminalResultSha256: executed.terminalResultSha256
+      });
+      expect(resumed.snapshot()).toEqual(beforeReplay);
+      await expect(resumed.acknowledgeNavigation(
+        planned.planId,
+        "0".repeat(64)
+      )).rejects.toThrow("acknowledgement mismatch");
+      expect(await resumed.acknowledgeNavigation(
+        planned.planId,
+        executed.terminalResultSha256!
+      )).toBe(true);
+      expect(resumed.checkpoint().routes).toEqual([]);
+    } finally {
+      await resumed?.dispose();
+      await world.dispose();
+    }
+  }, 45_000);
+
+  it("persists a rejected navigation terminal after admission state changes", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const start = world.snapshot().robot.rootPosition;
+      const planned = await world.planNavigation({
+        x: start.x,
+        y: 0,
+        z: start.z + 0.55
+      });
+      expect(planned.accepted, planned.reason).toBe(true);
+      await world.advanceStationary();
+      const execution = world.executeNavigation(
+        planned.planId,
+        undefined,
+        { retainTerminal: true }
+      );
+      await Promise.all(Array.from({ length: 4 }, () => world.advanceStationary()));
+      const rejected = await execution;
+      expect(rejected).toMatchObject({
+        accepted: false,
+        code: "plan_stale",
+        frames: 0
+      });
+      expect(() => world.checkpoint()).not.toThrow();
+      expect(world.checkpoint().routes[0]!.terminal).toMatchObject({
+        plan_id: planned.planId,
+        code: "plan_stale",
+        total_frames: 0,
+        final_world_revision: rejected.finalSnapshot.worldRevision
+      });
+    } finally {
+      await world.dispose();
+    }
+  }, 30_000);
+
   it("executes long routes as physically previewed closed-loop chunks", async () => {
     const catalog = await loadRuntimeCatalog();
     const generated = catalog.materialize("humanoid_frontier", 0);
@@ -132,6 +556,16 @@ describe("HumanoidWorld", () => {
       expect(motionResult.code).toBe("motion_completed");
       expect(motionResult.finalSnapshot.robot.fallen).toBe(false);
       expect(motionResult.finalSnapshot.worldRevision).toBeGreaterThan(0);
+      expect(motionResult.detail.physical_safety).toMatchObject({
+        protocol: "humanoid-physical-safety-evidence-v1",
+        frame_count: motion.motion!.frame_count,
+        first_frame: 1,
+        last_frame: motion.motion!.frame_count
+      });
+      expect(motionResult.finalSnapshot.physicalSafety).toEqual({
+        planId: motion.planId,
+        evidence: motionResult.detail.physical_safety
+      });
 
       const beforeNavigation = world.snapshot();
       const target = {
@@ -178,6 +612,7 @@ describe("HumanoidWorld", () => {
         5
       );
       expect(restored.robot.fallen).toBe(false);
+      expect(restored.physicalSafety).toEqual(motionResult.finalSnapshot.physicalSafety);
     } finally {
       await resumed?.dispose();
       await world.dispose();
@@ -288,6 +723,18 @@ describe("HumanoidWorld", () => {
       });
       expect(planned.candidates[1]!.validation.feasible).toBe(true);
       expect(planned.option?.certificate.artifact_sha256).toBe(planned.motion?.sha256);
+      expect(planned.option?.certificate.physical_safety).toMatchObject({
+        protocol: "humanoid-physical-safety-evidence-v1",
+        frame_count: planned.option!.certificate.validated_frame_limit,
+        first_frame: 1,
+        last_frame: planned.option!.certificate.validated_frame_limit,
+        maximum_actuator_effort_utilization: {
+          joint: expect.any(String),
+          requested_utilization: expect.any(Number),
+          applied_utilization: expect.any(Number),
+          saturated: expect.any(Boolean)
+        }
+      });
       expect(world.snapshot().frame).toBe(before.frame);
       expect(world.snapshot().worldRevision).toBe(before.worldRevision);
       expect(world.checkpoint().motions).toHaveLength(1);
@@ -309,8 +756,26 @@ describe("HumanoidWorld", () => {
       expect(executed.detail.option!.actual_termination_frame).toBe(
         executed.detail.option!.predicted_termination_frame
       );
+      expect(executed.detail.physical_safety).toMatchObject({
+        frame_count: executed.detail.option!.executed_prefix_frame_count,
+        first_frame: 1,
+        last_frame: executed.detail.option!.executed_prefix_frame_count,
+        maximum_actuator_effort_utilization: {
+          joint: expect.any(String),
+          requested_utilization: expect.any(Number),
+          applied_utilization: expect.any(Number),
+          saturated: expect.any(Boolean)
+        }
+      });
+      expect(executed.finalSnapshot.physicalSafety).toEqual({
+        planId: planned.planId,
+        evidence: executed.detail.physical_safety
+      });
       expect(executed.finalSnapshot.robot.fallen).toBe(false);
       expect(world.checkpoint().motions).toEqual([]);
+      expect(world.checkpoint().physicalSafety).toEqual(
+        executed.finalSnapshot.physicalSafety
+      );
     } finally {
       await world.dispose();
     }
@@ -383,7 +848,14 @@ describe("HumanoidWorld", () => {
 
       expect(recoveryCheckpoint).toBeDefined();
       expect(recoveryCheckpoint!.motions[0]).toMatchObject({
-        progress: { nextFrameIndex: interruptionFrame },
+        progress: {
+          nextFrameIndex: interruptionFrame,
+          physicalSafety: {
+            frame_count: interruptionFrame,
+            first_frame: 1,
+            last_frame: interruptionFrame
+          }
+        },
         option: {
           status: "executing",
           successStreak: 1,
@@ -399,6 +871,10 @@ describe("HumanoidWorld", () => {
         frames: 1
       });
       expect(recovered.detail.option?.executed_prefix_frame_count).toBe(predictedFrame);
+      expect(recovered.detail.physical_safety).toEqual(complete.detail.physical_safety);
+      expect(recovered.finalSnapshot.physicalSafety).toEqual(
+        complete.finalSnapshot.physicalSafety
+      );
       expect(recovered.finalSnapshot.frame).toBe(complete.finalSnapshot.frame);
       expect(recovered.finalSnapshot.worldRevision).toBe(
         complete.finalSnapshot.worldRevision
@@ -418,6 +894,7 @@ describe("HumanoidWorld", () => {
 
   it("rejects restored options when their artifact or termination contract was altered", async () => {
     const world = await HumanoidWorld.create(scenario);
+    let legacyWorld: HumanoidWorld | undefined;
     try {
       const planned = await world.planWholeBodyMotionCandidates(
         forwardCandidateBatch(world.snapshot(), "tamper")
@@ -438,7 +915,27 @@ describe("HumanoidWorld", () => {
       await expect(HumanoidWorld.create(scenario, contractChanged)).rejects.toThrow(
         "certificate does not match"
       );
+
+      const legacy = structuredClone(checkpoint);
+      delete legacy.motions[0]!.option!.certificate.physical_safety;
+      delete legacy.physicalSafety;
+      delete legacy.simulation.requestedActuatorTorques;
+      legacyWorld = await HumanoidWorld.create(scenario, legacy);
+      expect(
+        legacyWorld.snapshot().robot.joints.left_hip_pitch_joint.effort
+      ).toBeUndefined();
+      const executed = await legacyWorld.executeWholeBodyMotion(planned.planId);
+      expect(executed.accepted).toBe(true);
+      expect(executed.detail.physical_safety).toMatchObject({
+        protocol: "humanoid-physical-safety-evidence-v1",
+        first_frame: 1,
+        maximum_actuator_effort_utilization: {
+          requested_utilization: expect.any(Number),
+          applied_utilization: expect.any(Number)
+        }
+      });
     } finally {
+      await legacyWorld?.dispose();
       await world.dispose();
     }
   }, 45_000);
@@ -471,7 +968,7 @@ describe("HumanoidWorld", () => {
     }
   }, 30_000);
 
-  it("rejects invalid contact history and requires fresh contact after restoration", async () => {
+  it("rejects invalid contact history and preserves executed-prefix evidence", async () => {
     const world = await HumanoidWorld.create(scenario);
     let resumed: HumanoidWorld | undefined;
     try {
@@ -495,6 +992,9 @@ describe("HumanoidWorld", () => {
 
       const prefilledPlan = structuredClone(initialCheckpoint);
       prefilledPlan.motions[0]!.plan.contact_constraints = [contact];
+      prefilledPlan.motions[0]!.intentSha256 = humanoidMotionIntentSha256(
+        prefilledPlan.motions[0]!.plan
+      );
       prefilledPlan.motions[0]!.progress.satisfiedContactKeys = [contactKey];
       await expect(HumanoidWorld.create(scenario, prefilledPlan)).rejects.toThrow(
         "unstarted humanoid motion"
@@ -508,18 +1008,39 @@ describe("HumanoidWorld", () => {
       })).rejects.toThrow("simulated contact-history interruption");
       expect(interruptedCheckpoint).toBeDefined();
       interruptedCheckpoint!.motions[0]!.plan.contact_constraints = [contact];
+      interruptedCheckpoint!.motions[0]!.intentSha256 = humanoidMotionIntentSha256(
+        interruptedCheckpoint!.motions[0]!.plan
+      );
       interruptedCheckpoint!.motions[0]!.progress.satisfiedContactKeys = [contactKey];
 
+      await expect(HumanoidWorld.create(
+        scenario,
+        structuredClone(interruptedCheckpoint)
+      )).rejects.toThrow("contact evidence identity does not match");
+      const interruptedMotion = interruptedCheckpoint!.motions[0]!;
+      interruptedMotion.progress.satisfiedContactEvidenceSha256 =
+        humanoidMotionContactEvidenceSha256({
+          planId: interruptedMotion.plan.id,
+          intentSha256: interruptedMotion.intentSha256,
+          artifactSha256: humanoidMotionArtifactSha256(
+            interruptedMotion.artifact
+          ),
+          nextFrameIndex: interruptedMotion.progress.nextFrameIndex,
+          satisfiedContactKeys: interruptedMotion.progress.satisfiedContactKeys
+        });
+
       resumed = await HumanoidWorld.create(scenario, interruptedCheckpoint);
-      expect(resumed.checkpoint().motions[0]!.progress.satisfiedContactKeys).toEqual([]);
+      expect(resumed.checkpoint().motions[0]!.progress.satisfiedContactKeys).toEqual([
+        contactKey
+      ]);
       const executed = await resumed.executeWholeBodyMotion(planned.planId);
       expect(executed).toMatchObject({
-        accepted: false,
-        code: "motion_goal_unmet",
+        accepted: true,
+        code: "motion_option_succeeded",
         detail: {
           option: {
-            status: "goal_unmet",
-            termination_reason: "motion_goal_unmet"
+            status: "succeeded",
+            termination_reason: "physical_success"
           }
         }
       });
@@ -563,12 +1084,13 @@ describe("HumanoidWorld", () => {
       expect(executed).toMatchObject({
         accepted: false,
         code: "motion_goal_unmet",
-        frames: stored.artifact.frames.length,
+        frames: stored.option!.certificate.validated_frame_limit,
         detail: {
           option: {
             status: "goal_unmet",
             termination_reason: "motion_goal_unmet",
-            executed_prefix_frame_count: stored.artifact.frames.length
+            executed_prefix_frame_count:
+              stored.option!.certificate.validated_frame_limit
           }
         }
       });
@@ -753,238 +1275,51 @@ describe("HumanoidWorld", () => {
     }
   }, 45_000);
 
-  it("resumes an interrupted motion from the exact next artifact frame", async () => {
-    const uninterrupted = await HumanoidWorld.create(scenario);
-    const interrupted = await HumanoidWorld.create(scenario);
-    let resumed: HumanoidWorld | undefined;
-    try {
-      const plan = {
-        id: "mid-motion-resume",
-        intent: "保持平衡并连续改变躯干姿态",
-        duration_seconds: 0.4,
-        keyframes: [
-          { at_seconds: 0 },
-          { at_seconds: 0.4, torso_yaw: 0.04 }
-        ]
-      };
-      const completePlan = await uninterrupted.planWholeBodyMotion(plan);
-      const interruptedPlan = await interrupted.planWholeBodyMotion(plan);
-      expect(completePlan.accepted).toBe(true);
-      expect(interruptedPlan.accepted).toBe(true);
-
-      const complete = await uninterrupted.executeWholeBodyMotion(completePlan.planId);
-      let recoveryCheckpoint;
-      await expect(interrupted.executeWholeBodyMotion(
-        interruptedPlan.planId,
-        () => {
-          const checkpoint = interrupted.checkpoint();
-          if (checkpoint.worldRevision === 10) {
-            recoveryCheckpoint = checkpoint;
-            throw new Error("simulated process interruption");
-          }
-        }
-      )).rejects.toThrow("simulated process interruption");
-
-      expect(recoveryCheckpoint).toBeDefined();
-      expect(recoveryCheckpoint!.motions[0]).toMatchObject({
-        createdRevision: 0,
-        progress: { nextFrameIndex: 10 }
-      });
-      resumed = await HumanoidWorld.create(scenario, recoveryCheckpoint);
-      const recovered = await resumed.executeWholeBodyMotion(interruptedPlan.planId);
-      expect(recovered.accepted).toBe(true);
-      expect(recovered.frames).toBe(10);
-      expect(recovered.finalSnapshot.frame).toBe(complete.finalSnapshot.frame);
-      expect(recovered.finalSnapshot.worldRevision).toBe(complete.finalSnapshot.worldRevision);
-      expect(recovered.finalSnapshot.robot.simulatedTime).toBeCloseTo(
-        complete.finalSnapshot.robot.simulatedTime,
-        10
-      );
-      expect(recovered.finalSnapshot.robot.rootPosition).toEqual(
-        complete.finalSnapshot.robot.rootPosition
-      );
-      expect(recovered.finalSnapshot.robot.joints).toEqual(
-        complete.finalSnapshot.robot.joints
-      );
-    } finally {
-      await resumed?.dispose();
-      await interrupted.dispose();
-      await uninterrupted.dispose();
-    }
-  }, 45_000);
-
-  it("blocks restored navigation state when its route is no longer restorable", async () => {
-    const world = await HumanoidWorld.create(scenario);
-    let resumed: HumanoidWorld | undefined;
-    try {
-      const planned = await world.planNavigation({ x: 1.5, y: 0, z: 2.2 });
-      expect(planned.accepted, planned.reason).toBe(true);
-      const checkpoint = world.checkpoint();
-      checkpoint.worldRevision += 1;
-
-      resumed = await HumanoidWorld.create(scenario, checkpoint);
-      expect(resumed.snapshot().navigation).toMatchObject({
-        planId: null,
-        status: "blocked",
-        waypointIndex: null
-      });
-      expect(resumed.checkpoint().routes).toEqual([]);
-    } finally {
-      await resumed?.dispose();
-      await world.dispose();
-    }
-  }, 30_000);
-
-  it("executes an injected motion generator only through the validated artifact protocol", async () => {
-    const generator = new HoldingMotionGenerator();
-    const world = await HumanoidWorld.create(scenario, undefined, {
-      motionGeneratorFactory: async () => generator
-    });
-    try {
-      const planned = await world.planWholeBodyMotion({
-        id: "injected-generator-motion",
-        intent: "保持当前全身姿态",
-        duration_seconds: 0.1,
-        keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1 }]
-      });
-      expect(generator.calls).toBe(1);
-      expect(planned.accepted).toBe(true);
-      expect(planned.motion).toMatchObject({
-        protocol: "humanoid-motion-v1",
-        generator: "contract_test_generator",
-        control_step_seconds: 0.02,
-        duration_seconds: 0.1,
-        frame_count: 5
-      });
-      expect(planned.motion?.sha256).toMatch(/^[a-f0-9]{64}$/);
-      const persistedArtifact = world.checkpoint().motions[0]!.artifact;
-      const executed = await world.executeWholeBodyMotion(planned.planId);
-      expect(executed.accepted).toBe(true);
-      expect(executed.frames).toBe(persistedArtifact.frames.length);
-      expect(world.checkpoint().motions).toEqual([]);
-    } finally {
-      await world.dispose();
-    }
-    expect(generator.disposed).toBe(true);
-  }, 30_000);
-
-  it("rejects a generator artifact whose cadence disagrees with the controller", async () => {
-    const generator = new HoldingMotionGenerator(true);
-    const world = await HumanoidWorld.create(scenario, undefined, {
-      motionGeneratorFactory: async () => generator
-    });
-    try {
-      const planned = await world.planWholeBodyMotion({
-        id: "invalid-generator-cadence",
-        intent: "验证运动制品时序",
-        duration_seconds: 0.1,
-        keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1 }]
-      });
-      expect(planned.accepted).toBe(false);
-      expect(planned.motion).toBeNull();
-      expect(planned.validation.failures).toContainEqual(expect.objectContaining({
-        code: "invalid_reference",
-        message: "Humanoid motion artifact frame cadence mismatch"
-      }));
-      expect(world.checkpoint().motions).toEqual([]);
-    } finally {
-      await world.dispose();
-    }
-  }, 30_000);
-
-  it("refuses to resume with a different motion generator contract", async () => {
-    const generator = new HoldingMotionGenerator();
-    const world = await HumanoidWorld.create(scenario, undefined, {
-      motionGeneratorFactory: async () => generator
-    });
-    const checkpoint = world.checkpoint();
-    await world.dispose();
-
-    await expect(HumanoidWorld.create(scenario, checkpoint)).rejects.toThrow(
-      "Humanoid motion generator mismatch"
-    );
-  }, 30_000);
-
-  it("persists sensor-grounded object tokens and rejects contact plans before observation", async () => {
-    const world = await HumanoidWorld.create(perceptionScenario);
-    let restored: HumanoidWorld | undefined;
-    try {
-      const unobserved = await world.planWholeBodyMotion(contactPlan("before-observation"));
-      expect(unobserved.accepted).toBe(false);
-      expect(unobserved.validation.failures).toContainEqual(expect.objectContaining({
-        code: "contact_object_not_currently_visible"
-      }));
-
-      const observation = world.observe();
-      expect(observation.objectTokens).toHaveLength(1);
-      expect(observation.objectTokens[0]).toMatchObject({
-        id: "crate",
-        role: "manipulable",
-        status: "visible",
-        state: "active",
-        authority: "mujoco_exact",
-        exact: true,
-        observable: true,
-        observedFrame: observation.frame,
-        observedWorldRevision: observation.worldRevision,
-        ageRevisions: 0
-      });
-
-      const grounded = await world.planWholeBodyMotion(contactPlan("after-observation"));
-      expect(grounded.accepted).toBe(false);
-      expect(grounded.validation.failures).toContainEqual(expect.objectContaining({
-        code: "required_contact_missing"
-      }));
-      expect(grounded.validation.failures.some((failure) => (
-        failure.code === "contact_object_not_currently_visible"
-      ))).toBe(false);
-
-      const checkpoint = world.checkpoint();
-      expect(checkpoint.objectMemory.records).toHaveLength(1);
-      expect(checkpoint.objectMemory.records[0]).toMatchObject({
-        id: "crate",
-        lastSeenRevision: observation.worldRevision
-      });
-      restored = await HumanoidWorld.create(perceptionScenario, checkpoint);
-      const historicalOnly = await restored.planWholeBodyMotion(
-        contactPlan("restored-before-observation")
-      );
-      expect(historicalOnly.accepted).toBe(false);
-      expect(historicalOnly.validation.failures).toContainEqual(expect.objectContaining({
-        code: "contact_object_not_currently_visible"
-      }));
-
-      const restoredObservation = restored.observe();
-      expect(restoredObservation.objectTokens[0]).toMatchObject({
-        id: "crate",
-        state: "active",
-        authority: "mujoco_exact",
-        exact: true,
-        observable: true
-      });
-      const observedAgain = await restored.planWholeBodyMotion(
-        contactPlan("restored-after-observation")
-      );
-      expect(observedAgain.validation.failures.some((failure) => (
-        failure.code === "contact_object_not_currently_visible"
-      ))).toBe(false);
-    } finally {
-      await Promise.all([world.dispose(), restored?.dispose()]);
-    }
-  }, 45_000);
 });
 
-function contactPlan(id: string) {
+function graspCandidateBatch(
+  graspContractSha256: string
+): HumanoidMotionCandidateBatch {
+  const contactConstraints = [{
+    hand_surface: "left_hand_thumb_2_link" as const,
+    object_id: "crate",
+    required: false
+  }, {
+    hand_surface: "left_hand_index_1_link" as const,
+    object_id: "crate",
+    required: false
+  }];
   return {
-    id,
-    intent: "保持站立并验证左手与箱体接触",
-    duration_seconds: 0.1,
-    contact_constraints: [{
-      body: "left_wrist_yaw_link" as const,
-      object_id: "crate",
-      required: true
-    }],
-    keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1 }]
+    objective: "验证左手真实抓取",
+    termination: {
+      option_id: "grasp-crate-option",
+      predicates: [{
+        type: "grasp_verified",
+        object_id: "crate",
+        hand: "left",
+        grasp_contract_sha256: graspContractSha256
+      }],
+      stable_steps: 2
+    },
+    candidates: [{
+      id: "grasp-crate-hold",
+      intent: "保持当前姿态并闭合左手",
+      duration_seconds: 0.1,
+      contact_constraints: contactConstraints,
+      keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1 }]
+    }, {
+      id: "grasp-crate-turn",
+      intent: "轻微转身并闭合左手",
+      duration_seconds: 0.1,
+      contact_constraints: contactConstraints,
+      keyframes: [{
+        at_seconds: 0,
+        root_yaw_velocity: 0.05
+      }, {
+        at_seconds: 0.1,
+        root_yaw_velocity: 0.05
+      }]
+    }]
   };
 }
 
@@ -1031,42 +1366,4 @@ function forwardCandidateBatch(
       }
     ]
   };
-}
-
-class HoldingMotionGenerator implements HumanoidMotionGenerator {
-  readonly descriptor = {
-    protocol: "humanoid-motion-generator-v1" as const,
-    implementation: "contract_test_generator",
-    motionClass: "constraint_solver" as const,
-    sampling: "deterministic" as const
-  };
-  calls = 0;
-  disposed = false;
-
-  constructor(private readonly invalidCadence = false) {}
-
-  async generate(input: HumanoidMotionGeneratorInput) {
-    this.calls += 1;
-    const count = Math.ceil(input.plan.duration_seconds / input.controlStepSeconds);
-    return {
-      version: 1 as const,
-      protocol: "humanoid-motion-v1" as const,
-      generator: this.descriptor.implementation,
-      controlStepSeconds: input.controlStepSeconds,
-      durationSeconds: input.plan.duration_seconds,
-      frames: Array.from({ length: count }, (_, index) => ({
-        atSeconds: this.invalidCadence && index === 0
-          ? input.controlStepSeconds / 2
-          : Math.min(
-              (index + 1) * input.controlStepSeconds,
-              input.plan.duration_seconds
-            ),
-        reference: serializeHumanoidReference(input.baseline)
-      }))
-    };
-  }
-
-  async dispose(): Promise<void> {
-    this.disposed = true;
-  }
 }

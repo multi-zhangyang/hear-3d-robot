@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Bootstrap, Goal } from "../types";
+import type { Bootstrap, Goal, HumanoidRunMode } from "../types";
 import { UiButton } from "../ui/Button";
-import { goalSummaryLabel, scenarioLabel } from "../ui-text";
+import { goalSummaryLabel, predicateLabel, scenarioLabel } from "../ui-text";
 import { GoalEditor } from "./GoalEditor";
 import { validGoal } from "./goal-form";
 
@@ -14,6 +14,7 @@ interface MissionModalProps {
     mission: string;
     scenario_id: string;
     goal: Goal;
+    run_mode: HumanoidRunMode;
   }) => Promise<void>;
 }
 
@@ -23,6 +24,7 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
   const [mission, setMission] = useState("");
   const [scenarioId, setScenarioId] = useState("");
   const [goal, setGoal] = useState<Goal | null>(null);
+  const [runMode, setRunMode] = useState<HumanoidRunMode>("continuous");
   const [confirmed, setConfirmed] = useState(false);
   const scenario = useMemo(
     () => props.scenarios.find((candidate) => candidate.id === scenarioId),
@@ -54,6 +56,7 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
     setMission("");
     setScenarioId("");
     setGoal(null);
+    setRunMode("continuous");
     setConfirmed(false);
   }, [props.open]);
 
@@ -100,7 +103,8 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
           void props.onSubmit({
             mission: mission.trim(),
             scenario_id: scenarioId,
-            goal
+            goal,
+            run_mode: runMode
           });
         }}
       >
@@ -121,6 +125,11 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
         </header>
 
         <div className="mission-dialog-body">
+          <span className="sr-only" id="mission-dialog-state">
+            {scenario && goal
+              ? `已配置 ${goal.predicates.length} 项真实验收条件`
+              : "选择世界后配置真实验收条件"}
+          </span>
           <div className="mission-basics">
             <label className="mission-control">
               <span>世界场景</span>
@@ -138,9 +147,39 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
                 ))}
               </select>
             </label>
+            <fieldset className="mission-run-mode" aria-label="运行模式">
+              <legend>运行模式</legend>
+              <label className={runMode === "continuous" ? "active" : ""}>
+                <input
+                  type="radio"
+                  name="run-mode"
+                  value="continuous"
+                  checked={runMode === "continuous"}
+                  onChange={() => {
+                    setRunMode("continuous");
+                    setConfirmed(false);
+                  }}
+                />
+                <span>持续运行</span>
+              </label>
+              <label className={runMode === "mission" ? "active" : ""}>
+                <input
+                  type="radio"
+                  name="run-mode"
+                  value="mission"
+                  checked={runMode === "mission"}
+                  onChange={() => {
+                    setRunMode("mission");
+                    setConfirmed(false);
+                  }}
+                />
+                <span>完成后停止</span>
+              </label>
+            </fieldset>
             <label className="mission-control mission-objective-control">
-              <span>任务目标</span>
+              <span>任务意图</span>
               <textarea
+                aria-label="任务意图"
                 rows={3}
                 required
                 value={mission}
@@ -154,9 +193,12 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
           </div>
 
           {scenario && goal ? (
-            <GoalEditor scenario={scenario} goal={goal} onChange={updateGoal} />
+            <>
+              <GoalEditor scenario={scenario} goal={goal} onChange={updateGoal} />
+              <MissionContractReview goal={goal} />
+            </>
           ) : (
-            <div className="mission-goal-placeholder" id="mission-dialog-state">
+            <div className="mission-goal-placeholder">
               <i aria-hidden="true" />
               <span>选择世界后配置完成条件</span>
             </div>
@@ -172,9 +214,7 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
               onChange={(event) => setConfirmed(event.currentTarget.checked)}
             />
             <span aria-hidden="true" />
-            <b id={scenario && goal ? "mission-dialog-state" : undefined}>
-              确认完成条件
-            </b>
+            <b>我确认以上条件是本任务的真实验收标准</b>
           </label>
           <div>
             <UiButton type="button" disabled={props.submitting} onClick={cancel}>
@@ -187,5 +227,27 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
         </footer>
       </form>
     </dialog>
+  );
+}
+
+function MissionContractReview({ goal }: { goal: Goal }): React.JSX.Element {
+  return (
+    <section className="mission-contract-review" aria-labelledby="mission-contract-title">
+      <header>
+        <div>
+          <span>启动核对</span>
+          <h3 id="mission-contract-title">真实验收条件</h3>
+        </div>
+        <b>{goal.predicates.length} 项</b>
+      </header>
+      <ol>
+        {goal.predicates.map((predicate, index) => (
+          <li key={`${predicate.type}-${index}`}>
+            <span>{index + 1}</span>
+            <b>{predicateLabel(predicate)}</b>
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }

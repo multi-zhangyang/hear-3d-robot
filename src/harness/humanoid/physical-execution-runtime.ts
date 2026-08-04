@@ -1,0 +1,427 @@
+import {
+  actionExecutionFingerprintSha256,
+  activeActionExecutions,
+  recordActionExecutionProgress,
+  stageActionExecutionIntent,
+  type ActionExecutionLedgerEntry
+} from "../../domain/action-execution-ledger.js";
+import type { PendingActionCommit } from "../../domain/action-commit-outbox.js";
+import {
+  sameAutonomousCycle,
+  type AutonomousCycleRef
+} from "../../domain/autonomous-cycle.js";
+import type { HumanoidRunCheckpoint } from "../../domain/humanoid-run.js";
+import type { PhysicalTrajectorySummary } from "../../domain/physical-trajectory.js";
+import type { Goal, Scenario } from "../../domain/schema.js";
+import { advanceHumanoidGoal } from "../../runtime/humanoid-checker.js";
+import type {
+  HumanoidWorld,
+  HumanoidWorldSnapshot
+} from "../../world/humanoid/world.js";
+import {
+  json,
+  object,
+  physicalCheckpointSha256,
+  physicalExecutionCheckpointDue,
+  physicalExecutionReceipt
+} from "./run-runtime-persistence.js";
+import {
+  advancePhysicalTrajectory,
+  createPhysicalTrajectory
+} from "./physical-trajectory-recorder.js";
+import type {
+  HumanoidActionReceipt,
+  HumanoidPhysicalExecutionIntent
+} from "./runtime.js";
+
+const EXECUTION_FRAME_CHECKPOINT_INTERVAL = 10;
+const STATIONARY_FRAME_CHECKPOINT_INTERVAL = 50;
+
+type HumanoidPersistenceCut = Awaited<
+  ReturnType<HumanoidWorld["capturePersistenceState"]>
+>;
+
+export class HumanoidPhysicalExecutionRuntime {
+  readonly #runId: string;
+  readonly #world: HumanoidWorld;
+  readonly #checkpoint: () => HumanoidRunCheckpoint;
+  readonly #scenario: () => Scenario;
+  readonly #activeGoal: () => Goal | undefined;
+  readonly #requiredActiveCycle: () => AutonomousCycleRef;
+  readonly #persist: (refreshWorld?: boolean) => Promise<void>;
+  readonly #emitFrame: (input: {
+    world: HumanoidWorldSnapshot;
+    checker: HumanoidRunCheckpoint["checker"];
+    goalProgress: HumanoidRunCheckpoint["goal_progress"];
+    source: "execution" | "stationary";
+  }) => Promise<void>;
+  readonly #signal: AbortSignal | undefined;
+  readonly #physicalTrajectories = new Map<string, PhysicalTrajectorySummary>();
+
+  constructor(input: {
+    runId: string;
+    world: HumanoidWorld;
+    checkpoint: () => HumanoidRunCheckpoint;
+    scenario: () => Scenario;
+    activeGoal: () => Goal | undefined;
+    requiredActiveCycle: () => AutonomousCycleRef;
+    persist: (refreshWorld?: boolean) => Promise<void>;
+    emitFrame: (input: {
+      world: HumanoidWorldSnapshot;
+      checker: HumanoidRunCheckpoint["checker"];
+      goalProgress: HumanoidRunCheckpoint["goal_progress"];
+      source: "execution" | "stationary";
+    }) => Promise<void>;
+    signal?: AbortSignal;
+  }) {
+    this.#runId = input.runId;
+    this.#world = input.world;
+    this.#checkpoint = input.checkpoint;
+    this.#scenario = input.scenario;
+    this.#activeGoal = input.activeGoal;
+    this.#requiredActiveCycle = input.requiredActiveCycle;
+    this.#persist = input.persist;
+    this.#emitFrame = input.emitFrame;
+    this.#signal = input.signal;
+  }
+
+  assertExecutionOwner(transactionId: string): void {
+    const active = activeActionExecutions(
+      this.#checkpoint().action_execution_ledger
+    );
+    if (active.length > 1) {
+      throw new Error("Multiple physical executions cannot share one humanoid runtime");
+    }
+    const owner = active[0];
+    if (owner && owner.transaction_id !== transactionId.trim()) {
+      throw new Error(
+        `Physical execution ${owner.transaction_id} must be recovered before ${transactionId}`
+      );
+    }
+  }
+
+  async admit(intent: HumanoidPhysicalExecutionIntent): Promise<void> {
+    const checkpoint = this.#checkpoint();
+    const cycle = this.#requiredActiveCycle();
+    const planningReceipt = checkpoint.committed_actions[intent.planningTransactionId];
+    if (!planningReceipt || !sameAutonomousCycle(planningReceipt.cycle, cycle)) {
+      throw new Error(
+        `Physical execution plan belongs to another autonomous cycle: ${intent.planningTransactionId}`
+      );
+    }
+    this.assertExecutionOwner(intent.transactionId);
+    const cut = await this.#capturePhysicalCut();
+    this.#applyPhysicalCut(cut);
+    const existing = checkpoint.action_execution_ledger.active[intent.transactionId];
+    if (existing) {
+      this.#assertExecutionIntent(existing, intent);
+      if (existing.status !== "terminal") {
+        this.#recordTrajectoryFrame(existing, cut.world);
+        this.#recordExecutionProgress(existing, cut);
+      }
+    } else {
+      const trajectory = createPhysicalTrajectory(cut.world);
+      this.#physicalTrajectories.set(intent.transactionId, trajectory);
+      checkpoint.action_execution_ledger = stageActionExecutionIntent(
+        checkpoint.action_execution_ledger,
+        {
+          runId: this.#runId,
+          transactionId: intent.transactionId,
+          agentId: intent.agentId,
+          action: intent.action,
+          actionFingerprint: intent.fingerprint,
+          cycle,
+          planningTransactionId: intent.planningTransactionId,
+          planId: intent.planId,
+          worldFrame: cut.world.frame,
+          worldRevision: cut.world.worldRevision,
+          authorityStateSha256: cut.authority.stateSha256,
+          physicalCheckpointSha256: physicalCheckpointSha256(cut),
+          physicalTrajectory: trajectory
+        }
+      );
+    }
+    await this.#persist();
+  }
+
+  async normalizeReceipt(
+    receipt: HumanoidActionReceipt
+  ): Promise<HumanoidActionReceipt> {
+    const checkpoint = this.#checkpoint();
+    const cycle = this.#requiredActiveCycle();
+    if (receipt.cycle && !sameAutonomousCycle(receipt.cycle, cycle)) {
+      throw new Error(
+        `Humanoid action receipt changed autonomous cycle: ${receipt.transactionId}`
+      );
+    }
+    receipt = { ...receipt, cycle };
+    if (!physicalExecutionReceipt(receipt)) return receipt;
+    const entry = checkpoint.action_execution_ledger.active[receipt.transactionId];
+    if (!entry) {
+      if (object(receipt.detail).automatic_actuation === false) return receipt;
+      throw new Error(
+        `Physical receipt has no durable execution intent: ${receipt.transactionId}`
+      );
+    }
+    if (entry.agent_id !== receipt.agentId
+      || entry.action !== receipt.action
+      || entry.action_fingerprint_sha256
+        !== actionExecutionFingerprintSha256(receipt.fingerprint)) {
+      throw new Error(
+        `Physical receipt conflicts with its durable execution intent: ${receipt.transactionId}`
+      );
+    }
+    await this.synchronizeProgress(receipt.transactionId);
+    const current = checkpoint.action_execution_ledger.active[receipt.transactionId]!;
+    const frameCount = current.progress.committed_frame_count;
+    const detail = object(receipt.detail);
+    detail.frames = frameCount;
+    const trajectory = current.progress.physical_trajectory;
+    if (!trajectory) {
+      throw new Error(
+        `Physical receipt has no authoritative trajectory: ${receipt.transactionId}`
+      );
+    }
+    detail.physical_trajectory = json(trajectory);
+    return {
+      ...receipt,
+      worldBeforeRevision: current.admission.world_revision,
+      worldAfterRevision: current.progress.world_revision,
+      frameCount,
+      detail
+    };
+  }
+
+  async synchronizeProgress(transactionId: string): Promise<void> {
+    const checkpoint = this.#checkpoint();
+    const entry = checkpoint.action_execution_ledger.active[transactionId];
+    if (!entry) {
+      throw new Error(`Physical execution ledger is unavailable: ${transactionId}`);
+    }
+    const cut = await this.#capturePhysicalCut();
+    this.#applyPhysicalCut(cut);
+    if (entry.status !== "terminal") {
+      this.#recordTrajectoryFrame(entry, cut.world);
+      this.#recordExecutionProgress(entry, cut);
+    }
+  }
+
+  async recordFrame(
+    frame: HumanoidWorldSnapshot,
+    source: "execution" | "stationary"
+  ): Promise<void> {
+    const checkpoint = this.#checkpoint();
+    const advanced = this.#advanceGoal(frame);
+    checkpoint.world = structuredClone(frame);
+    checkpoint.goal_progress = advanced?.progress ?? null;
+    checkpoint.checker = advanced?.checker ?? null;
+    if (source === "stationary") {
+      if (frame.frame % STATIONARY_FRAME_CHECKPOINT_INTERVAL === 0) {
+        const cut = await this.#capturePhysicalCut();
+        this.#applyPhysicalCut(cut);
+        await this.#persist();
+      }
+    } else {
+      const [entry] = activeActionExecutions(checkpoint.action_execution_ledger);
+      if (!entry) {
+        throw new Error("Physical execution frame has no durable execution intent");
+      }
+      this.#recordTrajectoryFrame(entry, frame);
+      const cut = await this.#capturePhysicalCut();
+      this.#applyPhysicalCut(cut);
+      await this.#persistExecutionCut(cut);
+    }
+    this.#signal?.throwIfAborted();
+    await this.#publishFrame(frame, advanced, source);
+  }
+
+  async recordPhysicalCut(cut: HumanoidPersistenceCut): Promise<void> {
+    this.#assertAlignedCut(cut, "Humanoid physical frame cut is not aligned");
+    const checkpoint = this.#checkpoint();
+    const frame = cut.world;
+    const advanced = this.#advanceGoal(frame);
+    this.#applyPhysicalCut(cut);
+    const [entry] = activeActionExecutions(checkpoint.action_execution_ledger);
+    if (!entry) {
+      throw new Error("Physical execution cut has no durable execution intent");
+    }
+    this.#recordTrajectoryFrame(entry, frame);
+    checkpoint.goal_progress = advanced?.progress ?? null;
+    checkpoint.checker = advanced?.checker ?? null;
+    await this.#persistExecutionCut(cut);
+    this.#signal?.throwIfAborted();
+    await this.#publishFrame(frame, advanced, "execution");
+  }
+
+  async acknowledgeTerminals(
+    staged: readonly PendingActionCommit[]
+  ): Promise<void> {
+    const checkpoint = this.#checkpoint();
+    let changed = false;
+    for (const entry of staged) {
+      if (checkpoint.action_commit_outbox.pending[entry.transaction_id]) continue;
+      const action = object(entry.action_record);
+      if (action.action !== "execute_whole_body_motion"
+        && action.action !== "execute_humanoid_navigation") continue;
+      const detail = object(action.detail ?? null);
+      const planId = detail.plan_id;
+      const resultSha256 = detail.terminal_result_sha256;
+      if (typeof planId !== "string" || typeof resultSha256 !== "string") continue;
+      changed = action.action === "execute_whole_body_motion"
+        ? await this.#world.acknowledgeWholeBodyMotion(planId, resultSha256) || changed
+        : await this.#world.acknowledgeNavigation(planId, resultSha256) || changed;
+      this.#physicalTrajectories.delete(entry.transaction_id);
+    }
+    if (!changed) return;
+    try {
+      await this.#persist();
+    } catch {
+      return;
+    }
+  }
+
+  async #persistExecutionCut(cut: HumanoidPersistenceCut): Promise<void> {
+    const checkpoint = this.#checkpoint();
+    const [entry] = activeActionExecutions(checkpoint.action_execution_ledger);
+    if (!entry) {
+      throw new Error("Physical frame was committed without a durable execution intent");
+    }
+    if (!physicalExecutionCheckpointDue(
+      entry,
+      cut,
+      EXECUTION_FRAME_CHECKPOINT_INTERVAL
+    )) return;
+    if (entry.status !== "terminal") this.#recordExecutionProgress(entry, cut);
+    await this.#persist(false);
+  }
+
+  #advanceGoal(frame: HumanoidWorldSnapshot) {
+    const checkpoint = this.#checkpoint();
+    const activeGoal = this.#activeGoal();
+    return activeGoal && checkpoint.goal_progress
+      ? advanceHumanoidGoal(
+          activeGoal,
+          this.#scenario(),
+          frame,
+          checkpoint.goal_progress
+        )
+      : null;
+  }
+
+  async #publishFrame(
+    frame: HumanoidWorldSnapshot,
+    advanced: ReturnType<typeof advanceHumanoidGoal> | null,
+    source: "execution" | "stationary"
+  ): Promise<void> {
+    try {
+      await this.#emitFrame({
+        world: frame,
+        checker: advanced?.checker ?? null,
+        goalProgress: advanced?.progress ?? null,
+        source
+      });
+    } catch {
+      return;
+    }
+  }
+
+  #assertExecutionIntent(
+    entry: ActionExecutionLedgerEntry,
+    intent: HumanoidPhysicalExecutionIntent
+  ): void {
+    const cycle = this.#requiredActiveCycle();
+    if (entry.run_id !== this.#runId
+      || entry.agent_id !== intent.agentId
+      || !sameAutonomousCycle(entry.cycle, cycle)
+      || entry.action !== intent.action
+      || entry.action_fingerprint_sha256
+        !== actionExecutionFingerprintSha256(intent.fingerprint)
+      || entry.admission.planning_transaction_id !== intent.planningTransactionId
+      || entry.admission.plan_id !== intent.planId) {
+      throw new Error(
+        `Physical execution retry conflicts with durable intent: ${intent.transactionId}`
+      );
+    }
+  }
+
+  #recordExecutionProgress(
+    entry: ActionExecutionLedgerEntry,
+    cut: HumanoidPersistenceCut
+  ): void {
+    const checkpoint = this.#checkpoint();
+    const committedFrameCount = cut.world.worldRevision - entry.admission.world_revision;
+    if (committedFrameCount < entry.progress.committed_frame_count
+      || cut.world.frame !== entry.admission.world_frame + committedFrameCount) {
+      throw new Error(
+        `Physical checkpoint regressed from durable execution: ${entry.transaction_id}`
+      );
+    }
+    if (committedFrameCount === 0
+      && entry.progress.committed_frame_count === 0) {
+      if (cut.authority.stateSha256 !== entry.progress.authority_state_sha256) {
+        throw new Error(
+          `Physical admission authority changed without a frame: ${entry.transaction_id}`
+        );
+      }
+      return;
+    }
+    checkpoint.action_execution_ledger = recordActionExecutionProgress(
+      checkpoint.action_execution_ledger,
+      {
+        transactionId: entry.transaction_id,
+        committedFrameCount,
+        worldFrame: cut.world.frame,
+        worldRevision: cut.world.worldRevision,
+        authorityStateSha256: cut.authority.stateSha256,
+        physicalCheckpointSha256: physicalCheckpointSha256(cut),
+        physicalTrajectory: this.#requiredTrajectory(entry, cut.world)
+      }
+    );
+  }
+
+  #recordTrajectoryFrame(
+    entry: ActionExecutionLedgerEntry,
+    frame: HumanoidWorldSnapshot
+  ): PhysicalTrajectorySummary {
+    const existing = this.#physicalTrajectories.get(entry.transaction_id)
+      ?? entry.progress.physical_trajectory
+      ?? createPhysicalTrajectory(frame, false);
+    const advanced = advancePhysicalTrajectory(existing, frame);
+    this.#physicalTrajectories.set(entry.transaction_id, advanced);
+    return advanced;
+  }
+
+  #requiredTrajectory(
+    entry: ActionExecutionLedgerEntry,
+    frame: HumanoidWorldSnapshot
+  ): PhysicalTrajectorySummary {
+    const trajectory = this.#recordTrajectoryFrame(entry, frame);
+    if (trajectory.end_frame !== frame.frame
+      || trajectory.end_world_revision !== frame.worldRevision) {
+      throw new Error(
+        `Physical trajectory is not aligned with execution ${entry.transaction_id}`
+      );
+    }
+    return trajectory;
+  }
+
+  async #capturePhysicalCut(): Promise<HumanoidPersistenceCut> {
+    const cut = await this.#world.capturePersistenceState();
+    this.#assertAlignedCut(cut, "Humanoid persistence cut is not physically aligned");
+    return cut;
+  }
+
+  #assertAlignedCut(cut: HumanoidPersistenceCut, message: string): void {
+    if (cut.authority.revision !== cut.world.worldRevision
+      || cut.world.frame !== cut.worldCheckpoint.frame
+      || cut.world.worldRevision !== cut.worldCheckpoint.worldRevision) {
+      throw new Error(message);
+    }
+  }
+
+  #applyPhysicalCut(cut: HumanoidPersistenceCut): void {
+    const checkpoint = this.#checkpoint();
+    checkpoint.world = structuredClone(cut.world);
+    checkpoint.world_checkpoint = structuredClone(cut.worldCheckpoint);
+  }
+}

@@ -11,35 +11,40 @@ import {
   stopRun,
   subscribeToRun
 } from "./api";
-import { HumanoidMissionWorkspace } from "./humanoid/HumanoidMissionWorkspace";
-import { MissionModal } from "./MissionModal";
-import { GameShell, type ModelConnectionState, type Workspace } from "./game/GameShell";
-import { OverlayPanel } from "./game/OverlayPanel";
+import { GameShell, type Workspace } from "./game/GameShell";
 import { CenteredSpin, FailureAlert, Login, RunStatus } from "./Shell";
 import { reduceHumanoidRunDetails } from "./humanoid-run-details-reducer";
 import { HumanoidFrameBuffer } from "./stage/humanoid-frame-buffer";
 import {
   asRecord,
   isAbortError,
-  latestProviderActivity,
   nextRuntimeEventCursor,
   providerActivityFrom,
   humanoidWorldSnapshotsFrom,
   upsertRuntimeJournalEntry,
   updateRunListStatus
 } from "./stream-state";
+import {
+  createModelActivity,
+  modelActivityFromJournal,
+  reduceProviderActivity,
+  reduceRuntimeModelActivity,
+  settleModelActivity,
+  type ModelActivityState
+} from "./model-activity";
 import type {
   Bootstrap,
   Goal,
+  HumanoidRunMode,
   HumanoidRunDetails,
   HumanoidWorldSnapshot,
-  ProviderActivity,
   RunListItem,
   RuntimeEvent,
   StreamState
 } from "./types";
 import { UiButton } from "./ui/Button";
 import { DeferredBoundary } from "./ui/DeferredBoundary";
+import { LoadingView } from "./ui/LoadingView";
 import { runOptionLabel, runStatusLabel } from "./ui-text";
 
 const FRAMEWORK_HISTORY_LIMIT = 300;
@@ -50,14 +55,12 @@ interface LoadRunOptions {
   preserveStream?: boolean;
 }
 
-const ActivityView = lazy(() => import("./flow/ActivityView").then((module) => ({
-  default: module.ActivityView
-})));
-const AgentFlowView = lazy(() => import("./flow/AgentFlowView").then((module) => ({
-  default: module.AgentFlowView
-})));
-const RobotTrailView = lazy(() => import("./flow/RobotTrailView").then((module) => ({
-  default: module.RobotTrailView
+const loadMissionModal = () => import("./MissionModal").then((module) => ({
+  default: module.MissionModal
+}));
+const MissionModal = lazy(loadMissionModal);
+const WorkspaceView = lazy(() => import("./game/WorkspaceView").then((module) => ({
+  default: module.WorkspaceView
 })));
 
 export function App(): React.JSX.Element {
@@ -73,7 +76,9 @@ export function App(): React.JSX.Element {
   const [streamError, setStreamError] = useState<string | null>(null);
   const [streamState, setStreamState] = useState<StreamState>("inactive");
   const [streamEpoch, setStreamEpoch] = useState(0);
-  const [providerActivity, setProviderActivity] = useState<ProviderActivity | null>(null);
+  const [modelActivity, setModelActivity] = useState<ModelActivityState>(
+    () => createModelActivity(true)
+  );
   const [missionOpen, setMissionOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [resuming, setResuming] = useState(false);
@@ -100,6 +105,10 @@ export function App(): React.JSX.Element {
   useEffect(() => {
     selectedRunRef.current = selectedRunId;
   }, [selectedRunId]);
+
+  useEffect(() => {
+    if (bootstrap?.provider.configured) void loadMissionModal();
+  }, [bootstrap?.provider.configured]);
 
   const loadRun = useCallback(async (
     runId: string,
@@ -133,7 +142,9 @@ export function App(): React.JSX.Element {
       };
       humanoidFrameBuffer.reset(nextDetails.checkpoint.world);
       setFramework(nextDetails.framework);
-      setProviderActivity(latestProviderActivity(nextDetails.provider));
+      const runIsActive = nextDetails.checkpoint.status === "starting"
+        || nextDetails.checkpoint.status === "running";
+      setModelActivity(modelActivityFromJournal(true, nextDetails.provider, runIsActive));
       setRuns((current) => updateRunListStatus(
         current,
         runId,
@@ -169,7 +180,7 @@ export function App(): React.JSX.Element {
         eventCursorRef.current = null;
         setDetails(null);
         setFramework([]);
-        setProviderActivity(null);
+        setModelActivity(createModelActivity(true));
       }
       selectedRunRef.current = candidate;
       setSelectedRunId(candidate);
@@ -228,13 +239,17 @@ export function App(): React.JSX.Element {
 
     if (event.type === "provider_event") {
       const activity = providerActivityFrom(event.data);
-      if (activity) setProviderActivity(activity);
+      if (activity) setModelActivity((current) => reduceProviderActivity(current, activity));
+    }
+    if (event.type === "model_request_started") {
+      setModelActivity((current) => reduceRuntimeModelActivity(current, event));
     }
 
     const humanoidWorlds = humanoidWorldSnapshotsFrom(event.data);
     if (humanoidWorlds.length > 0) appendHumanoidFrames(humanoidWorlds);
     const terminalEvent = event.type === "run_succeeded"
       || event.type === "run_failed"
+      || event.type === "run_paused"
       || event.type === "run_interrupted";
     setDetails((current) => {
       if (current === null) return current;
@@ -256,19 +271,23 @@ export function App(): React.JSX.Element {
       setRuns((current) => updateRunListStatus(current, runId, "running", null, event.at));
       return;
     }
-    if (event.type === "run_succeeded" || event.type === "run_failed" || event.type === "run_interrupted") {
+    if (event.type === "run_succeeded" || event.type === "run_failed"
+      || event.type === "run_paused" || event.type === "run_interrupted") {
       const data = asRecord(event.data);
-      const error = event.type === "run_succeeded"
+      const error = event.type === "run_succeeded" || event.type === "run_paused"
         ? null
         : typeof data?.error === "string"
           ? data.error
           : typeof data?.reason === "string" ? data.reason : "运行已结束，但服务端未提供原因";
       const status = event.type === "run_succeeded"
         ? "succeeded"
-        : event.type === "run_failed" ? "failed" : "interrupted";
+        : event.type === "run_failed"
+          ? "failed"
+          : event.type === "run_paused" ? "paused" : "interrupted";
       setRuns((current) => updateRunListStatus(current, runId, status, error, event.at));
       setStoppingRunId((currentId) => currentId === runId ? null : currentId);
       setStreamState("inactive");
+      setModelActivity((current) => settleModelActivity(current, false));
     }
   }, [appendHumanoidFrames, humanoidFrameBuffer]);
 
@@ -333,7 +352,7 @@ export function App(): React.JSX.Element {
     eventCursorRef.current = null;
     setDetails(null);
     setFramework([]);
-    setProviderActivity(null);
+    setModelActivity(createModelActivity(true));
     setSelectedRunId(runId);
     try {
       await loadRun(runId);
@@ -348,6 +367,7 @@ export function App(): React.JSX.Element {
     mission: string;
     scenario_id: string;
     goal: Goal;
+    run_mode: HumanoidRunMode;
   }): Promise<void> => {
     setSubmitting(true);
     try {
@@ -364,7 +384,7 @@ export function App(): React.JSX.Element {
 
   const resumeSelected = async (): Promise<void> => {
     if (!selectedRunId || !details || resuming
-      || (details.checkpoint.status !== "failed" && details.checkpoint.status !== "interrupted")) return;
+      || !["paused", "failed", "interrupted"].includes(details.checkpoint.status)) return;
     const previousStatus = details.checkpoint.status;
     const previousError = details.checkpoint.error;
     const optimisticAt = new Date().toISOString();
@@ -445,16 +465,14 @@ export function App(): React.JSX.Element {
   const activeRun = runs.find((run) => run.status === "starting" || run.status === "running");
   const selectedIsActive = details?.checkpoint.status === "starting" || details?.checkpoint.status === "running";
   const missionControlsBusy = submitting || resuming || stoppingRunId !== null;
-  const modelState = modelConnectionState(
-    bootstrap.provider.configured,
-    providerActivity?.status ?? null,
-    selectedIsActive
-  );
+  const visibleModelActivity = bootstrap.provider.configured
+    ? modelActivity
+    : createModelActivity(false);
   return (
     <GameShell
         workspace={workspace}
         onWorkspace={setWorkspace}
-        modelState={modelState}
+        modelState={visibleModelActivity.phase}
         onRefresh={() => void refreshRuns()}
         onLogout={hasPassword()
           ? () => {
@@ -495,10 +513,10 @@ export function App(): React.JSX.Element {
                   disabled={resuming || submitting || (stoppingRunId !== null && stoppingRunId !== selectedRunId)}
                   onClick={() => void stopSelected()}
                 >
-                  停止
+                  暂停
                 </UiButton>
               )}
-              {details && ["failed", "interrupted"].includes(details.checkpoint.status) && (
+              {details && ["paused", "failed", "interrupted"].includes(details.checkpoint.status) && (
                 <UiButton
                   busy={resuming}
                   disabled={missionControlsBusy || activeRun !== undefined}
@@ -510,6 +528,7 @@ export function App(): React.JSX.Element {
               <UiButton
                 tone="primary"
                 disabled={missionControlsBusy || activeRun !== undefined || !bootstrap.provider.configured}
+                onPointerDown={() => void loadMissionModal()}
                 onClick={() => setMissionOpen(true)}
               >
                 <b aria-hidden="true">＋</b>新建任务
@@ -538,115 +557,43 @@ export function App(): React.JSX.Element {
               <UiButton
                 tone="primary"
                 disabled={missionControlsBusy || activeRun !== undefined || !bootstrap.provider.configured}
+                onPointerDown={() => void loadMissionModal()}
                 onClick={() => setMissionOpen(true)}
               >
                 <b aria-hidden="true">＋</b>新建任务
               </UiButton>
             </section>
           ) : (
-            <WorkspaceView
-              workspace={workspace}
-              details={details}
-              humanoidFrameBuffer={humanoidFrameBuffer}
-              framework={framework}
-              streamState={streamState}
-              onClose={() => setWorkspace("world")}
-            />
+            <DeferredBoundary resetKey={details.definition.run_id}>
+              <Suspense fallback={<CenteredSpin />}>
+                <WorkspaceView
+                  workspace={workspace}
+                  details={details}
+                  humanoidFrameBuffer={humanoidFrameBuffer}
+                  framework={framework}
+                  modelActivity={visibleModelActivity}
+                  streamState={streamState}
+                  onClose={() => setWorkspace("world")}
+                />
+              </Suspense>
+            </DeferredBoundary>
           )}
         </div>
         {missionOpen && (
           <DeferredBoundary resetKey="mission-open" modal>
-            <MissionModal
-              open
-              scenarios={bootstrap.scenarios}
-              submitting={submitting}
-              onCancel={() => setMissionOpen(false)}
-              onSubmit={createMission}
-            />
+            <Suspense fallback={<LoadingView label="正在加载任务编辑器" modal />}>
+              <MissionModal
+                open
+                scenarios={bootstrap.scenarios}
+                submitting={submitting}
+                onCancel={() => setMissionOpen(false)}
+                onSubmit={createMission}
+              />
+            </Suspense>
           </DeferredBoundary>
         )}
     </GameShell>
   );
-}
-
-function WorkspaceView(props: {
-  workspace: Workspace;
-  details: HumanoidRunDetails;
-  humanoidFrameBuffer: HumanoidFrameBuffer;
-  framework: unknown[];
-  streamState: StreamState;
-  onClose: () => void;
-}): React.JSX.Element {
-  const world = (
-    <HumanoidMissionWorkspace
-      key={props.details.definition.run_id}
-      details={props.details}
-      frameBuffer={props.humanoidFrameBuffer}
-      streamState={props.streamState}
-    />
-  );
-  const panel = props.workspace === "world" ? null : props.workspace === "flow"
-    ? {
-        title: "智能体流",
-        body: (
-          <AgentFlowView
-            checkpoint={props.details.checkpoint}
-            actions={props.details.actions}
-            framework={props.framework}
-          />
-        )
-      }
-    : props.workspace === "journey"
-      ? {
-          title: "行动历程",
-          body: <RobotTrailView actions={props.details.actions} />
-        }
-      : {
-          title: "智能体输出",
-          body: (
-            <ActivityView
-              checkpoint={props.details.checkpoint}
-              provider={props.details.provider}
-              framework={props.framework}
-            />
-          )
-        };
-  return (
-    <div className="game-world-stack">
-      {world}
-      {panel && (
-        <OverlayPanel title={panel.title} onClose={props.onClose}>
-          <DeferredBoundary resetKey={`${props.details.definition.run_id}:${props.workspace}`}>
-            <Suspense fallback={<PanelLoading />}>
-              {panel.body}
-            </Suspense>
-          </DeferredBoundary>
-        </OverlayPanel>
-      )}
-    </div>
-  );
-}
-
-function PanelLoading(): React.JSX.Element {
-  return (
-    <div className="panel-loading" role="status" aria-label="正在加载视图">
-      <i /><i /><i />
-    </div>
-  );
-}
-
-function modelConnectionState(
-  configured: boolean,
-  status: string | null,
-  runIsActive: boolean
-): ModelConnectionState {
-  if (!runIsActive && status === "usable_stream") return "verified";
-  if (!configured) return "offline";
-  if (status === null || status === "configured") return "ready";
-  if (status === "no_text" || status.includes("error") || status === "transport_interrupted") return "error";
-  if (status === "usable_stream") return runIsActive ? "active" : "verified";
-  if (status === "contacted" || status === "streaming_text") return runIsActive ? "active" : "ready";
-  return "ready";
 }
 
 function updateDetailsStatus(

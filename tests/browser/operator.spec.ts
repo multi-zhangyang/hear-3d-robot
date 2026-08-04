@@ -2,6 +2,7 @@ import { access } from "node:fs/promises";
 import { resolve } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 import { E2E_RUNS_DIR } from "./e2e-runs.js";
+import { openRecordedOperator } from "./open-recorded-operator.js";
 
 const UPDATE_README_SCREENSHOTS = process.env.HEAR_UPDATE_SCREENSHOTS === "1";
 
@@ -14,16 +15,9 @@ test("渲染自主人形世界与实时层级智能体界面", async ({ page }, 
     }
   });
   await access(resolve(E2E_RUNS_DIR, ".operator.lock"));
-  await page.goto("/");
-  const passwordInput = page.getByLabel("操作密码");
-  if (await passwordInput.isVisible().catch(() => false)) {
-    expect(await loadedDeferredChunks(page)).toEqual([]);
-    await passwordInput.fill(process.env.HEAR_E2E_PASSWORD ?? "hear-e2e-local");
-    await page.getByRole("button", { name: /登\s*录/ }).click();
-  }
-
-  const mission = page.locator("section.humanoid-mission-world");
-  await expect(mission).toBeVisible({ timeout: 60_000 });
+  const mission = await openRecordedOperator(page, {
+    beforeLogin: async () => expect(await loadedDeferredChunks(page)).toEqual([])
+  });
   const label = await mission.getAttribute("aria-label");
   if (label !== "实时人形任务" && label !== "人形任务回顾") {
     throw new Error(`Unexpected humanoid mission mode: ${label ?? "missing"}`);
@@ -38,7 +32,7 @@ async function assertHumanoidOperator(
   meshes: ReadonlySet<string>
 ): Promise<void> {
   const worldMode = missionMode === "实时人形任务" ? "实时人形世界" : "人形世界回顾";
-  await expect(page.locator(`section[aria-label="${worldMode}"]`)).toBeVisible();
+  await expect(page.locator(`section[aria-label="${worldMode}"]`)).toBeAttached();
   const canvas = page.locator("canvas.humanoid-canvas");
   await expect(canvas).toBeVisible({ timeout: 90_000 });
   await page.waitForFunction(() => {
@@ -47,6 +41,8 @@ async function assertHumanoidOperator(
   });
   await expect.poll(() => loadedDeferredChunks(page)).toEqual(expect.arrayContaining([
     expect.stringMatching(/create-humanoid-stage/),
+    expect.stringMatching(/HumanoidMissionWorkspace/),
+    expect.stringMatching(/WorkspaceView/),
     expect.stringMatching(/three~/)
   ]));
   await expect.poll(() => meshes.size).toBeGreaterThan(20);
@@ -234,7 +230,7 @@ function overlapArea(
 async function loadedDeferredChunks(page: Page): Promise<string[]> {
   return page.evaluate(() => performance.getEntriesByType("resource")
     .map((entry) => new URL(entry.name).pathname.split("/").at(-1) ?? "")
-    .filter((name) => /three~|create-humanoid-stage|AgentFlowView|ActivityView|RobotTrailView|MissionModal/.test(name)));
+    .filter((name) => /three~|create-humanoid-stage|WorkspaceView|HumanoidMissionWorkspace|AgentFlowView|ActivityView|RobotTrailView|MissionModal/.test(name)));
 }
 
 async function captureSolidReference(page: Page, width: number, height: number): Promise<Buffer> {

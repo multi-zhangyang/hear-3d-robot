@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 import type { ProviderConfig, RuntimeCatalog } from "../config/load.js";
 import type { Goal, JsonValue } from "../domain/schema.js";
+import type { HumanoidRunMode } from "../domain/run-mode.js";
 import type { AnyRunCheckpoint } from "../domain/run-checkpoint.js";
 import type { RuntimeEvent, RuntimeEventSink } from "../runtime/events.js";
 import type { MutationFence } from "../persistence/mutation-fence.js";
@@ -23,6 +24,7 @@ import {
   resumeHumanoidMission,
   startHumanoidMission
 } from "../runtime/humanoid-mission-runner.js";
+import { RunPauseRequestedError } from "../runtime/run-pause.js";
 
 export interface RunListItem {
   run_id: string;
@@ -121,6 +123,7 @@ export class RunManager {
     mission: string;
     scenarioId: string;
     goal: Goal;
+    runMode?: HumanoidRunMode;
     seed?: number;
   }): Promise<string> {
     const provider = this.#requireProvider();
@@ -134,6 +137,7 @@ export class RunManager {
       mission: input.mission,
       scenarioId: input.scenarioId,
       goal: input.goal,
+      runMode: input.runMode ?? "continuous",
       catalog: this.#catalog,
       provider,
       ...(input.seed === undefined ? {} : { seed: input.seed }),
@@ -285,8 +289,10 @@ export class RunManager {
   }
 
   stopAll(reason = "Operator server stopped"): void {
-    this.#launchController?.abort(new Error(reason));
-    for (const controller of this.#controllers.values()) controller.abort(reason);
+    this.#launchController?.abort(new RunPauseRequestedError(reason));
+    for (const controller of this.#controllers.values()) {
+      controller.abort(new RunPauseRequestedError(reason));
+    }
   }
 
   async drain(reason = "Operator server stopped"): Promise<void> {
@@ -300,7 +306,7 @@ export class RunManager {
   stop(runId: string, reason = "Mission stopped by operator"): void {
     const controller = this.#controllers.get(runId);
     if (!controller) throw new RunNotActiveError(`Run ${runId} is not active`);
-    controller.abort(new Error(reason));
+    controller.abort(new RunPauseRequestedError(reason));
   }
 
   async list(): Promise<RunListItem[]> {
@@ -316,6 +322,7 @@ export class RunManager {
   }): Promise<{
     definition: RunStore["definition"];
     checkpoint: AnyRunCheckpoint;
+    scenario_chunks: Awaited<ReturnType<RunStore["readScenarioChunkDeltaState"]>>;
     actions: JsonValue[];
     provider: JsonValue[];
     framework: JsonValue[];
@@ -339,6 +346,7 @@ export class RunManager {
     return {
       definition: store.definition,
       checkpoint: snapshot.checkpoint,
+      scenario_chunks: snapshot.scenarioChunks,
       actions: snapshot.actions.entries,
       provider: snapshot.provider.entries,
       framework: snapshot.framework.entries,

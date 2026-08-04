@@ -34,10 +34,11 @@ describe("YAHMP joint tracking authority", () => {
     expect(command.stiffness[0]).toBe(YAHMP_POLICY.stiffness[0]);
     expect(command.stiffness[1]).toBeGreaterThan(YAHMP_POLICY.stiffness[1]);
     expect(command.stiffness[1]).toBeLessThan(command.stiffness[2]!);
-    expect(command.stiffness[2]).toBe(240);
+    expect(command.stiffness[2]).toBe(100);
     expect(command.damping[0]).toBe(YAHMP_POLICY.damping[0]);
     expect(command.damping[2]).toBeGreaterThan(YAHMP_POLICY.damping[2]);
     expect(session.run).toHaveBeenCalledOnce();
+    expect(session.output.dispose).toHaveBeenCalledOnce();
     await controller.dispose();
   });
 
@@ -65,9 +66,11 @@ function policyState(jointPositions: Float64Array): HumanoidPolicyState {
 }
 
 function fakeSession(action: Float32Array) {
+  const output = { data: action, dispose: vi.fn() };
   return {
-    run: vi.fn(async () => ({ actions: { data: action } })),
-    release: vi.fn(async () => undefined)
+    run: vi.fn(async () => ({ actions: output })),
+    release: vi.fn(async () => undefined),
+    output
   };
 }
 

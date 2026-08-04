@@ -9,12 +9,13 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 ## 核心能力
 
 - OpenAI Agents SDK 层级编排，每个智能体拥有独立 Model 实例、Session 和上下文生命周期
-- G1 29 自由度人形模型、双足接触、质心、支撑面和跌倒检测
+- G1 29 个全身关节与 14 个手部关节、双足接触、质心、支撑面和跌倒检测
 - 模型按偏好提交多个根运动、躯干朝向、双手腕和双脚踝末端目标候选，不直接编写关节角
-- 任务可直接约束左/右手腕或脚踝的世界坐标与骨盆相对三维位置，并要求连续物理帧稳定成立
+- 任务可约束左/右手腕或脚踝的世界或骨盆相对三维位姿，并要求位置、朝向在连续物理帧内稳定成立
 - 每个全身候选从同一 MuJoCo 状态独立预演，只选择排序最前且物理可行的模型候选
 - 全身 Option 使用受限物理条件树和前置、持续、终止三个阶段，成功必须经过连续帧稳定验收
 - 预演轨迹与运动制品分别进行 SHA-256 校验；真实执行持续偏离预演时立即截断并重新规划
+- 预演与真实执行分别累计支撑余量、足底滑移、关节余量、速度、接触冲击和执行器力矩证据
 - YAHMP ONNX 全身策略在 50 Hz 生成控制目标，MuJoCo 在 200 Hz 处理重力、力矩、碰撞与接触
 - Recast 导航网格和分段物理预演，不通过修改根节点坐标伪造移动
 - 程序化方块世界，世界种子、障碍、物体和目标区域按任务生成
@@ -28,32 +29,31 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 ```text
 任务目标
-  └─ 人形自主协调智能体
-       ├─ 人形感知哨兵
-       ├─ 全身运动参考智能体
-       └─ 人形物理执行智能体
-              │
-              ▼
-       连续运动意图
-              │
-       模型排序的全身候选
-              │
-       运动生成器 / 独立物理预演
-              │ 首个可行候选
-       已选择的全身参考 + 物理 Option
-              │
-       YAHMP 神经运动跟踪
-              │
-       MuJoCo 实际执行 + 逐帧验收
-              │ 达成 / 偏离 / 违反约束
-       提前终止或交回重规划
-              │
-       权威世界帧与动作回执
-              │
-       目标检查 / 滚动重规划
+  └─ 自主目标管理智能体
+       │ Goal
+       ▼
+人形自主协调智能体
+  ├─ 人形感知哨兵
+  ├─ 全身运动参考智能体
+  └─ 人形物理执行智能体
+       │
+       ▼
+连续运动意图 → 模型排序的全身候选
+       │
+       ▼
+运动生成器 / 独立物理预演
+       │ 首个可行候选
+       ▼
+已选择的全身参考 + 物理 Option
+       │
+       ▼
+YAHMP 神经运动跟踪 → MuJoCo 实际执行
+       │ 达成 / 偏离 / 违反约束
+       ▼
+权威世界帧与动作回执 → 目标检查 / 滚动重规划
 ```
 
-协调、感知、运动参考和物理执行是四个边界明确的智能体，而不是一个模型扮演多个名称。协调智能体不能直接修改世界；运动参考智能体只能提交规划；执行智能体只能消费当前世界版本中已接受规划的原始回执。
+目标管理、协调、感知、运动参考和物理执行是五个边界明确的智能体，而不是一个模型扮演多个名称。协调智能体不能直接修改世界；目标管理智能体负责提出并选择当前 Goal；运动参考智能体只能提交规划；执行智能体只能消费当前世界版本中已接受规划的原始回执。
 
 一次动作需要同时满足以下条件才会改变世界：
 
@@ -80,7 +80,9 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 | `left_arm` | 左臂和左手末端 |
 | `right_arm` | 右臂和右手末端 |
 
-运动工具接收任务空间关键帧。根运动使用身体局部速度，双手腕与双脚踝目标可使用世界坐标或骨盆相对坐标；多末端 DLS 逆运动学求出连续腿臂关节参考，再由 YAHMP 神经残差与任务链阻抗组成的混合控制器跟踪。显式跟踪权限只在当前运动制品执行期间生效，结束后会交还给自主全身策略。一次非导航决策提交 2 至 3 个不同候选，每个候选都从当前物理状态完整预演，并按模型给出的偏好顺序选择首个可行候选。模型可以组合行走、转身、抬腿、跨步、躯干调整和双臂动作，而不依赖固定动作名称或动作表。
+运动工具接收任务空间关键帧。根运动使用身体局部速度，双手腕与双脚踝目标可使用世界坐标或骨盆相对坐标，并可同时指定末端朝向；多末端 SE(3) 阻尼最小二乘逆运动学求出连续腿臂关节参考，再由 YAHMP 神经残差与任务链阻抗组成的混合控制器跟踪。显式跟踪权限只在当前运动制品执行期间生效，结束后会交还给自主全身策略。一次非导航决策提交 2 至 3 个不同候选，每个候选都从当前物理状态完整预演，并按模型给出的偏好顺序选择首个可行候选。模型可以组合行走、转身、抬腿、跨步、躯干调整和双臂动作，而不依赖固定动作名称或动作表。
+
+每个预演证书与真实执行回执分别记录动态安全证据。证据来自对应的实际物理帧，包括支撑凸包余量、足底切向滑移、关节极限余量、关节速度、峰值接触力、法向力上升率，以及执行器请求与实际力矩、利用率和饱和状态；缺失的观测保持缺失，不会合成默认数值。恢复后的证据只覆盖真正执行过的轨迹前缀。
 
 默认生成器是确定性的任务约束求解器，自主性来自上层模型产生的连续目标，不来自固定动作表。`humanoid-motion-generator-v1` 协议允许接入学习式生成器；生成器类型、采样方式和实现身份会进入实时世界状态与检查点，恢复时必须与原运行一致，不会静默切换后端。
 
@@ -110,7 +112,7 @@ Operator 异常退出后，未完成任务会转为可恢复状态。恢复操�
 
 3D 世界始终保持在主视图。界面提供跟随、世界和头部三个观察视角，并实时显示：
 
-- 当前活动智能体与四节点执行链
+- 当前活动智能体与五节点层级
 - 身体通道活动状态
 - 世界版本、物理时间、双脚法向力、支撑和直立度
 - 任务谓词与上下文占用
@@ -169,11 +171,11 @@ AI_API_KEY=your-api-key
 AI_REQUEST_TIMEOUT_MS=90000
 
 AI_TEMPERATURE=0.2
-AI_MAX_OUTPUT_TOKENS=8192
-AI_CONTEXT_WINDOW_TOKENS=65536
-AI_COMPACT_TRIGGER_TOKENS=18000
+AI_MAX_OUTPUT_TOKENS=
+AI_CONTEXT_WINDOW_TOKENS=262144
+AI_COMPACT_TRIGGER_TOKENS=
 AI_COMPACT_RECENT_MODEL_TURNS=4
-AI_COMPACT_MAX_OUTPUT_TOKENS=4096
+AI_COMPACT_MAX_OUTPUT_TOKENS=
 
 HEAR_HOST=127.0.0.1
 HEAR_PORT=8765
@@ -189,7 +191,22 @@ HEAR_RUNS_DIR=./runs
 | `openai_responses` | OpenAI Responses API |
 | `anthropic_messages` | Anthropic Messages API |
 
-`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限。压缩阈值必须为输出和工具回执预留足够空间。
+`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时会随上下文窗口计算，并为模型输出和工具回执保留安全空间。
+
+目标管理、协调、感知、运动、执行和压缩可以使用彼此独立的模型配置。未设置的角色变量继承同名 `AI_*` 默认值；设置时使用 `AI_<ROLE>_<SETTING>`：
+
+| `ROLE` | 运行职责 |
+|---|---|
+| `GOAL_MANAGER` | 自主 Goal 候选与选择 |
+| `COORDINATOR` | 自主循环协调 |
+| `SENTRY` | 实时感知 |
+| `MOTION` | 全身运动规划 |
+| `EXECUTOR` | 物理执行 |
+| `COMPACTOR` | 长期上下文压缩 |
+
+`SETTING` 支持 `PROVIDER`、`BASE_URL`、`MODEL`、`API_KEY`、`REQUEST_TIMEOUT_MS`、`TEMPERATURE`、`MAX_OUTPUT_TOKENS`、`CONTEXT_WINDOW_TOKENS`、`COMPACT_TRIGGER_TOKENS`、`COMPACT_RECENT_MODEL_TURNS` 和 `COMPACT_MAX_OUTPUT_TOKENS`。例如 `AI_MOTION_MODEL` 只覆盖运动节点，`AI_COMPACTOR_CONTEXT_WINDOW_TOKENS` 只描述压缩模型的真实上下文上限。配置仍基于协议能力，不绑定服务商或模型名称。
+
+五个业务层级节点各自持有独立 Model facade 与持久 Session；压缩器使用独立模型配置和无历史污染的有界 SDK 回合。每个 Run 会写入不含凭证和端点明文的 Agent 身份清单。恢复时会核验模型、协议、端点身份哈希、模型参数、指令、工具 Schema 和 Agents SDK 版本；不兼容配置会被明确拒绝，不会静默复用旧 Session。
 
 ## 启动
 
@@ -212,10 +229,12 @@ pnpm start
 
 ```text
 pnpm hear scenarios
-pnpm hear run --scenario ID --mission TEXT --goal JSON [--seed N] --confirm
+pnpm hear run --scenario ID --mission TEXT --goal JSON [--mode mission|continuous] [--seed N] --confirm
 pnpm hear resume --run RUN_ID --confirm
 pnpm hear operator [--host HOST] [--port PORT] [--dev]
 ```
+
+`mission` 在模型选择并经物理验收完成与任务约束完全一致的 Goal 后结束；`continuous` 在每个 Goal 完成后继续自主选择下一目标，直到操作者暂停。命令行默认使用 `mission`，Web Operator 默认使用 `continuous`。
 
 ## 场景
 
@@ -238,6 +257,7 @@ pnpm hear operator [--host HOST] [--port PORT] [--dev]
 | `agent-state.json` | 可恢复的 Agents SDK 运行状态 |
 | `session.json` | 协调智能体 Session |
 | `sessions/` | 专职智能体独立 Session |
+| `agent-manifest.json` | Agent 配置、指令、工具与 SDK 身份清单；不含 API 凭证 |
 | `actions.jsonl` | 规划和执行回执 |
 | `episodes.jsonl` | 可按来源标识召回的长期具身经历 |
 | `events.jsonl` | 实时与恢复事件 |
@@ -253,9 +273,14 @@ pnpm typecheck
 pnpm test
 pnpm check
 pnpm test:browser
+pnpm test:live:mission
+pnpm test:live:autonomy
+pnpm test:live:endurance
 ```
 
 `pnpm check` 包含无用代码扫描、服务端和前端类型检查、单元与集成测试、生产构建及生产启动检查。浏览器测试在桌面与移动视口中验证 G1 网格加载、实时界面、三个相机视角、延迟加载面板和真实 WebGL/WebGPU 画布。
+
+真实模型验收使用正常环境配置，不包含在离线 CI 中。有限任务验收验证模型决策、物理执行、Goal 证据和具身记忆的完整因果链；持续自主验收从同一场景与世界种子运行多次，并分别验证模型响应、规划参数和实际物理轨迹的实质差异；耐久验收覆盖多轮上下文压缩、进程中断、恢复和后续 Goal。
 
 ## 项目结构
 
@@ -279,7 +304,7 @@ HEAR 当前面向虚拟人形机器人，不直接控制实体硬件。默认运
 
 - `.env`、运行数据、构建产物和浏览器测试产物不会提交到 Git。
 - API 凭证只在服务端读取，不会进入浏览器启动数据。
-- Operator 默认监听 `127.0.0.1`；对外开放前应设置操作密码和反向代理访问控制。
+- Operator 默认监听 `127.0.0.1`；绑定非回环地址时必须设置操作密码，并建议同时使用反向代理访问控制。
 - 任务日志包含模型输出和世界状态，应按部署环境的数据策略管理。
 
 ## 许可证

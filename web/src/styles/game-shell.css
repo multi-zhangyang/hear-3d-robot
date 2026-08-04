@@ -122,6 +122,8 @@
 .run-status-interrupted { color: #ef9a9a; }
 .run-status-failed i,
 .run-status-interrupted i { background: #e66f6f; }
+.run-status-paused { color: #e7c77e; }
+.run-status-paused i { background: #d9aa4f; box-shadow: 0 0 8px rgb(217 170 79 / 38%); }
 
 .mission-actions {
   display: flex;
@@ -168,6 +170,7 @@
 
 .model-lamp.online { color: #75d8ad; }
 .model-lamp.ready { color: #aab5b1; }
+.model-lamp.recovering { color: #e3c06f; }
 .model-lamp.error { color: #e8a06f; }
 
 .game-main {

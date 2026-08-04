@@ -34,6 +34,28 @@ const COMPACTOR_INSTRUCTIONS = [
   "The authority block is current; older observations and the prior checkpoint may be stale."
 ].join(" ");
 
+export function contextCompactorIdentitySource(): {
+  instructions: string;
+  tools: Array<{
+    type: "function";
+    name: string;
+    description: string;
+    strict: boolean;
+    parameters: Record<string, unknown>;
+  }>;
+} {
+  return {
+    instructions: COMPACTOR_INSTRUCTIONS,
+    tools: [{
+      type: "function",
+      name: COMMIT_CONTEXT_TOOL,
+      description: COMMIT_CONTEXT_DESCRIPTION,
+      strict: true,
+      parameters: z.toJSONSchema(ContextCompactionSummarySchema) as Record<string, unknown>
+    }]
+  };
+}
+
 export interface ContextSummaryRequest {
   priorSummary: ContextCompactionSummary | null;
   sourceItems: AgentInputItem[];
@@ -41,6 +63,7 @@ export interface ContextSummaryRequest {
   acceptedTransactionIds: string[];
   blockerTransactionIds: string[];
   maxInputTokens: number;
+  maxOutputTokens: number;
   signal?: AbortSignal;
 }
 
@@ -72,13 +95,13 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
   readonly #runner: Runner;
   readonly #model: Model;
   readonly #temperature: number;
-  readonly #maxOutputTokens: number;
+  readonly #maxOutputTokens: number | undefined;
   readonly #onModelResponseCompleted: (() => void | Promise<void>) | undefined;
 
   constructor(input: {
     model: Model;
     temperature: number;
-    maxOutputTokens: number;
+    maxOutputTokens?: number;
     onModelResponseCompleted?: () => void | Promise<void>;
   }) {
     this.#model = input.model;
@@ -129,7 +152,9 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
       const agent = compactorAgent({
         model: countedModel,
         temperature: this.#temperature,
-        maxOutputTokens: this.#maxOutputTokens,
+        ...(this.#maxOutputTokens === undefined
+          ? {}
+          : { maxOutputTokens: this.#maxOutputTokens }),
         accepted,
         blockers
       });
@@ -218,7 +243,7 @@ export function isContextCompactionInterruption(error: unknown): boolean {
 function compactorAgent(input: {
   model: Model;
   temperature: number;
-  maxOutputTokens: number;
+  maxOutputTokens?: number;
   accepted: string[];
   blockers: string[];
 }): Agent {
@@ -229,7 +254,9 @@ function compactorAgent(input: {
     model: input.model,
     modelSettings: {
       temperature: input.temperature,
-      maxTokens: input.maxOutputTokens,
+      ...(input.maxOutputTokens === undefined
+        ? {}
+        : { maxTokens: input.maxOutputTokens }),
       parallelToolCalls: false,
       // This agent exposes exactly one terminal tool. Naming it gives the
       // provider a stronger, SDK-native constraint than generic "required".

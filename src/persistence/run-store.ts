@@ -17,6 +17,15 @@ import {
   type Scenario
 } from "../domain/schema.js";
 import {
+  applyScenarioChunkDeltaMutations,
+  type ScenarioChunkDeltaMutation
+} from "../domain/scenario-chunk-delta.js";
+import {
+  createScenarioChunkDeltaState,
+  restoreScenarioChunkDeltaState,
+  type ScenarioChunkDeltaState
+} from "../domain/scenario-chunk-delta-schema.js";
+import {
   AnyRunCheckpointSchema,
   type AnyRunCheckpoint
 } from "../domain/run-checkpoint.js";
@@ -24,6 +33,14 @@ import {
   HumanoidRunCheckpointSchema,
   type HumanoidRunCheckpoint
 } from "../domain/humanoid-run.js";
+import {
+  HumanoidRunModeSchema,
+  type HumanoidRunMode
+} from "../domain/run-mode.js";
+import {
+  AgentManifestSchema,
+  type AgentManifest
+} from "../domain/agent-manifest.js";
 import { z } from "zod";
 import {
   appendIndexedRecordsBuilt,
@@ -37,6 +54,10 @@ import {
   runFencedMutation,
   type MutationFence
 } from "./mutation-fence.js";
+import {
+  humanoidRunCheckpointNeedsPhysicalMigration,
+  normalizeHumanoidRunCheckpoint
+} from "./humanoid-checkpoint-migration.js";
 
 const RunDefinitionSchema = z.object({
   version: z.literal(1),
@@ -46,6 +67,7 @@ const RunDefinitionSchema = z.object({
   scenario: ScenarioSchema,
   goal: GoalSchema,
   runtime: z.literal("humanoid_g1"),
+  run_mode: HumanoidRunModeSchema.default("mission"),
   created_at: z.string().datetime()
 });
 const AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -65,7 +87,11 @@ export type JournalName =
   | "hierarchy"
   | "checker"
   | "episodes"
-  | "context";
+  | "experiences"
+  | "context"
+  | "goal_evidence"
+  | "model_calls"
+  | "action_identities";
 
 export interface JournalPage {
   entries: JsonValue[];
@@ -75,6 +101,7 @@ export interface JournalPage {
 
 export interface RunDetailsSnapshot {
   checkpoint: AnyRunCheckpoint;
+  scenarioChunks: ScenarioChunkDeltaState;
   actions: JournalPage;
   provider: JournalPage;
   framework: JournalPage;
@@ -105,6 +132,7 @@ export class RunStore {
   readonly definition: RunDefinition;
   readonly #mutationFence: MutationFence | undefined;
   readonly #journalWrites = new Map<JournalName, Promise<void>>();
+  #chunkDeltaWrites: Promise<void> = Promise.resolve();
 
   static async create(
     runsDir: string,
@@ -114,24 +142,29 @@ export class RunStore {
       scenario: Scenario;
       goal: Goal;
       runtime?: RunDefinition["runtime"];
+      runMode?: HumanoidRunMode;
     },
     options: RunStoreOptions = {}
   ): Promise<RunStore> {
     const runId = createRunId(input.scenarioId);
     const runDir = resolve(runsDir, runId);
+    const scenario = ScenarioSchema.parse(input.scenario);
     const definition: RunDefinition = {
       version: 1,
       run_id: runId,
       mission: input.mission,
       scenario_id: input.scenarioId,
-      scenario: structuredClone(input.scenario),
+      scenario: structuredClone(scenario),
       goal: structuredClone(input.goal),
       runtime: input.runtime ?? "humanoid_g1",
+      run_mode: input.runMode ?? "mission",
       created_at: new Date().toISOString()
     };
+    const chunkDeltas = createScenarioChunkDeltaState(scenario);
     await runFencedMutation(options.mutationFence, async () => {
       await mkdir(runDir, { recursive: false });
       await atomicJson(resolve(runDir, "run.json"), definition);
+      await atomicJson(resolve(runDir, "chunk-deltas.json"), chunkDeltas);
     });
     return new RunStore(runDir, definition, options.mutationFence);
   }
@@ -142,7 +175,9 @@ export class RunStore {
       JSON.parse(await readFile(resolve(resolved, "run.json"), "utf8"))
     );
     if (basename(resolved) !== definition.run_id) throw new Error("Run directory identity mismatch");
-    return new RunStore(resolved, definition, options.mutationFence);
+    const store = new RunStore(resolved, definition, options.mutationFence);
+    await store.#normalizeCheckpointIfPresent();
+    return store;
   }
 
   private constructor(
@@ -197,11 +232,47 @@ export class RunStore {
   }
 
   async readCheckpoint(): Promise<AnyRunCheckpoint> {
-    return this.#readCheckpoint();
+    return this.#runMutation(() => this.#readCheckpoint());
   }
 
   async readHumanoidCheckpoint(): Promise<HumanoidRunCheckpoint> {
-    return HumanoidRunCheckpointSchema.parse(await this.#readCheckpoint());
+    return HumanoidRunCheckpointSchema.parse(await this.readCheckpoint());
+  }
+
+  async readScenarioChunkDeltaState(): Promise<ScenarioChunkDeltaState> {
+    await this.#chunkDeltaWrites;
+    return this.#readScenarioChunkDeltaState();
+  }
+
+  /** Serializes one pure delta transition and publishes it with atomic replace. */
+  async applyScenarioChunkDeltaMutation(
+    mutation: ScenarioChunkDeltaMutation
+  ): Promise<ScenarioChunkDeltaState> {
+    return this.applyScenarioChunkDeltaMutations([mutation]);
+  }
+
+  /** Publishes one validated multi-entity world transition with one atomic replace. */
+  async applyScenarioChunkDeltaMutations(
+    mutations: readonly ScenarioChunkDeltaMutation[]
+  ): Promise<ScenarioChunkDeltaState> {
+    let result: ScenarioChunkDeltaState | undefined;
+    const write = this.#chunkDeltaWrites.then(async () => {
+      await this.#runMutation(async () => {
+        const current = await this.#readScenarioChunkDeltaState();
+        result = applyScenarioChunkDeltaMutations(
+          this.definition.scenario,
+          current,
+          mutations
+        );
+        if (result.revision !== current.revision) {
+          await atomicJson(resolve(this.runDir, "chunk-deltas.json"), result);
+        }
+      });
+    });
+    this.#chunkDeltaWrites = write.catch(() => undefined);
+    await write;
+    if (!result) throw new Error("Scenario chunk delta mutation did not produce a state");
+    return result;
   }
 
   async readJournal(name: JournalName): Promise<JsonValue[]> {
@@ -268,16 +339,27 @@ export class RunStore {
       }
     }
     const journals = ["actions", "provider", "framework", "events"] as const;
-    await Promise.all(journals.map((name) => this.#journalWrites.get(name)));
+    await Promise.all([
+      ...journals.map((name) => this.#journalWrites.get(name)),
+      this.#chunkDeltaWrites
+    ]);
     return this.#runMutation(async () => {
-      const [actions, provider, framework, events, checkpoint] = await Promise.all([
+      const [
+        actions,
+        provider,
+        framework,
+        events,
+        checkpoint,
+        scenarioChunks
+      ] = await Promise.all([
         this.#readJournalTail("actions", limits.actions),
         this.#readJournalTail("provider", limits.provider),
         this.#readJournalTail("framework", limits.framework),
         this.#readJournalTail("events", 1),
-        this.#readCheckpoint()
+        this.#readCheckpoint(),
+        this.#readScenarioChunkDeltaState()
       ]);
-      return { checkpoint, actions, provider, framework, events };
+      return { checkpoint, scenarioChunks, actions, provider, framework, events };
     });
   }
 
@@ -340,6 +422,28 @@ export class RunStore {
     });
   }
 
+  async writeAgentManifest(manifest: AgentManifest): Promise<void> {
+    const parsed = AgentManifestSchema.parse(manifest);
+    await this.#runMutation(
+      () => atomicJson(resolve(this.runDir, "agent-manifest.json"), parsed)
+    );
+  }
+
+  async readAgentManifest(): Promise<AgentManifest> {
+    try {
+      return AgentManifestSchema.parse(
+        JSON.parse(await readFile(resolve(this.runDir, "agent-manifest.json"), "utf8"))
+      );
+    } catch (error) {
+      if (isMissing(error)) {
+        throw new Error(
+          "Agent manifest is missing; refusing to reuse unverified model or Session state"
+        );
+      }
+      throw error;
+    }
+  }
+
   sessionPath(): string {
     return resolve(this.runDir, "session.json");
   }
@@ -386,11 +490,44 @@ export class RunStore {
   }
 
   async #readCheckpoint(): Promise<AnyRunCheckpoint> {
-    const checkpoint = AnyRunCheckpointSchema.parse(
-      JSON.parse(await readFile(resolve(this.runDir, "checkpoint.json"), "utf8"))
+    const normalized = await normalizeHumanoidRunCheckpoint(
+      JSON.parse(await readFile(resolve(this.runDir, "checkpoint.json"), "utf8")),
+      this.definition.scenario
     );
+    const checkpoint = AnyRunCheckpointSchema.parse(normalized.checkpoint);
     this.#assertCheckpointRuntime(checkpoint);
+    if (normalized.migrated) {
+      await atomicJson(resolve(this.runDir, "checkpoint.json"), checkpoint);
+    }
     return checkpoint;
+  }
+
+  async #normalizeCheckpointIfPresent(): Promise<void> {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(
+        await readFile(resolve(this.runDir, "checkpoint.json"), "utf8")
+      );
+    } catch (error) {
+      if (isMissing(error)) return;
+      throw error;
+    }
+    if (!humanoidRunCheckpointNeedsPhysicalMigration(raw)) return;
+    await this.#runMutation(async () => {
+      await this.#readCheckpoint();
+    });
+  }
+
+  async #readScenarioChunkDeltaState(): Promise<ScenarioChunkDeltaState> {
+    try {
+      return restoreScenarioChunkDeltaState(
+        this.definition.scenario,
+        JSON.parse(await readFile(resolve(this.runDir, "chunk-deltas.json"), "utf8"))
+      );
+    } catch (error) {
+      if (isMissing(error)) return createScenarioChunkDeltaState(this.definition.scenario);
+      throw error;
+    }
   }
 
   #assertCheckpointRuntime(checkpoint: AnyRunCheckpoint): void {

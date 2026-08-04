@@ -6,7 +6,9 @@ import {
 } from "../../domain/humanoid-run.js";
 import type { RunStore } from "../../persistence/run-store.js";
 import type { HumanoidWorld } from "../../world/humanoid/world.js";
-import { createHumanoidGoalProgress } from "../../runtime/humanoid-checker.js";
+import { createGoalDAG } from "../../domain/goal-epoch.js";
+import { EmptyActionCommitOutbox } from "../../domain/action-commit-outbox.js";
+import { EmptyActionExecutionLedger } from "../../domain/action-execution-ledger.js";
 import {
   HUMANOID_AGENT_IDS,
   HUMANOID_CAPABILITIES
@@ -21,11 +23,11 @@ export function createHumanoidRunCheckpoint(input: {
   const rootId = HUMANOID_AGENT_IDS.coordinator;
   const world = input.world.snapshot();
   return {
-    version: 5,
+    version: 6,
     runtime: "humanoid_g1",
     run_id: input.store.definition.run_id,
     scenario_id: input.store.definition.scenario_id,
-    goal: structuredClone(input.goal),
+    mission_goal: structuredClone(input.goal),
     capability_catalog: [...HUMANOID_CAPABILITIES],
     status: "starting",
     root_id: rootId,
@@ -34,7 +36,11 @@ export function createHumanoidRunCheckpoint(input: {
     nodes: hierarchyNodes(input.store.definition.mission, input.goal, at),
     world,
     world_checkpoint: input.world.checkpoint(),
-    goal_progress: createHumanoidGoalProgress(input.goal, world),
+    goal_dag: createGoalDAG(),
+    goal_progress: null,
+    active_cycle: null,
+    action_commit_outbox: structuredClone(EmptyActionCommitOutbox),
+    action_execution_ledger: structuredClone(EmptyActionExecutionLedger),
     committed_actions: {},
     context_memory: structuredClone(EmptyContextMemoryState),
     embodied_memory: structuredClone(EmptyHumanoidEmbodiedMemoryState),
@@ -57,6 +63,29 @@ export function reconcileHumanoidHierarchyCapabilities(
   checkpoint.capability_catalog = [...HUMANOID_CAPABILITIES];
   const coordinator = checkpoint.nodes[HUMANOID_AGENT_IDS.coordinator];
   if (coordinator) coordinator.capabilities = [...HUMANOID_CAPABILITIES];
+  const goalManager = checkpoint.nodes[HUMANOID_AGENT_IDS.goalManager]
+    ?? node({
+      id: HUMANOID_AGENT_IDS.goalManager,
+      name: "自主目标管理智能体",
+      parentId: HUMANOID_AGENT_IDS.coordinator,
+      childIds: [],
+      objective: "根据长期任务、Goal DAG 和当前物理证据提出并显式选择下一阶段目标。",
+      criteria: ["候选和选择均绑定真实模型调用、物理证据与恢复身份。"],
+      capabilities: [],
+      mayDelegate: false,
+      status: "ready",
+      predicateIndexes: [],
+      at: checkpoint.updated_at
+    });
+  goalManager.capabilities = [
+    "submit_goal_candidates",
+    "select_goal_candidate",
+    "retire_goal_epoch"
+  ];
+  checkpoint.nodes[goalManager.id] = goalManager;
+  if (coordinator && !coordinator.child_ids.includes(goalManager.id)) {
+    coordinator.child_ids = [goalManager.id, ...coordinator.child_ids];
+  }
   const sentry = checkpoint.nodes[HUMANOID_AGENT_IDS.sentry];
   if (sentry) sentry.capabilities = ["observe_humanoid"];
   const motion = checkpoint.nodes[HUMANOID_AGENT_IDS.motion];
@@ -69,7 +98,8 @@ export function reconcileHumanoidHierarchyCapabilities(
   const executor = checkpoint.nodes[HUMANOID_AGENT_IDS.executor];
   if (executor) executor.capabilities = [
     "execute_whole_body_motion",
-    "execute_humanoid_navigation"
+    "execute_humanoid_navigation",
+    "remove_world_block"
   ];
   return checkpoint;
 }
@@ -80,6 +110,7 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     name: "人形自主协调智能体",
     parentId: null,
     childIds: [
+      HUMANOID_AGENT_IDS.goalManager,
       HUMANOID_AGENT_IDS.sentry,
       HUMANOID_AGENT_IDS.motion,
       HUMANOID_AGENT_IDS.executor
@@ -90,6 +121,23 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     mayDelegate: true,
     status: "active",
     predicateIndexes: goal.predicates.map((_, index) => index),
+    at
+  });
+  const goalManager = node({
+    id: HUMANOID_AGENT_IDS.goalManager,
+    name: "自主目标管理智能体",
+    parentId: coordinator.id,
+    childIds: [],
+    objective: "根据长期任务、Goal DAG 和当前物理证据提出并显式选择下一阶段目标。",
+    criteria: ["候选和选择均绑定真实模型调用、物理证据与恢复身份。"],
+    capabilities: [
+      "submit_goal_candidates",
+      "select_goal_candidate",
+      "retire_goal_epoch"
+    ],
+    mayDelegate: false,
+    status: "ready",
+    predicateIndexes: [],
     at
   });
   const sentry = node({
@@ -132,14 +180,18 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     criteria: ["返回包含世界版本增长与物理终态的执行回执。"],
     capabilities: [
       "execute_whole_body_motion",
-      "execute_humanoid_navigation"
+      "execute_humanoid_navigation",
+      "remove_world_block"
     ],
     mayDelegate: false,
     status: "ready",
     predicateIndexes: [],
     at
   });
-  return Object.fromEntries([coordinator, sentry, motion, executor].map((entry) => [entry.id, entry]));
+  return Object.fromEntries(
+    [coordinator, goalManager, sentry, motion, executor]
+      .map((entry) => [entry.id, entry])
+  );
 }
 
 function node(input: {

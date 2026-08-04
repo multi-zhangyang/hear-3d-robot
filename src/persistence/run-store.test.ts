@@ -17,6 +17,7 @@ describe("RunStore journal windows", () => {
       scenario,
       goal: scenario.default_goal
     });
+    expect(store.definition.run_mode).toBe("mission");
 
     await store.writeAgentState("serialized-state");
     expect(await store.readAgentState()).toBe("serialized-state");

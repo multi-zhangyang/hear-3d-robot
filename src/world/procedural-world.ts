@@ -1,4 +1,8 @@
-import type { Scenario, ScenarioTemplate } from "../domain/schema.js";
+import {
+  ScenarioSchema,
+  type Scenario,
+  type ScenarioTemplate
+} from "../domain/schema.js";
 import { createRandom, deriveSeed, randomBetween, shuffle } from "./random.js";
 
 type ProceduralTemplate = Extract<ScenarioTemplate, { kind: "procedural" }>;
@@ -90,7 +94,7 @@ export function materializeProceduralWorld(
   });
   const robot = cellCentre(robotCell, shape.cell);
 
-  return {
+  return ScenarioSchema.parse({
     title: template.title,
     seed,
     bounds: structuredClone(shape.bounds),
@@ -104,7 +108,7 @@ export function materializeProceduralWorld(
     objects,
     zones,
     default_goal: structuredClone(shape.default_goal)
-  };
+  });
 }
 
 function interiorCells(columns: number, rows: number): GridCell[] {

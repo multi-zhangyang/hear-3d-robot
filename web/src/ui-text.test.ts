@@ -57,6 +57,33 @@ describe("中文界面文案", () => {
       tolerance: 0.05,
       stable_frames: 5
     })).toBe("右手腕到达骨盆相对 [-0.25, 0.30, 0.15]");
+    expect(predicateLabel({
+      type: "end_effector_at",
+      end_effector: "left_wrist",
+      frame: "world",
+      target: { x: 2, y: 1.1, z: 3 },
+      tolerance: 0.05,
+      stable_frames: 5,
+      orientation: { x: 0, y: 0, z: 0, w: 1 },
+      orientation_tolerance_rad: 0.15
+    })).toBe("左手腕到达世界 [2.00, 1.10, 3.00] · 姿态");
+  });
+
+  it("用中文显示抓取手和目标物体", () => {
+    expect(predicateLabel({
+      type: "object_grasped",
+      object_id: "courtyard_crate",
+      hand: "either"
+    })).toBe("任意手抓住庭院木箱");
+  });
+
+  it("用中文显示真实稳放目标", () => {
+    expect(predicateLabel({
+      type: "object_placed",
+      object_id: "courtyard_crate",
+      zone_id: "courtyard_beacon",
+      tolerance: 0.05
+    })).toBe("将庭院木箱稳放在区域 庭院信标区");
   });
 
   it("从结构化模型结果中只展示真实摘要", () => {

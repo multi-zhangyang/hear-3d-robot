@@ -98,9 +98,57 @@
 
 .mission-basics {
   display: grid;
-  grid-template-columns: minmax(210px, 0.8fr) minmax(280px, 1.35fr);
+  grid-template-columns: minmax(190px, 0.72fr) minmax(190px, 0.72fr) minmax(280px, 1.35fr);
   align-items: start;
   gap: 14px;
+}
+
+.mission-run-mode {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.mission-run-mode legend {
+  grid-column: 1 / -1;
+  margin-bottom: 1px;
+  color: #9fa9a5;
+  font-size: 11px;
+  font-weight: 560;
+  letter-spacing: 0.03em;
+}
+
+.mission-run-mode label {
+  display: grid;
+  height: 39px;
+  place-items: center;
+  border: 1px solid rgb(139 164 154 / 24%);
+  border-radius: 10px;
+  color: #9fa9a5;
+  background: rgb(7 11 10 / 52%);
+  cursor: pointer;
+  transition: border-color 140ms ease, color 140ms ease, background 140ms ease;
+}
+
+.mission-run-mode label.active {
+  border-color: rgb(91 222 170 / 58%);
+  color: #e8f8f1;
+  background: rgb(50 116 88 / 24%);
+}
+
+.mission-run-mode input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mission-run-mode span {
+  font-size: 12px;
+  font-weight: 620;
 }
 
 .mission-control {
@@ -357,6 +405,73 @@
   color: #cd8d8d;
   text-align: center;
   font-size: 11px;
+}
+
+.mission-contract-review {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid rgb(92 214 164 / 25%);
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 92% 0%, rgb(75 195 145 / 12%), transparent 42%),
+    rgb(27 37 33 / 76%);
+}
+
+.mission-contract-review > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mission-contract-review > header span {
+  color: #65cda3;
+  font: 8px/1.4 "JetBrains Mono Variable", monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.mission-contract-review h3 { margin: 2px 0 0; color: #eef7f2; font-size: 15px; }
+.mission-contract-review > header > b {
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #8ee3bd;
+  background: rgb(74 179 134 / 14%);
+  font-size: 9px;
+  font-weight: 560;
+}
+
+.mission-contract-review ol { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.mission-contract-review li {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 1px solid rgb(139 167 155 / 12%);
+  border-radius: 9px;
+  background: rgb(6 10 9 / 24%);
+}
+
+.mission-contract-review li > span {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 7px;
+  color: #72d6ad;
+  background: rgb(58 131 101 / 22%);
+  font: 9px/1 "JetBrains Mono Variable", monospace;
+}
+
+.mission-contract-review li > b {
+  color: #cbd7d1;
+  font-size: 11px;
+  font-weight: 520;
+  line-height: 1.35;
 }
 
 .mission-dialog-footer {

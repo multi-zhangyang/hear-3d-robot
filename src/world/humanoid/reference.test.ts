@@ -8,6 +8,7 @@ import {
   interpolateReference,
   neutralHumanoidReference,
   releaseReferenceTracking,
+  stationaryHumanoidReference,
   targetReference
 } from "./reference.js";
 
@@ -74,5 +75,24 @@ describe("humanoid joint tracking references", () => {
     );
     expect(released.jointPositions).not.toBe(tracked.jointPositions);
     expect(released.jointTrackingWeights).not.toBe(tracked.jointTrackingWeights);
+  });
+
+  it("stops commanded root motion while preserving autonomous balance authority", () => {
+    const moving = targetReference(neutralHumanoidReference(), {
+      joints: { left_elbow_joint: 0.2 },
+      rootVelocity: [0.32, -0.08],
+      rootYawVelocity: 0.45,
+      rootHeight: 0.81
+    });
+
+    const stationary = stationaryHumanoidReference(moving);
+
+    expect(stationary.rootVelocity).toEqual([0, 0]);
+    expect(stationary.rootYawVelocity).toBe(0);
+    expect(stationary.rootHeight).toBe(0.81);
+    expect([...stationary.jointPositions]).toEqual([...moving.jointPositions]);
+    expect([...stationary.jointTrackingWeights]).toEqual(
+      Array.from({ length: HUMANOID_JOINT_NAMES.length }, () => 0)
+    );
   });
 });

@@ -3,15 +3,17 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { Model } from "@openai/agents";
 import { aisdk } from "@openai/agents-extensions/ai-sdk";
-import type { ProviderConfig } from "../config/load.js";
+import type {
+  ModelProviderConfig,
+  ProviderConfig
+} from "../config/load.js";
 
 export interface ProviderIdentity {
-  protocol: ProviderConfig["protocol"];
+  protocol: ModelProviderConfig["protocol"];
   model: string;
-  endpoint: string;
 }
 
-export function createConfiguredModel(config: ProviderConfig): Model {
+export function createConfiguredModel(config: ModelProviderConfig): Model {
   const timedFetch = requestTimedFetch(config.requestTimeoutMs ?? 90_000);
   if (config.protocol === "openai_compatible") {
     const provider = createOpenAICompatible({
@@ -67,10 +69,9 @@ export function requestTimedFetch(
   };
 }
 
-export function providerIdentity(config: ProviderConfig): ProviderIdentity {
+export function providerIdentity(config: ProviderConfig | ModelProviderConfig): ProviderIdentity {
   return {
     protocol: config.protocol,
-    model: config.model,
-    endpoint: new URL(config.baseUrl).origin
+    model: config.model
   };
 }

@@ -60,6 +60,21 @@ describe("humanoid role object observation", () => {
           rotation: expect.any(Object)
         }
       });
+      expect(detail.grasp).toMatchObject({
+        contractSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        assessments: [
+          expect.objectContaining({
+            frame: detail.frame,
+            object_id: "crate",
+            hand: "left"
+          }),
+          expect.objectContaining({
+            frame: detail.frame,
+            object_id: "crate",
+            hand: "right"
+          })
+        ]
+      });
     } finally {
       await world.dispose();
     }

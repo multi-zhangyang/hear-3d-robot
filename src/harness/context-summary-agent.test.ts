@@ -1,6 +1,10 @@
 import type { Model } from "@openai/agents";
 import { describe, expect, it } from "vitest";
-import { CONTEXT_COMPACTOR_MAX_ATTEMPTS } from "../runtime/context-budget.js";
+import {
+  CONTEXT_COMPACTOR_MAX_ATTEMPTS,
+  compactorInputTokenLimit,
+  effectiveContextSummaryOutputTokens
+} from "../runtime/context-budget.js";
 import {
   AgentsSdkContextSummaryGenerator,
   ContextCompactionInterruption,
@@ -10,6 +14,16 @@ import {
 } from "./context-summary-agent.js";
 
 describe("context summary fidelity", () => {
+  it("uses the tightest source, compactor, and model output ceiling", () => {
+    expect(effectiveContextSummaryOutputTokens(90, 120, 150)).toBe(90);
+    expect(effectiveContextSummaryOutputTokens(150, 80, 120)).toBe(80);
+    expect(effectiveContextSummaryOutputTokens(150, 120, 70)).toBe(70);
+  });
+
+  it("budgets one fresh compactor attempt rather than accumulating independent retries", () => {
+    expect(compactorInputTokenLimit(65_536, 4_096)).toBe(57_344);
+  });
+
   it("rebases durable model semantics while removing stale evidence and action arguments", () => {
     const rebased = rebaseContextSummary({
       summary: {
@@ -65,9 +79,11 @@ describe("context summary fidelity", () => {
 
   it("interrupts after bounded real-model attempts instead of returning a synthetic summary", async () => {
     let calls = 0;
+    const outputLimits: Array<number | undefined> = [];
     const model = {
-      getResponse: async () => {
+      getResponse: async (request: Parameters<Model["getResponse"]>[0]) => {
         calls += 1;
+        outputLimits.push(request.modelSettings.maxTokens);
         throw new Error("checkpoint tool omitted");
       },
       getStreamedResponse: () => {
@@ -76,8 +92,7 @@ describe("context summary fidelity", () => {
     } as unknown as Model;
     const generator = new AgentsSdkContextSummaryGenerator({
       model,
-      temperature: 0,
-      maxOutputTokens: 256
+      temperature: 0
     });
 
     const failure = await generator.generate({
@@ -86,7 +101,8 @@ describe("context summary fidelity", () => {
       authority: { world_revision: 3 },
       acceptedTransactionIds: [],
       blockerTransactionIds: [],
-      maxInputTokens: 16_000
+      maxInputTokens: 16_000,
+      maxOutputTokens: 256
     }).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(ContextCompactionInterruption);
@@ -95,6 +111,9 @@ describe("context summary fidelity", () => {
       usage: { requests: CONTEXT_COMPACTOR_MAX_ATTEMPTS }
     });
     expect(calls).toBe(CONTEXT_COMPACTOR_MAX_ATTEMPTS);
+    expect(outputLimits).toEqual(
+      Array.from({ length: CONTEXT_COMPACTOR_MAX_ATTEMPTS }, () => undefined)
+    );
     expect(isContextCompactionInterruption(new Error("wrapper", { cause: failure }))).toBe(true);
   });
 
@@ -111,8 +130,7 @@ describe("context summary fidelity", () => {
     } as unknown as Model;
     const generator = new AgentsSdkContextSummaryGenerator({
       model,
-      temperature: 0,
-      maxOutputTokens: 256
+      temperature: 0
     });
     const request = {
       priorSummary: null,
@@ -120,7 +138,8 @@ describe("context summary fidelity", () => {
       authority: { world_revision: 9 },
       acceptedTransactionIds: [],
       blockerTransactionIds: [],
-      maxInputTokens: Number.MAX_SAFE_INTEGER
+      maxInputTokens: Number.MAX_SAFE_INTEGER,
+      maxOutputTokens: 256
     };
     const retrySafeEstimate = estimateContextSummaryRequestTokens(request);
 

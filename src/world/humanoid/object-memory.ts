@@ -7,7 +7,7 @@ import {
   subtract,
   vectorLength
 } from "../geometry.js";
-import { humanoidObjectContacts } from "./motion-plan.js";
+import { humanoidEnvironmentContacts } from "./motion-plan.js";
 import {
   historicalHumanoidObjectState,
   HumanoidAuthoritativeObjectFrame,
@@ -72,10 +72,18 @@ export interface HumanoidObjectToken {
     distanceToLeftWrist: number;
     distanceToRightWrist: number;
   };
-  currentContacts: Array<{
-    body: string;
-    normalForce: number;
-  }>;
+  currentContacts: Array<
+    | {
+        body: string;
+        handSurface?: never;
+        normalForce: number;
+      }
+    | {
+        body?: never;
+        handSurface: string;
+        normalForce: number;
+      }
+  >;
 }
 
 interface ObjectDescriptor extends HumanoidObjectStateDescriptor {
@@ -163,7 +171,7 @@ export class HumanoidObjectMemory {
     frame: number,
     worldRevision: number
   ): HumanoidObjectToken[] {
-    const contacts = humanoidObjectContacts(snapshot);
+    const contacts = humanoidEnvironmentContacts(snapshot);
     const observable = new Map(this.#authoritativeFrame
       .observableStates(frame, worldRevision)
       .map((state) => [state.id, state]));
@@ -216,10 +224,15 @@ export class HumanoidObjectMemory {
           },
           currentContacts: (active ? contacts : [])
             .filter((contact) => contact.objectId === record.id)
-            .map((contact) => ({
-              body: contact.body,
-              normalForce: contact.normalForce
-            }))
+            .map((contact) => "body" in contact
+              ? {
+                  body: contact.body,
+                  normalForce: contact.normalForce
+                }
+              : {
+                  handSurface: contact.handSurface,
+                  normalForce: contact.normalForce
+                })
         };
       });
   }

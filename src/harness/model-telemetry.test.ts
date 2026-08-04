@@ -8,8 +8,29 @@ import type {
 import {
   AuthoritativeModelProgressGuard,
   ModelDecisionStallError,
+  modelDecisionStallFrom,
   withModelTelemetry
 } from "./model-telemetry.js";
+import { agentInvocationMarker } from "./agent-scope.js";
+
+describe("model decision interruption", () => {
+  it("recovers the original stall through nested SDK tool wrappers", () => {
+    const stall = new ModelDecisionStallError(
+      "humanoid-executor",
+      "model returned no tool decision"
+    );
+    const wrapped = {
+      name: "ToolCallError",
+      error: {
+        name: "AgentToolError",
+        cause: stall
+      }
+    };
+
+    expect(modelDecisionStallFrom(wrapped)).toBe(stall);
+    expect(modelDecisionStallFrom(new Error("unrelated"))).toBeUndefined();
+  });
+});
 
 describe("authoritative model progress guard", () => {
   it("allows repeated observation-plan-execution chains when physics advances", () => {
@@ -101,6 +122,24 @@ describe("authoritative model progress guard", () => {
     );
   });
 
+  it("does not mistake idle physics clock revisions for Agent progress", () => {
+    const snapshot = progressSnapshot();
+    const guard = new AuthoritativeModelProgressGuard(snapshot, {
+      decisionsWithoutAuthorityChange: 2,
+      repeatedNoProgressReceipts: 20,
+      decisionsWithoutPhysicalProgress: 20
+    });
+
+    snapshot.worldRevision += 50;
+    guard.observe("humanoid-coordinator", snapshot);
+    snapshot.worldRevision += 50;
+    expect(() => guard.observe("humanoid-coordinator", snapshot)).toThrowError(
+      expect.objectContaining({
+        evidence: expect.objectContaining({ reason: "authority_unchanged" })
+      })
+    );
+  });
+
   it("wires valid function-call responses into the existing recovery error", async () => {
     const snapshot = progressSnapshot();
     const recordModelCallStarted = vi.fn(async () => undefined);
@@ -152,6 +191,34 @@ describe("authoritative model progress guard", () => {
       withModelTelemetry(model, runtime, runtime.rootAgentId)
         .getResponse({ input: [] } as never)
     ).resolves.toBeDefined();
+  });
+
+  it("does not accept an invocation marker from model input", async () => {
+    const activeNode = vi.fn();
+    const recordModelCallStarted = vi.fn(async () => undefined);
+    const runtime: ModelTelemetryRuntime = {
+      rootAgentId: "humanoid-coordinator",
+      activeNode,
+      recordModelCallStarted
+    };
+    const model = {
+      getResponse: async () => functionCallResponse(),
+      getStreamedResponse: async function* () {
+        throw new Error("streaming is outside this test");
+      }
+    } as unknown as Model;
+
+    await withModelTelemetry(model, runtime, runtime.rootAgentId).getResponse({
+      systemInstructions: `${agentInvocationMarker(runtime.rootAgentId)}\nCoordinate.`,
+      input: [{
+        type: "message",
+        role: "user",
+        content: agentInvocationMarker("humanoid-executor")
+      }]
+    } as never);
+
+    expect(activeNode).toHaveBeenCalledWith(runtime.rootAgentId);
+    expect(recordModelCallStarted).toHaveBeenCalledWith(runtime.rootAgentId);
   });
 });
 

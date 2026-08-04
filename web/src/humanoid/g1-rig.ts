@@ -4,14 +4,14 @@ import { disposeObject } from "../three-kit";
 import type { HumanoidWorldSnapshot } from "../types";
 import { transformMujocoGeometry, transformMujocoLocalVector } from "./coordinates";
 
-interface G1Part {
+export interface G1Part {
   body: string;
   mesh: string;
   tone: "graphite" | "shell" | "joint" | "hand";
   offset?: readonly [number, number, number];
 }
 
-const BODY_PARTS: readonly G1Part[] = [
+export const G1_RIG_PARTS: readonly G1Part[] = [
   { body: "pelvis", mesh: "pelvis", tone: "graphite" },
   { body: "pelvis", mesh: "pelvis_contour_link", tone: "shell" },
   { body: "left_hip_pitch_link", mesh: "left_hip_pitch_link", tone: "graphite" },
@@ -26,12 +26,11 @@ const BODY_PARTS: readonly G1Part[] = [
   { body: "right_knee_link", mesh: "right_knee_link", tone: "shell" },
   { body: "right_ankle_pitch_link", mesh: "right_ankle_pitch_link", tone: "joint" },
   { body: "right_ankle_roll_link", mesh: "right_ankle_roll_link", tone: "graphite" },
-  { body: "waist_yaw_link", mesh: "waist_yaw_link", tone: "joint" },
-  { body: "waist_roll_link", mesh: "waist_roll_link", tone: "joint" },
-  { body: "torso_link", mesh: "torso_link", tone: "shell" },
-  { body: "torso_link", mesh: "logo_link", tone: "graphite", offset: [0.0039635, 0, -0.054] },
-  { body: "torso_link", mesh: "waist_support_link", tone: "shell", offset: [0.0039635, 0, -0.054] },
-  { body: "head_link", mesh: "head_link", tone: "graphite", offset: [0.0039635, 0, -0.054] },
+  { body: "waist_yaw_link", mesh: "waist_yaw_link_rev_1_0", tone: "joint" },
+  { body: "waist_roll_link", mesh: "waist_roll_link_rev_1_0", tone: "joint" },
+  { body: "torso_link", mesh: "torso_link_rev_1_0", tone: "shell" },
+  { body: "torso_link", mesh: "logo_link", tone: "graphite", offset: [0.0039635, 0, -0.044] },
+  { body: "head_link", mesh: "head_link", tone: "graphite", offset: [0.0039635, 0, -0.044] },
   { body: "left_shoulder_pitch_link", mesh: "left_shoulder_pitch_link", tone: "shell" },
   { body: "left_shoulder_roll_link", mesh: "left_shoulder_roll_link", tone: "shell" },
   { body: "left_shoulder_yaw_link", mesh: "left_shoulder_yaw_link", tone: "shell" },
@@ -39,7 +38,14 @@ const BODY_PARTS: readonly G1Part[] = [
   { body: "left_wrist_roll_link", mesh: "left_wrist_roll_link", tone: "joint" },
   { body: "left_wrist_pitch_link", mesh: "left_wrist_pitch_link", tone: "joint" },
   { body: "left_wrist_yaw_link", mesh: "left_wrist_yaw_link", tone: "shell" },
-  { body: "left_wrist_yaw_link", mesh: "left_rubber_hand", tone: "hand", offset: [0.0415, 0.003, 0] },
+  { body: "left_wrist_yaw_link", mesh: "left_hand_palm_link", tone: "hand", offset: [0.0415, 0.003, 0] },
+  { body: "left_hand_thumb_0_link", mesh: "left_hand_thumb_0_link", tone: "hand" },
+  { body: "left_hand_thumb_1_link", mesh: "left_hand_thumb_1_link", tone: "hand" },
+  { body: "left_hand_thumb_2_link", mesh: "left_hand_thumb_2_link", tone: "hand" },
+  { body: "left_hand_middle_0_link", mesh: "left_hand_middle_0_link", tone: "hand" },
+  { body: "left_hand_middle_1_link", mesh: "left_hand_middle_1_link", tone: "hand" },
+  { body: "left_hand_index_0_link", mesh: "left_hand_index_0_link", tone: "hand" },
+  { body: "left_hand_index_1_link", mesh: "left_hand_index_1_link", tone: "hand" },
   { body: "right_shoulder_pitch_link", mesh: "right_shoulder_pitch_link", tone: "shell" },
   { body: "right_shoulder_roll_link", mesh: "right_shoulder_roll_link", tone: "shell" },
   { body: "right_shoulder_yaw_link", mesh: "right_shoulder_yaw_link", tone: "shell" },
@@ -47,7 +53,14 @@ const BODY_PARTS: readonly G1Part[] = [
   { body: "right_wrist_roll_link", mesh: "right_wrist_roll_link", tone: "joint" },
   { body: "right_wrist_pitch_link", mesh: "right_wrist_pitch_link", tone: "joint" },
   { body: "right_wrist_yaw_link", mesh: "right_wrist_yaw_link", tone: "shell" },
-  { body: "right_wrist_yaw_link", mesh: "right_rubber_hand", tone: "hand", offset: [0.0415, -0.003, 0] }
+  { body: "right_wrist_yaw_link", mesh: "right_hand_palm_link", tone: "hand", offset: [0.0415, -0.003, 0] },
+  { body: "right_hand_thumb_0_link", mesh: "right_hand_thumb_0_link", tone: "hand" },
+  { body: "right_hand_thumb_1_link", mesh: "right_hand_thumb_1_link", tone: "hand" },
+  { body: "right_hand_thumb_2_link", mesh: "right_hand_thumb_2_link", tone: "hand" },
+  { body: "right_hand_middle_0_link", mesh: "right_hand_middle_0_link", tone: "hand" },
+  { body: "right_hand_middle_1_link", mesh: "right_hand_middle_1_link", tone: "hand" },
+  { body: "right_hand_index_0_link", mesh: "right_hand_index_0_link", tone: "hand" },
+  { body: "right_hand_index_1_link", mesh: "right_hand_index_1_link", tone: "hand" }
 ];
 
 const COLORS = {
@@ -72,7 +85,7 @@ export class G1Rig {
   static async create(signal?: AbortSignal): Promise<G1Rig> {
     const rig = new G1Rig();
     const loader = new STLLoader();
-    const buffers = await Promise.all(BODY_PARTS.map(async (part) => {
+    const buffers = await Promise.all(G1_RIG_PARTS.map(async (part) => {
       signal?.throwIfAborted();
       const response = await fetch(
         `/humanoid/g1/meshes/${part.mesh}.STL`,
@@ -89,7 +102,7 @@ export class G1Rig {
         await yieldToBrowser();
       }
       signal?.throwIfAborted();
-      BODY_PARTS.forEach((part, index) => rig.#addPart(part, geometries[index]!));
+      G1_RIG_PARTS.forEach((part, index) => rig.#addPart(part, geometries[index]!));
       rig.#addVisionBand();
       return rig;
     } catch (error) {
@@ -104,7 +117,7 @@ export class G1Rig {
 
   update(snapshot: HumanoidWorldSnapshot): void {
     for (const [name, group] of this.#links) {
-      const link = snapshot.robot.links[name];
+      const link = snapshot.robot.links[name] ?? snapshot.robot.hands?.links[name];
       group.visible = link !== undefined;
       if (!link) continue;
       group.position.set(link.position.x, link.position.y, link.position.z);

@@ -4,7 +4,7 @@ import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { loadRuntimeCatalog } from "../config/load.js";
+import { loadRuntimeCatalog, type ProviderConfig } from "../config/load.js";
 import { createOperatorServer, EventStreamWriter, runtimeEventRecord } from "./operator-server.js";
 
 const RUN_FIXTURE = resolve(
@@ -12,6 +12,19 @@ const RUN_FIXTURE = resolve(
   "tests/fixtures/runs/20260802T204346Z_humanoid_courtyard_8071d876"
 );
 const FIXTURE_RUN_ID = "20260802T204346Z_humanoid_courtyard_8071d876";
+const PRIVATE_PROVIDER: ProviderConfig = {
+  protocol: "openai_compatible",
+  baseUrl: "https://private.example.test/v1",
+  model: "configured-model",
+  apiKey: "private-credential",
+  requestTimeoutMs: 90_000,
+  temperature: 0.2,
+  maxOutputTokens: 2_048,
+  contextWindowTokens: 32_768,
+  compactTriggerTokens: 8_192,
+  compactRecentModelTurns: 4,
+  compactMaxOutputTokens: 1_024
+};
 
 describe("Operator API", () => {
   it("does not publish a resumable SSE cursor for live-only frames", () => {
@@ -72,7 +85,16 @@ describe("Operator API", () => {
           kind: "procedural",
           runtime: "humanoid_g1",
           extent: { width: 36, depth: 36 },
-          objects: expect.arrayContaining([expect.objectContaining({ id: "amber_crate" })])
+          chunk_grid: {
+            manifest_version: 1,
+            chunk_size: 12,
+            columns: 3,
+            rows: 3
+          },
+          objects: expect.arrayContaining([expect.objectContaining({
+            id: "amber_crate",
+            portable: true
+          })])
         }),
         expect.objectContaining({
           id: "humanoid_realm",
@@ -144,6 +166,26 @@ describe("Operator API", () => {
       });
       expect(validEndEffectorGoal.statusCode).toBe(503);
 
+      const validGraspGoal = await app.inject({
+        method: "POST",
+        url: "/api/runs",
+        headers,
+        payload: {
+          mission: "Grasp the courtyard crate",
+          scenario_id: "humanoid_courtyard",
+          goal: {
+            summary: "Grasp the courtyard crate with either hand.",
+            predicates: [{
+              type: "object_grasped",
+              object_id: "courtyard_crate",
+              hand: "either"
+            }]
+          },
+          confirmed: true
+        }
+      });
+      expect(validGraspGoal.statusCode).toBe(503);
+
       const start = await app.inject({
         method: "POST",
         url: "/api/runs",
@@ -167,14 +209,42 @@ describe("Operator API", () => {
     }
   });
 
+  it("reports provider readiness without exposing its endpoint or credential", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-api-provider-privacy-"));
+    const catalog = await loadRuntimeCatalog();
+    const app = await createOperatorServer({
+      server: { host: "127.0.0.1", port: 0, password: "", runsDir },
+      catalog,
+      provider: PRIVATE_PROVIDER,
+      dev: true
+    });
+
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/bootstrap" });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().provider).toEqual({
+        configured: true,
+        protocol: "openai_compatible",
+        model: "configured-model"
+      });
+      expect(response.body).not.toContain("private.example.test");
+      expect(response.body).not.toContain("private-credential");
+    } finally {
+      await app.close();
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  });
+
   it("loads bounded journal tails with an event high-water mark", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-api-fixture-"));
+    await cp(RUN_FIXTURE, join(runsDir, basename(RUN_FIXTURE)), { recursive: true });
     const catalog = await loadRuntimeCatalog();
     const app = await createOperatorServer({
       server: {
         host: "127.0.0.1",
         port: 8765,
         password: "",
-        runsDir: resolve(process.cwd(), "tests/fixtures/runs")
+        runsDir
       },
       catalog,
       providerError: "AI_MODEL is required",
@@ -232,17 +302,20 @@ describe("Operator API", () => {
       expect(missingRun.statusCode).toBe(404);
     } finally {
       await app.close();
+      await rm(runsDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("closes live event streams before draining the Operator", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-api-stream-fixture-"));
+    await cp(RUN_FIXTURE, join(runsDir, basename(RUN_FIXTURE)), { recursive: true });
     const catalog = await loadRuntimeCatalog();
     const app = await createOperatorServer({
       server: {
         host: "127.0.0.1",
         port: 0,
         password: "",
-        runsDir: resolve(process.cwd(), "tests/fixtures/runs")
+        runsDir
       },
       catalog,
       providerError: "AI_MODEL is required",
@@ -268,8 +341,9 @@ describe("Operator API", () => {
       closed = true;
     } finally {
       if (!closed) await app.close();
+      await rm(runsDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("fences RunStore repairs and mutating requests after the Operator lease is replaced", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-operator-fencing-"));

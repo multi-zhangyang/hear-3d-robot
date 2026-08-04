@@ -9,14 +9,14 @@ const scenario = ScenarioSchema.parse({
   seed: 31,
   bounds: { width: 8, depth: 8 },
   visibility_radius: 5,
-  robot: { x: 0, z: 0, yaw: 0 },
+  robot: { x: 4, z: 4, yaw: 0 },
   obstacles: [],
   objects: [
     {
       id: "near",
       kind: "crate",
       color: "#8b6b45",
-      position: { x: 0, y: 1.05, z: 1.2 },
+      position: { x: 4, y: 1.05, z: 5.2 },
       size: { x: 0.3, y: 0.3, z: 0.3 },
       portable: true
     },
@@ -24,7 +24,7 @@ const scenario = ScenarioSchema.parse({
       id: "hidden",
       kind: "crate",
       color: "#426a88",
-      position: { x: 0, y: 1.05, z: -1.2 },
+      position: { x: 4, y: 1.05, z: 2.8 },
       size: { x: 0.3, y: 0.3, z: 0.3 },
       portable: true
     }
@@ -34,7 +34,7 @@ const scenario = ScenarioSchema.parse({
     summary: "观察物体",
     predicates: [{
       type: "robot_at",
-      target: { x: 0, y: 0, z: 0 },
+      target: { x: 4, y: 0, z: 4 },
       tolerance: 0.2
     }]
   }
@@ -43,6 +43,7 @@ const scenario = ScenarioSchema.parse({
 describe("HumanoidObjectMemory", () => {
   it("keeps source revisions for seen objects without revealing unseen world state", async () => {
     const simulation = await HumanoidSimulation.create({
+      spawn: { position: { x: 4, y: 0, z: 4 }, yaw: 0 },
       objects: scenario.objects.map((object) => ({
         id: object.id,
         center: object.position,
@@ -97,6 +98,7 @@ describe("HumanoidObjectMemory", () => {
         observableObjects: memory.observableObjectStates(10, 5).map((state) => ({
           id: state.id,
           position: state.pose.position,
+          rotation: state.pose.rotation,
           size: state.size
         })),
         zones: []
@@ -121,6 +123,7 @@ describe("HumanoidObjectMemory", () => {
         observableObjects: memory.observableObjectStates(10, 5).map((state) => ({
           id: state.id,
           position: state.pose.position,
+          rotation: state.pose.rotation,
           size: state.size
         })),
         zones: []

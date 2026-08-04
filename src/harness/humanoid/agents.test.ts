@@ -6,7 +6,10 @@ import {
 import { describe, expect, it } from "vitest";
 import type { ProviderConfig } from "../../config/load.js";
 import type { HumanoidActionReceipt } from "./runtime.js";
-import { createHumanoidAgentHierarchy } from "./agents.js";
+import {
+  createHumanoidAgentHierarchy,
+  goalManagerInvocationInput
+} from "./agents.js";
 
 const provider: ProviderConfig = {
   protocol: "openai_compatible",
@@ -22,11 +25,57 @@ const provider: ProviderConfig = {
 };
 
 describe("humanoid agent hierarchy", () => {
+  it("places exact live Goal identifiers in every Goal Manager invocation", () => {
+    const evidenceRef = `goal-world:19:19:${"a".repeat(64)}`;
+    const candidateId = `goal-candidate:${"b".repeat(64)}`;
+
+    const rendered = goalManagerInvocationInput("推进长期任务。", {
+      goal_dag: {
+        status: "awaiting_model_selection",
+        candidates: { [candidateId]: { status: "proposed" } },
+        current_epoch_id: null
+      },
+      goal_context: {
+        evidence_ref: evidenceRef,
+        observation: {
+          zone_ids: ["courtyard_beacon"],
+          visible_object_ids: ["courtyard_crate"],
+          solids: [
+            { id: "stone_column", kind: "block" },
+            { id: "wall", kind: "wall" }
+          ]
+        }
+      }
+    });
+
+    expect(rendered).toContain(`"current_goal_evidence_ref":"${evidenceRef}"`);
+    expect(rendered).toContain(`"existing_goal_candidate_ids":["${candidateId}"]`);
+    expect(rendered).toContain(
+      '"visible_object_ids":["courtyard_crate"],"removable_block_ids":["stone_column"]'
+    );
+    expect(rendered).toContain("候选提交和选择会由 Harness 绑定本次证据");
+  });
+
   it("owns one Model facade and one Session per concrete hierarchy node", async () => {
     const modelOwners: string[] = [];
     const sessionOwners: string[] = [];
     const models: Model[] = [];
     const recallRequests: unknown[] = [];
+    let cycleCompletion = {
+      status: "not_ready" as "ready" | "not_ready",
+      evidence_transaction_ids: [] as string[],
+      execution_transaction_id: null as string | null,
+      observed_after_execution: false,
+      reason: "no execution" as string | null
+    };
+    let coordinatorPhase = "observe_or_plan" as
+      | "goal_selection"
+      | "observe_or_plan"
+      | "plan"
+      | "replan_or_retire"
+      | "execute_plan"
+      | "post_execution"
+      | "complete_cycle";
     const execution = receipt({
       transactionId: "execute-accepted",
       action: "execute_whole_body_motion",
@@ -49,7 +98,9 @@ describe("humanoid agent hierarchy", () => {
       validateCycleEvidence: (transactionIds: readonly string[]) => {
         expect(transactionIds).toEqual([execution.transactionId]);
         return structuredClone(execution);
-      }
+      },
+      cycleCompletionReadiness: () => structuredClone(cycleCompletion),
+      coordinatorPhase: () => coordinatorPhase
     } as never;
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
@@ -67,18 +118,21 @@ describe("humanoid agent hierarchy", () => {
     });
 
     expect(modelOwners).toEqual([
+      "humanoid-goal-manager",
       "humanoid-sentry",
       "humanoid-motion-reference",
       "humanoid-executor",
       "humanoid-coordinator"
     ]);
     expect(sessionOwners).toEqual([
+      "humanoid-goal-manager",
       "humanoid-sentry",
       "humanoid-motion-reference",
       "humanoid-executor",
       "humanoid-coordinator"
     ]);
-    expect(new Set(models).size).toBe(4);
+    expect(new Set(models).size).toBe(5);
+    expect(hierarchy.goalManager.model).not.toBe(hierarchy.coordinator.model);
     expect(hierarchy.coordinator.model).not.toBe(hierarchy.sentry.model);
     expect(hierarchy.sentry.model).not.toBe(hierarchy.motion.model);
     expect(hierarchy.motion.model).not.toBe(hierarchy.executor.model);
@@ -92,10 +146,12 @@ describe("humanoid agent hierarchy", () => {
 
     expect(hierarchy.coordinator.tools.map((entry) => entry.name)).toEqual([
       "recall_embodied_history",
+      "delegate_goal_manager",
       "delegate_humanoid_sentry",
       "delegate_motion_reference",
       "delegate_physics_executor",
-      "complete_autonomous_cycle"
+      "complete_autonomous_cycle",
+      "complete_goal_transition"
     ]);
     expect(hierarchy.coordinator.tools.map((entry) => entry.name)).not.toContain(
       "execute_whole_body_motion"
@@ -111,7 +167,8 @@ describe("humanoid agent hierarchy", () => {
     ]);
     expect(hierarchy.executor.tools.map((entry) => entry.name)).toEqual([
       "execute_whole_body_motion",
-      "execute_humanoid_navigation"
+      "execute_humanoid_navigation",
+      "remove_world_block"
     ]);
     expect(hierarchy.sentry.tools.map((entry) => entry.name)).not.toContain(
       "recall_embodied_history"
@@ -119,6 +176,67 @@ describe("humanoid agent hierarchy", () => {
     expect(hierarchy.executor.tools.map((entry) => entry.name)).not.toContain(
       "recall_embodied_history"
     );
+
+    const coordinatorTool = (name: string) => {
+      const selected = hierarchy.coordinator.tools.find((entry) => entry.name === name);
+      if (!selected || selected.type !== "function") {
+        throw new Error(`Coordinator tool is missing: ${name}`);
+      }
+      return selected;
+    };
+    const enabled = (name: string) => coordinatorTool(name).isEnabled(
+      new RunContext({ runId: `enabled-${name}` }),
+      hierarchy.coordinator
+    );
+    expect(await enabled("delegate_motion_reference")).toBe(true);
+    expect(await enabled("complete_autonomous_cycle")).toBe(false);
+    cycleCompletion = {
+      status: "ready",
+      evidence_transaction_ids: [execution.transactionId],
+      execution_transaction_id: execution.transactionId,
+      observed_after_execution: false,
+      reason: null
+    };
+    coordinatorPhase = "post_execution";
+    expect(await enabled("delegate_motion_reference")).toBe(false);
+    expect(await enabled("delegate_humanoid_sentry")).toBe(true);
+    expect(await enabled("complete_autonomous_cycle")).toBe(true);
+    cycleCompletion.observed_after_execution = true;
+    coordinatorPhase = "complete_cycle";
+    expect(await enabled("delegate_humanoid_sentry")).toBe(false);
+    expect(await enabled("delegate_physics_executor")).toBe(true);
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "object_in_zone、not grasp_verified 与 object_settled_on_support"
+    ));
+
+    const coordinatorBehavior = hierarchy.coordinator.toolUseBehavior;
+    if (typeof coordinatorBehavior !== "function") {
+      throw new Error("Coordinator must validate terminal tool output");
+    }
+    const rejectedTerminal = await coordinatorBehavior(
+      new RunContext({ runId: "rejected-terminal" }),
+      [{
+        type: "function_output",
+        tool: { name: "complete_goal_transition" },
+        output: "An error occurred while running the tool"
+      }] as never
+    );
+    expect(rejectedTerminal).toEqual({
+      isFinalOutput: false,
+      isInterrupted: undefined
+    });
+    const acceptedTerminal = await coordinatorBehavior(
+      new RunContext({ runId: "accepted-terminal" }),
+      [{
+        type: "function_output",
+        tool: { name: "complete_goal_transition" },
+        output: JSON.stringify({ status: "goal_transition_completed" })
+      }] as never
+    );
+    expect(acceptedTerminal).toMatchObject({
+      isFinalOutput: true,
+      finalOutput: JSON.stringify({ status: "goal_transition_completed" })
+    });
 
     const recall = hierarchy.coordinator.tools.find(
       (entry) => entry.name === "recall_embodied_history"
@@ -169,6 +287,49 @@ describe("humanoid agent hierarchy", () => {
       createModel: () => shared,
       createSession: (agentId) => new MemorySession({ sessionId: agentId })
     })).toThrow("cannot share one Model facade");
+  });
+
+  it("applies each resolved profile to only its owning Agent", () => {
+    const { maxOutputTokens: _maxOutputTokens, ...unboundedProvider } = provider;
+    const configured: ProviderConfig = {
+      ...provider,
+      agentModels: {
+        goal_manager: { ...unboundedProvider, model: "goal-manager", temperature: 0.15 },
+        coordinator: { ...provider, model: "coordinator", temperature: 0.1 },
+        sentry: { ...provider, model: "sentry", temperature: 0.2 },
+        motion: { ...provider, model: "motion", temperature: 0.3 },
+        executor: { ...provider, model: "executor", temperature: 0.4 },
+        compactor: { ...provider, model: "compactor", temperature: 0.5 }
+      }
+    };
+    const owners = new Map<string, string>();
+    const hierarchy = createHumanoidAgentHierarchy({
+      provider: configured,
+      runtime: {
+        invoke: async () => { throw new Error("outside test"); },
+        recallEmbodiedHistory: async () => { throw new Error("outside test"); },
+        validateCycleEvidence: () => { throw new Error("outside test"); }
+      } as never,
+      createModel: (agentId, selected) => {
+        owners.set(agentId, selected.model);
+        return modelStub();
+      },
+      createSession: (agentId) => new MemorySession({ sessionId: agentId })
+    });
+
+    expect(Object.fromEntries(owners)).toEqual({
+      "humanoid-goal-manager": "goal-manager",
+      "humanoid-sentry": "sentry",
+      "humanoid-motion-reference": "motion",
+      "humanoid-executor": "executor",
+      "humanoid-coordinator": "coordinator"
+    });
+    expect(hierarchy.coordinator.modelSettings.temperature).toBe(0.1);
+    expect(hierarchy.goalManager.modelSettings.temperature).toBe(0.15);
+    expect(hierarchy.goalManager.modelSettings).not.toHaveProperty("maxTokens");
+    expect(hierarchy.sentry.modelSettings.temperature).toBe(0.2);
+    expect(hierarchy.motion.modelSettings.temperature).toBe(0.3);
+    expect(hierarchy.executor.modelSettings.temperature).toBe(0.4);
   });
 });
 

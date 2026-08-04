@@ -1,5 +1,7 @@
 import type {
+  ActiveAutonomousCycle,
   ContextMemoryState,
+  GoalDAG,
   HumanoidActionReceipt,
   HumanoidCheckerResult,
   HumanoidEmbodiedMemoryState,
@@ -10,6 +12,18 @@ import type {
   RuntimeEvent,
   TaskNode
 } from "./types";
+
+export function activeAutonomousCycleFrom(value: unknown): ActiveAutonomousCycle | null {
+  const record = asRecord(value);
+  if (!record
+    || typeof record.cycle_id !== "string"
+    || !positiveInteger(record.cycle_index)
+    || typeof record.goal_epoch_id !== "string"
+    || !nonnegativeInteger(record.started_world_frame)
+    || !nonnegativeInteger(record.started_world_revision)
+    || typeof record.started_at !== "string") return null;
+  return record as unknown as ActiveAutonomousCycle;
+}
 
 export function nextRuntimeEventCursor(
   current: string | undefined,
@@ -105,7 +119,8 @@ export function providerActivityFrom(value: unknown): ProviderActivity | null {
   return {
     status: record.status,
     at: typeof record.at === "string" ? record.at : null,
-    source: typeof record.source === "string" ? record.source : null
+    source: typeof record.source === "string" ? record.source : null,
+    ...(typeof record.agent_id === "string" ? { agentId: record.agent_id } : {})
   };
 }
 
@@ -169,31 +184,140 @@ export function humanoidGoalProgressFrom(value: unknown): HumanoidGoalProgress |
   return record as unknown as HumanoidGoalProgress;
 }
 
+export function goalDAGFrom(value: unknown): GoalDAG | null {
+  const record = asRecord(value);
+  const candidates = asRecord(record?.candidates);
+  if (!record || record.version !== 1
+    || (record.status !== "awaiting_model_selection" && record.status !== "active")
+    || candidates === null
+    || !Array.isArray(record.epochs)
+    || (record.current_epoch_id !== null && typeof record.current_epoch_id !== "string")
+    || typeof record.next_epoch_index !== "number"
+    || typeof record.state_sha256 !== "string") return null;
+  return record as unknown as GoalDAG;
+}
+
 export function contextMemoryFrom(value: unknown): ContextMemoryState | null {
   const record = asRecord(value);
+  const scopes = asRecord(record?.scopes);
   if (!record || record.version !== 1
     || typeof record.context_window_tokens !== "number"
     || typeof record.compact_trigger_tokens !== "number"
     || typeof record.active_estimated_tokens !== "number"
     || typeof record.total_compactions !== "number"
-    || asRecord(record.scopes) === null) return null;
+    || scopes === null) return null;
+  for (const value of Object.values(scopes)) {
+    const scope = asRecord(value);
+    if (!scope || !validContextScopeBudget(scope)) return null;
+  }
   return record as unknown as ContextMemoryState;
+}
+
+function validContextScopeBudget(scope: Record<string, unknown>): boolean {
+  const values = [
+    scope.context_window_tokens,
+    scope.compact_trigger_tokens,
+    scope.compact_recent_model_turns,
+    scope.compact_max_output_tokens
+  ];
+  const present = values.filter((value) => value !== undefined);
+  if (present.length === 0) return true;
+  return present.length === values.length
+    && positiveInteger(scope.context_window_tokens)
+    && positiveInteger(scope.compact_trigger_tokens)
+    && nonnegativeInteger(scope.compact_recent_model_turns)
+    && positiveInteger(scope.compact_max_output_tokens);
+}
+
+function positiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function nonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 export function embodiedMemoryFrom(value: unknown): HumanoidEmbodiedMemoryState | null {
   const record = asRecord(value);
-  if (!record || record.version !== 1
-    || typeof record.total_episodes !== "number"
-    || typeof record.pruned_episodes !== "number"
+  if (!record || (record.version !== 1 && record.version !== 2)
+    || !nonnegativeInteger(record.total_episodes)
+    || !nonnegativeInteger(record.pruned_episodes)
     || !Array.isArray(record.recent_episodes)) return null;
   for (const episode of record.recent_episodes) {
     const candidate = asRecord(episode);
-    if (!candidate || typeof candidate.sequence !== "number"
+    if (!candidate || !positiveInteger(candidate.sequence)
       || typeof candidate.transaction_id !== "string"
       || typeof candidate.model_summary !== "string"
       || typeof candidate.recorded_at !== "string") return null;
   }
-  return record as unknown as HumanoidEmbodiedMemoryState;
+  if (record.version === 1) {
+    return {
+      version: 2,
+      total_episodes: record.total_episodes,
+      pruned_episodes: record.pruned_episodes,
+      recent_episodes: structuredClone(
+        record.recent_episodes
+      ) as HumanoidEmbodiedMemoryState["recent_episodes"],
+      total_experiences: 0,
+      pruned_experiences: 0,
+      recent_experiences: [],
+      outcome_counts: emptyExperienceOutcomeCounts(),
+      predicate_outcome_counts: {},
+      object_outcome_counts: {},
+      zone_outcome_counts: {}
+    };
+  }
+  if (!nonnegativeInteger(record.total_experiences)
+    || !nonnegativeInteger(record.pruned_experiences)
+    || !Array.isArray(record.recent_experiences)
+    || !experienceOutcomeCounts(record.outcome_counts)
+    || !experienceOutcomeIndex(record.predicate_outcome_counts)
+    || !experienceOutcomeIndex(record.object_outcome_counts)
+    || !experienceOutcomeIndex(record.zone_outcome_counts)) return null;
+  const outcomeCounts = record.outcome_counts;
+  if (outcomeCounts.succeeded + outcomeCounts.rejected
+    + outcomeCounts.physically_failed !== record.total_experiences) return null;
+  for (const experience of record.recent_experiences) {
+    const candidate = asRecord(experience);
+    if (!candidate
+      || !positiveInteger(candidate.sequence)
+      || typeof candidate.source_ref !== "string"
+      || typeof candidate.transaction_id !== "string"
+      || candidate.source_ref !== `action:${candidate.transaction_id}`
+      || typeof candidate.accepted !== "boolean"
+      || typeof candidate.code !== "string"
+      || !["succeeded", "rejected", "physically_failed"].includes(
+        String(candidate.outcome)
+      )
+      || !Array.isArray(candidate.predicate_types)
+      || !Array.isArray(candidate.object_ids)
+      || !Array.isArray(candidate.solid_ids)
+      || !Array.isArray(candidate.zone_ids)
+      || typeof candidate.recorded_at !== "string") return null;
+  }
+  return structuredClone(record) as unknown as HumanoidEmbodiedMemoryState;
+}
+
+function emptyExperienceOutcomeCounts() {
+  return { succeeded: 0, rejected: 0, physically_failed: 0 };
+}
+
+function experienceOutcomeCounts(value: unknown): value is {
+  succeeded: number;
+  rejected: number;
+  physically_failed: number;
+} {
+  const record = asRecord(value);
+  return record !== null
+    && nonnegativeInteger(record.succeeded)
+    && nonnegativeInteger(record.rejected)
+    && nonnegativeInteger(record.physically_failed);
+}
+
+function experienceOutcomeIndex(value: unknown): boolean {
+  const record = asRecord(value);
+  return record !== null
+    && Object.values(record).every(experienceOutcomeCounts);
 }
 
 function isHumanoidWorldSnapshot(value: unknown): value is HumanoidWorldSnapshot {

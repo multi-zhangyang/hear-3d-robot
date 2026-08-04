@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { JsonValue } from "../../domain/schema.js";
 import { HUMANOID_JOINT_INDEX, HUMANOID_JOINT_NAMES } from "./model.js";
-import { inverseQuaternion, rotateVector, subtract } from "../geometry.js";
+import {
+  inverseQuaternion,
+  multiplyQuaternion,
+  normalizeQuaternion,
+  rotateVector,
+  subtract
+} from "../geometry.js";
 import {
   interpolateReference,
   neutralHumanoidReference,
@@ -21,6 +27,24 @@ import type {
 } from "./whole-body-controller.js";
 
 describe("HumanoidSimulation", () => {
+  it("releases native contact handles across long-running snapshots", async () => {
+    const simulation = await HumanoidSimulation.create();
+    try {
+      const neutral = neutralHumanoidReference();
+      for (let index = 0; index < 100; index += 1) {
+        await simulation.step(neutral);
+      }
+      for (let index = 0; index < 100; index += 1) simulation.snapshot();
+      const baselineExternalBytes = process.memoryUsage().external;
+      for (let index = 0; index < 2_000; index += 1) simulation.snapshot();
+      const growthBytes = process.memoryUsage().external - baselineExternalBytes;
+
+      expect(growthBytes).toBeLessThan(8 * 1_024 * 1_024);
+    } finally {
+      await simulation.dispose();
+    }
+  }, 30_000);
+
   it("holds physical balance and tracks a generated whole-body arm reference", async () => {
     const simulation = await HumanoidSimulation.create();
     try {
@@ -140,9 +164,106 @@ describe("HumanoidSimulation", () => {
     }
   }, 30_000);
 
+  it("solves and tracks a complete end-effector pose with analytic Jacobians", async () => {
+    const simulation = await HumanoidSimulation.create();
+    try {
+      const neutral = neutralHumanoidReference();
+      const wrist = simulation.snapshot().links.left_wrist_yaw_link;
+      const localYaw = normalizeQuaternion({
+        x: 0,
+        y: 0,
+        z: Math.sin(0.18),
+        w: Math.cos(0.18)
+      });
+      const targetOrientation = normalizeQuaternion(multiplyQuaternion(
+        wrist.rotation,
+        localYaw
+      ));
+      const solution = simulation.solveEndEffectorTargets(neutral, [{
+        body: "left_wrist_yaw_link",
+        position: wrist.position,
+        frame: "world",
+        tolerance: 0.003,
+        orientation: targetOrientation,
+        orientationTolerance: 0.01
+      }]);
+
+      expect(solution.residuals[0]).toMatchObject({
+        body: "left_wrist_yaw_link",
+        orientationTarget: targetOrientation
+      });
+      expect(solution.residuals[0]!.error).toBeLessThanOrEqual(0.003);
+      expect(solution.residuals[0]!.orientationError).toBeLessThanOrEqual(0.01);
+      expect(solution.reference.jointPositions[
+        HUMANOID_JOINT_INDEX.get("left_wrist_yaw_joint")!
+      ]).toBeGreaterThan(0.05);
+      expect(solution.reference.jointTrackingWeights[
+        HUMANOID_JOINT_INDEX.get("left_wrist_yaw_joint")!
+      ]).toBe(1);
+
+      const initial = simulation.snapshot();
+      const anklePosition = rotateVector(
+        inverseQuaternion(initial.links.pelvis.rotation),
+        subtract(
+          initial.links.left_ankle_roll_link.position,
+          initial.links.pelvis.position
+        )
+      );
+      const ankleOrientation = normalizeQuaternion(multiplyQuaternion(
+        inverseQuaternion(initial.links.pelvis.rotation),
+        initial.links.left_ankle_roll_link.rotation
+      ));
+      const ankleTargetOrientation = normalizeQuaternion(multiplyQuaternion(
+        ankleOrientation,
+        { x: 0, y: 0, z: Math.sin(0.05), w: Math.cos(0.05) }
+      ));
+      const ankleSolution = simulation.solveEndEffectorTargets(neutral, [{
+        body: "left_ankle_roll_link",
+        position: anklePosition,
+        frame: "pelvis",
+        tolerance: 0.002,
+        orientation: ankleTargetOrientation,
+        orientationTolerance: 0.005
+      }]);
+      expect(ankleSolution.residuals[0]!.error).toBeLessThanOrEqual(0.002);
+      expect(ankleSolution.residuals[0]!.orientationError).toBeLessThanOrEqual(0.005);
+      expect(ankleSolution.reference.jointPositions[
+        HUMANOID_JOINT_INDEX.get("left_ankle_roll_joint")!
+      ]).toBeGreaterThan(0.05);
+      expect(ankleSolution.reference.jointTrackingWeights[
+        HUMANOID_JOINT_INDEX.get("left_ankle_roll_joint")!
+      ]).toBe(1);
+
+      expect(() => simulation.solveEndEffectorTargets(neutral, [{
+        body: "left_wrist_yaw_link",
+        position: wrist.position,
+        frame: "world",
+        tolerance: 0.01,
+        orientation: targetOrientation
+      }])).toThrow(/provided together/);
+    } finally {
+      await simulation.dispose();
+    }
+  }, 30_000);
+
   it("reports only dynamic objects inside the physical head sensor cone with clear sight", async () => {
     const simulation = await HumanoidSimulation.create({
+      solids: [{
+        id: "manipulation-support",
+        center: { x: 0.17, y: 0.3375, z: 0.28 },
+        size: { x: 0.057, y: 0.675, z: 0.057 }
+      }, {
+        id: "occlusion-wall",
+        center: { x: -0.6, y: 1.05, z: 1.2 },
+        size: { x: 0.5, y: 0.8, z: 0.1 }
+      }],
       objects: [
+        {
+          id: "manipulation-zone",
+          center: { x: 0.17, y: 0.7, z: 0.28 },
+          size: { x: 0.05, y: 0.05, z: 0.05 },
+          mass: 0.25
+        },
         {
           id: "near",
           center: { x: 0, y: 1.05, z: 1.2 },
@@ -151,7 +272,7 @@ describe("HumanoidSimulation", () => {
         },
         {
           id: "occluded",
-          center: { x: 0, y: 1.05, z: 2.2 },
+          center: { x: -1.2, y: 1.05, z: 2.4 },
           size: { x: 0.3, y: 0.3, z: 0.3 },
           mass: 0.2
         },
@@ -165,14 +286,60 @@ describe("HumanoidSimulation", () => {
     });
     try {
       const sensed = simulation.senseObjects(5);
-      expect(Object.keys(sensed.objects)).toEqual(["near"]);
+      expect(Object.keys(sensed.objects)).toEqual(["manipulation-zone", "near"]);
       expect(sensed.sensor.position.z).toBeGreaterThan(
         simulation.snapshot().links.head_link.position.z
       );
       expect(sensed.sensor.position.y).toBeGreaterThan(
         simulation.snapshot().links.head_link.position.y + 0.4
       );
+      expect(rotateVector(sensed.sensor.rotation, { x: 0, y: 0, z: 1 }).y)
+        .toBeLessThan(-0.35);
       expect(sensed.sensor.maximumRange).toBe(5);
+    } finally {
+      await simulation.dispose();
+    }
+  }, 30_000);
+
+  it("uses MuJoCo rays for solid occlusion and reports exact tactile solid identity", async () => {
+    const simulation = await HumanoidSimulation.create({
+      solids: [{
+        id: "near-solid",
+        center: { x: 0, y: 1.05, z: 1.2 },
+        size: { x: 0.4, y: 0.4, z: 0.2 }
+      }, {
+        id: "far-solid",
+        center: { x: 0, y: 0.85, z: 2.4 },
+        size: { x: 0.4, y: 0.4, z: 0.2 }
+      }, {
+        id: "hand-probe",
+        center: { x: 0.24, y: 0.68, z: 0.11 },
+        size: { x: 0.08, y: 0.08, z: 0.08 }
+      }]
+    });
+    try {
+      expect(simulation.solidIds()).toEqual([
+        "far-solid",
+        "hand-probe",
+        "near-solid"
+      ]);
+      expect(Object.keys(simulation.senseSolids(5).solids)).toEqual([
+        "near-solid"
+      ]);
+
+      for (let index = 0; index < 2; index += 1) {
+        await simulation.step(neutralHumanoidReference());
+      }
+      const contact = simulation.snapshot().contacts.find((candidate) => (
+        (candidate.firstSolid === "hand-probe"
+          && candidate.secondHandLink === "left_hand_palm_link")
+        || (candidate.secondSolid === "hand-probe"
+          && candidate.firstHandLink === "left_hand_palm_link")
+      ));
+      expect(contact).toMatchObject({
+        normalForce: expect.any(Number)
+      });
+      expect(contact!.normalForce).toBeGreaterThan(0);
     } finally {
       await simulation.dispose();
     }
@@ -185,6 +352,8 @@ describe("HumanoidSimulation", () => {
     });
     try {
       expect(simulation.snapshot().controller).toEqual(controller.descriptor);
+      expect(simulation.snapshot().joints.left_hip_pitch_joint.effort).toBeUndefined();
+      expect(simulation.captureState().requestedActuatorTorques).toBeUndefined();
       await simulation.step(neutralHumanoidReference());
       const captured = simulation.captureState();
       expect(captured.controller).toEqual({
@@ -195,6 +364,21 @@ describe("HumanoidSimulation", () => {
       });
       simulation.restoreState(captured);
       expect(controller.inferenceCount).toBe(1);
+
+      controller.commandMode = "saturated";
+      await simulation.step(neutralHumanoidReference());
+      const saturated = simulation.snapshot().joints.left_hip_pitch_joint.effort;
+      expect(saturated).toMatchObject({
+        saturated: true,
+        requestedUtilization: expect.any(Number),
+        appliedUtilization: 1
+      });
+      expect(saturated!.requestedUtilization).toBeGreaterThan(1);
+      const saturatedState = simulation.captureState();
+      controller.commandMode = "valid";
+      await simulation.step(neutralHumanoidReference());
+      simulation.restoreState(saturatedState);
+      expect(simulation.snapshot().joints.left_hip_pitch_joint.effort).toEqual(saturated);
     } finally {
       await simulation.dispose();
     }
@@ -273,7 +457,8 @@ class ContractController implements HumanoidWholeBodyController {
   readonly descriptor: HumanoidControllerDescriptor;
   inferenceCount = 0;
   disposed = false;
-  commandMode: "valid" | "wrong_dimension" | "non_finite" | "negative_gain" = "valid";
+  commandMode: "valid" | "wrong_dimension" | "non_finite" | "negative_gain"
+    | "saturated" = "valid";
 
   constructor(timing: Partial<Pick<
     HumanoidControllerDescriptor,
@@ -310,6 +495,10 @@ class ContractController implements HumanoidWholeBodyController {
     };
     if (this.commandMode === "non_finite") command.positions[0] = Number.NaN;
     if (this.commandMode === "negative_gain") command.stiffness[0] = -1;
+    if (this.commandMode === "saturated") {
+      command.positions[0] = command.positions[0]! + 1;
+      command.stiffness[0] = 1000;
+    }
     return command;
   }
 

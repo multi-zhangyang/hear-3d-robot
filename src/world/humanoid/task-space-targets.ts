@@ -3,11 +3,15 @@ import {
   type HumanoidJointName
 } from "./model.js";
 
+export const HUMANOID_END_EFFECTOR_BODIES = [
+  "left_ankle_roll_link",
+  "right_ankle_roll_link",
+  "left_wrist_yaw_link",
+  "right_wrist_yaw_link"
+] as const;
+
 export type HumanoidEndEffectorBody =
-  | "left_ankle_roll_link"
-  | "right_ankle_roll_link"
-  | "left_wrist_yaw_link"
-  | "right_wrist_yaw_link";
+  typeof HUMANOID_END_EFFECTOR_BODIES[number];
 
 const HUMANOID_END_EFFECTOR_JOINT_CHAINS: Readonly<Record<
   HumanoidEndEffectorBody,
@@ -45,11 +49,15 @@ const HUMANOID_END_EFFECTOR_JOINT_CHAINS: Readonly<Record<
   ]
 };
 
-const HUMANOID_WRIST_FRAME_JOINTS = [
-  "waist_yaw_joint",
-  "waist_roll_joint",
-  "waist_pitch_joint"
-] as const satisfies readonly HumanoidJointName[];
+const HUMANOID_END_EFFECTOR_ORIENTATION_JOINTS: Readonly<Record<
+  HumanoidEndEffectorBody,
+  HumanoidJointName
+>> = {
+  left_ankle_roll_link: "left_ankle_roll_joint",
+  right_ankle_roll_link: "right_ankle_roll_joint",
+  left_wrist_yaw_link: "left_wrist_yaw_joint",
+  right_wrist_yaw_link: "right_wrist_yaw_joint"
+};
 
 export function humanoidEndEffectorJointIndexes(
   body: HumanoidEndEffectorBody
@@ -57,14 +65,22 @@ export function humanoidEndEffectorJointIndexes(
   return humanoidJointIndexes(HUMANOID_END_EFFECTOR_JOINT_CHAINS[body]);
 }
 
-export function humanoidEndEffectorTrackingJointIndexes(
+export function humanoidEndEffectorPoseJointIndexes(
   body: HumanoidEndEffectorBody
 ): number[] {
   return humanoidJointIndexes([
-    ...(body === "left_wrist_yaw_link" || body === "right_wrist_yaw_link"
-      ? HUMANOID_WRIST_FRAME_JOINTS
-      : []),
-    ...HUMANOID_END_EFFECTOR_JOINT_CHAINS[body]
+    ...HUMANOID_END_EFFECTOR_JOINT_CHAINS[body],
+    HUMANOID_END_EFFECTOR_ORIENTATION_JOINTS[body]
+  ]);
+}
+
+export function humanoidEndEffectorTrackingJointIndexes(
+  body: HumanoidEndEffectorBody,
+  trackOrientation = false
+): number[] {
+  return humanoidJointIndexes([
+    ...HUMANOID_END_EFFECTOR_JOINT_CHAINS[body],
+    ...(trackOrientation ? [HUMANOID_END_EFFECTOR_ORIENTATION_JOINTS[body]] : [])
   ]);
 }
 

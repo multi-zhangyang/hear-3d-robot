@@ -71,7 +71,13 @@ export type HumanoidBodyName = typeof HUMANOID_BODY_NAMES[number];
 export const HUMANOID_HEAD_SENSOR = {
   horizontalFieldOfView: 110 * Math.PI / 180,
   verticalFieldOfView: 80 * Math.PI / 180,
-  localPosition: { x: 0, y: 0.43, z: 0.08 }
+  localPosition: { x: 0, y: 0.43, z: 0.08 },
+  localRotation: {
+    x: Math.sin(25 * Math.PI / 360),
+    y: 0,
+    z: 0,
+    w: Math.cos(25 * Math.PI / 360)
+  }
 } as const;
 
 export const YAHMP_POLICY = {

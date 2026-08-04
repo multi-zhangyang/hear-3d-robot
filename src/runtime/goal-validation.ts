@@ -4,12 +4,14 @@ import {
   type GoalPredicate,
   type Scenario
 } from "../domain/schema.js";
+import { assertScenarioChunkIntegrity } from "../domain/scenario-chunk.js";
 
 export class GoalValidationError extends Error {
   readonly statusCode = 400;
 }
 
 export function assertScenarioIntegrity(scenarioId: string, scenario: Scenario): void {
+  assertScenarioChunkIntegrity(scenario, scenario.chunk_manifest);
   const ids = new Set<string>();
   for (const item of [...scenario.obstacles, ...scenario.objects, ...scenario.zones]) {
     if (ids.has(item.id)) throw new Error(`${scenarioId} contains duplicate entity ID: ${item.id}`);
@@ -39,9 +41,21 @@ export function assertGoalSupported(goal: Goal, scenario: Scenario): void {
       }
       continue;
     }
+    if (predicate.type === "block_removed") {
+      if (!scenario.obstacles.some((candidate) => candidate.id === predicate.block_id)) {
+        throw new GoalValidationError(`Unknown block: ${predicate.block_id}`);
+      }
+      continue;
+    }
     const object = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
     if (!object) throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
-    if (predicate.type === "object_in_zone") {
+    if (predicate.type === "object_grasped" || predicate.type === "object_placed") {
+      if (!object.portable) {
+        throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);
+      }
+      if (predicate.type === "object_grasped") continue;
+    }
+    if (predicate.type === "object_in_zone" || predicate.type === "object_placed") {
       if (!scenario.zones.some((candidate) => candidate.id === predicate.zone_id)) {
         throw new GoalValidationError(`Unknown zone: ${predicate.zone_id}`);
       }

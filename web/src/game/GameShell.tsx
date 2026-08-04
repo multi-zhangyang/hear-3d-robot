@@ -1,7 +1,7 @@
 import { useEffect } from "react";
+import { modelActivityLabel, type ModelActivityPhase } from "../model-activity";
 
 export type Workspace = "world" | "flow" | "journey" | "output";
-export type ModelConnectionState = "offline" | "ready" | "active" | "verified" | "error";
 
 const WORKSPACES: Array<{
   key: Workspace;
@@ -18,7 +18,7 @@ const WORKSPACES: Array<{
 interface GameShellProps {
   workspace: Workspace;
   onWorkspace: (workspace: Workspace) => void;
-  modelState: ModelConnectionState;
+  modelState: ModelActivityPhase;
   toolbar: React.ReactNode;
   onRefresh: () => void;
   onLogout: (() => void) | null;
@@ -38,7 +38,7 @@ export function GameShell(props: GameShellProps): React.JSX.Element {
         <div className="game-toolbar">{props.toolbar}</div>
         <div className="system-controls">
           <span className={`model-lamp ${modelOnline ? "online" : props.modelState}`}>
-            {modelStateLabel(props.modelState)}
+            {modelActivityLabel(props.modelState)}
           </span>
           <button type="button" aria-label="刷新" title="刷新" onClick={props.onRefresh}>↻</button>
           {props.onLogout && (
@@ -67,14 +67,6 @@ export function GameShell(props: GameShellProps): React.JSX.Element {
       </nav>
     </div>
   );
-}
-
-function modelStateLabel(state: ModelConnectionState): string {
-  if (state === "active") return "模型调用中";
-  if (state === "verified") return "模型已响应";
-  if (state === "ready") return "模型已就绪";
-  if (state === "error") return "模型异常";
-  return "模型未配置";
 }
 
 function useWorkspaceKeys(onWorkspace: (workspace: Workspace) => void): void {

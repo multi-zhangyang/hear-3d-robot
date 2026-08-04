@@ -11,6 +11,7 @@ import type {
 const RUN_STATUS: Record<RunListItem["status"], string> = {
   starting: "启动中",
   running: "运行中",
+  paused: "已暂停",
   succeeded: "已完成",
   failed: "失败",
   interrupted: "已暂停",
@@ -50,6 +51,7 @@ const ACTION_LABELS: Record<string, string> = {
   execute_whole_body_motion: "执行全身动作",
   plan_humanoid_navigation: "规划双足路线",
   execute_humanoid_navigation: "执行双足导航",
+  remove_world_block: "提交方块拆除",
   delegate_humanoid_sentry: "委派感知哨兵",
   delegate_motion_reference: "委派运动参考智能体",
   delegate_physics_executor: "委派物理执行智能体",
@@ -88,6 +90,19 @@ const RESULT_CODES: Record<string, string> = {
   required_contact_missing: "动作缺少要求的物理接触",
   unknown_contact_object: "接触目标不存在",
   contact_object_not_currently_visible: "接触目标当前不可见",
+  unknown_contact_solid: "静态接触目标不存在",
+  contact_solid_not_currently_visible: "静态接触目标当前不可见",
+  world_block_removal_authorized: "方块拆除已由物理证据授权",
+  block_removal_execution_missing: "缺少拆除所需的物理执行",
+  block_removal_execution_invalid: "拆除所引用的物理执行无效",
+  block_removal_execution_superseded: "拆除接触已被后续动作取代",
+  block_removal_execution_consumed: "该物理接触已被使用",
+  block_removal_plan_invalid: "拆除规划证据无效",
+  block_removal_contact_contract_missing: "规划未要求目标方块接触",
+  block_removal_contact_evidence_missing: "缺少目标方块接触证据",
+  block_removal_contact_too_brief: "方块接触稳定时间不足",
+  block_removal_contact_force_insufficient: "方块接触力不足",
+  block_removal_target_invalid: "目标方块不可拆除",
   unsupported_finish: "动作结束状态不受支持"
 };
 
@@ -187,8 +202,8 @@ export function entityLabel(id: string): string {
   return /[㐀-鿿]/u.test(id) ? id : "场景实体";
 }
 
-export function nodePurposeLabel(node: TaskNode, goal: Goal): string {
-  if (node.depth === 0) return goalSummaryLabel(goal);
+export function nodePurposeLabel(node: TaskNode, goal: Goal | null): string {
+  if (node.depth === 0) return goal ? goalSummaryLabel(goal) : "等待选择本轮目标";
   if (node.may_delegate) return "协调下级智能体 · 汇总物理回执";
   const capabilities = [...new Set(node.capabilities.map(actionLabel))].slice(0, 3);
   return capabilities.length > 0 ? capabilities.join(" · ") : "执行当前分配";
@@ -273,13 +288,25 @@ export function predicateLabel(predicate: GoalPredicate): string {
       return `到达坐标 ${position(predicate.target)}`;
     case "robot_in_zone":
       return `进入区域 ${entityLabel(predicate.zone_id)}`;
+    case "block_removed":
+      return "拆除目标方块";
     case "object_in_zone":
       return `${entityLabel(predicate.object_id)}${predicate.expected ? "位于" : "离开"}区域 ${entityLabel(predicate.zone_id)}`;
+    case "object_placed":
+      return `将${entityLabel(predicate.object_id)}稳放在区域 ${entityLabel(predicate.zone_id)}`;
     case "object_at":
       return `将${entityLabel(predicate.object_id)}移动到 ${position(predicate.target)}`;
+    case "object_grasped":
+      return `${graspHandLabel(predicate.hand)}抓住${entityLabel(predicate.object_id)}`;
     case "end_effector_at":
-      return `${endEffectorLabel(predicate.end_effector)}到达${predicate.frame === "pelvis" ? "骨盆相对" : "世界"} ${position3(predicate.target)}`;
+      return `${endEffectorLabel(predicate.end_effector)}到达${predicate.frame === "pelvis" ? "骨盆相对" : "世界"} ${position3(predicate.target)}${predicate.orientation ? " · 姿态" : ""}`;
   }
+}
+
+function graspHandLabel(hand: Extract<GoalPredicate, { type: "object_grasped" }>["hand"]): string {
+  if (hand === "left") return "左手";
+  if (hand === "right") return "右手";
+  return "任意手";
 }
 
 export function missionResultLabel(checkpoint: HumanoidRunCheckpoint): string | null {
@@ -288,9 +315,11 @@ export function missionResultLabel(checkpoint: HumanoidRunCheckpoint): string | 
   }
   if (checkpoint.status === "succeeded") {
     const passed = checkpoint.checker?.checks.filter((check) => check.passed).length ?? 0;
-    return `${passed}/${checkpoint.goal.predicates.length} 项任务条件已通过。`;
+    const total = checkpoint.checker?.goal.predicates.length;
+    return total === undefined ? "任务已完成。" : `${passed}/${total} 项任务条件已通过。`;
   }
-  if (checkpoint.status === "interrupted") return "任务已暂停，可继续运行。";
+  if (checkpoint.status === "paused") return "任务已暂停，可继续运行。";
+  if (checkpoint.status === "interrupted") return "运行意外中断，可从检查点恢复。";
   return "任务未完成。";
 }
 

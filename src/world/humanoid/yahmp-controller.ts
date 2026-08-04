@@ -3,7 +3,9 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
+  HUMANOID_JOINT_INDEX,
   HUMANOID_JOINT_NAMES,
+  type HumanoidJointName,
   YAHMP_POLICY
 } from "./model.js";
 import {
@@ -22,7 +24,16 @@ const POLICY_PATH = fileURLToPath(
   new URL("../../../assets/humanoid/controllers/g1_yahmp.onnx", import.meta.url)
 );
 
-const EXPLICIT_TRACKING_STIFFNESS = 240;
+const EXPLICIT_TRACKING_STIFFNESS: Readonly<Record<
+  "leg" | "ankle" | "waist" | "arm" | "wrist",
+  number
+>> = Object.freeze({
+  leg: 100,
+  ankle: 70,
+  waist: 65,
+  arm: 80,
+  wrist: 40
+});
 
 const YahmpControllerStatePayloadSchema = z.object({
   previous_action: z.array(z.number().finite()).length(HUMANOID_JOINT_NAMES.length),
@@ -79,16 +90,26 @@ export class YahmpController implements HumanoidWholeBodyController {
       observation.set(historical, offset);
       offset += historical.length;
     }
-    const result = await this.#session.run({
-      obs: new ort.Tensor("float32", observation, [1, observation.length])
-    });
-    const action = result.actions?.data;
-    if (!(action instanceof Float32Array) || action.length !== HUMANOID_JOINT_NAMES.length) {
-      throw new Error("YAHMP returned an invalid whole-body action tensor");
+    const input = new ort.Tensor("float32", observation, [1, observation.length]);
+    let result: Awaited<ReturnType<ort.InferenceSession["run"]>> | undefined;
+    let action: Float32Array;
+    try {
+      result = await this.#session.run({ obs: input });
+      const output = result.actions?.data;
+      if (!(output instanceof Float32Array)
+        || output.length !== HUMANOID_JOINT_NAMES.length) {
+        throw new Error("YAHMP returned an invalid whole-body action tensor");
+      }
+      action = output.slice();
+    } finally {
+      for (const tensor of Object.values(result ?? {})) tensor.dispose();
+      input.dispose();
     }
     this.#previousAction = action.slice();
     const stiffness = Float64Array.from(YAHMP_POLICY.stiffness, (value, index) => {
-      const target = Math.max(value, EXPLICIT_TRACKING_STIFFNESS);
+      const joint = HUMANOID_JOINT_NAMES[index];
+      if (!joint) throw new Error(`Missing humanoid joint stiffness identity: ${index}`);
+      const target = Math.max(value, explicitTrackingStiffness(joint));
       return value + (target - value) * reference.jointTrackingWeights[index]!;
     });
     return {
@@ -152,9 +173,25 @@ export class YahmpController implements HumanoidWholeBodyController {
       throw new Error("Humanoid policy state has an invalid joint count");
     }
     const projectedGravity = inverseRotate(state.rootQuaternion, [0, 0, -1]);
+    const policyReferencePositions = Array.from(
+      reference.jointPositions,
+      (value, index) => mix(
+        value,
+        state.jointPositions[index]!,
+        reference.jointTrackingWeights[index]!
+      )
+    );
+    const policyReferenceVelocities = Array.from(
+      reference.jointVelocities,
+      (value, index) => mix(
+        value,
+        state.jointVelocities[index]!,
+        reference.jointTrackingWeights[index]!
+      )
+    );
     return Float32Array.from([
-      ...reference.jointPositions,
-      ...reference.jointVelocities,
+      ...policyReferencePositions,
+      ...policyReferenceVelocities,
       reference.rootVelocity[0],
       reference.rootVelocity[1],
       reference.rootYawVelocity,
@@ -170,6 +207,24 @@ export class YahmpController implements HumanoidWholeBodyController {
       ...this.#previousAction
     ]);
   }
+}
+
+function mix(start: number, end: number, amount: number): number {
+  return start + (end - start) * amount;
+}
+
+function explicitTrackingStiffness(joint: HumanoidJointName): number {
+  const index = HUMANOID_JOINT_INDEX.get(joint);
+  if (index === undefined) throw new Error(`Unknown humanoid tracking joint: ${joint}`);
+  if (joint.includes("ankle")) return EXPLICIT_TRACKING_STIFFNESS.ankle;
+  if (joint.startsWith("left_hip_")
+    || joint.startsWith("right_hip_")
+    || joint.includes("knee")) {
+    return EXPLICIT_TRACKING_STIFFNESS.leg;
+  }
+  if (joint.startsWith("waist_")) return EXPLICIT_TRACKING_STIFFNESS.waist;
+  if (joint.includes("wrist")) return EXPLICIT_TRACKING_STIFFNESS.wrist;
+  return EXPLICIT_TRACKING_STIFFNESS.arm;
 }
 
 function inverseRotate(

@@ -9,7 +9,7 @@ import {
 } from "../ui-text";
 
 type FeedTone = "active" | "success" | "warning" | "neutral";
-export type ActionCategory = "sense" | "plan" | "move" | "verify";
+export type ActionCategory = "sense" | "plan" | "move" | "mutate" | "verify";
 
 export interface PresentedAction {
   id: string;
@@ -27,6 +27,8 @@ export interface ModelMoment {
   id: string;
   at: string;
   agent: string;
+  kind: "agent" | "model_completed" | "tool_called" | "model_output" | "tool_output";
+  cycleId: string | null;
   title: string;
   detail: string;
   tone: FeedTone;
@@ -38,6 +40,7 @@ const HUMANOID_PLAN_ACTIONS = new Set([
   "plan_whole_body_motion_candidates",
   "plan_humanoid_navigation"
 ]);
+const HUMANOID_MUTATION_ACTIONS = new Set(["remove_world_block"]);
 
 export function presentAction(action: HumanoidActionReceipt): PresentedAction {
   const name = action.action;
@@ -45,7 +48,9 @@ export function presentAction(action: HumanoidActionReceipt): PresentedAction {
   const channels = action.channels;
   const category: ActionCategory = HUMANOID_SENSE_ACTIONS.has(name)
     ? "sense"
-    : HUMANOID_PLAN_ACTIONS.has(name) ? "plan" : "move";
+    : HUMANOID_PLAN_ACTIONS.has(name)
+      ? "plan"
+      : HUMANOID_MUTATION_ACTIONS.has(name) ? "mutate" : "move";
   return {
     id: action.transactionId,
     at: action.committedAt,
@@ -71,13 +76,16 @@ export function presentEmbodiedEpisode(episode: HumanoidEmbodiedEpisode): Presen
   const optionResult = episode.motion_option
     ? ` · 物理达成 ${episode.motion_option.actual_termination_frame}/${episode.motion_option.predicted_termination_frame} 帧`
     : "";
+  const mutationResult = episode.world_mutations?.length
+    ? ` · 世界提交 ${episode.world_mutations.length}`
+    : "";
   return {
     id: `episode-${episode.sequence}-${episode.transaction_id}`,
     at: episode.recorded_at,
     agent: "具身记忆",
     title: "物理经历已记住",
     detail: modelOutputLabel(episode.model_summary, 160) ?? "已保存本次物理执行结果。",
-    meta: `${episode.frame_count.toLocaleString("zh-CN")} 个物理帧${candidateSelection}${optionResult} · 世界版本 ${episode.world_after_revision}`,
+    meta: `${episode.frame_count.toLocaleString("zh-CN")} 个物理帧${candidateSelection}${optionResult}${mutationResult} · 世界版本 ${episode.result_world_revision ?? episode.world_after_revision}`,
     tone: episode.fallen ? "warning" : episode.goal_success ? "success" : "neutral",
     category: "verify",
     channels: []
@@ -98,6 +106,7 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
     const agent = agentNameLabel(rawAgent);
     const at = stringOf(outer?.at) ?? new Date(0).toISOString();
     const recordId = stringOf(outer?.runtime_event_id) ?? `${index}-${at}`;
+    const cycleId = stringOf(record(outer?.cycle)?.cycle_id);
 
     if (event?.type === "agent_updated_stream_event") {
       const activeAgent = agentNameLabel(stringOf(event.agent) ?? rawAgent);
@@ -105,6 +114,8 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
         id: `agent-${recordId}`,
         at,
         agent: activeAgent,
+        kind: "agent",
+        cycleId,
         title: "接管当前执行流",
         detail: "当前由该智能体执行。",
         tone: "active"
@@ -120,6 +131,8 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
         id: `usage-${recordId}`,
         at,
         agent,
+        kind: "model_completed",
+        cycleId,
         title: "模型调用已完成",
         detail: usageDetail(usage),
         tone: "success"
@@ -140,6 +153,8 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
         id: `decision-${recordId}`,
         at,
         agent,
+        kind: "tool_called",
+        cycleId,
         title: `发起${actionLabel(name)}`,
         detail: decisionDetail(raw?.arguments),
         tone: "active"
@@ -155,6 +170,8 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
         id: `message-${recordId}`,
         at,
         agent,
+        kind: "model_output",
+        cycleId,
         title: "模型输出",
         detail,
         tone: "neutral"
@@ -169,6 +186,8 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
         id: `result-${recordId}`,
         at,
         agent,
+        kind: "tool_output",
+        cycleId,
         title: `${actionLabel(name)}回执`,
         detail: result.detail,
         tone: result.tone
@@ -244,6 +263,9 @@ function toolFacts(payload: Record<string, unknown> | null): string[] {
     const passed = checker.checks.filter((check) => record(check)?.passed === true).length;
     facts.push(`${passed}/${checker.checks.length} 项条件通过`);
   }
+  const removal = record(detail?.removal_transaction);
+  const chunkRevision = numeric(removal?.projected_chunk_revision);
+  if (chunkRevision !== null) facts.push(`区块 R${chunkRevision}`);
   return facts;
 }
 
@@ -303,6 +325,14 @@ function actionDetail(action: HumanoidActionReceipt): string {
   }
   if (name === "plan_whole_body_motion") return "已对连续全身动作完成 MuJoCo 物理预演。";
   if (name === "execute_whole_body_motion") return "已在 MuJoCo 中执行连续全身动作。";
+  if (name === "remove_world_block") {
+    const detail = record(action.detail);
+    const removal = record(detail?.removal_transaction);
+    const chunkRevision = numeric(removal?.projected_chunk_revision);
+    return chunkRevision === null
+      ? "物理接触证据已提交到权威世界。"
+      : `目标方块已从权威世界移除 · 区块 R${chunkRevision}。`;
+  }
   if (name === "observe_humanoid") return "已更新头部感知、身体姿态、接触、平衡和持久对象状态。";
   if (target) return `目标位置：${target}。`;
   if (action.channels.length > 0) {

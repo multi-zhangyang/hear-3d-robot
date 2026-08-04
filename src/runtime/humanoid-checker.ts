@@ -7,8 +7,14 @@ import {
 } from "../domain/humanoid-run.js";
 import {
   humanoidEndEffectorBody,
-  humanoidEndEffectorPosition
+  humanoidEndEffectorPosition,
+  humanoidEndEffectorRotation
 } from "../world/humanoid/end-effectors.js";
+import {
+  normalizeQuaternion,
+  quaternionAngularDistance
+} from "../world/geometry.js";
+import { assessHumanoidObjectSettledOnSupport } from "../world/humanoid/object-settled-support.js";
 import type { HumanoidWorldSnapshot } from "../world/humanoid/world.js";
 import { GoalValidationError } from "./goal-validation.js";
 
@@ -29,7 +35,7 @@ export function assertHumanoidGoalSupported(goal: Goal, scenario: Scenario): voi
       && !scenario.zones.some((zone) => zone.id === predicate.zone_id)) {
       throw new GoalValidationError(`Unknown zone: ${predicate.zone_id}`);
     }
-    if (predicate.type === "object_in_zone") {
+    if (predicate.type === "object_in_zone" || predicate.type === "object_placed") {
       const object = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
       if (!object) throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
       if (!object.portable) throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);
@@ -40,6 +46,13 @@ export function assertHumanoidGoalSupported(goal: Goal, scenario: Scenario): voi
     if (predicate.type === "object_at"
       && !scenario.objects.some((object) => object.id === predicate.object_id)) {
       throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
+    }
+    if (predicate.type === "object_grasped") {
+      const object = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
+      if (!object) throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
+      if (!object.portable) {
+        throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);
+      }
     }
   }
 }
@@ -234,6 +247,17 @@ function evaluatePredicates(
         tolerance: predicate.tolerance
       });
     }
+    if (predicate.type === "block_removed") {
+      const block = scenario.obstacles.find((candidate) => (
+        candidate.id === predicate.block_id
+      ));
+      return evaluation(name, block === undefined, {
+        block_id: predicate.block_id,
+        present: block !== undefined,
+        center: block?.center ?? null,
+        size: block?.size ?? null
+      });
+    }
     if (predicate.type === "object_in_zone") {
       const object = world.robot.objects[predicate.object_id];
       const descriptor = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
@@ -256,6 +280,54 @@ function evaluatePredicates(
         }
       );
     }
+    if (predicate.type === "object_placed") {
+      const object = world.robot.objects[predicate.object_id];
+      const descriptor = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
+      const zone = scenario.zones.find((candidate) => candidate.id === predicate.zone_id);
+      const inside = object !== undefined && descriptor !== undefined && zone !== undefined
+        && objectInsideZone(object.position, descriptor.size, zone, predicate.tolerance);
+      const currentAssessments = world.grasp.assessments.filter((assessment) => (
+        assessment.frame === world.frame
+          && assessment.object_id === predicate.object_id
+      ));
+      const assessedHands = new Set(currentAssessments.map((assessment) => assessment.hand));
+      const evidenceComplete = assessedHands.has("left") && assessedHands.has("right");
+      const verifiedHands = currentAssessments
+        .filter((assessment) => assessment.grasp_verified)
+        .map((assessment) => assessment.hand)
+        .sort(compareCodePoints);
+      const settledSupport = assessHumanoidObjectSettledOnSupport({
+        objectId: predicate.object_id,
+        objectObservable: object !== undefined && descriptor !== undefined,
+        snapshot: world.robot
+      });
+      return evaluation(
+        name,
+        inside
+          && evidenceComplete
+          && verifiedHands.length === 0
+          && settledSupport.status === "satisfied",
+        {
+          object_id: predicate.object_id,
+          object_position: object?.position ?? null,
+          object_size: descriptor?.size ?? null,
+          zone_id: predicate.zone_id,
+          zone_center: zone?.center ?? null,
+          zone_size: zone?.size ?? null,
+          inside,
+          tolerance: predicate.tolerance,
+          world_frame: world.frame,
+          grasp: {
+            contract_sha256: world.grasp.contractSha256,
+            evidence_complete: evidenceComplete,
+            assessed_hands: [...assessedHands].sort(compareCodePoints),
+            verified_hands: verifiedHands,
+            assessments: currentAssessments
+          },
+          settled_support: settledSupport
+        }
+      );
+    }
     if (predicate.type === "object_at") {
       const object = world.robot.objects[predicate.object_id];
       const distance = object ? distance3(object.position, predicate.target) : null;
@@ -267,6 +339,33 @@ function evaluatePredicates(
         tolerance: predicate.tolerance
       });
     }
+    if (predicate.type === "object_grasped") {
+      const requiredHands = predicate.hand === "either"
+        ? ["left", "right"] as const
+        : [predicate.hand];
+      const currentAssessments = world.grasp.assessments.filter((assessment) => (
+        assessment.frame === world.frame
+          && assessment.object_id === predicate.object_id
+          && requiredHands.includes(assessment.hand)
+      ));
+      const assessedHands = new Set(currentAssessments.map((assessment) => assessment.hand));
+      const evidenceComplete = requiredHands.every((hand) => assessedHands.has(hand));
+      const verified = currentAssessments.filter((assessment) => assessment.grasp_verified);
+      return evaluation(
+        name,
+        evidenceComplete && verified.length > 0,
+        {
+          object_id: predicate.object_id,
+          requested_hand: predicate.hand,
+          contract_sha256: world.grasp.contractSha256,
+          world_frame: world.frame,
+          evidence_complete: evidenceComplete,
+          assessed_hands: [...assessedHands].sort(compareCodePoints),
+          verified_hands: verified.map((assessment) => assessment.hand).sort(compareCodePoints),
+          assessments: currentAssessments
+        }
+      );
+    }
     if (predicate.type === "end_effector_at") {
       const position = humanoidEndEffectorPosition(
         world.robot,
@@ -274,18 +373,57 @@ function evaluatePredicates(
         predicate.frame
       );
       const distance = position ? distance3(position, predicate.target) : null;
-      return evaluation(name, distance !== null && distance <= predicate.tolerance, {
-        end_effector: predicate.end_effector,
-        body: humanoidEndEffectorBody(predicate.end_effector),
-        frame: predicate.frame,
-        position,
-        target: predicate.target,
-        distance,
-        tolerance: predicate.tolerance
-      });
+      const targetOrientation = predicate.orientation
+        ? normalizeQuaternion(predicate.orientation)
+        : undefined;
+      const orientation = targetOrientation
+        ? observedEndEffectorRotation(world, predicate.end_effector, predicate.frame)
+        : undefined;
+      const orientationError: number | null | undefined = targetOrientation
+        ? orientation
+          ? quaternionAngularDistance(targetOrientation, orientation)
+          : null
+        : undefined;
+      const orientationSatisfied = !targetOrientation
+        || typeof orientationError === "number"
+          && predicate.orientation_tolerance_rad !== undefined
+          && orientationError <= predicate.orientation_tolerance_rad;
+      return evaluation(
+        name,
+        distance !== null && distance <= predicate.tolerance && orientationSatisfied,
+        {
+          end_effector: predicate.end_effector,
+          body: humanoidEndEffectorBody(predicate.end_effector),
+          frame: predicate.frame,
+          position,
+          target: predicate.target,
+          distance,
+          tolerance: predicate.tolerance,
+          ...(targetOrientation
+            ? {
+                orientation: orientation ?? null,
+                target_orientation: targetOrientation,
+                orientation_error_rad: orientationError,
+                orientation_tolerance_rad: predicate.orientation_tolerance_rad
+              }
+            : {})
+        }
+      );
     }
     return assertNever(predicate);
   });
+}
+
+function observedEndEffectorRotation(
+  world: HumanoidWorldSnapshot,
+  endEffector: Parameters<typeof humanoidEndEffectorRotation>[1],
+  frame: Parameters<typeof humanoidEndEffectorRotation>[2]
+): ReturnType<typeof humanoidEndEffectorRotation> {
+  try {
+    return humanoidEndEffectorRotation(world.robot, endEffector, frame);
+  } catch {
+    return null;
+  }
 }
 
 function assertNever(value: never): never {
@@ -335,6 +473,10 @@ function distance3(
   right: { x: number; y: number; z: number }
 ): number {
   return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z);
+}
+
+function compareCodePoints(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function json(value: unknown): JsonValue {

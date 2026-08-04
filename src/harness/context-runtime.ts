@@ -30,7 +30,19 @@ export interface LongRunContextRuntime {
 export interface ModelTelemetryRuntime {
   readonly rootAgentId: string;
   activeNode(agentId?: string): TaskNode;
-  recordModelCallStarted(agentId: string): Promise<void>;
+  recordModelCallStarted(agentId: string): Promise<string | undefined>;
+  recordModelCallCompleted?(input: {
+    modelCallId: string;
+    agentId: string;
+    responseId: string;
+    responseOutputSha256: string;
+    toolCalls: Array<{
+      toolCallId: string;
+      toolName: string;
+      argumentsSha256: string;
+    }>;
+  }): Promise<void>;
+  recordModelCallFailed?(modelCallId: string, agentId: string): Promise<void>;
   modelProgressSnapshot?(): ModelProgressSnapshot;
 }
 

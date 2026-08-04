@@ -1,5 +1,9 @@
 import { randomBytes } from "node:crypto";
-import type { Scenario, ScenarioTemplate } from "../domain/schema.js";
+import {
+  ScenarioSchema,
+  type Scenario,
+  type ScenarioTemplate
+} from "../domain/schema.js";
 import { materializeProceduralWorld } from "./procedural-world.js";
 
 export function materializeScenario(
@@ -7,7 +11,7 @@ export function materializeScenario(
   seed: number
 ): Scenario {
   if (template.kind === "authored") {
-    return { ...structuredClone(template.scenario), seed };
+    return ScenarioSchema.parse({ ...structuredClone(template.scenario), seed });
   }
   return materializeProceduralWorld(template, seed);
 }

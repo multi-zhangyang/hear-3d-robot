@@ -144,6 +144,22 @@
 .humanoid-state-grid span.active b { color: #64ddc5; }
 .balance-track { height: 3px; overflow: hidden; border-radius: 3px; background: #263139; }
 .balance-track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #e3b958, #51d8ba); }
+.humanoid-grasp-state { display: grid; gap: 5px; margin-top: 10px; }
+.humanoid-grasp-state > span {
+  display: grid;
+  grid-template-columns: 7px 1fr;
+  gap: 1px 7px;
+  padding: 7px 8px;
+  border: 1px solid rgba(226, 186, 94, .16);
+  border-radius: 9px;
+  background: rgba(226, 186, 94, .055);
+}
+.humanoid-grasp-state i { grid-row: 1 / 3; align-self: center; width: 6px; height: 6px; border-radius: 50%; background: #d7ad50; }
+.humanoid-grasp-state b { color: #d8dee1; font-size: 10px; font-weight: 600; }
+.humanoid-grasp-state small { color: #788892; font-size: 8px; }
+.humanoid-grasp-state > span.verified { border-color: rgba(79, 219, 189, .22); background: rgba(79, 219, 189, .06); }
+.humanoid-grasp-state > span.verified i { background: #4fdbbd; box-shadow: 0 0 8px rgba(79, 219, 189, .45); }
+.humanoid-grasp-state > span.verified small { color: #70cdb9; }
 .humanoid-state-hud footer { display: flex; justify-content: space-between; margin-top: 11px; color: #72818b; font-size: 10px; }
 .humanoid-state-hud footer b { color: #85dec9; font-weight: 600; }
 
@@ -161,6 +177,8 @@
 .humanoid-goal-list i.passed { border-color: #4fdbbd; background: #4fdbbd; box-shadow: 0 0 8px rgba(79, 219, 189, .45); }
 .humanoid-goal-list b { min-width: 0; font-weight: 500; }
 .humanoid-goal-list em { margin-left: auto; color: #6de0c8; font: 10px/1.3 "JetBrains Mono Variable", monospace; font-style: normal; }
+.humanoid-goal-list .humanoid-goal-awaiting { color: #788892; }
+.humanoid-goal-list .humanoid-goal-awaiting i { border-color: #d0ad5e; box-shadow: 0 0 8px rgb(208 173 94 / 22%); }
 .memory-meter { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; }
 .memory-meter > span { display: flex; gap: 6px; align-items: baseline; }
 .memory-meter small { color: #65747d; font-size: 9px; }

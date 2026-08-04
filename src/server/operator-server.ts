@@ -5,8 +5,14 @@ import { fileURLToPath } from "node:url";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
 import { z, ZodError } from "zod";
-import type { ProviderConfig, RuntimeCatalog, ServerConfig } from "../config/load.js";
+import {
+  providerConfigForRole,
+  type ProviderConfig,
+  type RuntimeCatalog,
+  type ServerConfig
+} from "../config/load.js";
 import { GoalSchema } from "../domain/schema.js";
+import { HumanoidRunModeSchema } from "../domain/run-mode.js";
 import { HUMANOID_CAPABILITIES } from "../harness/humanoid/agents.js";
 import type { RuntimeEvent } from "../runtime/events.js";
 import { providerIdentity } from "../model/factory.js";
@@ -24,6 +30,7 @@ const StartRunInput = z.object({
   mission: z.string().trim().min(1),
   scenario_id: z.string().min(1),
   goal: GoalSchema,
+  run_mode: HumanoidRunModeSchema.default("continuous"),
   seed: z.number().int().min(0).max(0xffff_ffff).optional(),
   confirmed: z.literal(true)
 }).strict();
@@ -74,6 +81,33 @@ export async function createOperatorServer(input: {
     ...(input.providerError ? { providerError: input.providerError } : {}),
     mutationFence
   });
+  const scenarioSummaries = Object.entries(input.catalog.templates).map(([id, template]) => {
+    const source = template.kind === "authored" ? template.scenario : template.generate;
+    const manifest = input.catalog.materialize(id, 0).chunk_manifest;
+    return {
+      id,
+      title: template.title,
+      kind: template.kind,
+      runtime: template.runtime,
+      extent: template.kind === "authored"
+        ? { width: template.scenario.bounds.width, depth: template.scenario.bounds.depth }
+        : structuredClone(template.generate.bounds),
+      chunk_grid: {
+        manifest_version: manifest.version,
+        chunk_size: manifest.chunk_size,
+        columns: manifest.grid.columns,
+        rows: manifest.grid.rows
+      },
+      objects: source.objects.map(({ id: objectId, kind, color, portable }) => ({
+        id: objectId,
+        kind,
+        color,
+        portable
+      })),
+      zones: source.zones.map(({ id: zoneId, color }) => ({ id: zoneId, color })),
+      suggested_goal: source.default_goal
+    };
+  });
   const activeStreams = new Set<() => void>();
   let leaseLossDrain: Promise<void> | undefined;
   app.addHook("onRequest", async (request, reply) => {
@@ -97,26 +131,14 @@ export async function createOperatorServer(input: {
 
   app.get("/api/bootstrap", async () => ({
     provider: input.provider
-      ? { configured: true, ...providerIdentity(input.provider) }
+      ? {
+          configured: true,
+          ...providerIdentity(providerConfigForRole(input.provider, "coordinator"))
+        }
       : { configured: false, error: input.providerError ?? "Provider is not configured" },
     authentication_required: Boolean(input.server.password),
     capability_catalog: [...HUMANOID_CAPABILITIES],
-    scenarios: Object.entries(input.catalog.templates)
-      .map(([id, template]) => {
-      const source = template.kind === "authored" ? template.scenario : template.generate;
-      return {
-        id,
-        title: template.title,
-        kind: template.kind,
-        runtime: template.runtime,
-        extent: template.kind === "authored"
-          ? { width: template.scenario.bounds.width, depth: template.scenario.bounds.depth }
-          : structuredClone(template.generate.bounds),
-        objects: source.objects.map(({ id: objectId, kind, color }) => ({ id: objectId, kind, color })),
-        zones: source.zones.map(({ id: zoneId, color }) => ({ id: zoneId, color })),
-        suggested_goal: source.default_goal
-      };
-    })
+    scenarios: scenarioSummaries
   }));
 
   app.get("/api/runs", async () => ({ runs: await manager.list() }));
@@ -131,6 +153,7 @@ export async function createOperatorServer(input: {
       mission: body.mission,
       scenarioId: body.scenario_id,
       goal: body.goal,
+      runMode: body.run_mode,
       ...(body.seed === undefined ? {} : { seed: body.seed })
     });
     return reply.code(202).send({ run_id: runId, status: "running" });
@@ -153,7 +176,7 @@ export async function createOperatorServer(input: {
     StopInput.parse(request.body);
     const { runId } = RunParams.parse(request.params);
     manager.stop(runId);
-    return reply.code(202).send({ run_id: runId, status: "stopping" });
+    return reply.code(202).send({ run_id: runId, status: "pausing" });
   });
 
   app.get("/api/runs/:runId/journal", async (request) => {

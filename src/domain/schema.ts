@@ -1,4 +1,9 @@
 import { z } from "zod";
+import {
+  buildScenarioChunkManifest,
+  scenarioChunkIntegrityIssues,
+  ScenarioChunkManifestSchema
+} from "./scenario-chunk.js";
 
 export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
   z.string(),
@@ -43,7 +48,7 @@ const Size3Schema = Vec3Schema.refine(
   "size components must be positive"
 );
 
-export const GoalPredicateSchema = z.discriminatedUnion("type", [
+const GoalPredicateUnionSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("robot_at"),
     target: Vec3Schema,
@@ -55,10 +60,20 @@ export const GoalPredicateSchema = z.discriminatedUnion("type", [
     tolerance: z.number().finite().nonnegative()
   }).strict(),
   z.object({
+    type: z.literal("block_removed"),
+    block_id: z.string().trim().min(1)
+  }).strict(),
+  z.object({
     type: z.literal("object_in_zone"),
     object_id: z.string().trim().min(1),
     zone_id: z.string().trim().min(1),
     expected: z.boolean(),
+    tolerance: z.number().finite().nonnegative()
+  }).strict(),
+  z.object({
+    type: z.literal("object_placed"),
+    object_id: z.string().trim().min(1),
+    zone_id: z.string().trim().min(1),
     tolerance: z.number().finite().nonnegative()
   }).strict(),
   z.object({
@@ -68,14 +83,49 @@ export const GoalPredicateSchema = z.discriminatedUnion("type", [
     tolerance: z.number().finite().positive()
   }).strict(),
   z.object({
+    type: z.literal("object_grasped"),
+    object_id: z.string().trim().min(1),
+    hand: z.enum(["left", "right", "either"])
+  }).strict(),
+  z.object({
     type: z.literal("end_effector_at"),
     end_effector: HumanoidEndEffectorSchema,
     frame: z.enum(["world", "pelvis"]),
     target: Vec3Schema,
     tolerance: z.number().finite().positive().max(5),
-    stable_frames: z.number().int().min(1).max(500)
+    stable_frames: z.number().int().min(1).max(500),
+    orientation: QuaternionSchema.optional(),
+    orientation_tolerance_rad: z.number().finite().positive().max(Math.PI).optional()
   }).strict()
 ]);
+
+export const GoalPredicateSchema = GoalPredicateUnionSchema.superRefine(
+  (predicate, context) => {
+    if (predicate.type !== "end_effector_at") return;
+    const hasOrientation = predicate.orientation !== undefined;
+    const hasOrientationTolerance = predicate.orientation_tolerance_rad !== undefined;
+    if (hasOrientation !== hasOrientationTolerance) {
+      context.addIssue({
+        code: "custom",
+        path: [hasOrientation ? "orientation_tolerance_rad" : "orientation"],
+        message: "End-effector orientation and tolerance must be provided together"
+      });
+    }
+    if (predicate.orientation
+      && Math.hypot(
+        predicate.orientation.x,
+        predicate.orientation.y,
+        predicate.orientation.z,
+        predicate.orientation.w
+      ) <= 1e-9) {
+      context.addIssue({
+        code: "custom",
+        path: ["orientation"],
+        message: "End-effector orientation must be a non-zero quaternion"
+      });
+    }
+  }
+);
 export type GoalPredicate = z.infer<typeof GoalPredicateSchema>;
 
 export const GoalSchema = z.object({
@@ -106,7 +156,7 @@ const RobotStartSchema = z.object({
   yaw: z.number().finite()
 }).strict();
 
-export const ScenarioSchema = z.object({
+const ScenarioCoreSchema = z.object({
   title: z.string().trim().min(1),
   seed: z.number().int().nonnegative(),
   bounds: z.object({
@@ -124,6 +174,21 @@ export const ScenarioSchema = z.object({
   zones: z.array(ScenarioZoneSchema),
   default_goal: GoalSchema
 }).strict();
+
+export const ScenarioSchema = ScenarioCoreSchema.extend({
+  chunk_manifest: ScenarioChunkManifestSchema.optional()
+}).transform((scenario) => ({
+  ...scenario,
+  chunk_manifest: scenario.chunk_manifest ?? buildScenarioChunkManifest(scenario)
+})).superRefine((scenario, context) => {
+  for (const message of scenarioChunkIntegrityIssues(scenario, scenario.chunk_manifest)) {
+    context.addIssue({
+      code: "custom",
+      path: ["chunk_manifest"],
+      message
+    });
+  }
+});
 export type Scenario = z.infer<typeof ScenarioSchema>;
 
 const ProceduralWorldShapeSchema = z.object({
@@ -153,7 +218,7 @@ const ScenarioTemplateSchema = z.discriminatedUnion("kind", [
     kind: z.literal("authored"),
     runtime: z.literal("humanoid_g1"),
     title: z.string().trim().min(1),
-    scenario: ScenarioSchema.omit({ seed: true })
+    scenario: ScenarioCoreSchema.omit({ seed: true })
   }).strict(),
   z.object({
     kind: z.literal("procedural"),
@@ -228,12 +293,33 @@ const ContextScopeStateSchema = z.object({
   retained_item_count: z.number().int().nonnegative().default(0),
   retained_chain_hash: z.string().regex(/^[a-f0-9]{64}$/).nullable().default(null),
   active_estimated_tokens: z.number().int().nonnegative(),
+  context_window_tokens: z.number().int().positive().optional(),
+  compact_trigger_tokens: z.number().int().positive().optional(),
+  compact_recent_model_turns: z.number().int().nonnegative().optional(),
+  compact_max_output_tokens: z.number().int().positive().optional(),
   compaction_count: z.number().int().nonnegative(),
   summary: ContextCompactionSummarySchema.nullable(),
   summary_origin: z.enum(["model", "authority_projection"]).nullable().default(null),
   summary_world_revision: z.number().int().nonnegative().nullable(),
   last_compacted_at: z.string().datetime().nullable()
-}).strict();
+}).strict().superRefine((scope, context) => {
+  const budgetKeys = [
+    "context_window_tokens",
+    "compact_trigger_tokens",
+    "compact_recent_model_turns",
+    "compact_max_output_tokens"
+  ] as const;
+  const present = budgetKeys.filter((key) => scope[key] !== undefined);
+  if (present.length === 0 || present.length === budgetKeys.length) return;
+  for (const key of budgetKeys) {
+    if (scope[key] !== undefined) continue;
+    context.addIssue({
+      code: "custom",
+      path: [key],
+      message: "Context scope budgets must be persisted as one complete envelope"
+    });
+  }
+});
 export type ContextScopeState = z.infer<typeof ContextScopeStateSchema>;
 
 export const ContextMemoryStateSchema = z.object({
@@ -252,10 +338,10 @@ export type ContextMemoryState = z.infer<typeof ContextMemoryStateSchema>;
 
 export const EmptyContextMemoryState: ContextMemoryState = {
   version: 1,
-  context_window_tokens: 65_536,
-  compact_trigger_tokens: 18_000,
+  context_window_tokens: 262_144,
+  compact_trigger_tokens: 72_089,
   compact_recent_model_turns: 4,
-  compact_max_output_tokens: 4_096,
+  compact_max_output_tokens: 13_107,
   active_scope_id: null,
   active_estimated_tokens: 0,
   total_compactions: 0,
@@ -266,6 +352,7 @@ export const EmptyContextMemoryState: ContextMemoryState = {
 export const RunStatusSchema = z.enum([
   "starting",
   "running",
+  "paused",
   "succeeded",
   "failed",
   "interrupted"
@@ -274,6 +361,7 @@ export const RunStatusSchema = z.enum([
 const RunLifecycleEventTypeSchema = z.enum([
   "run_started",
   "run_resumed",
+  "run_paused",
   "run_succeeded",
   "run_failed",
   "run_interrupted"

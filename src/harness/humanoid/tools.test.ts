@@ -1,5 +1,6 @@
 import { RunContext } from "@openai/agents";
 import { describe, expect, it, vi } from "vitest";
+import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import type { HumanoidActionReceipt } from "./runtime.js";
 import {
   createHumanoidActionTools,
@@ -36,7 +37,8 @@ describe("humanoid Agents SDK tools", () => {
     expect(tools.map((entry) => entry.name)).toEqual(["observe_humanoid"]);
     const observe = tools[0];
     if (!observe || observe.type !== "function") throw new Error("Observe tool is missing");
-    expect(observe.description).toContain("29 个关节");
+    expect(observe.description).toContain("43 自由度");
+    expect(observe.description).toContain("掌指抓取证据");
 
     const output = await observe.invoke(
       new RunContext({ runId: "run-humanoid-tools" }),
@@ -62,7 +64,12 @@ describe("humanoid Agents SDK tools", () => {
       "observe_humanoid",
       {},
       "observe-call-1",
-      "perception-agent"
+      "perception-agent",
+      {
+        tool_call_id: "observe-call-1",
+        tool_name: "observe_humanoid",
+        arguments_sha256: modelPayloadSha256({})
+      }
     );
   });
 
@@ -97,6 +104,10 @@ describe("humanoid Agents SDK tools", () => {
     const parameters = JSON.stringify(recall.parameters);
     expect(parameters).toContain('"source_refs"');
     expect(parameters).toContain('"before_sequence"');
+    expect(parameters).toContain('"before_experience_sequence"');
+    expect(parameters).toContain('"outcomes"');
+    expect(parameters).toContain('"predicate_types"');
+    expect(parameters).toContain('"object_ids"');
     expect(parameters).toContain('"limit"');
     expect(parameters).toContain("action:");
     expect(recall.description).toContain("不代表当前传感");
@@ -134,10 +145,36 @@ describe("humanoid Agents SDK tools", () => {
       limit: 2
     });
 
+    await recall.invoke(
+      new RunContext({ runId: "semantic-embodied-recall" }),
+      JSON.stringify({
+        outcomes: ["physically_failed"],
+        object_ids: ["crate"],
+        before_experience_sequence: 30,
+        limit: 4
+      }),
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "recall-failed-crate",
+          name: "recall_embodied_history",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    );
+    expect(recallEmbodiedHistory).toHaveBeenLastCalledWith({
+      outcomes: ["physically_failed"],
+      object_ids: ["crate"],
+      before_experience_sequence: 30,
+      limit: 4
+    });
+
     const invalid = await recall.invoke(
       new RunContext({ runId: "invalid-embodied-recall" }),
       JSON.stringify({
-        source_refs: ["episode:12", "episode:12"],
+        source_refs: ["episode:12"],
+        outcomes: ["rejected"],
         limit: 2
       }),
       {
@@ -156,7 +193,7 @@ describe("humanoid Agents SDK tools", () => {
       tool: "recall_embodied_history",
       historical_only: true
     });
-    expect(recallEmbodiedHistory).toHaveBeenCalledTimes(1);
+    expect(recallEmbodiedHistory).toHaveBeenCalledTimes(2);
   });
 
   it("publishes a strict task-space schema without exposing joint-angle authoring", () => {
@@ -244,9 +281,15 @@ describe("humanoid Agents SDK tools", () => {
             end_effector: null,
             frame: null,
             object_id: null,
+            solid_id: null,
+            hand_surface: null,
+            hand: null,
+            grasp_contract_sha256: null,
             zone_id: null,
             target: { x: 0, y: 0.76, z: 0.1 },
             tolerance_m: 0.05,
+            target_orientation: null,
+            orientation_tolerance_rad: null,
             minimum_normal_force: null,
             expected: null
           }],

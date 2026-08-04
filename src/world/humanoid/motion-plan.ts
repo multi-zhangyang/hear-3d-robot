@@ -1,45 +1,42 @@
 import { z } from "zod";
 import {
   JsonValueSchema,
-  Vec3Schema,
   type JsonValue,
+  type Quaternion,
   type Scenario,
   type Vec3
 } from "../../domain/schema.js";
 import {
   inverseQuaternion,
+  multiplyQuaternion,
+  normalizeQuaternion,
+  quaternionAngularDistance,
   rotateVector,
   subtract
 } from "../geometry.js";
+import type { HumanoidBodyName } from "./model.js";
+import type { G1HandContactSurfaceName } from "./morphology.js";
 import {
-  HUMANOID_BODY_NAMES,
-  type HumanoidBodyName
-} from "./model.js";
-import {
-  interpolateReference,
-  targetReference,
-  type HumanoidReference,
-  type HumanoidReferenceTarget
+  type HumanoidReference
 } from "./reference.js";
 import {
   HumanoidMotionArtifactSchema,
-  hydrateHumanoidReference,
   humanoidMotionArtifactSha256,
-  serializeHumanoidReference,
   type HumanoidMotionArtifact
 } from "./motion-artifact.js";
+import { applyHumanoidMotionArtifactFrame } from "./motion-frame-application.js";
 import {
-  HumanoidMotionOptionContractSchema,
   advanceHumanoidMotionOptionMonitor,
   createHumanoidMotionOptionMonitorState,
-  detectHumanoidMotionOption,
   humanoidMotionOptionContractSha256,
   type HumanoidMotionOptionContract,
   type HumanoidMotionOptionDetection,
-  type HumanoidMotionOptionDetectorInput,
-  type HumanoidMotionOptionMonitorState,
-  type HumanoidMotionOptionObservableObject
+  type HumanoidMotionOptionMonitorState
 } from "./motion-option.js";
+import {
+  detectHumanoidMotionOptionFromSimulation,
+  humanoidMotionOptionDetectorInputFromSimulation
+} from "./motion-option-observation.js";
 import {
   HumanoidMotionGeneratorDescriptorSchema,
   TASK_SPACE_MOTION_GENERATOR_DESCRIPTOR,
@@ -54,203 +51,92 @@ import {
   type HumanoidMotionRolloutFrame
 } from "./motion-rollout.js";
 import {
+  accumulateHumanoidPhysicalSafetyFrame,
+  completeHumanoidPhysicalSafetyEvidence,
+  createHumanoidPhysicalSafetyAccumulator,
+  HumanoidPhysicalSafetyEvidenceSchema
+} from "./physical-safety.js";
+import {
   type HumanoidEndEffectorTarget,
   type HumanoidSimulation,
   type HumanoidSimulationSnapshot
 } from "./simulation.js";
+import { HumanoidGraspRegistry } from "./grasp-registry.js";
+import {
+  contactAwareG1GraspTargetsForBindings,
+  contactAwareG1GraspTargetsForOption,
+  mergeG1ContactAwareGraspTargets
+} from "./contact-aware-grasp-servo.js";
+import {
+  HumanoidCarriedObjectBindingSetSchema,
+  humanoidCarriedObjectContactConstraints,
+  humanoidCarriedObjectContinuationEvidence,
+  humanoidCarriedObjectUnauthorizedContacts,
+  type HumanoidCarriedObjectBindingSet
+} from "./carried-object-binding.js";
+import {
+  HumanoidCarryTaskSpaceTargetsSchema,
+  humanoidCarryTaskSpaceTargetsMatchBindings,
+  type HumanoidCarryTaskSpaceTarget
+} from "./carry-task-space-servo.js";
+import {
+  authorizeHumanoidCarriedObjectRelease,
+  type HumanoidCarriedObjectReleaseAuthority
+} from "./carried-object-release.js";
+import { assessHumanoidObjectReleased } from "./object-release.js";
+import {
+  distinctContactBodies,
+  distinctContactHandSurfaces,
+  humanoidEnvironmentContacts,
+  humanoidContactConstraintKey as contactKey,
+  humanoidEnvironmentContactKey,
+  missingRequiredHumanoidContacts,
+  type HumanoidEnvironmentContact
+} from "./motion-contact-policy.js";
 
-const HumanoidRootVelocitySchema = z.object({
-  forward_mps: z.number().finite().describe("身体局部前向速度，单位米每秒"),
-  lateral_mps: z.number().finite().describe("身体局部左向速度，单位米每秒")
-}).strict();
+import {
+  HumanoidMotionPlanSchema,
+  type HumanoidContactConstraint,
+  type HumanoidMotionPlan
+} from "./motion-plan-schema.js";
+import {
+  plannedHandCommandAtTime,
+  TaskSpaceHumanoidMotionGenerator,
+  type HumanoidMotionGenerator
+} from "./task-space-motion-generator.js";
+import { taskSpaceTargets } from "./task-space-motion-targets.js";
 
-const HumanoidEndEffectorTargetSchema = z.object({
-  position: Vec3Schema.describe("末端目标位置；world 为世界坐标，pelvis 为相对骨盆坐标"),
-  frame: z.enum(["world", "pelvis"]),
-  tolerance_m: z.number().finite().min(0.01).max(0.12)
-    .describe("该关键帧在真实 MuJoCo 跟踪后的物理验收容差，单位米；应依据任务精度和已有跟踪误差选择，不是 IK 数值求解误差")
-}).strict();
+export {
+  HumanoidContactConstraintSchema,
+  HumanoidMotionCandidateBatchSchema,
+  HumanoidMotionPlanSchema,
+  duplicateHumanoidMotionCandidateIndexes,
+  humanoidGraspContactAuthorizationFailures,
+  type HumanoidContactConstraint,
+  type HumanoidMotionCandidateBatch,
+  type HumanoidMotionPlan
+} from "./motion-plan-schema.js";
 
-const HumanoidContactConstraintSchema = z.object({
-  body: z.enum(HUMANOID_BODY_NAMES)
-    .describe("允许接触指定物体的真实 G1 Link"),
-  object_id: z.string().trim().min(1)
-    .describe("必须与当前 MuJoCo 动态物体 ID 完全一致"),
-  required: z.boolean()
-    .describe("为 true 时，完整物理预演和真实执行都必须观测到该接触")
-}).strict();
+export {
+  TaskSpaceHumanoidMotionGenerator,
+  occupiedHumanoidChannels,
+  type HumanoidBodyChannel,
+  type HumanoidMotionGenerator,
+  type HumanoidMotionGeneratorInput
+} from "./task-space-motion-generator.js";
 
-type HumanoidContactConstraint = z.infer<typeof HumanoidContactConstraintSchema>;
-
-const HumanoidKeyframeSchema = z.object({
-  at_seconds: z.number().finite().nonnegative(),
-  root_velocity: HumanoidRootVelocitySchema.nullable().optional(),
-  root_yaw_velocity: z.number().finite().describe("根节点偏航角速度，单位弧度每秒").nullable().optional(),
-  root_height: z.number().finite().nullable().optional().refine(
-    (value) => value == null || value > 0,
-    "root_height must be null when unused or a positive pelvis height in meters"
-  ),
-  root_roll: z.number().finite().nullable().optional(),
-  root_pitch: z.number().finite().nullable().optional(),
-  torso_yaw: z.number().finite().min(-1.2).max(1.2).nullable().optional(),
-  left_hand: HumanoidEndEffectorTargetSchema.nullable().optional(),
-  right_hand: HumanoidEndEffectorTargetSchema.nullable().optional(),
-  left_foot: HumanoidEndEffectorTargetSchema.nullable().optional(),
-  right_foot: HumanoidEndEffectorTargetSchema.nullable().optional()
-}).strict();
-
-export const HumanoidMotionPlanSchema = z.object({
-  id: z.string().trim().min(1),
-  intent: z.string().trim().min(1),
-  duration_seconds: z.number().finite().positive().max(30)
-    .describe("本次连续运动分块的总时长，最多 30 秒"),
-  contact_constraints: z.array(HumanoidContactConstraintSchema)
-    .max(16)
-    .describe("只授权列出的 Link 接触列出的物体；未列出的身体-环境接触仍会拒绝计划")
-    .nullable()
-    .optional(),
-  keyframes: z.array(HumanoidKeyframeSchema).min(2).max(128)
-}).strict().superRefine((plan, context) => {
-  const contactKeys = plan.contact_constraints?.map(contactKey) ?? [];
-  if (new Set(contactKeys).size !== contactKeys.length) {
-    context.addIssue({
-      code: "custom",
-      path: ["contact_constraints"],
-      message: "A humanoid plan cannot repeat the same body-object contact constraint"
-    });
-  }
-  if (plan.keyframes[0]?.at_seconds !== 0) {
-    context.addIssue({
-      code: "custom",
-      path: ["keyframes", 0, "at_seconds"],
-      message: "The first humanoid keyframe must start at zero"
-    });
-  }
-  for (let index = 1; index < plan.keyframes.length; index += 1) {
-    if (plan.keyframes[index]!.at_seconds <= plan.keyframes[index - 1]!.at_seconds) {
-      context.addIssue({
-        code: "custom",
-        path: ["keyframes", index, "at_seconds"],
-        message: "Humanoid keyframe times must increase"
-      });
-    }
-  }
-  const finalTime = plan.keyframes.at(-1)?.at_seconds;
-  if (finalTime !== plan.duration_seconds) {
-    context.addIssue({
-      code: "custom",
-      path: ["duration_seconds"],
-      message: "The final humanoid keyframe must equal the plan duration"
-    });
-  }
-});
-
-export type HumanoidMotionPlan = z.infer<typeof HumanoidMotionPlanSchema>;
-
-export function duplicateHumanoidMotionCandidateIndexes(
-  candidates: readonly HumanoidMotionPlan[]
-): Array<{ candidateIndex: number; originalIndex: number }> {
-  const firstIndexByContent = new Map<string, number>();
-  const duplicates: Array<{ candidateIndex: number; originalIndex: number }> = [];
-  candidates.forEach((candidate, candidateIndex) => {
-    const content = humanoidMotionCandidateContent(candidate);
-    const originalIndex = firstIndexByContent.get(content);
-    if (originalIndex === undefined) {
-      firstIndexByContent.set(content, candidateIndex);
-      return;
-    }
-    duplicates.push({ candidateIndex, originalIndex });
-  });
-  return duplicates;
-}
-
-export const HumanoidMotionCandidateBatchSchema = z.object({
-  objective: z.string().trim().min(1)
-    .describe("所有候选共同服务的当前自主目标"),
-  termination: HumanoidMotionOptionContractSchema
-    .describe("所有候选必须共同达成的可观测物理结果；时长只是最多八秒的执行上界"),
-  candidates: z.array(HumanoidMotionPlanSchema).min(2).max(3)
-    .describe("按模型偏好排序的不同连续全身动作候选；每个候选都会从同一物理状态完整预演")
-}).strict().superRefine((batch, context) => {
-  const ids = batch.candidates.map((candidate) => candidate.id);
-  if (new Set(ids).size !== ids.length) {
-    context.addIssue({
-      code: "custom",
-      path: ["candidates"],
-      message: "A humanoid motion candidate batch cannot repeat a plan identifier"
-    });
-  }
-  for (const duplicate of duplicateHumanoidMotionCandidateIndexes(
-    batch.candidates
-  )) {
-    context.addIssue({
-      code: "custom",
-      path: ["candidates", duplicate.candidateIndex],
-      message: `Candidate motion content duplicates candidate ${duplicate.originalIndex + 1}; id and intent labels do not make a distinct candidate`
-    });
-  }
-  const contactPredicates = batch.termination.predicates.filter((predicate) => (
-    predicate.type === "body_contact_object"
-  ));
-  batch.candidates.forEach((candidate, candidateIndex) => {
-    if (candidate.duration_seconds > 8) {
-      context.addIssue({
-        code: "custom",
-        path: ["candidates", candidateIndex, "duration_seconds"],
-        message: "Autonomous humanoid options must return control within eight seconds"
-      });
-    }
-    for (const predicate of contactPredicates) {
-      const authorized = candidate.contact_constraints?.some((constraint) => (
-        constraint.required
-        && constraint.body === predicate.body
-        && constraint.object_id === predicate.object_id
-      ));
-      if (!authorized) {
-        context.addIssue({
-          code: "custom",
-          path: ["candidates", candidateIndex, "contact_constraints"],
-          message: "A contact termination predicate requires the same required body-object contact constraint"
-        });
-      }
-    }
-  });
-});
-
-function humanoidMotionCandidateContent(candidate: HumanoidMotionPlan): string {
-  const contactConstraints = (candidate.contact_constraints ?? [])
-    .map((constraint) => ({
-      body: constraint.body,
-      object_id: constraint.object_id,
-      required: constraint.required
-    }))
-    .sort((left, right) => {
-      const leftKey = contactKey(left);
-      const rightKey = contactKey(right);
-      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
-    });
-  return JSON.stringify({
-    duration_seconds: candidate.duration_seconds,
-    contact_constraints: contactConstraints,
-    keyframes: candidate.keyframes.map((keyframe) => ({
-      at_seconds: keyframe.at_seconds,
-      root_velocity: keyframe.root_velocity ?? null,
-      root_yaw_velocity: keyframe.root_yaw_velocity ?? null,
-      root_height: keyframe.root_height ?? null,
-      root_roll: keyframe.root_roll ?? null,
-      root_pitch: keyframe.root_pitch ?? null,
-      torso_yaw: keyframe.torso_yaw ?? null,
-      left_hand: keyframe.left_hand ?? null,
-      right_hand: keyframe.right_hand ?? null,
-      left_foot: keyframe.left_foot ?? null,
-      right_foot: keyframe.right_foot ?? null
-    }))
-  });
-}
-
-export type HumanoidMotionCandidateBatch = z.infer<
-  typeof HumanoidMotionCandidateBatchSchema
->;
+export {
+  HumanoidEnvironmentContactSchema,
+  blockedHumanoidContacts,
+  humanoidContactConstraintKey,
+  humanoidContactKey,
+  humanoidEnvironmentContacts,
+  humanoidHandContactKey,
+  humanoidHandSolidContactKey,
+  humanoidEnvironmentContactKey,
+  humanoidSolidContactKey,
+  missingRequiredHumanoidContacts
+} from "./motion-contact-policy.js";
 
 export const HumanoidMotionOptionCertificateSchema = z.object({
   artifact_sha256: z.string().regex(/^[a-f0-9]{64}$/),
@@ -262,42 +148,27 @@ export const HumanoidMotionOptionCertificateSchema = z.object({
   predicted_termination_frame: z.number().int().positive(),
   predicted_at_seconds: z.number().finite().positive(),
   stable_steps: z.number().int().positive(),
-  evidence: JsonValueSchema
+  evidence: JsonValueSchema,
+  physical_safety: HumanoidPhysicalSafetyEvidenceSchema.optional()
 }).strict();
 
 export type HumanoidMotionOptionCertificate = z.infer<
   typeof HumanoidMotionOptionCertificateSchema
 >;
 
-export type HumanoidBodyChannel =
-  | "locomotion"
-  | "left_leg"
-  | "right_leg"
-  | "torso"
-  | "left_arm"
-  | "right_arm";
-const HUMANOID_CHANNEL_ORDER: readonly HumanoidBodyChannel[] = [
-  "locomotion",
-  "left_leg",
-  "right_leg",
-  "torso",
-  "left_arm",
-  "right_arm"
-];
-
 export interface HumanoidMotionValidationOptions {
   requireFinalSupport?: boolean;
   contactObjectIds?: ReadonlySet<string>;
+  contactSolidIds?: ReadonlySet<string>;
+  graspRegistry?: HumanoidGraspRegistry;
+  worldFrame?: number;
+  worldRevision?: number;
+  carriedObjectBindings?: HumanoidCarriedObjectBindingSet;
+  carriedObjectTaskSpaceTargets?: readonly HumanoidCarryTaskSpaceTarget[];
   motionOption?: {
     contract: HumanoidMotionOptionContract;
     scenario: Scenario;
   };
-}
-
-export interface HumanoidObjectContact {
-  body: HumanoidBodyName;
-  objectId: string | null;
-  normalForce: number;
 }
 
 export interface HumanoidMotionValidation {
@@ -305,6 +176,7 @@ export interface HumanoidMotionValidation {
   failures: Array<{
     code: "fallen" | "environment_contact" | "required_contact_missing"
       | "unknown_contact_object" | "contact_object_not_currently_visible"
+      | "unknown_contact_solid" | "contact_solid_not_currently_visible"
       | "unsupported_finish" | "invalid_reference"
       | "task_space_target_unmet"
       | "motion_goal_already_satisfied" | "motion_goal_unmet"
@@ -312,7 +184,8 @@ export interface HumanoidMotionValidation {
       | "execution_drift";
     atSeconds: number;
     bodies?: HumanoidBodyName[];
-    contacts?: HumanoidObjectContact[];
+    handSurfaces?: G1HandContactSurfaceName[];
+    contacts?: HumanoidEnvironmentContact[];
     constraints?: HumanoidContactConstraint[];
     drift?: HumanoidMotionDriftEvidence;
     taskSpaceTarget?: {
@@ -322,6 +195,10 @@ export interface HumanoidMotionValidation {
       achieved: Vec3;
       errorMeters: number;
       toleranceMeters: number;
+      orientationTarget?: Quaternion;
+      orientationAchieved?: Quaternion;
+      orientationErrorRadians?: number;
+      orientationToleranceRadians?: number;
       requestedAtSeconds: number;
       observedAtSeconds: number;
     };
@@ -334,7 +211,8 @@ export interface HumanoidMotionValidation {
     minimumSupportMargin: number | null;
     travelledDistance: number;
     environmentContactBodies: HumanoidBodyName[];
-    environmentContacts: HumanoidObjectContact[];
+    environmentContactHandSurfaces: G1HandContactSurfaceName[];
+    environmentContacts: HumanoidEnvironmentContact[];
     satisfiedRequiredContacts: HumanoidContactConstraint[];
   };
   finalSnapshot: HumanoidSimulationSnapshot;
@@ -345,100 +223,6 @@ export interface PreparedHumanoidMotion {
   rollout: HumanoidMotionRollout | null;
   optionCertificate: HumanoidMotionOptionCertificate | null;
   validation: HumanoidMotionValidation;
-}
-
-export interface HumanoidMotionGeneratorInput {
-  simulation: HumanoidSimulation;
-  plan: HumanoidMotionPlan;
-  baseline: HumanoidReference;
-  controlStepSeconds: number;
-}
-
-export interface HumanoidMotionGenerator {
-  readonly descriptor: HumanoidMotionGeneratorDescriptor;
-  generate(input: HumanoidMotionGeneratorInput): Promise<HumanoidMotionArtifact>;
-  dispose(): Promise<void>;
-}
-
-export class TaskSpaceHumanoidMotionGenerator implements HumanoidMotionGenerator {
-  readonly descriptor: HumanoidMotionGeneratorDescriptor =
-    TASK_SPACE_MOTION_GENERATOR_DESCRIPTOR;
-
-  async generate(input: HumanoidMotionGeneratorInput): Promise<HumanoidMotionArtifact> {
-    return generateTaskSpaceMotion(input, this.descriptor.implementation);
-  }
-
-  async dispose(): Promise<void> {}
-}
-
-export function occupiedHumanoidChannels(
-  rawPlan: HumanoidMotionPlan
-): HumanoidBodyChannel[] {
-  const plan = HumanoidMotionPlanSchema.parse(rawPlan);
-  const channels = new Set<HumanoidBodyChannel>();
-  for (const keyframe of plan.keyframes) {
-    if (keyframe.root_velocity
-      || keyframe.root_yaw_velocity != null
-      || keyframe.root_height != null
-      || keyframe.root_roll != null
-      || keyframe.root_pitch != null) {
-      channels.add("locomotion");
-    }
-    if (keyframe.torso_yaw != null) channels.add("torso");
-    if (keyframe.left_foot) channels.add("left_leg");
-    if (keyframe.right_foot) channels.add("right_leg");
-    if (keyframe.left_hand) channels.add("left_arm");
-    if (keyframe.right_hand) channels.add("right_arm");
-  }
-  return HUMANOID_CHANNEL_ORDER.filter((channel) => channels.has(channel));
-}
-
-async function generateTaskSpaceMotion(
-  input: HumanoidMotionGeneratorInput,
-  implementation: string
-): Promise<HumanoidMotionArtifact> {
-  const plan = HumanoidMotionPlanSchema.parse(input.plan);
-  const controlStep = input.controlStepSeconds;
-  if (!Number.isFinite(controlStep) || controlStep <= 0) {
-    throw new Error("Humanoid motion control step must be positive");
-  }
-  const targets: HumanoidReference[] = [];
-  let previous = input.baseline;
-  for (const keyframe of plan.keyframes) {
-    previous = taskSpaceReference(input.simulation, previous, keyframe);
-    targets.push(previous);
-  }
-
-  const frames: HumanoidMotionArtifact["frames"] = [];
-  const steps = Math.ceil(plan.duration_seconds / controlStep);
-  let segment = 1;
-  for (let index = 1; index <= steps; index += 1) {
-    const atSeconds = Math.min(index * controlStep, plan.duration_seconds);
-    while (segment < plan.keyframes.length - 1
-      && atSeconds > plan.keyframes[segment]!.at_seconds) {
-      segment += 1;
-    }
-    const startKeyframe = plan.keyframes[segment - 1]!;
-    const endKeyframe = plan.keyframes[segment]!;
-    const duration = endKeyframe.at_seconds - startKeyframe.at_seconds;
-    frames.push({
-      atSeconds,
-      reference: serializeHumanoidReference(interpolateReference(
-        targets[segment - 1]!,
-        targets[segment]!,
-        (atSeconds - startKeyframe.at_seconds) / duration,
-        duration
-      ))
-    });
-  }
-  return HumanoidMotionArtifactSchema.parse({
-    version: 1,
-    protocol: "humanoid-motion-v1",
-    generator: implementation,
-    controlStepSeconds: controlStep,
-    durationSeconds: plan.duration_seconds,
-    frames
-  });
 }
 
 export async function prepareHumanoidMotion(
@@ -530,8 +314,81 @@ function assertMotionArtifactContract(
     if (Math.abs(artifact.frames[index]!.atSeconds - expectedTime) > 1e-9) {
       throw new Error("Humanoid motion artifact frame cadence mismatch");
     }
+    assertTaskSpaceServoArtifactFrame(
+      artifact.frames[index]!,
+      plan,
+      descriptor.implementation === TASK_SPACE_MOTION_GENERATOR_DESCRIPTOR.implementation
+    );
+  }
+  const coordinatedHands = plan.keyframes.some(
+    (keyframe) => keyframe.hand_coordination != null
+  );
+  if (coordinatedHands !== (artifact.version === 2)) {
+    throw new Error(
+      coordinatedHands
+        ? "Humanoid hand coordination requires a version 2 motion artifact"
+        : "A motion generator cannot add hand commands without model coordination"
+    );
+  }
+  if (artifact.version === 2) {
+    for (const frame of artifact.frames) {
+      const expected = plannedHandCommandAtTime(plan.keyframes, frame.atSeconds);
+      if (!expected || JSON.stringify(expected.coordination)
+        !== JSON.stringify(frame.handCommand.coordination)) {
+        throw new Error("Humanoid motion artifact hand command does not match its model plan");
+      }
+    }
   }
   return artifact;
+}
+
+function assertTaskSpaceServoArtifactFrame(
+  frame: HumanoidMotionArtifact["frames"][number],
+  plan: HumanoidMotionPlan,
+  required: boolean
+): void {
+  const endpointKeyframe = plan.keyframes.find(
+    (keyframe) => frame.atSeconds <= keyframe.at_seconds + 1e-9
+  );
+  if (!endpointKeyframe) {
+    throw new Error("Task-space servo frame exceeds its model plan");
+  }
+  const expected = taskSpaceTargets(endpointKeyframe);
+  const actual = frame.taskSpaceTargets ?? [];
+  if (required && (expected.length === 0) !== (actual.length === 0)) {
+    throw new Error(
+      expected.length === 0
+        ? "Task-space generator added an unauthorized servo target"
+        : "Task-space generator omitted an executable servo target"
+    );
+  }
+  if (actual.length === 0) return;
+  if (expected.length === 0 || actual.length !== expected.length) {
+    throw new Error("Motion artifact task-space targets do not match its model plan");
+  }
+  const expectedByBody = new Map(expected.map((target) => [target.body, target]));
+  for (const target of actual) {
+    const endpoint = expectedByBody.get(target.body);
+    if (!endpoint
+      || target.frame !== endpoint.frame
+      || target.tolerance !== endpoint.tolerance
+      || target.orientationTolerance !== endpoint.orientationTolerance
+      || (target.orientation === undefined) !== (endpoint.orientation === undefined)) {
+      throw new Error("Motion artifact task-space authority exceeds its model plan");
+    }
+    if (Math.abs(frame.atSeconds - endpointKeyframe.at_seconds) > 1e-9) continue;
+    const positionError = Math.hypot(
+      target.position.x - endpoint.position.x,
+      target.position.y - endpoint.position.y,
+      target.position.z - endpoint.position.z
+    );
+    const orientationError = endpoint.orientation && target.orientation
+      ? quaternionAngularDistance(target.orientation, endpoint.orientation)
+      : 0;
+    if (positionError > 1e-9 || orientationError > 1e-9) {
+      throw new Error("Motion artifact task-space endpoint differs from its model plan");
+    }
+  }
 }
 
 async function validateHumanoidMotionArtifact(
@@ -546,15 +403,31 @@ async function validateHumanoidMotionArtifact(
 }> {
   const saved = simulation.captureState();
   const start = simulation.snapshot();
-  const constraints = plan.contact_constraints ?? [];
+  const modelConstraints = plan.contact_constraints ?? [];
+  const carriedObjectBindings = options.carriedObjectBindings
+    ? HumanoidCarriedObjectBindingSetSchema.parse(options.carriedObjectBindings)
+    : null;
+  const carriedObjectTaskSpaceTargets = HumanoidCarryTaskSpaceTargetsSchema.parse(
+    options.carriedObjectTaskSpaceTargets ?? []
+  );
+  const constraints = mergeHumanoidContactConstraints(
+    modelConstraints,
+    carriedObjectBindings
+      ? humanoidCarriedObjectContactConstraints(carriedObjectBindings)
+      : []
+  );
+  const carriedObjectIds = new Set(
+    carriedObjectBindings?.bindings.map((binding) => binding.object_id) ?? []
+  );
   const allowed = new Set(constraints.map(contactKey));
-  const required = constraints.filter((constraint) => constraint.required);
+  const required = modelConstraints.filter((constraint) => constraint.required);
   const knownObjects = new Set(Object.keys(start.objects));
+  const knownSolids = new Set(simulation.solidIds());
   const physicalTargets = scheduledTaskSpaceTargets(plan);
   let nextPhysicalTargetIndex = 0;
   const failures: HumanoidMotionValidation["failures"] = [];
   const contacted = new Set<HumanoidBodyName>();
-  const environmentContacts = new Map<string, HumanoidObjectContact>();
+  const environmentContacts = new Map<string, HumanoidEnvironmentContact>();
   const satisfiedRequired = new Set<string>();
   let minimumRootHeight = start.rootPosition.y;
   let minimumUpright = start.balance.upright;
@@ -570,8 +443,79 @@ async function validateHumanoidMotionArtifact(
   let predictedAtSeconds: number | null = null;
   let predictedEvidence: JsonValue | null = null;
   const rolloutFrames: HumanoidMotionRolloutFrame[] = [];
+  let physicalSafety = createHumanoidPhysicalSafetyAccumulator();
+  const graspRegistry = options.graspRegistry?.fork();
+  const graspTargets = graspRegistry
+    ? mergeG1ContactAwareGraspTargets(
+        carriedObjectBindings
+          ? contactAwareG1GraspTargetsForBindings({
+              bindings: carriedObjectBindings.bindings,
+              graspRegistry
+            })
+          : [],
+        options.motionOption
+          ? contactAwareG1GraspTargetsForOption({
+              option: options.motionOption.contract,
+              graspContract: graspRegistry.contract
+            })
+          : []
+      )
+    : [];
+  const releaseAuthority = carriedObjectBindings && options.motionOption
+    ? authorizeHumanoidCarriedObjectRelease({
+        contract: options.motionOption.contract,
+        bindingSet: carriedObjectBindings
+      })
+    : null;
+  const releaseTrackedObjectIds = new Set(
+    releaseAuthority?.bindings.map((binding) => binding.objectId) ?? []
+  );
+  let releaseSeparated = false;
+  const rolloutStartFrame = options.worldFrame;
+  if ((graspRegistry === undefined) !== (rolloutStartFrame === undefined)) {
+    throw new Error(
+      "Humanoid motion preview requires both grasp registry and world frame"
+    );
+  }
+  if (graspRegistry && graspRegistry.lastFrame !== rolloutStartFrame) {
+    throw new Error(
+      "Humanoid motion preview grasp registry is not aligned with its world frame"
+    );
+  }
+  if (graspRegistry && rolloutStartFrame !== undefined) {
+    graspRegistry.observe(rolloutStartFrame, start);
+  }
+  if (carriedObjectBindings && (
+    graspRegistry === undefined
+      || rolloutStartFrame === undefined
+      || options.worldRevision === undefined
+  )) {
+    throw new Error(
+      "Humanoid carried-object preview requires grasp, frame and revision authority"
+    );
+  }
+  if (carriedObjectBindings
+    && !humanoidCarryTaskSpaceTargetsMatchBindings(
+      carriedObjectTaskSpaceTargets,
+      carriedObjectBindings
+    )) {
+    throw new Error(
+      "Humanoid carried-object preview targets do not match their authority bindings"
+    );
+  }
+  if (!carriedObjectBindings && carriedObjectTaskSpaceTargets.length > 0) {
+    throw new Error(
+      "Humanoid carried-object preview targets require authority bindings"
+    );
+  }
   try {
-    const unknownObjects = constraints.filter((constraint) => (
+    const objectConstraints = constraints.filter((constraint): constraint is (
+      HumanoidContactConstraint & { object_id: string }
+    ) => "object_id" in constraint);
+    const solidConstraints = constraints.filter((constraint): constraint is (
+      HumanoidContactConstraint & { solid_id: string }
+    ) => "solid_id" in constraint);
+    const unknownObjects = objectConstraints.filter((constraint) => (
       !knownObjects.has(constraint.object_id)
     ));
     if (unknownObjects.length > 0) {
@@ -599,8 +543,9 @@ async function validateHumanoidMotionArtifact(
       };
     }
     const unseenObjects = options.contactObjectIds
-      ? constraints.filter((constraint) => (
+      ? objectConstraints.filter((constraint) => (
           !options.contactObjectIds?.has(constraint.object_id)
+            && !carriedObjectIds.has(constraint.object_id)
         ))
       : [];
     if (unseenObjects.length > 0) {
@@ -608,6 +553,62 @@ async function validateHumanoidMotionArtifact(
         code: "contact_object_not_currently_visible",
         atSeconds: 0,
         constraints: unseenObjects
+      });
+      return {
+        validation: validationResult(
+          failures,
+          start,
+          start,
+          0,
+          minimumRootHeight,
+          minimumUpright,
+          minimumSupportMargin,
+          contacted,
+          environmentContacts,
+          required,
+          satisfiedRequired
+        ),
+        rollout: null,
+        optionCertificate: null
+      };
+    }
+    const unknownSolids = solidConstraints.filter((constraint) => (
+      !knownSolids.has(constraint.solid_id)
+    ));
+    if (unknownSolids.length > 0) {
+      failures.push({
+        code: "unknown_contact_solid",
+        atSeconds: 0,
+        constraints: unknownSolids
+      });
+      return {
+        validation: validationResult(
+          failures,
+          start,
+          start,
+          0,
+          minimumRootHeight,
+          minimumUpright,
+          minimumSupportMargin,
+          contacted,
+          environmentContacts,
+          required,
+          satisfiedRequired
+        ),
+        rollout: null,
+        optionCertificate: null
+      };
+    }
+    const unseenSolids = options.contactSolidIds
+      ? solidConstraints.filter((constraint) => (
+          !options.contactSolidIds?.has(constraint.solid_id)
+        ))
+      : [];
+    if (unseenSolids.length > 0) {
+      failures.push({
+        code: "contact_solid_not_currently_visible",
+        atSeconds: 0,
+        constraints: unseenSolids
       });
       return {
         validation: validationResult(
@@ -636,6 +637,14 @@ async function validateHumanoidMotionArtifact(
       if (failure) failures.push(failure);
       nextPhysicalTargetIndex += 1;
     }
+    if (releaseAuthority
+      && !artifactCommandsActiveRelease(start, artifact, releaseAuthority)) {
+      failures.push({
+        code: "motion_constraint_violated",
+        atSeconds: 0,
+        message: "Object release requires a model-authored opening hand command"
+      });
+    }
     if (failures.length > 0) {
       return {
         validation: validationResult(
@@ -656,13 +665,19 @@ async function validateHumanoidMotionArtifact(
       };
     }
     if (options.motionOption) {
-      optionDetection = detectOptionFromSimulation(
+      optionDetection = detectHumanoidMotionOptionFromSimulation({
         simulation,
-        start,
-        options.motionOption,
-        options.contactObjectIds
-      );
-      if (optionDetection.hasUncertain) {
+        snapshot: start,
+        option: options.motionOption,
+        boundObjectIds: options.contactObjectIds,
+        graspRegistry,
+        worldFrame: rolloutStartFrame,
+        trackedObjectIds: releaseTrackedObjectIds
+      });
+      const initialEvidenceUncertain = options.motionOption.contract.phases?.precondition
+        ? optionDetection.phases.precondition?.status === "uncertain"
+        : optionDetection.hasUncertain;
+      if (initialEvidenceUncertain) {
         failures.push({
           code: "motion_goal_uncertain",
           atSeconds: 0,
@@ -700,12 +715,17 @@ async function validateHumanoidMotionArtifact(
         const update = advanceHumanoidMotionOptionMonitor(
           options.motionOption.contract,
           optionMonitor,
-          motionOptionDetectorInputFromSimulation(
+          humanoidMotionOptionDetectorInputFromSimulation({
             simulation,
-            finalSnapshot,
-            options.motionOption,
-            options.contactObjectIds
-          )
+            snapshot: finalSnapshot,
+            option: options.motionOption,
+            boundObjectIds: options.contactObjectIds,
+            graspRegistry,
+            worldFrame: rolloutStartFrame === undefined
+              ? undefined
+              : rolloutStartFrame + simulatedSteps,
+            trackedObjectIds: releaseTrackedObjectIds
+          })
         );
         optionMonitor = update.state;
         optionDetection = update.detection;
@@ -727,7 +747,12 @@ async function validateHumanoidMotionArtifact(
         }
       }
       try {
-        finalSnapshot = await simulation.step(hydrateHumanoidReference(frame.reference));
+        finalSnapshot = (
+          await applyHumanoidMotionArtifactFrame(simulation, frame, {
+            graspTargets,
+            carryTaskSpaceTargets: carriedObjectTaskSpaceTargets
+          })
+        ).snapshot;
       } catch (error) {
         failures.push({
           code: "invalid_reference",
@@ -737,10 +762,60 @@ async function validateHumanoidMotionArtifact(
         break;
       }
       simulatedSteps += 1;
+      if (graspRegistry && rolloutStartFrame !== undefined) {
+        graspRegistry.observe(rolloutStartFrame + simulatedSteps, finalSnapshot);
+      }
+      if (carriedObjectBindings && graspRegistry
+        && rolloutStartFrame !== undefined
+        && options.worldRevision !== undefined) {
+        const continuation = humanoidCarriedObjectContinuationEvidence({
+          state: carriedObjectBindings,
+          registry: graspRegistry,
+          currentFrame: rolloutStartFrame + simulatedSteps,
+          currentWorldRevision: options.worldRevision + simulatedSteps
+        });
+        const unauthorized = humanoidCarriedObjectUnauthorizedContacts(
+          carriedObjectBindings,
+          finalSnapshot.contacts
+        );
+        if (releaseAuthority) {
+          releaseSeparated ||= releaseAuthority.bindings.every((binding) => (
+            assessHumanoidObjectReleased({
+              objectId: binding.objectId,
+              hand: binding.hand,
+              objectObservable: knownObjects.has(binding.objectId),
+              contacts: finalSnapshot.contacts
+            }).status === "satisfied"
+          ));
+        }
+        if ((!releaseAuthority && !continuation.continued)
+          || unauthorized.length > 0 && !releaseSeparated) {
+          const failed = continuation.bindings.find((binding) => !binding.continued);
+          const collision = unauthorized[0];
+          failures.push({
+            code: "motion_constraint_violated",
+            atSeconds: frame.atSeconds,
+            message: failed
+              ? `Carried grasp continuation failed for ${failed.object_id}/${failed.hand}: ${
+                  failed.failure ?? "unknown"
+                }; ${failed.detail ?? "no detail"}`
+              : `Carried object ${collision!.object_id} contacted an unauthorized ${
+                  collision!.counterpart_kind
+                } counterpart`
+          });
+          break;
+        }
+      }
+      physicalSafety = accumulateHumanoidPhysicalSafetyFrame(
+        physicalSafety,
+        simulatedSteps,
+        finalSnapshot
+      );
       if (options.motionOption) {
         rolloutFrames.push(captureHumanoidMotionRolloutFrame(
           frame.atSeconds,
-          finalSnapshot
+          finalSnapshot,
+          artifact.version
         ));
       }
       minimumRootHeight = Math.min(minimumRootHeight, finalSnapshot.rootPosition.y);
@@ -750,30 +825,31 @@ async function validateHumanoidMotionArtifact(
           ? finalSnapshot.balance.supportMargin
           : Math.min(minimumSupportMargin, finalSnapshot.balance.supportMargin);
       }
-      const observedContacts = humanoidObjectContacts(finalSnapshot);
+      const observedContacts = humanoidEnvironmentContacts(finalSnapshot);
       for (const contact of observedContacts) {
-        contacted.add(contact.body);
-        const key = contactPairKey(contact.body, contact.objectId);
+        if ("body" in contact) contacted.add(contact.body);
+        const key = humanoidEnvironmentContactKey(contact);
         const previous = environmentContacts.get(key);
         if (!previous || contact.normalForce > previous.normalForce) {
           environmentContacts.set(key, contact);
         }
-        if (contact.objectId !== null && allowed.has(contactPairKey(
-          contact.body,
-          contact.objectId
-        ))) {
-          satisfiedRequired.add(contactPairKey(contact.body, contact.objectId));
+        if ((contact.objectId !== null || contact.solidId !== null)
+          && allowed.has(key)) {
+          satisfiedRequired.add(key);
         }
       }
       const blockedContacts = observedContacts.filter((contact) => (
-        contact.objectId === null
-        || !allowed.has(contactPairKey(contact.body, contact.objectId))
+        contact.objectId === null && contact.solidId === null
+        || !allowed.has(humanoidEnvironmentContactKey(contact))
       ));
       if (blockedContacts.length > 0) {
+        const bodies = distinctContactBodies(blockedContacts);
+        const handSurfaces = distinctContactHandSurfaces(blockedContacts);
         failures.push({
           code: "environment_contact",
           atSeconds: frame.atSeconds,
-          bodies: [...new Set(blockedContacts.map((contact) => contact.body))],
+          ...(bodies.length > 0 ? { bodies } : {}),
+          ...(handSurfaces.length > 0 ? { handSurfaces } : {}),
           contacts: blockedContacts
         });
         break;
@@ -800,12 +876,17 @@ async function validateHumanoidMotionArtifact(
         const update = advanceHumanoidMotionOptionMonitor(
           options.motionOption.contract,
           optionMonitor,
-          motionOptionDetectorInputFromSimulation(
+          humanoidMotionOptionDetectorInputFromSimulation({
             simulation,
-            finalSnapshot,
-            options.motionOption,
-            options.contactObjectIds
-          )
+            snapshot: finalSnapshot,
+            option: options.motionOption,
+            boundObjectIds: options.contactObjectIds,
+            graspRegistry,
+            worldFrame: rolloutStartFrame === undefined
+              ? undefined
+              : rolloutStartFrame + simulatedSteps,
+            trackedObjectIds: releaseTrackedObjectIds
+          })
         );
         optionMonitor = update.state;
         optionDetection = update.detection;
@@ -840,6 +921,7 @@ async function validateHumanoidMotionArtifact(
             phases: optionDetection.phases,
             monitor: optionMonitor
           });
+          break;
         }
       }
     }
@@ -876,8 +958,9 @@ async function validateHumanoidMotionArtifact(
     }
     const rollout = failures.length === 0
       && options.motionOption
-      && rolloutFrames.length === artifact.frames.length
-      ? createHumanoidMotionRollout(rolloutFrames)
+      && predictedTerminationFrame !== null
+      && rolloutFrames.length === predictedTerminationFrame
+      ? createHumanoidMotionRollout(rolloutFrames, artifact.version)
       : null;
     const optionCertificate = failures.length === 0
       && options.motionOption
@@ -893,11 +976,12 @@ async function validateHumanoidMotionArtifact(
           rollout_sha256: humanoidMotionRolloutSha256(rollout),
           rollout_frame_count: rollout.frames.length,
           drift_consecutive_steps: rollout.limits.consecutive_steps,
-          validated_frame_limit: artifact.frames.length,
+          validated_frame_limit: predictedTerminationFrame,
           predicted_termination_frame: predictedTerminationFrame,
           predicted_at_seconds: predictedAtSeconds,
           stable_steps: options.motionOption.contract.stable_steps,
-          evidence: predictedEvidence
+          evidence: predictedEvidence,
+          physical_safety: completeHumanoidPhysicalSafetyEvidence(physicalSafety)
         })
       : null;
     return {
@@ -922,108 +1006,30 @@ async function validateHumanoidMotionArtifact(
   }
 }
 
-function detectOptionFromSimulation(
-  simulation: HumanoidSimulation,
-  snapshot: HumanoidSimulationSnapshot,
-  option: NonNullable<HumanoidMotionValidationOptions["motionOption"]>,
-  boundObjectIds?: ReadonlySet<string>
-): HumanoidMotionOptionDetection {
-  return detectHumanoidMotionOption(
-    option.contract,
-    motionOptionDetectorInputFromSimulation(
-      simulation,
-      snapshot,
-      option,
-      boundObjectIds
-    )
-  );
-}
-
-function motionOptionDetectorInputFromSimulation(
-  simulation: HumanoidSimulation,
-  snapshot: HumanoidSimulationSnapshot,
-  option: NonNullable<HumanoidMotionValidationOptions["motionOption"]>,
-  boundObjectIds?: ReadonlySet<string>
-): HumanoidMotionOptionDetectorInput {
-  const visible = simulation.senseObjects(option.scenario.visibility_radius).objects;
-  const observableObjects: HumanoidMotionOptionObservableObject[] = [];
-  for (const descriptor of option.scenario.objects) {
-    const object = visible[descriptor.id];
-    if (!object || boundObjectIds && !boundObjectIds.has(descriptor.id)) continue;
-    observableObjects.push({
-      id: descriptor.id,
-      position: { ...object.position },
-      size: { ...descriptor.size }
-    });
-  }
-  return {
-    snapshot,
-    observableObjects,
-    zones: option.scenario.zones
-  };
+function artifactCommandsActiveRelease(
+  start: HumanoidSimulationSnapshot,
+  artifact: HumanoidMotionArtifact,
+  authority: HumanoidCarriedObjectReleaseAuthority
+): boolean {
+  return authority.bindings.every((binding) => {
+    const prefix = `${binding.hand}_hand_`;
+    const baselineClosure = Object.entries(start.hands.joints)
+      .filter(([joint]) => joint.startsWith(prefix))
+      .reduce((total, [, state]) => total + Math.abs(state.target), 0);
+    const commandedClosures = artifact.frames.flatMap((frame) => (
+      "handCommand" in frame
+        ? [Object.entries(frame.handCommand.jointTargets)
+            .filter(([joint]) => joint.startsWith(prefix))
+            .reduce((total, [, target]) => total + Math.abs(target), 0)]
+        : []
+    ));
+    const minimumCommandedClosure = Math.min(...commandedClosures);
+    return minimumCommandedClosure < baselineClosure - 1e-9;
+  });
 }
 
 function asJson(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
-}
-
-function taskSpaceReference(
-  simulation: HumanoidSimulation,
-  baseline: HumanoidReference,
-  keyframe: z.infer<typeof HumanoidKeyframeSchema>
-): HumanoidReference {
-  const rootTarget: HumanoidReferenceTarget = {
-    ...(keyframe.root_velocity
-      ? {
-          rootVelocity: [
-            keyframe.root_velocity.forward_mps,
-            keyframe.root_velocity.lateral_mps
-          ]
-        }
-      : {}),
-    ...(keyframe.root_yaw_velocity != null
-      ? { rootYawVelocity: keyframe.root_yaw_velocity }
-      : {}),
-    ...(keyframe.root_height != null ? { rootHeight: keyframe.root_height } : {}),
-    ...(keyframe.root_roll != null ? { rootRoll: keyframe.root_roll } : {}),
-    ...(keyframe.root_pitch != null ? { rootPitch: keyframe.root_pitch } : {}),
-    ...(keyframe.torso_yaw != null
-      ? { joints: { waist_yaw_joint: keyframe.torso_yaw } }
-      : {})
-  };
-  const rooted = targetReference(baseline, rootTarget);
-  return simulation.solveEndEffectorTargets(rooted, taskSpaceTargets(keyframe)).reference;
-}
-
-function taskSpaceTargets(
-  keyframe: z.infer<typeof HumanoidKeyframeSchema>
-): HumanoidEndEffectorTarget[] {
-  return [
-    ...(keyframe.left_hand ? [{
-      body: "left_wrist_yaw_link" as const,
-      position: keyframe.left_hand.position,
-      frame: keyframe.left_hand.frame,
-      tolerance: keyframe.left_hand.tolerance_m
-    }] : []),
-    ...(keyframe.right_hand ? [{
-      body: "right_wrist_yaw_link" as const,
-      position: keyframe.right_hand.position,
-      frame: keyframe.right_hand.frame,
-      tolerance: keyframe.right_hand.tolerance_m
-    }] : []),
-    ...(keyframe.left_foot ? [{
-      body: "left_ankle_roll_link" as const,
-      position: keyframe.left_foot.position,
-      frame: keyframe.left_foot.frame,
-      tolerance: keyframe.left_foot.tolerance_m
-    }] : []),
-    ...(keyframe.right_foot ? [{
-      body: "right_ankle_roll_link" as const,
-      position: keyframe.right_foot.position,
-      frame: keyframe.right_foot.frame,
-      tolerance: keyframe.right_foot.tolerance_m
-    }] : [])
-  ];
 }
 
 interface ScheduledTaskSpaceTarget {
@@ -1048,7 +1054,8 @@ function physicalTaskSpaceTargetFailure(
   observedAtSeconds: number
 ): HumanoidMotionValidation["failures"][number] | null {
   const target = scheduled.target;
-  const achievedWorld = snapshot.links[target.body].position;
+  const achievedLink = snapshot.links[target.body];
+  const achievedWorld = achievedLink.position;
   const achieved = target.frame === "world"
     ? { ...achievedWorld }
     : rotateVector(
@@ -1060,7 +1067,25 @@ function physicalTaskSpaceTargetFailure(
     achieved.y - target.position.y,
     achieved.z - target.position.z
   );
-  if (errorMeters <= target.tolerance + 1e-9) return null;
+  const orientationTarget = target.orientation
+    ? normalizeQuaternion(target.orientation)
+    : undefined;
+  const orientationAchieved = orientationTarget
+    ? target.frame === "world"
+      ? normalizeQuaternion(achievedLink.rotation)
+      : normalizeQuaternion(multiplyQuaternion(
+          inverseQuaternion(snapshot.links.pelvis.rotation),
+          achievedLink.rotation
+        ))
+    : undefined;
+  const orientationErrorRadians = orientationTarget && orientationAchieved
+    ? quaternionAngularDistance(orientationTarget, orientationAchieved)
+    : undefined;
+  const positionSatisfied = errorMeters <= target.tolerance + 1e-9;
+  const orientationSatisfied = orientationErrorRadians === undefined
+    || target.orientationTolerance !== undefined
+      && orientationErrorRadians <= target.orientationTolerance + 1e-9;
+  if (positionSatisfied && orientationSatisfied) return null;
   const evidence = {
     body: target.body,
     frame: target.frame,
@@ -1068,6 +1093,16 @@ function physicalTaskSpaceTargetFailure(
     achieved,
     errorMeters,
     toleranceMeters: target.tolerance,
+    ...(orientationTarget && orientationAchieved
+      && orientationErrorRadians !== undefined
+      && target.orientationTolerance !== undefined
+      ? {
+          orientationTarget,
+          orientationAchieved,
+          orientationErrorRadians,
+          orientationToleranceRadians: target.orientationTolerance
+        }
+      : {}),
     requestedAtSeconds: scheduled.atSeconds,
     observedAtSeconds
   };
@@ -1077,7 +1112,24 @@ function physicalTaskSpaceTargetFailure(
     taskSpaceTarget: evidence,
     message: `Physical task-space target missed: ${target.body} `
       + `error=${errorMeters.toFixed(3)}m tolerance=${target.tolerance.toFixed(3)}m`
+      + (orientationErrorRadians === undefined || target.orientationTolerance === undefined
+        ? ""
+        : ` orientation=${orientationErrorRadians.toFixed(3)}rad`
+          + ` tolerance=${target.orientationTolerance.toFixed(3)}rad`)
   };
+}
+
+function mergeHumanoidContactConstraints(
+  primary: readonly HumanoidContactConstraint[],
+  additional: readonly HumanoidContactConstraint[]
+): HumanoidContactConstraint[] {
+  const merged = new Map<string, HumanoidContactConstraint>();
+  for (const constraint of [...additional, ...primary]) {
+    merged.set(contactKey(constraint), { ...constraint });
+  }
+  return [...merged.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, constraint]) => constraint);
 }
 
 function validationResult(
@@ -1089,7 +1141,7 @@ function validationResult(
   minimumUpright: number,
   minimumSupportMargin: number | null,
   contacted: ReadonlySet<HumanoidBodyName>,
-  environmentContacts: ReadonlyMap<string, HumanoidObjectContact>,
+  environmentContacts: ReadonlyMap<string, HumanoidEnvironmentContact>,
   required: readonly HumanoidContactConstraint[],
   satisfiedRequired: ReadonlySet<string>
 ): HumanoidMotionValidation {
@@ -1106,6 +1158,9 @@ function validationResult(
         finalSnapshot.rootPosition.z - start.rootPosition.z
       ),
       environmentContactBodies: [...contacted],
+      environmentContactHandSurfaces: distinctContactHandSurfaces(
+        [...environmentContacts.values()]
+      ),
       environmentContacts: [...environmentContacts.values()],
       satisfiedRequiredContacts: required.filter((constraint) => (
         satisfiedRequired.has(contactKey(constraint))
@@ -1113,58 +1168,4 @@ function validationResult(
     },
     finalSnapshot
   };
-}
-
-export function humanoidObjectContacts(
-  snapshot: HumanoidSimulationSnapshot
-): HumanoidObjectContact[] {
-  const contacts = new Map<string, HumanoidObjectContact>();
-  for (const contact of snapshot.contacts) {
-    if ((contact.firstBody === null) === (contact.secondBody === null)) continue;
-    const body = contact.firstBody ?? contact.secondBody;
-    if (!body) continue;
-    const objectId = contact.firstObject ?? contact.secondObject;
-    const foot = body === "left_ankle_roll_link" || body === "right_ankle_roll_link";
-    if (foot && objectId === null && Math.abs(contact.normal.y) >= 0.55) continue;
-    const key = contactPairKey(body, objectId);
-    const candidate = { body, objectId, normalForce: contact.normalForce };
-    const previous = contacts.get(key);
-    if (!previous || candidate.normalForce > previous.normalForce) contacts.set(key, candidate);
-  }
-  return [...contacts.values()];
-}
-
-export function blockedHumanoidContacts(
-  snapshot: HumanoidSimulationSnapshot,
-  constraints: readonly HumanoidContactConstraint[]
-): HumanoidObjectContact[] {
-  const allowed = new Set(constraints.map(contactKey));
-  return humanoidObjectContacts(snapshot).filter((contact) => (
-    contact.objectId === null
-    || !allowed.has(contactPairKey(contact.body, contact.objectId))
-  ));
-}
-
-export function missingRequiredHumanoidContacts(
-  constraints: readonly HumanoidContactConstraint[],
-  satisfied: ReadonlySet<string>
-): HumanoidContactConstraint[] {
-  return constraints.filter((constraint) => (
-    constraint.required && !satisfied.has(contactKey(constraint))
-  ));
-}
-
-export function humanoidContactKey(
-  body: HumanoidBodyName,
-  objectId: string
-): string {
-  return contactPairKey(body, objectId);
-}
-
-function contactKey(constraint: HumanoidContactConstraint): string {
-  return contactPairKey(constraint.body, constraint.object_id);
-}
-
-function contactPairKey(body: HumanoidBodyName, objectId: string | null): string {
-  return `${body}\u0000${objectId ?? ""}`;
 }

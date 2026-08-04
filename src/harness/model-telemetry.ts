@@ -1,8 +1,12 @@
 import type { Model, ModelResponse } from "@openai/agents";
+import { modelPayloadSha256 } from "../domain/model-call-authority.js";
 import { errorMessage } from "../runtime/error-message.js";
 import { isTransportInterruption } from "../runtime/transport-recovery.js";
 import {
-  agentIdFromModelPayload,
+  agentIdFromInstructions,
+  clearAgentInvocationTransportInterruption,
+  currentAgentInvocationId,
+  recordAgentInvocationDecisionInterruption,
   recordAgentInvocationTransportInterruption
 } from "./agent-scope.js";
 import type {
@@ -40,22 +44,32 @@ export function withModelTelemetry(
     : undefined;
   return {
     getResponse: async (request) => {
-      const agentId = agentIdFromModelPayload(request, runtime.rootAgentId);
+      const agentId = requestAgentId(request.systemInstructions, runtime.rootAgentId);
       assertModelBinding(boundAgentId, agentId);
       runtime.activeNode(agentId);
-      await runtime.recordModelCallStarted(agentId);
+      const modelCallId = await runtime.recordModelCallStarted(agentId);
+      let response: ModelResponse;
       try {
-        const response = await model.getResponse(request);
-        await onModelResponseCompleted?.(agentId);
-        const hasDecision = decisionGuard.observe(agentId, response.output);
-        const progressSnapshot = runtime.modelProgressSnapshot?.();
-        if (hasDecision && progressGuard && progressSnapshot) {
-          progressGuard.observe(agentId, progressSnapshot);
-        }
-        return response;
+        response = await model.getResponse(request);
       } catch (error) {
+        if (modelCallId) await runtime.recordModelCallFailed?.(modelCallId, agentId);
         throw preserveModelInterruption(error);
       }
+      clearAgentInvocationTransportInterruption();
+      if (modelCallId && response.responseId) {
+        await runtime.recordModelCallCompleted?.(
+          completedModelCall(modelCallId, agentId, response.responseId, response.output)
+        );
+      } else if (modelCallId) {
+        await runtime.recordModelCallFailed?.(modelCallId, agentId);
+      }
+      await onModelResponseCompleted?.(agentId);
+      const hasDecision = decisionGuard.observe(agentId, response.output);
+      const progressSnapshot = runtime.modelProgressSnapshot?.();
+      if (hasDecision && progressGuard && progressSnapshot) {
+        progressGuard.observe(agentId, progressSnapshot);
+      }
+      return response;
     },
     getStreamedResponse: (request) => claimAndStream(
       model,
@@ -81,13 +95,24 @@ async function* claimAndStream(
   request: Parameters<Model["getStreamedResponse"]>[0],
   onModelResponseCompleted?: (agentId: string) => void | Promise<void>
 ) {
-  const agentId = agentIdFromModelPayload(request, runtime.rootAgentId);
+  const agentId = requestAgentId(request.systemInstructions, runtime.rootAgentId);
   assertModelBinding(boundAgentId, agentId);
   runtime.activeNode(agentId);
-  await runtime.recordModelCallStarted(agentId);
+  const modelCallId = await runtime.recordModelCallStarted(agentId);
+  let terminalRecorded = false;
   try {
     for await (const event of model.getStreamedResponse(request)) {
       if (event.type === "response_done") {
+        if (modelCallId) {
+          await runtime.recordModelCallCompleted?.(completedModelCall(
+            modelCallId,
+            agentId,
+            event.response.id,
+            event.response.output
+          ));
+          terminalRecorded = true;
+        }
+        clearAgentInvocationTransportInterruption();
         await onModelResponseCompleted?.(agentId);
         const hasDecision = decisionGuard.observe(agentId, event.response.output);
         const progressSnapshot = runtime.modelProgressSnapshot?.();
@@ -98,16 +123,54 @@ async function* claimAndStream(
       yield event;
     }
   } catch (error) {
+    if (modelCallId && !terminalRecorded) {
+      await runtime.recordModelCallFailed?.(modelCallId, agentId);
+    }
     throw preserveModelInterruption(error);
   }
+}
+
+function completedModelCall(
+  modelCallId: string,
+  agentId: string,
+  responseId: string,
+  output: ModelResponse["output"]
+): Parameters<NonNullable<ModelTelemetryRuntime["recordModelCallCompleted"]>>[0] {
+  return {
+    modelCallId,
+    agentId,
+    responseId,
+    responseOutputSha256: modelPayloadSha256(output),
+    toolCalls: output.flatMap((item) => {
+      if (item.type !== "function_call") return [];
+      let parsedArguments: unknown;
+      try {
+        parsedArguments = JSON.parse(item.arguments);
+      } catch {
+        parsedArguments = item.arguments;
+      }
+      return [{
+        toolCallId: item.callId,
+        toolName: item.name,
+        argumentsSha256: modelPayloadSha256(parsedArguments)
+      }];
+    })
+  };
 }
 
 function preserveModelInterruption(error: unknown): Error {
   const normalized = asError(error);
   if (isTransportInterruption(normalized)) {
     recordAgentInvocationTransportInterruption(normalized);
+  } else if (normalized instanceof ModelDecisionStallError) {
+    recordAgentInvocationDecisionInterruption(normalized);
   }
   return normalized;
+}
+
+function requestAgentId(systemInstructions: unknown, rootAgentId: string): string {
+  return currentAgentInvocationId()
+    ?? agentIdFromInstructions(systemInstructions, rootAgentId);
 }
 
 function assertModelBinding(boundAgentId: string, requestAgentId: string): void {
@@ -183,7 +246,6 @@ interface ModelProgressGuardLimits {
 export class AuthoritativeModelProgressGuard {
   readonly #limits: ModelProgressGuardLimits;
   readonly #receiptPatterns = new Map<string, number>();
-  #worldRevision: number;
   #cycleIndex: number;
   #checkerSuccess: boolean;
   #previousReceiptIds: Set<string>;
@@ -207,7 +269,6 @@ export class AuthoritativeModelProgressGuard {
         throw new Error("Model progress guard limits must be positive safe integers");
       }
     }
-    this.#worldRevision = snapshot.worldRevision;
     this.#cycleIndex = snapshot.cycleIndex;
     this.#checkerSuccess = snapshot.checkerSuccess;
     this.#previousReceiptIds = new Set(snapshot.receipts.map((receipt) => receipt.transactionId));
@@ -221,11 +282,9 @@ export class AuthoritativeModelProgressGuard {
     this.#previousReceiptIds = new Set(
       snapshot.receipts.map((receipt) => receipt.transactionId)
     );
-    const physicalProgress = snapshot.worldRevision !== this.#worldRevision
-      || snapshot.cycleIndex !== this.#cycleIndex
+    const physicalProgress = snapshot.cycleIndex !== this.#cycleIndex
       || (!this.#checkerSuccess && snapshot.checkerSuccess)
       || newReceipts.some(receiptHasPhysicalProgress);
-    this.#worldRevision = snapshot.worldRevision;
     this.#cycleIndex = snapshot.cycleIndex;
     this.#checkerSuccess = snapshot.checkerSuccess;
     if (physicalProgress) {
@@ -313,6 +372,29 @@ export class ModelDecisionStallError extends Error {
     this.agentId = agentId;
     this.evidence = evidence ? structuredClone(evidence) : undefined;
   }
+}
+
+export function modelDecisionStallFrom(
+  error: unknown
+): ModelDecisionStallError | undefined {
+  const pending: unknown[] = [error];
+  const visited = new Set<object>();
+  while (pending.length > 0 && visited.size < 12) {
+    const candidate = pending.shift();
+    if (candidate instanceof ModelDecisionStallError) return candidate;
+    if (candidate === null || typeof candidate !== "object"
+      || visited.has(candidate)) continue;
+    visited.add(candidate);
+    const wrapper = candidate as {
+      error?: unknown;
+      cause?: unknown;
+      originalError?: unknown;
+      errors?: unknown;
+    };
+    pending.push(wrapper.error, wrapper.cause, wrapper.originalError);
+    if (Array.isArray(wrapper.errors)) pending.push(...wrapper.errors);
+  }
+  return undefined;
 }
 
 function receiptHasPhysicalProgress(receipt: ModelProgressReceipt): boolean {

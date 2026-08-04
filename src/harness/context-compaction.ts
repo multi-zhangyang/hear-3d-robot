@@ -11,11 +11,18 @@ import {
   type JsonValue,
   type TaskNode
 } from "../domain/schema.js";
-import type { ProviderConfig } from "../config/load.js";
+import type {
+  ModelProviderConfig,
+  ProviderConfig
+} from "../config/load.js";
 import type { FileSession } from "../persistence/file-session.js";
 import type { LongRunContextRuntime } from "./context-runtime.js";
-import { compactorInputTokenLimit } from "../runtime/context-budget.js";
-import { agentIdFromModelPayload, agentInvocationMarker } from "./agent-scope.js";
+import {
+  compactorInputTokenLimit,
+  defaultOutputTokenReserve,
+  effectiveContextSummaryOutputTokens
+} from "../runtime/context-budget.js";
+import { agentIdFromInstructions, agentInvocationMarker } from "./agent-scope.js";
 import {
   ContextCompactionInterruption,
   estimateContextSummaryRequestTokens,
@@ -55,7 +62,9 @@ export class LongRunContextManager {
   readonly #runtime: LongRunContextRuntime;
   readonly #createGenerator: (agentId: string) => ContextSummaryGenerator;
   readonly #generators = new Map<string, ContextSummaryGenerator>();
-  readonly #config: ProviderConfig;
+  readonly #defaultConfig: ModelProviderConfig;
+  readonly #configForAgent: (agentId: string) => ModelProviderConfig;
+  readonly #compactorConfig: ModelProviderConfig;
   readonly #sessionForAgent: ((agentId: string) => FileSession) | undefined;
   readonly #recoveredInputs = new Map<string, RecoveredInputState>();
   readonly #freshTurnScopes = new Set<string>();
@@ -67,19 +76,24 @@ export class LongRunContextManager {
     runtime: LongRunContextRuntime;
     createGenerator: (agentId: string) => ContextSummaryGenerator;
     provider: ProviderConfig;
+    configForAgent?: (agentId: string) => ModelProviderConfig;
+    compactorProvider?: ModelProviderConfig;
     sessionForAgent?: (agentId: string) => FileSession;
   }) {
     this.#runtime = input.runtime;
     this.#createGenerator = input.createGenerator;
-    this.#config = input.provider;
+    this.#defaultConfig = input.provider;
+    this.#configForAgent = input.configForAgent ?? (() => this.#defaultConfig);
+    this.#compactorConfig = input.compactorProvider ?? input.provider;
     this.#sessionForAgent = input.sessionForAgent;
     const persisted = input.runtime.contextMemory();
+    const defaultSummaryOutputTokens = this.#summaryOutputTokens(this.#defaultConfig);
     this.#state = ContextMemoryStateSchema.parse({
       ...persisted,
       context_window_tokens: input.provider.contextWindowTokens,
       compact_trigger_tokens: input.provider.compactTriggerTokens,
       compact_recent_model_turns: input.provider.compactRecentModelTurns,
-      compact_max_output_tokens: input.provider.compactMaxOutputTokens
+      compact_max_output_tokens: defaultSummaryOutputTokens
     });
   }
 
@@ -133,9 +147,14 @@ export class LongRunContextManager {
     agent
   }): Promise<ModelInputData> => {
     this.#runtime.signal?.throwIfAborted();
-    const agentId = agentIdFromModelPayload(modelData.input, this.#runtime.rootAgentId);
+    const agentId = agentIdFromInstructions(
+      modelData.instructions,
+      this.#runtime.rootAgentId
+    );
     const node = this.#runtime.activeNode(agentId);
-    const scope = this.#scope(node);
+    const config = this.#configForAgent(agentId);
+    const summaryOutputTokens = this.#summaryOutputTokens(config);
+    const scope = this.#scope(node, config, summaryOutputTokens);
     const physicalInput = modelData.input;
     const logicalInput = await this.#logicalInput(scope, physicalInput);
     const logicalModelData: ModelInputData = {
@@ -174,8 +193,16 @@ export class LongRunContextManager {
       persisted = true;
     }
 
-    while (scope.active_estimated_tokens > this.#config.compactTriggerTokens) {
-      const compacted = await this.#compact(logicalModelData, node, scope, authority, toolTokens);
+    while (scope.active_estimated_tokens > config.compactTriggerTokens) {
+      const compacted = await this.#compact(
+        logicalModelData,
+        node,
+        scope,
+        authority,
+        toolTokens,
+        config,
+        summaryOutputTokens
+      );
       if (compacted === null) break;
       filtered = compacted.modelData;
       // Each completed batch is its own restart-safe checkpoint. If a later
@@ -217,7 +244,8 @@ export class LongRunContextManager {
       persisted = true;
     }
 
-    const hardLimit = this.#config.contextWindowTokens - this.#config.maxOutputTokens;
+    const hardLimit = config.contextWindowTokens
+      - (config.maxOutputTokens ?? defaultOutputTokenReserve(config.contextWindowTokens));
     if (scope.active_estimated_tokens > hardLimit) {
       throw new ContextCompactionInterruption(
         `Active context for ${agent.name} is estimated at ${scope.active_estimated_tokens} tokens, `
@@ -228,10 +256,15 @@ export class LongRunContextManager {
     return filtered;
   };
 
-  #scope(node: TaskNode): ContextScopeState {
+  #scope(
+    node: TaskNode,
+    config: ModelProviderConfig,
+    summaryOutputTokens: number
+  ): ContextScopeState {
     const existing = this.#state.scopes[node.id];
     if (existing) {
       existing.agent_name = node.name;
+      this.#setScopeBudget(existing, config, summaryOutputTokens);
       return existing;
     }
     const created: ContextScopeState = {
@@ -244,6 +277,10 @@ export class LongRunContextManager {
       retained_item_count: 0,
       retained_chain_hash: null,
       active_estimated_tokens: 0,
+      context_window_tokens: config.contextWindowTokens,
+      compact_trigger_tokens: config.compactTriggerTokens,
+      compact_recent_model_turns: config.compactRecentModelTurns,
+      compact_max_output_tokens: summaryOutputTokens,
       compaction_count: 0,
       summary: null,
       summary_origin: null,
@@ -496,23 +533,25 @@ export class LongRunContextManager {
     node: TaskNode,
     scope: ContextScopeState,
     authority: JsonValue,
-    toolTokens: number
+    toolTokens: number,
+    config: ModelProviderConfig,
+    summaryOutputTokens: number
   ): Promise<{ modelData: ModelInputData; journalRecord: JsonValue } | null> {
     const targetCut = chooseCutIndex({
       items: modelData.input,
       alreadyCompacted: scope.compacted_item_count,
-      recentTurns: this.#config.compactRecentModelTurns,
+      recentTurns: config.compactRecentModelTurns,
       modelData,
       authority,
       toolTokens,
-      summaryTokenReserve: this.#config.compactMaxOutputTokens,
-      triggerTokens: this.#config.compactTriggerTokens
+      summaryTokenReserve: summaryOutputTokens,
+      triggerTokens: config.compactTriggerTokens
     });
     if (targetCut <= scope.compacted_item_count) return null;
 
     const maxInputTokens = compactorInputTokenLimit(
-      this.#config.contextWindowTokens,
-      this.#config.compactMaxOutputTokens
+      this.#compactorConfig.contextWindowTokens,
+      summaryOutputTokens
     );
     if (maxInputTokens <= 0) {
       throw new ContextCompactionInterruption(
@@ -550,6 +589,7 @@ export class LongRunContextManager {
           receipts[transactionId]?.worldRevision === currentWorldRevision
         ),
         maxInputTokens,
+        maxOutputTokens: summaryOutputTokens,
         ...(this.#runtime.signal ? { signal: this.#runtime.signal } : {})
       };
       const estimatedInputTokens = estimateContextSummaryRequestTokens(request);
@@ -645,6 +685,7 @@ export class LongRunContextManager {
       source_to_item: cut,
       compactor_estimated_input_tokens: estimatedInputTokens,
       compactor_input_limit_tokens: maxInputTokens,
+      compactor_max_output_tokens: summaryOutputTokens,
       active_estimated_tokens: scope.active_estimated_tokens,
       usage: generated.usage
     }));
@@ -661,6 +702,7 @@ export class LongRunContextManager {
         source_estimated_tokens: estimateItemsTokens(sourceItems),
         compactor_estimated_input_tokens: estimatedInputTokens,
         compactor_input_limit_tokens: maxInputTokens,
+        compactor_max_output_tokens: summaryOutputTokens,
         retained_items: modelData.input.length - cut,
         active_estimated_tokens: scope.active_estimated_tokens,
         world_revision: world.worldRevision,
@@ -687,9 +729,11 @@ export class LongRunContextManager {
     authority: JsonValue
   ): ModelInputData {
     const identity = agentInvocationMarker(scope.agent_id);
+    const exactIdentifiers = authorityIdentifierBlock(authority);
     const authorityBlock = [
       "CURRENT HARNESS AUTHORITY",
       "This block is rebuilt from the live checkpoint for every model request. It overrides compact memory and older observations.",
+      ...exactIdentifiers,
       JSON.stringify(authority)
     ].join("\n");
     if (!scope.summary) return {
@@ -779,6 +823,35 @@ export class LongRunContextManager {
   #setActive(scope: ContextScopeState): void {
     this.#state.active_scope_id = scope.scope_id;
     this.#state.active_estimated_tokens = scope.active_estimated_tokens;
+    if (scope.context_window_tokens !== undefined
+      && scope.compact_trigger_tokens !== undefined
+      && scope.compact_recent_model_turns !== undefined
+      && scope.compact_max_output_tokens !== undefined) {
+      this.#state.context_window_tokens = scope.context_window_tokens;
+      this.#state.compact_trigger_tokens = scope.compact_trigger_tokens;
+      this.#state.compact_recent_model_turns = scope.compact_recent_model_turns;
+      this.#state.compact_max_output_tokens = scope.compact_max_output_tokens;
+    }
+  }
+
+  #setScopeBudget(
+    scope: ContextScopeState,
+    config: ModelProviderConfig,
+    summaryOutputTokens: number
+  ): void {
+    scope.context_window_tokens = config.contextWindowTokens;
+    scope.compact_trigger_tokens = config.compactTriggerTokens;
+    scope.compact_recent_model_turns = config.compactRecentModelTurns;
+    scope.compact_max_output_tokens = summaryOutputTokens;
+  }
+
+  #summaryOutputTokens(config: ModelProviderConfig): number {
+    return effectiveContextSummaryOutputTokens(
+      config.compactMaxOutputTokens,
+      this.#compactorConfig.compactMaxOutputTokens,
+      this.#compactorConfig.maxOutputTokens,
+      this.#compactorConfig.contextWindowTokens
+    );
   }
 
   #rememberRetainedTail(scope: ContextScopeState, items: AgentInputItem[]): void {
@@ -958,4 +1031,34 @@ function compactionFailureUsage(error: unknown): ContextSummaryResult["usage"] |
 
 function json(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function authorityIdentifierBlock(authority: JsonValue): string[] {
+  if (!isJsonRecord(authority)) return [];
+  const goalContext = isJsonRecord(authority.goal_context)
+    ? authority.goal_context
+    : undefined;
+  const goalDAG = isJsonRecord(authority.goal_dag)
+    ? authority.goal_dag
+    : undefined;
+  const evidenceRef = typeof goalContext?.evidence_ref === "string"
+    ? goalContext.evidence_ref
+    : undefined;
+  const candidates = isJsonRecord(goalDAG?.candidates)
+    ? Object.keys(goalDAG.candidates).sort()
+    : [];
+  const currentEpochId = typeof goalDAG?.current_epoch_id === "string"
+    ? goalDAG.current_epoch_id
+    : null;
+  if (!evidenceRef && candidates.length === 0 && currentEpochId === null) return [];
+  return [
+    "CURRENT EXACT IDENTIFIERS (copy values character-for-character; never invent aliases)",
+    `goal_evidence_ref=${JSON.stringify(evidenceRef ?? null)}`,
+    `existing_goal_candidate_ids=${JSON.stringify(candidates)}`,
+    `current_goal_epoch_id=${JSON.stringify(currentEpochId)}`
+  ];
+}
+
+function isJsonRecord(value: unknown): value is Record<string, JsonValue> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

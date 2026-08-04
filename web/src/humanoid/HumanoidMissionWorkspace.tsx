@@ -1,15 +1,20 @@
 import { useMemo } from "react";
 import type { HumanoidFrameBuffer } from "../stage/humanoid-frame-buffer";
 import type {
+  GoalPredicate,
   HumanoidBodyChannel,
   HumanoidRunDetails,
   HumanoidWorldSnapshot,
   StreamState
 } from "../types";
+import { activeContextUsage } from "../context-memory";
+import { activeCheckpointGoal } from "../goal-state";
+import { buildAgentTree } from "../flow/agent-tree";
 import {
   actionLabel,
   agentNameLabel,
   bodyChannelLabel,
+  entityLabel,
   humanoidControllerLabel,
   motionGeneratorLabel,
   nodeStatusLabel,
@@ -39,18 +44,20 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
   const live = checkpoint.status === "starting" || checkpoint.status === "running";
   const frame = useHumanoidHudFrame(props.frameBuffer, checkpoint.world);
   const nodes = useMemo(
-    () => Object.values(checkpoint.nodes).sort((left, right) => left.created_at.localeCompare(right.created_at)),
-    [checkpoint.nodes]
+    () => buildAgentTree(checkpoint.nodes, checkpoint.root_id).map((entry) => entry.node),
+    [checkpoint.nodes, checkpoint.root_id]
   );
   const current = checkpoint.active_agent_id
     ? checkpoint.nodes[checkpoint.active_agent_id]
     : checkpoint.nodes[checkpoint.root_id];
   const activeChannels = movingHumanoidChannels(frame);
   const latest = props.details.actions.at(-1);
+  const goal = activeCheckpointGoal(checkpoint);
   const passed = checkpoint.checker?.checks.filter((check) => check.passed).length ?? 0;
-  const total = checkpoint.goal.predicates.length;
+  const total = goal?.predicates.length ?? 0;
   const context = checkpoint.context_memory;
-  const contextLoad = Math.min(100, context.active_estimated_tokens / context.compact_trigger_tokens * 100);
+  const contextUsage = activeContextUsage(context);
+  const activeGrasps = activeHumanoidGrasps(frame);
 
   return (
     <section className="mission-world humanoid-mission-world" aria-label={live ? "实时人形任务" : "人形任务回顾"}>
@@ -101,6 +108,23 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
         <div className="balance-track">
           <span style={{ width: `${Math.max(0, Math.min(100, frame.robot.balance.upright * 100))}%` }} />
         </div>
+        {activeGrasps.length > 0 && (
+          <div className="humanoid-grasp-state" aria-label="实时抓取状态">
+            {activeGrasps.map((assessment) => (
+              <span
+                key={`${assessment.object_id}-${assessment.hand}`}
+                className={assessment.grasp_verified ? "verified" : ""}
+              >
+                <i />
+                <b>{graspHandLabel(assessment.hand)} · {entityLabel(assessment.object_id)}</b>
+                <small>
+                  {assessment.grasp_verified ? "已抓稳 · " : ""}
+                  接触 {assessment.evidence.relative_pose.stable_frames} 帧 · 抬离 {assessment.evidence.lifted_hold_frames} 帧
+                </small>
+              </span>
+            ))}
+          </div>
+        )}
         <footer>
           <span>{navigationLabel(frame.navigation.status)}</span>
           <b>{frame.robot.fallen ? "失衡" : "稳定"}</b>
@@ -109,24 +133,44 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
 
       <section className="humanoid-goal-hud game-card" aria-label="目标与长期记忆">
         <div className="humanoid-goal-title">
-          <span>目标</span><b>{passed}/{total}</b>
+          <span>{checkpoint.version === 6 ? "Goal Epoch" : "目标"}</span>
+          <b>{goal ? `${passed}/${total}` : "选择中"}</b>
         </div>
         <div className="humanoid-goal-list">
-          {checkpoint.goal.predicates.map((predicate, index) => (
-            <span key={`${predicate.type}-${index}`}>
-              <i className={checkpoint.checker?.checks[index]?.passed ? "passed" : ""} />
-              <b>{predicateLabel(predicate)}</b>
-              {predicate.type === "end_effector_at" && (
-                <em aria-label="连续稳定帧">
-                  {checkpoint.goal_progress?.predicate_streaks[index] ?? 0}/{predicate.stable_frames}
-                </em>
-              )}
+          {goal ? goal.predicates.map((predicate, index) => {
+            const graspProgress = predicate.type === "object_grasped"
+              ? graspPredicateProgress(frame, predicate)
+              : null;
+            const blockContact = predicate.type === "block_removed"
+              ? blockContactProgress(frame, predicate.block_id)
+              : null;
+            return (
+              <span key={`${predicate.type}-${index}`}>
+                <i className={checkpoint.checker?.checks[index]?.passed ? "passed" : ""} />
+                <b>{predicateLabel(predicate)}</b>
+                {predicate.type === "end_effector_at" && (
+                  <em aria-label="连续稳定帧">
+                    {checkpoint.goal_progress?.predicate_streaks[index] ?? 0}/{predicate.stable_frames}
+                  </em>
+                )}
+                {graspProgress && (
+                  <em aria-label="抓取保持进度">{graspProgress}</em>
+                )}
+                {blockContact && (
+                  <em aria-label="方块接触力">{blockContact}</em>
+                )}
+              </span>
+            );
+          }) : (
+            <span className="humanoid-goal-awaiting">
+              <i />
+              <b>等待目标管理智能体选择</b>
             </span>
-          ))}
+          )}
         </div>
         <div className="memory-meter">
-          <span><small>上下文</small><b>{compactTokens(context.active_estimated_tokens)}</b></span>
-          <i><em style={{ width: `${contextLoad}%` }} /></i>
+          <span><small>上下文</small><b>{compactTokens(contextUsage.activeEstimatedTokens)}</b></span>
+          <i><em style={{ width: `${contextUsage.loadFraction * 100}%` }} /></i>
           <small>{context.total_compactions} 次压缩 · {checkpoint.embodied_memory.total_episodes} 段经历</small>
         </div>
       </section>
@@ -136,6 +180,18 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
 
 function Metric(props: { label: string; value: string | number; active?: boolean }): React.JSX.Element {
   return <span className={props.active ? "active" : ""}><small>{props.label}</small><b>{props.value}</b></span>;
+}
+
+function blockContactProgress(
+  frame: HumanoidWorldSnapshot,
+  blockId: string
+): string | null {
+  const maximumForce = frame.robot.contacts.reduce((maximum, contact) => (
+    contact.firstSolid === blockId || contact.secondSolid === blockId
+      ? Math.max(maximum, contact.normalForce)
+      : maximum
+  ), 0);
+  return maximumForce > 0 ? `接触 ${forceLabel(maximumForce)}` : null;
 }
 
 export function movingHumanoidChannels(
@@ -162,6 +218,37 @@ export function movingHumanoidChannels(
     else if (name.startsWith("right_")) active.add("right_arm");
   }
   return HUMANOID_BODY_CHANNELS.filter((channel) => active.has(channel));
+}
+
+export function activeHumanoidGrasps(
+  frame: HumanoidWorldSnapshot
+): HumanoidWorldSnapshot["grasp"]["assessments"] {
+  return frame.grasp.assessments.filter((assessment) => (
+    assessment.frame === frame.frame
+      && (assessment.grasp_verified
+        || assessment.phase !== "idle"
+        || assessment.evidence.contact.status !== "missing")
+  ));
+}
+
+function graspHandLabel(hand: "left" | "right"): string {
+  return hand === "left" ? "左手" : "右手";
+}
+
+function graspPredicateProgress(
+  frame: HumanoidWorldSnapshot,
+  predicate: Extract<GoalPredicate, { type: "object_grasped" }>
+): string | null {
+  const matching = frame.grasp.assessments.filter((assessment) => (
+    assessment.frame === frame.frame
+      && assessment.object_id === predicate.object_id
+      && (predicate.hand === "either" || assessment.hand === predicate.hand)
+  ));
+  const assessment = matching.find((candidate) => candidate.grasp_verified)
+    ?? matching.find((candidate) => candidate.evidence.contact.status !== "missing");
+  return assessment
+    ? `${assessment.evidence.relative_pose.stable_frames}/${assessment.evidence.lifted_hold_frames}`
+    : null;
 }
 
 function forceLabel(force: number): string {

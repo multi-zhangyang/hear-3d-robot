@@ -9,14 +9,28 @@ import {
   type Scenario,
   type ScenarioTemplate
 } from "../domain/schema.js";
-import { compactorInputTokenLimit } from "../runtime/context-budget.js";
+import {
+  compactorInputTokenLimit,
+  defaultOutputTokenReserve
+} from "../runtime/context-budget.js";
 import { assertScenarioIntegrity } from "../runtime/goal-validation.js";
 import { assertHumanoidGoalSupported } from "../runtime/humanoid-checker.js";
 import { materializeScenario } from "../world/world-generator.js";
 
 const bundledConfigDirectory = fileURLToPath(new URL("../../config/", import.meta.url));
 
-const ProviderConfigSchema = z.object({
+export const AGENT_MODEL_ROLES = [
+  "goal_manager",
+  "coordinator",
+  "sentry",
+  "motion",
+  "executor",
+  "compactor"
+] as const;
+
+export type AgentModelRole = typeof AGENT_MODEL_ROLES[number];
+
+const ProviderConfigShape = {
   protocol: z.enum([
     "openai_compatible",
     "openai_responses",
@@ -27,13 +41,36 @@ const ProviderConfigSchema = z.object({
   apiKey: z.string().min(1),
   requestTimeoutMs: z.number().int().min(5_000).max(10 * 60_000).optional(),
   temperature: z.number().min(0).max(2),
-  maxOutputTokens: z.number().int().positive(),
+  maxOutputTokens: z.number().int().positive().optional(),
   contextWindowTokens: z.number().int().positive(),
   compactTriggerTokens: z.number().int().positive(),
   compactRecentModelTurns: z.number().int().nonnegative(),
-  compactMaxOutputTokens: z.number().int().positive()
-}).superRefine((config, context) => {
-  const reserved = config.maxOutputTokens + config.compactMaxOutputTokens;
+  compactMaxOutputTokens: z.number().int().positive().optional()
+} as const;
+
+const ModelProviderConfigSchema = z.object(ProviderConfigShape).strict().superRefine(
+  validateProviderBudget
+);
+
+const ProviderConfigSchema = z.object({
+  ...ProviderConfigShape,
+  agentModels: z.object({
+    goal_manager: ModelProviderConfigSchema,
+    coordinator: ModelProviderConfigSchema,
+    sentry: ModelProviderConfigSchema,
+    motion: ModelProviderConfigSchema,
+    executor: ModelProviderConfigSchema,
+    compactor: ModelProviderConfigSchema
+  }).strict().optional()
+}).strict().superRefine(validateProviderBudget);
+
+function validateProviderBudget(
+  config: z.infer<typeof ModelProviderConfigSchema>,
+  context: z.RefinementCtx
+): void {
+  const fallbackReserve = defaultOutputTokenReserve(config.contextWindowTokens);
+  const reserved = (config.maxOutputTokens ?? fallbackReserve)
+    + (config.compactMaxOutputTokens ?? fallbackReserve);
   if (config.compactTriggerTokens + reserved >= config.contextWindowTokens) {
     context.addIssue({
       code: "custom",
@@ -43,7 +80,7 @@ const ProviderConfigSchema = z.object({
   }
   if (compactorInputTokenLimit(
     config.contextWindowTokens,
-    config.compactMaxOutputTokens
+    config.compactMaxOutputTokens ?? fallbackReserve
   ) <= 0) {
     context.addIssue({
       code: "custom",
@@ -51,8 +88,9 @@ const ProviderConfigSchema = z.object({
       message: "AI_COMPACT_MAX_OUTPUT_TOKENS leaves no room for bounded compactor repair turns"
     });
   }
-});
+}
 
+export type ModelProviderConfig = z.infer<typeof ModelProviderConfigSchema>;
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
 /**
@@ -80,33 +118,38 @@ export function loadEnvironment(path = resolve(process.cwd(), ".env")): void {
 }
 
 export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): ProviderConfig {
-  const contextWindowTokens = numberFromEnv(env.AI_CONTEXT_WINDOW_TOKENS, 65_536);
-  return ProviderConfigSchema.parse({
+  const contextWindowTokens = numberFromEnv(env.AI_CONTEXT_WINDOW_TOKENS, 262_144);
+  const inherited = ModelProviderConfigSchema.parse({
     protocol: env.AI_PROVIDER,
     baseUrl: env.AI_BASE_URL,
     model: env.AI_MODEL,
     apiKey: env.AI_API_KEY,
     requestTimeoutMs: numberFromEnv(env.AI_REQUEST_TIMEOUT_MS, 90_000),
     temperature: numberFromEnv(env.AI_TEMPERATURE, 0.2),
-    // Bound unproductive generations while leaving enough room for model
-    // reasoning and the resulting tool call, both of which consume this budget.
-    maxOutputTokens: numberFromEnv(env.AI_MAX_OUTPUT_TOKENS, 8192),
+    maxOutputTokens: optionalNumberFromEnv(env.AI_MAX_OUTPUT_TOKENS),
     contextWindowTokens,
     compactTriggerTokens: numberFromEnv(
       env.AI_COMPACT_TRIGGER_TOKENS,
-      // The advertised context window is a hard ceiling, not a useful working
-      // set. Long tool histories can make planning quality collapse well
-      // before that ceiling, so compact around 27.5% for the default 65k
-      // window while still scaling down for smaller models.
-      Math.min(18_000, Math.floor(contextWindowTokens * 0.4))
+      Math.floor(contextWindowTokens * 0.275)
     ),
     compactRecentModelTurns: numberFromEnv(env.AI_COMPACT_RECENT_MODEL_TURNS, 4),
-    // Compaction is itself a reasoning/tool-call run. A 2k ceiling can be
-    // exhausted before a reasoning model emits the required typed checkpoint,
-    // so keep enough output room for the decision while still validating the
-    // complete repair-turn envelope against the configured context window.
-    compactMaxOutputTokens: numberFromEnv(env.AI_COMPACT_MAX_OUTPUT_TOKENS, 4096)
+    compactMaxOutputTokens: optionalNumberFromEnv(env.AI_COMPACT_MAX_OUTPUT_TOKENS)
   });
+  const agentModels = Object.fromEntries(AGENT_MODEL_ROLES.map((role) => [
+    role,
+    loadAgentModelConfig(env, role, inherited)
+  ])) as Record<AgentModelRole, ModelProviderConfig>;
+  return ProviderConfigSchema.parse({ ...inherited, agentModels });
+}
+
+export function providerConfigForRole(
+  config: ProviderConfig,
+  role: AgentModelRole
+): ModelProviderConfig {
+  const selected = config.agentModels?.[role];
+  if (selected) return ModelProviderConfigSchema.parse(selected);
+  const { agentModels: _agentModels, ...inherited } = config;
+  return ModelProviderConfigSchema.parse(inherited);
 }
 
 export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -114,10 +157,17 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error("HEAR_PORT must be an integer between 1 and 65535");
   }
+  const host = env.HEAR_HOST?.trim() || "127.0.0.1";
+  const password = env.HEAR_OPERATOR_PASSWORD?.trim() || "";
+  if (!password && !isLoopbackHost(host)) {
+    throw new Error(
+      "HEAR_OPERATOR_PASSWORD is required when HEAR_HOST is not a loopback address"
+    );
+  }
   return {
-    host: env.HEAR_HOST?.trim() || "127.0.0.1",
+    host,
     port,
-    password: env.HEAR_OPERATOR_PASSWORD?.trim() || "",
+    password,
     runsDir: resolve(env.HEAR_RUNS_DIR?.trim() || "runs")
   };
 }
@@ -156,4 +206,67 @@ function numberFromEnv(value: string | undefined, defaultValue: number): number 
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) throw new Error(`Invalid numeric environment value: ${value}`);
   return parsed;
+}
+
+function optionalNumberFromEnv(
+  value: string | undefined,
+  inherited?: number
+): number | undefined {
+  if (value === undefined || value.trim() === "") return inherited;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error(`Invalid numeric environment value: ${value}`);
+  return parsed;
+}
+
+function loadAgentModelConfig(
+  env: NodeJS.ProcessEnv,
+  role: AgentModelRole,
+  inherited: ModelProviderConfig
+): ModelProviderConfig {
+  const prefix = `AI_${role.toUpperCase()}_`;
+  return ModelProviderConfigSchema.parse({
+    protocol: stringFromEnv(env[`${prefix}PROVIDER`], inherited.protocol),
+    baseUrl: stringFromEnv(env[`${prefix}BASE_URL`], inherited.baseUrl),
+    model: stringFromEnv(env[`${prefix}MODEL`], inherited.model),
+    apiKey: stringFromEnv(env[`${prefix}API_KEY`], inherited.apiKey),
+    requestTimeoutMs: numberFromEnv(
+      env[`${prefix}REQUEST_TIMEOUT_MS`],
+      inherited.requestTimeoutMs ?? 90_000
+    ),
+    temperature: numberFromEnv(env[`${prefix}TEMPERATURE`], inherited.temperature),
+    maxOutputTokens: optionalNumberFromEnv(
+      env[`${prefix}MAX_OUTPUT_TOKENS`],
+      inherited.maxOutputTokens
+    ),
+    contextWindowTokens: numberFromEnv(
+      env[`${prefix}CONTEXT_WINDOW_TOKENS`],
+      inherited.contextWindowTokens
+    ),
+    compactTriggerTokens: numberFromEnv(
+      env[`${prefix}COMPACT_TRIGGER_TOKENS`],
+      inherited.compactTriggerTokens
+    ),
+    compactRecentModelTurns: numberFromEnv(
+      env[`${prefix}COMPACT_RECENT_MODEL_TURNS`],
+      inherited.compactRecentModelTurns
+    ),
+    compactMaxOutputTokens: optionalNumberFromEnv(
+      env[`${prefix}COMPACT_MAX_OUTPUT_TOKENS`],
+      inherited.compactMaxOutputTokens
+    )
+  });
+}
+
+function stringFromEnv(value: string | undefined, inherited: string): string {
+  return value?.trim() ? value : inherited;
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  if (normalized === "localhost" || normalized === "::1") return true;
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(normalized);
+  if (!match) return false;
+  const octets = match.slice(1).map(Number);
+  return octets.every((octet) => Number.isInteger(octet) && octet >= 0 && octet <= 255)
+    && octets[0] === 127;
 }

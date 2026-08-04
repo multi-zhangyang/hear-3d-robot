@@ -25,6 +25,17 @@ describe("goal validation", () => {
           tolerance: 0.1
         },
         {
+          type: "object_grasped",
+          object_id: "courtyard_crate",
+          hand: "either"
+        },
+        {
+          type: "object_placed",
+          object_id: "courtyard_crate",
+          zone_id: "courtyard_beacon",
+          tolerance: 0.05
+        },
+        {
           type: "end_effector_at",
           end_effector: "left_wrist",
           frame: "world",
@@ -66,6 +77,27 @@ describe("goal validation", () => {
     }, scenario)).toThrow("Unknown object: missing_object");
 
     expect(() => assertGoalSupported({
+      summary: "未知抓取物体",
+      predicates: [{
+        type: "object_grasped",
+        object_id: "missing_object",
+        hand: "left"
+      }]
+    }, scenario)).toThrow("Unknown object: missing_object");
+
+    expect(() => assertGoalSupported({
+      summary: "固定物体不可抓取",
+      predicates: [{
+        type: "object_grasped",
+        object_id: "courtyard_crate",
+        hand: "right"
+      }]
+    }, {
+      ...scenario,
+      objects: scenario.objects.map((object) => ({ ...object, portable: false }))
+    })).toThrow("Object is not movable: courtyard_crate");
+
+    expect(() => assertGoalSupported({
       summary: "未知区域",
       predicates: [{
         type: "object_in_zone",
@@ -75,6 +107,29 @@ describe("goal validation", () => {
         tolerance: 0
       }]
     }, scenario)).toThrow("Unknown zone: missing_zone");
+
+    expect(() => assertGoalSupported({
+      summary: "未知放置区域",
+      predicates: [{
+        type: "object_placed",
+        object_id: "courtyard_crate",
+        zone_id: "missing_zone",
+        tolerance: 0.05
+      }]
+    }, scenario)).toThrow("Unknown zone: missing_zone");
+
+    expect(() => assertGoalSupported({
+      summary: "固定物体不可放置",
+      predicates: [{
+        type: "object_placed",
+        object_id: "courtyard_crate",
+        zone_id: "courtyard_beacon",
+        tolerance: 0.05
+      }]
+    }, {
+      ...scenario,
+      objects: scenario.objects.map((object) => ({ ...object, portable: false }))
+    })).toThrow("Object is not movable: courtyard_crate");
 
     expect(() => assertGoalSupported({
       summary: "越界末端目标",

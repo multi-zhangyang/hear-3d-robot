@@ -1,233 +1,45 @@
 import { z } from "zod";
-import { createHash } from "node:crypto";
 import {
-  HumanoidEndEffectorSchema,
-  Vec3Schema,
   type HumanoidEndEffector,
   type Quaternion,
   type Vec3
 } from "../../domain/schema.js";
+import { type HumanoidBodyName } from "./model.js";
+import type { G1HandContactSurfaceName } from "./morphology.js";
 import {
-  HUMANOID_BODY_NAMES,
-  type HumanoidBodyName
-} from "./model.js";
-import { humanoidEndEffectorPosition } from "./end-effectors.js";
+  humanoidEndEffectorPosition,
+  humanoidEndEffectorRotation
+} from "./end-effectors.js";
+import {
+  HumanoidGraspAssessmentSchema,
+  type HumanoidGraspAssessment
+} from "./grasp-tracker.js";
+import {
+  assessHumanoidObjectSettledOnSupport,
+  type HumanoidObjectSettledSupportEvidence,
+  type HumanoidObjectSettledSupportReason
+} from "./object-settled-support.js";
+import { assessHumanoidObjectReleased } from "./object-release.js";
+import {
+  normalizeQuaternion,
+  orientedBoxWorldHalfExtents,
+  quaternionAngularDistance
+} from "../geometry.js";
+import {
+  HumanoidMotionOptionContractSchema,
+  humanoidMotionOptionConditionMetrics,
+  humanoidMotionOptionContractSha256,
+  type HumanoidMotionOptionCondition,
+  type HumanoidMotionOptionContract,
+  type HumanoidMotionOptionPredicate
+} from "./motion-option-contract.js";
 
-const PositionToleranceSchema = z.number().finite().positive().max(5);
-
-const RootNearPointPredicateSchema = z.object({
-  type: z.literal("root_near_point"),
-  target: Vec3Schema,
-  tolerance_m: PositionToleranceSchema
-}).strict();
-
-const BodyNearPointPredicateSchema = z.object({
-  type: z.literal("body_near_point"),
-  body: z.enum(HUMANOID_BODY_NAMES),
-  target: Vec3Schema,
-  tolerance_m: PositionToleranceSchema
-}).strict();
-
-const EndEffectorNearPointPredicateSchema = z.object({
-  type: z.literal("end_effector_near_point"),
-  end_effector: HumanoidEndEffectorSchema,
-  frame: z.enum(["world", "pelvis"]),
-  target: Vec3Schema,
-  tolerance_m: PositionToleranceSchema
-}).strict();
-
-const BodyContactObjectPredicateSchema = z.object({
-  type: z.literal("body_contact_object"),
-  body: z.enum(HUMANOID_BODY_NAMES),
-  object_id: z.string().trim().min(1),
-  minimum_normal_force: z.number().finite().positive()
-}).strict();
-
-const ObjectNearPointPredicateSchema = z.object({
-  type: z.literal("object_near_point"),
-  object_id: z.string().trim().min(1),
-  target: Vec3Schema,
-  tolerance_m: PositionToleranceSchema
-}).strict();
-
-const ObjectInZonePredicateSchema = z.object({
-  type: z.literal("object_in_zone"),
-  object_id: z.string().trim().min(1),
-  zone_id: z.string().trim().min(1),
-  expected: z.boolean(),
-  tolerance_m: z.number().finite().nonnegative().max(5)
-}).strict();
-
-const HumanoidMotionOptionPredicateSchema = z.discriminatedUnion("type", [
-  RootNearPointPredicateSchema,
-  BodyNearPointPredicateSchema,
-  EndEffectorNearPointPredicateSchema,
-  BodyContactObjectPredicateSchema,
-  ObjectNearPointPredicateSchema,
-  ObjectInZonePredicateSchema
-]);
-
-export type HumanoidMotionOptionCondition =
-  | {
-      op: "predicate";
-      predicate_index: number;
-    }
-  | {
-      op: "all" | "any";
-      conditions: HumanoidMotionOptionCondition[];
-    }
-  | {
-      op: "not";
-      condition: HumanoidMotionOptionCondition;
-    };
-
-const HumanoidMotionOptionConditionSchema:
-  z.ZodType<HumanoidMotionOptionCondition, HumanoidMotionOptionCondition> =
-    z.lazy(() => z.discriminatedUnion("op", [
-      z.object({
-        op: z.literal("predicate"),
-        predicate_index: z.number().int().min(0).max(15)
-      }).strict(),
-      z.object({
-        op: z.literal("all"),
-        conditions: z.array(HumanoidMotionOptionConditionSchema).min(1).max(16)
-      }).strict(),
-      z.object({
-        op: z.literal("any"),
-        conditions: z.array(HumanoidMotionOptionConditionSchema).min(1).max(16)
-      }).strict(),
-      z.object({
-        op: z.literal("not"),
-        condition: HumanoidMotionOptionConditionSchema
-      }).strict()
-    ]));
-
-const StableStepsSchema = z.number().int().min(1).max(500);
-
-const HumanoidMotionOptionPhasesSchema = z.object({
-  precondition: z.object({
-    condition: HumanoidMotionOptionConditionSchema,
-    stable_steps: StableStepsSchema.nullable().default(null)
-  }).strict().nullable().default(null),
-  during: z.object({
-    condition: HumanoidMotionOptionConditionSchema
-  }).strict().nullable().default(null),
-  terminal: z.object({
-    condition: HumanoidMotionOptionConditionSchema
-  }).strict()
-}).strict();
-
-const HumanoidMotionOptionContractShapeSchema = z.object({
-  option_id: z.string().trim().min(1),
-  predicates: z.array(HumanoidMotionOptionPredicateSchema).min(1).max(16),
-  stable_steps: StableStepsSchema,
-  phases: HumanoidMotionOptionPhasesSchema.nullable().default(null)
-}).strict();
-
-export const HumanoidMotionOptionContractSchema =
-  HumanoidMotionOptionContractShapeSchema.superRefine((contract, context) => {
-    if (!contract.phases) return;
-    const phaseConditions: Array<{
-      path: Array<string | number>;
-      condition: HumanoidMotionOptionCondition;
-    }> = [
-      ...(contract.phases.precondition
-        ? [{
-            path: ["phases", "precondition", "condition"],
-            condition: contract.phases.precondition.condition
-          }]
-        : []),
-      ...(contract.phases.during
-        ? [{
-            path: ["phases", "during", "condition"],
-            condition: contract.phases.during.condition
-          }]
-        : []),
-      {
-        path: ["phases", "terminal", "condition"],
-        condition: contract.phases.terminal.condition
-      }
-    ];
-    for (const phase of phaseConditions) {
-      const metrics = conditionMetrics(phase.condition);
-      if (metrics.depth > 8) {
-        context.addIssue({
-          code: "custom",
-          path: phase.path,
-          message: "A humanoid option condition cannot exceed eight AST levels"
-        });
-      }
-      if (metrics.nodes > 64) {
-        context.addIssue({
-          code: "custom",
-          path: phase.path,
-          message: "A humanoid option condition cannot exceed 64 AST nodes"
-        });
-      }
-      for (const predicateIndex of metrics.predicateIndexes) {
-        if (predicateIndex >= contract.predicates.length) {
-          context.addIssue({
-            code: "custom",
-            path: phase.path,
-            message: `Condition references missing predicate ${predicateIndex}`
-          });
-        }
-      }
-    }
-  });
-
-type HumanoidMotionOptionPredicate = z.infer<
-  typeof HumanoidMotionOptionPredicateSchema
->;
-export type HumanoidMotionOptionContract = z.input<
-  typeof HumanoidMotionOptionContractSchema
->;
-
-function conditionMetrics(condition: HumanoidMotionOptionCondition): {
-  depth: number;
-  nodes: number;
-  predicateIndexes: number[];
-} {
-  if (condition.op === "predicate") {
-    return {
-      depth: 1,
-      nodes: 1,
-      predicateIndexes: [condition.predicate_index]
-    };
-  }
-  if (condition.op === "not") {
-    const child = conditionMetrics(condition.condition);
-    return {
-      depth: child.depth + 1,
-      nodes: child.nodes + 1,
-      predicateIndexes: child.predicateIndexes
-    };
-  }
-  let depth = 0;
-  let nodes = 1;
-  const predicateIndexes: number[] = [];
-  for (const nested of condition.conditions) {
-    const child = conditionMetrics(nested);
-    depth = Math.max(depth, child.depth);
-    nodes += child.nodes;
-    predicateIndexes.push(...child.predicateIndexes);
-  }
-  return { depth: depth + 1, nodes, predicateIndexes };
-}
-
-export function humanoidMotionOptionContractSha256(
-  contract: HumanoidMotionOptionContract
-): string {
-  const parsed = HumanoidMotionOptionContractSchema.parse(contract);
-  const canonical = parsed.phases === null
-    ? {
-        option_id: parsed.option_id,
-        predicates: parsed.predicates,
-        stable_steps: parsed.stable_steps
-      }
-    : parsed;
-  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
-}
+export {
+  HumanoidMotionOptionContractSchema,
+  humanoidMotionOptionContractSha256,
+  type HumanoidMotionOptionCondition,
+  type HumanoidMotionOptionContract
+} from "./motion-option-contract.js";
 
 export interface HumanoidMotionOptionRobotSnapshot {
   rootPosition: Vec3;
@@ -235,18 +47,28 @@ export interface HumanoidMotionOptionRobotSnapshot {
     position: Vec3;
     rotation?: Quaternion;
   }>>>;
+  objects?: Readonly<Record<string, {
+    linearVelocity?: Vec3;
+    angularVelocity?: Vec3;
+  }>>;
   contacts: ReadonlyArray<{
+    normal?: Vec3 | null;
     normalForce: number;
     firstBody: HumanoidBodyName | null;
     secondBody: HumanoidBodyName | null;
     firstObject: string | null;
     secondObject: string | null;
+    firstSolid?: string | null | undefined;
+    secondSolid?: string | null | undefined;
+    firstHandLink?: string | null;
+    secondHandLink?: string | null;
   }>;
 }
 
 export interface HumanoidMotionOptionObservableObject {
   id: string;
   position: Vec3;
+  rotation: Quaternion;
   size: Vec3;
 }
 
@@ -259,15 +81,31 @@ interface HumanoidMotionOptionZone {
 export interface HumanoidMotionOptionDetectorInput {
   snapshot: HumanoidMotionOptionRobotSnapshot;
   observableObjects: readonly HumanoidMotionOptionObservableObject[];
+  observableSolidIds?: readonly string[];
   zones: readonly HumanoidMotionOptionZone[];
+  graspAssessments?: readonly HumanoidMotionOptionGraspAssessmentBinding[];
 }
+
+export interface HumanoidMotionOptionGraspAssessmentBinding {
+  predicate_index: number;
+  contract_sha256: string;
+  assessment: HumanoidGraspAssessment;
+}
+
+const HumanoidMotionOptionGraspAssessmentBindingSchema = z.object({
+  predicate_index: z.number().int().min(0).max(15),
+  contract_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  assessment: HumanoidGraspAssessmentSchema
+}).strict();
 
 type HumanoidMotionOptionTruth =
   "satisfied" | "unsatisfied" | "uncertain";
 type PredicateUncertainty = "body_snapshot_missing"
   | "end_effector_snapshot_missing"
   | "object_not_observable"
-  | "zone_not_found";
+  | "solid_not_observable"
+  | "zone_not_found"
+  | "grasp_assessment_missing";
 
 interface PredicateEvidenceBase {
   predicateIndex: number;
@@ -289,6 +127,10 @@ type HumanoidMotionOptionPredicateEvidence =
       target: Vec3;
       distanceMeters: number | null;
       toleranceMeters: number;
+      actualOrientation?: Quaternion | null;
+      targetOrientation?: Quaternion;
+      orientationErrorRadians?: number | null;
+      orientationToleranceRadians?: number;
       reason?: Extract<PredicateUncertainty, "body_snapshot_missing">;
     }
   | PredicateEvidenceBase & {
@@ -314,6 +156,24 @@ type HumanoidMotionOptionPredicateEvidence =
       reason?: Extract<PredicateUncertainty, "object_not_observable">;
     }
   | PredicateEvidenceBase & {
+      type: "body_contact_solid";
+      body: HumanoidBodyName;
+      solidId: string;
+      solidObservable: boolean;
+      maximumNormalForce: number | null;
+      minimumNormalForce: number;
+      reason?: Extract<PredicateUncertainty, "solid_not_observable">;
+    }
+  | PredicateEvidenceBase & {
+      type: "hand_contact_solid";
+      handSurface: G1HandContactSurfaceName;
+      solidId: string;
+      solidObservable: boolean;
+      maximumNormalForce: number | null;
+      minimumNormalForce: number;
+      reason?: Extract<PredicateUncertainty, "solid_not_observable">;
+    }
+  | PredicateEvidenceBase & {
       type: "object_near_point";
       objectId: string;
       objectObservable: boolean;
@@ -336,7 +196,31 @@ type HumanoidMotionOptionPredicateEvidence =
         PredicateUncertainty,
         "object_not_observable" | "zone_not_found"
       >;
-    };
+    }
+  | PredicateEvidenceBase & {
+      type: "grasp_verified";
+      objectId: string;
+      hand: "left" | "right";
+      contractSha256: string;
+      assessment: HumanoidGraspAssessment | null;
+      reason: HumanoidGraspAssessment["reason"]
+        | Extract<PredicateUncertainty, "grasp_assessment_missing">;
+    }
+  | PredicateEvidenceBase & {
+      type: "object_released";
+      objectId: string;
+      hand: "left" | "right";
+      reason: "object_released" | "hand_contact_present" | "object_not_observable";
+      objectObservable: boolean;
+      handContactCount: number | null;
+      contactSurfaces: string[];
+      totalNormalForceN: number | null;
+    }
+  | PredicateEvidenceBase & {
+      type: "object_settled_on_support";
+      objectId: string;
+      reason: HumanoidObjectSettledSupportReason;
+    } & HumanoidObjectSettledSupportEvidence;
 
 interface HumanoidMotionOptionConditionEvaluation {
   status: HumanoidMotionOptionTruth;
@@ -361,9 +245,25 @@ export function detectHumanoidMotionOption(
 ): HumanoidMotionOptionDetection {
   const contract = HumanoidMotionOptionContractSchema.parse(rawContract);
   const objects = uniqueById(input.observableObjects, "observable humanoid object");
+  const solids = new Set(input.observableSolidIds ?? []);
+  if (solids.size !== (input.observableSolidIds?.length ?? 0)) {
+    throw new Error("Duplicate observable humanoid solid");
+  }
   const zones = uniqueById(input.zones, "humanoid option zone");
+  const graspAssessments = graspAssessmentsForContract(
+    contract.predicates,
+    input.graspAssessments ?? []
+  );
   const evidence = contract.predicates.map((predicate, predicateIndex) => (
-    detectPredicate(predicate, predicateIndex, input.snapshot, objects, zones)
+    detectPredicate(
+      predicate,
+      predicateIndex,
+      input.snapshot,
+      objects,
+      solids,
+      zones,
+      graspAssessments
+    )
   ));
   const conditions = conditionsForContract(contract);
   const precondition = conditions.precondition
@@ -419,7 +319,7 @@ function evaluateCondition(
   condition: HumanoidMotionOptionCondition,
   evidence: readonly HumanoidMotionOptionPredicateEvidence[]
 ): HumanoidMotionOptionConditionEvaluation {
-  const metrics = conditionMetrics(condition);
+  const metrics = humanoidMotionOptionConditionMetrics(condition);
   return {
     status: evaluateConditionTruth(condition, evidence),
     predicateIndexes: [...new Set(metrics.predicateIndexes)]
@@ -611,7 +511,12 @@ function detectPredicate(
   predicateIndex: number,
   snapshot: HumanoidMotionOptionRobotSnapshot,
   objects: ReadonlyMap<string, HumanoidMotionOptionObservableObject>,
-  zones: ReadonlyMap<string, HumanoidMotionOptionZone>
+  solids: ReadonlySet<string>,
+  zones: ReadonlyMap<string, HumanoidMotionOptionZone>,
+  graspAssessments: ReadonlyMap<
+    number,
+    HumanoidMotionOptionGraspAssessmentBinding
+  >
 ): HumanoidMotionOptionPredicateEvidence {
   if (predicate.type === "root_near_point") {
     const distanceMeters = distance(snapshot.rootPosition, predicate.target);
@@ -658,7 +563,14 @@ function detectPredicate(
       predicate.end_effector,
       predicate.frame
     );
-    if (!actualPosition) {
+    const actualOrientation = predicate.target_orientation
+      ? humanoidEndEffectorRotation(
+          snapshot,
+          predicate.end_effector,
+          predicate.frame
+        )
+      : undefined;
+    if (!actualPosition || predicate.target_orientation && !actualOrientation) {
       return {
         predicateIndex,
         type: predicate.type,
@@ -669,14 +581,32 @@ function detectPredicate(
         target: { ...predicate.target },
         distanceMeters: null,
         toleranceMeters: predicate.tolerance_m,
+        ...(predicate.target_orientation
+          ? {
+              actualOrientation: null,
+              targetOrientation: normalizeQuaternion(predicate.target_orientation),
+              orientationErrorRadians: null,
+              orientationToleranceRadians: predicate.orientation_tolerance_rad
+            }
+          : {}),
         reason: "end_effector_snapshot_missing"
       };
     }
     const distanceMeters = distance(actualPosition, predicate.target);
+    const targetOrientation = predicate.target_orientation
+      ? normalizeQuaternion(predicate.target_orientation)
+      : undefined;
+    const orientationErrorRadians = targetOrientation && actualOrientation
+      ? quaternionAngularDistance(actualOrientation, targetOrientation)
+      : undefined;
+    const positionSatisfied = distanceMeters <= predicate.tolerance_m;
+    const orientationSatisfied = orientationErrorRadians === undefined
+      || predicate.orientation_tolerance_rad !== undefined
+        && orientationErrorRadians <= predicate.orientation_tolerance_rad;
     return {
       predicateIndex,
       type: predicate.type,
-      status: distanceMeters <= predicate.tolerance_m
+      status: positionSatisfied && orientationSatisfied
         ? "satisfied"
         : "unsatisfied",
       endEffector: predicate.end_effector,
@@ -684,7 +614,146 @@ function detectPredicate(
       actualPosition,
       target: { ...predicate.target },
       distanceMeters,
-      toleranceMeters: predicate.tolerance_m
+      toleranceMeters: predicate.tolerance_m,
+      ...(targetOrientation && actualOrientation
+        && orientationErrorRadians !== undefined
+        && predicate.orientation_tolerance_rad !== undefined
+        ? {
+            actualOrientation,
+            targetOrientation,
+            orientationErrorRadians,
+            orientationToleranceRadians: predicate.orientation_tolerance_rad
+          }
+        : {})
+    };
+  }
+  if (predicate.type === "grasp_verified") {
+    const binding = graspAssessments.get(predicateIndex);
+    if (!binding) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        objectId: predicate.object_id,
+        hand: predicate.hand,
+        contractSha256: predicate.grasp_contract_sha256,
+        assessment: null,
+        reason: "grasp_assessment_missing"
+      };
+    }
+    const assessment = structuredClone(binding.assessment);
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: assessment.grasp_verified
+        ? "satisfied"
+        : graspAssessmentIsPhysicallyUncertain(assessment)
+          ? "uncertain"
+          : "unsatisfied",
+      objectId: predicate.object_id,
+      hand: predicate.hand,
+      contractSha256: predicate.grasp_contract_sha256,
+      assessment,
+      reason: assessment.reason
+    };
+  }
+  if (predicate.type === "object_released") {
+    const assessment = assessHumanoidObjectReleased({
+      objectId: predicate.object_id,
+      hand: predicate.hand,
+      objectObservable: objects.has(predicate.object_id),
+      contacts: snapshot.contacts
+    });
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: assessment.status,
+      objectId: predicate.object_id,
+      hand: predicate.hand,
+      reason: assessment.reason,
+      objectObservable: assessment.objectObservable,
+      handContactCount: assessment.handContactCount,
+      contactSurfaces: assessment.contactSurfaces,
+      totalNormalForceN: assessment.totalNormalForceN
+    };
+  }
+  if (predicate.type === "object_settled_on_support") {
+    const assessment = assessHumanoidObjectSettledOnSupport({
+      objectId: predicate.object_id,
+      objectObservable: objects.has(predicate.object_id),
+      snapshot
+    });
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: assessment.status,
+      objectId: predicate.object_id,
+      reason: assessment.reason,
+      ...assessment.evidence
+    };
+  }
+  if (predicate.type === "body_contact_solid") {
+    if (!solids.has(predicate.solid_id)) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        body: predicate.body,
+        solidId: predicate.solid_id,
+        solidObservable: false,
+        maximumNormalForce: null,
+        minimumNormalForce: predicate.minimum_normal_force,
+        reason: "solid_not_observable"
+      };
+    }
+    const maximumNormalForce = maximumSolidBodyContactForce(
+      snapshot,
+      predicate.body,
+      predicate.solid_id
+    );
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: maximumNormalForce >= predicate.minimum_normal_force
+        ? "satisfied"
+        : "unsatisfied",
+      body: predicate.body,
+      solidId: predicate.solid_id,
+      solidObservable: true,
+      maximumNormalForce,
+      minimumNormalForce: predicate.minimum_normal_force
+    };
+  }
+  if (predicate.type === "hand_contact_solid") {
+    if (!solids.has(predicate.solid_id)) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        handSurface: predicate.hand_surface,
+        solidId: predicate.solid_id,
+        solidObservable: false,
+        maximumNormalForce: null,
+        minimumNormalForce: predicate.minimum_normal_force,
+        reason: "solid_not_observable"
+      };
+    }
+    const maximumNormalForce = maximumSolidHandContactForce(
+      snapshot,
+      predicate.hand_surface,
+      predicate.solid_id
+    );
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: maximumNormalForce >= predicate.minimum_normal_force
+        ? "satisfied"
+        : "unsatisfied",
+      handSurface: predicate.hand_surface,
+      solidId: predicate.solid_id,
+      solidObservable: true,
+      maximumNormalForce,
+      minimumNormalForce: predicate.minimum_normal_force
     };
   }
   const object = objects.get(predicate.object_id);
@@ -753,8 +822,64 @@ function detectPredicate(
   };
 }
 
+function graspAssessmentsForContract(
+  predicates: readonly HumanoidMotionOptionPredicate[],
+  rawBindings: readonly HumanoidMotionOptionGraspAssessmentBinding[]
+): ReadonlyMap<number, HumanoidMotionOptionGraspAssessmentBinding> {
+  const bindings = new Map<number, HumanoidMotionOptionGraspAssessmentBinding>();
+  const objectHands = new Set<string>();
+  for (const rawBinding of rawBindings) {
+    const binding = HumanoidMotionOptionGraspAssessmentBindingSchema.parse(rawBinding);
+    if (bindings.has(binding.predicate_index)) {
+      throw new Error(
+        `Duplicate humanoid grasp assessment predicate index: ${binding.predicate_index}`
+      );
+    }
+    const predicate = predicates[binding.predicate_index];
+    if (predicate?.type !== "grasp_verified") {
+      throw new Error(
+        `Humanoid grasp assessment ${binding.predicate_index} does not reference a grasp predicate`
+      );
+    }
+    if (binding.assessment.object_id !== predicate.object_id) {
+      throw new Error(
+        `Humanoid grasp assessment ${binding.predicate_index} object does not match`
+      );
+    }
+    if (binding.assessment.hand !== predicate.hand) {
+      throw new Error(
+        `Humanoid grasp assessment ${binding.predicate_index} hand does not match`
+      );
+    }
+    if (binding.contract_sha256 !== predicate.grasp_contract_sha256) {
+      throw new Error(
+        `Humanoid grasp assessment ${binding.predicate_index} contract does not match`
+      );
+    }
+    const objectHand = `${binding.assessment.object_id}\0${binding.assessment.hand}`;
+    if (objectHands.has(objectHand)) {
+      throw new Error(
+        `Duplicate humanoid grasp assessment object and hand: ${binding.assessment.object_id}/${binding.assessment.hand}`
+      );
+    }
+    objectHands.add(objectHand);
+    bindings.set(binding.predicate_index, binding);
+  }
+  return bindings;
+}
+
+function graspAssessmentIsPhysicallyUncertain(
+  assessment: HumanoidGraspAssessment
+): boolean {
+  return assessment.evidence.contact.status === "insufficient_normal"
+    || assessment.evidence.support.status === "insufficient_normal"
+    || assessment.reason === "support_baseline_missing";
+}
+
 function unobservableObjectEvidence(
-  predicate: Extract<HumanoidMotionOptionPredicate, { object_id: string }>,
+  predicate: Extract<HumanoidMotionOptionPredicate, {
+    type: "body_contact_object" | "object_near_point" | "object_in_zone";
+  }>,
   predicateIndex: number
 ): HumanoidMotionOptionPredicateEvidence {
   if (predicate.type === "body_contact_object") {
@@ -813,16 +938,47 @@ function maximumContactForce(
   return maximum;
 }
 
+function maximumSolidBodyContactForce(
+  snapshot: HumanoidMotionOptionRobotSnapshot,
+  body: HumanoidBodyName,
+  solidId: string
+): number {
+  let maximum = 0;
+  for (const contact of snapshot.contacts) {
+    const matches = (contact.firstBody === body && contact.secondSolid === solidId)
+      || (contact.secondBody === body && contact.firstSolid === solidId);
+    if (matches) maximum = Math.max(maximum, contact.normalForce);
+  }
+  return maximum;
+}
+
+function maximumSolidHandContactForce(
+  snapshot: HumanoidMotionOptionRobotSnapshot,
+  handSurface: G1HandContactSurfaceName,
+  solidId: string
+): number {
+  let maximum = 0;
+  for (const contact of snapshot.contacts) {
+    const matches = (contact.firstHandLink === handSurface
+      && contact.secondSolid === solidId)
+      || (contact.secondHandLink === handSurface
+        && contact.firstSolid === solidId);
+    if (matches) maximum = Math.max(maximum, contact.normalForce);
+  }
+  return maximum;
+}
+
 function objectInsideZone(
   object: HumanoidMotionOptionObservableObject,
   zone: HumanoidMotionOptionZone,
   tolerance: number
 ): boolean {
-  const bottom = object.position.y - object.size.y / 2;
+  const halfExtents = orientedBoxWorldHalfExtents(object.size, object.rotation);
+  const bottom = object.position.y - halfExtents.y;
   const surface = zone.center.y + zone.size.y / 2;
-  return Math.abs(object.position.x - zone.center.x) + object.size.x / 2
+  return Math.abs(object.position.x - zone.center.x) + halfExtents.x
       <= zone.size.x / 2 + tolerance
-    && Math.abs(object.position.z - zone.center.z) + object.size.z / 2
+    && Math.abs(object.position.z - zone.center.z) + halfExtents.z
       <= zone.size.z / 2 + tolerance
     && Math.abs(bottom - surface) <= Math.max(tolerance, 0.025);
 }

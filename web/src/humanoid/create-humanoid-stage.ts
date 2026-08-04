@@ -5,7 +5,11 @@ import type { HumanoidFrameBuffer } from "../stage/humanoid-frame-buffer";
 import { renderPixelRatio } from "../stage/render-quality";
 import { createRenderBackend } from "../stage/render-backend";
 import { addStudioLighting } from "../stage/scene-primitives";
-import type { HumanoidWorldSnapshot, ScenarioDefinition } from "../types";
+import type {
+  HumanoidWorldSnapshot,
+  ScenarioChunkDeltaState,
+  ScenarioDefinition
+} from "../types";
 import { HumanoidWorldScene } from "./humanoid-world-scene";
 
 export type HumanoidCameraMode = "follow" | "world" | "head";
@@ -13,6 +17,7 @@ export type HumanoidCameraMode = "follow" | "world" | "head";
 export interface HumanoidStageController {
   setLive(live: boolean): void;
   setCameraMode(mode: HumanoidCameraMode): void;
+  updateScenarioChunks(scenarioChunks: ScenarioChunkDeltaState): void;
   fit(): void;
   dispose(): void;
 }
@@ -20,6 +25,7 @@ export interface HumanoidStageController {
 export async function createHumanoidStage(
   host: HTMLDivElement,
   scenario: ScenarioDefinition,
+  scenarioChunks: ScenarioChunkDeltaState,
   initialFrame: HumanoidWorldSnapshot,
   frameBuffer: HumanoidFrameBuffer,
   initiallyLive: boolean,
@@ -56,7 +62,7 @@ export async function createHumanoidStage(
   host.appendChild(renderer.domElement);
   addStudioLighting(scene, scenario.bounds);
   scene.add(new THREE.AmbientLight(0xb6d0c5, 0.42));
-  const world = await HumanoidWorldScene.create(scene, scenario, signal);
+  const world = await HumanoidWorldScene.create(scene, scenario, scenarioChunks, signal);
   signal?.throwIfAborted();
 
   const camera = new THREE.PerspectiveCamera(42, 1, 0.03, Math.max(140, extent * 5));
@@ -81,6 +87,7 @@ export async function createHumanoidStage(
 
   const fit = (): void => {
     const root = vector(current.robot.rootPosition);
+    let portraitFollow = false;
     if (mode === "world") {
       const center = world.worldBounds().getCenter(new THREE.Vector3());
       controls.enabled = true;
@@ -102,6 +109,7 @@ export async function createHumanoidStage(
       const robotCenter = robotBounds.getCenter(new THREE.Vector3());
       const robotHeight = Math.max(1.25, robotBounds.getSize(new THREE.Vector3()).y);
       const portrait = camera.aspect < 0.72;
+      portraitFollow = portrait;
       const distance = Math.max(
         portrait ? 5.4 : 2.85,
         robotHeight * (portrait ? 4.55 : 2.2)
@@ -115,6 +123,9 @@ export async function createHumanoidStage(
       camera.position.y = controls.target.y + robotHeight * (portrait ? 0.82 : 0.76);
     }
     controls.update();
+    if (portraitFollow) {
+      fitPortraitHudFrame(camera, controls, world.robotBounds(), host);
+    }
     previousRoot = root;
     fitted = true;
   };
@@ -204,6 +215,11 @@ export async function createHumanoidStage(
   };
   const resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(host);
+  const mission = host.closest(".humanoid-mission-world");
+  for (const selector of [".humanoid-agent-hud", ".humanoid-goal-hud"]) {
+    const overlay = mission?.querySelector(selector);
+    if (overlay) resizeObserver.observe(overlay);
+  }
   const unsubscribe = frameBuffer.subscribe(schedule);
   resize();
   schedule();
@@ -217,6 +233,11 @@ export async function createHumanoidStage(
       mode = value;
       fitted = false;
       fit();
+      schedule();
+    },
+    updateScenarioChunks(value) {
+      world.updateScenarioChunks(value);
+      world.update(current);
       schedule();
     },
     fit() {
@@ -262,6 +283,63 @@ function quaternion(value: { x: number; y: number; z: number; w: number }): THRE
   return new THREE.Quaternion(value.x, value.y, value.z, value.w);
 }
 
+function fitPortraitHudFrame(
+  camera: THREE.PerspectiveCamera,
+  controls: OrbitControls,
+  bounds: THREE.Box3,
+  host: HTMLDivElement
+): void {
+  const safe = portraitSafeVerticalFrame(host);
+  if (!safe) return;
+  const availableHeight = safe.bottom - safe.top;
+  const desiredCenter = (safe.top + safe.bottom) / 2;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    controls.update();
+    const projected = projectedScreenBounds(
+      bounds,
+      camera,
+      host.clientWidth,
+      host.clientHeight
+    );
+    const projectedHeight = projected.bottom - projected.top;
+    if (projectedHeight > availableHeight) {
+      const offset = camera.position.clone().sub(controls.target);
+      camera.position.copy(controls.target).add(
+        offset.multiplyScalar(projectedHeight / availableHeight * 1.02)
+      );
+      continue;
+    }
+    const shiftPixels = desiredCenter - (projected.top + projected.bottom) / 2;
+    if (Math.abs(shiftPixels) < 0.5) return;
+    camera.updateMatrixWorld(true);
+    const center = bounds.getCenter(new THREE.Vector3()).applyMatrix4(camera.matrixWorldInverse);
+    const depth = Math.max(0.1, -center.z);
+    const worldUnitsPerPixel = 2 * depth
+      * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)
+      / Math.max(1, host.clientHeight);
+    const shiftWorld = shiftPixels * worldUnitsPerPixel;
+    camera.position.y += shiftWorld;
+    controls.target.y += shiftWorld;
+  }
+  controls.update();
+}
+
+function portraitSafeVerticalFrame(
+  host: HTMLDivElement
+): { top: number; bottom: number } | null {
+  const mission = host.closest(".humanoid-mission-world");
+  const agent = mission?.querySelector(".humanoid-agent-hud");
+  const goal = mission?.querySelector(".humanoid-goal-hud");
+  if (!(agent instanceof HTMLElement) || !(goal instanceof HTMLElement)) return null;
+  const hostRect = host.getBoundingClientRect();
+  const top = Math.max(0, agent.getBoundingClientRect().bottom - hostRect.top + 6);
+  const bottom = Math.min(
+    host.clientHeight,
+    goal.getBoundingClientRect().top - hostRect.top - 6
+  );
+  return bottom - top >= 80 ? { top, bottom } : null;
+}
+
 function publishRobotScreenBounds(
   canvas: HTMLCanvasElement,
   bounds: THREE.Box3,
@@ -270,6 +348,21 @@ function publishRobotScreenBounds(
   mode: HumanoidCameraMode,
   revision: number
 ): void {
+  const { left, right, top, bottom } = projectedScreenBounds(
+    bounds,
+    camera,
+    host.clientWidth,
+    host.clientHeight
+  );
+  canvas.dataset.robotScreenBounds = JSON.stringify({ left, right, top, bottom, mode, revision });
+}
+
+function projectedScreenBounds(
+  bounds: THREE.Box3,
+  camera: THREE.PerspectiveCamera,
+  width: number,
+  height: number
+): { left: number; right: number; top: number; bottom: number } {
   const points: THREE.Vector3[] = [];
   for (const x of [bounds.min.x, bounds.max.x]) {
     for (const y of [bounds.min.y, bounds.max.y]) {
@@ -278,9 +371,10 @@ function publishRobotScreenBounds(
   }
   camera.updateMatrixWorld(true);
   const projected = points.map((point) => point.project(camera));
-  const left = Math.min(...projected.map((point) => (point.x + 1) * host.clientWidth / 2));
-  const right = Math.max(...projected.map((point) => (point.x + 1) * host.clientWidth / 2));
-  const top = Math.min(...projected.map((point) => (1 - point.y) * host.clientHeight / 2));
-  const bottom = Math.max(...projected.map((point) => (1 - point.y) * host.clientHeight / 2));
-  canvas.dataset.robotScreenBounds = JSON.stringify({ left, right, top, bottom, mode, revision });
+  return {
+    left: Math.min(...projected.map((point) => (point.x + 1) * width / 2)),
+    right: Math.max(...projected.map((point) => (point.x + 1) * width / 2)),
+    top: Math.min(...projected.map((point) => (1 - point.y) * height / 2)),
+    bottom: Math.max(...projected.map((point) => (1 - point.y) * height / 2))
+  };
 }

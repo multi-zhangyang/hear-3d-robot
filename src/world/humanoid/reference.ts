@@ -125,6 +125,17 @@ export function releaseReferenceTracking(
   };
 }
 
+export function stationaryHumanoidReference(
+  reference: HumanoidReference
+): HumanoidReference {
+  const released = releaseReferenceTracking(reference);
+  return {
+    ...released,
+    rootVelocity: [0, 0],
+    rootYawVelocity: 0
+  };
+}
+
 export function assertHumanoidReference(reference: HumanoidReference): void {
   const jointCount = HUMANOID_JOINT_NAMES.length;
   if (reference.jointPositions.length !== jointCount

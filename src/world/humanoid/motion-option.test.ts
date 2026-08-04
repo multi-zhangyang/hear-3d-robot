@@ -11,6 +11,11 @@ import {
   type HumanoidMotionOptionDetectorInput,
   type HumanoidMotionOptionRobotSnapshot
 } from "./motion-option.js";
+import type {
+  HumanoidGraspAssessment,
+  HumanoidGraspContract
+} from "./grasp-tracker.js";
+import { humanoidGraspContractSha256 } from "./grasp-tracker.js";
 
 const robot: HumanoidMotionOptionRobotSnapshot = {
   rootPosition: { x: 1, y: 0.8, z: 2 },
@@ -43,6 +48,7 @@ const robot: HumanoidMotionOptionRobotSnapshot = {
 const observableCrate = {
   id: "crate",
   position: { x: 1, y: 0.3, z: 3 },
+  rotation: { x: 0, y: 0, z: 0, w: 1 },
   size: { x: 0.5, y: 0.5, z: 0.5 }
 };
 
@@ -89,6 +95,119 @@ const contract: HumanoidMotionOptionContract = {
   ]
 };
 
+const graspContract = {
+  protocol: "humanoid-grasp-contract-v1",
+  world_up: { x: 0, y: 1, z: 0 },
+  minimum_distinct_contact_links: 2,
+  minimum_contact_normal_force_n: 5,
+  maximum_opposing_normal_dot: -0.5,
+  maximum_opposing_position_dot: -0.5,
+  minimum_opposing_contact_separation_m: 0.02,
+  minimum_contact_radial_distance_m: 0.005,
+  maximum_relative_translation_drift_m: 0.01,
+  maximum_relative_rotation_drift_rad: 0.05,
+  minimum_relative_pose_stable_frames: 3,
+  minimum_lift_m: 0.05,
+  minimum_lifted_hold_frames: 2,
+  minimum_support_normal_force_n: 2,
+  minimum_support_up_dot: 0.7
+} as const satisfies HumanoidGraspContract;
+
+const graspOptionContract: HumanoidMotionOptionContract = {
+  option_id: "lift-crate",
+  stable_steps: 1,
+  predicates: [{
+    type: "grasp_verified",
+    object_id: "crate",
+    hand: "left",
+    grasp_contract_sha256: humanoidGraspContractSha256(graspContract)
+  }]
+};
+
+function graspAssessment(overrides: {
+  objectId?: string;
+  hand?: "left" | "right";
+  verified?: boolean;
+  reason?: HumanoidGraspAssessment["reason"];
+  contactStatus?: HumanoidGraspAssessment["evidence"]["contact"]["status"];
+  supportStatus?: HumanoidGraspAssessment["evidence"]["support"]["status"];
+  baselineProjection?: number | null;
+} = {}): HumanoidGraspAssessment {
+  const verified = overrides.verified ?? true;
+  const contactStatus = overrides.contactStatus ?? "opposed";
+  const supportStatus = overrides.supportStatus ?? "unsupported";
+  return {
+    protocol: "humanoid-grasp-assessment-v1",
+    frame: 42,
+    object_id: overrides.objectId ?? "crate",
+    hand: overrides.hand ?? "left",
+    phase: verified ? "verified" : "idle",
+    grasp_verified: verified,
+    reason: overrides.reason ?? (verified ? "grasp_verified" : "contact_missing"),
+    reset_reason: null,
+    evidence: {
+      contact: {
+        status: contactStatus,
+        observed_contact_count: contactStatus === "missing" ? 0 : 2,
+        force_qualified_contact_count: contactStatus === "missing" ? 0 : 2,
+        distinct_force_qualified_links: contactStatus === "missing"
+          ? []
+          : ["left_hand_index_1_link", "left_hand_thumb_2_link"],
+        distinct_normal_qualified_links: contactStatus === "opposed"
+          ? ["left_hand_index_1_link", "left_hand_thumb_2_link"]
+          : [],
+        opposing_pair: contactStatus === "opposed" ? {
+          first_link: "left_hand_index_1_link",
+          second_link: "left_hand_thumb_2_link",
+          first_position: { x: -0.03, y: 0.5, z: 0 },
+          second_position: { x: 0.03, y: 0.5, z: 0 },
+          first_normal_from_hand: { x: 1, y: 0, z: 0 },
+          second_normal_from_hand: { x: -1, y: 0, z: 0 },
+          first_normal_force_n: 10,
+          second_normal_force_n: 11,
+          separation_m: 0.06,
+          normal_dot: -1,
+          position_dot: -1
+        } : null
+      },
+      support: {
+        status: supportStatus,
+        candidate_contact_count: supportStatus === "unsupported" ? 0 : 1,
+        force_qualified_contact_count: supportStatus === "unsupported" ? 0 : 1,
+        upward_contact_count: supportStatus === "supported" ? 1 : 0,
+        baseline_projection_m: overrides.baselineProjection === undefined
+          ? 0.5
+          : overrides.baselineProjection,
+        current_projection_m: 0.56,
+        lift_m: overrides.baselineProjection === null ? null : 0.06
+      },
+      relative_pose: {
+        stable_frames: verified ? 5 : 0,
+        translation_drift_m: verified ? 0.001 : null,
+        rotation_drift_rad: verified ? 0.002 : null
+      },
+      lifted_hold_frames: verified ? 2 : 0
+    }
+  };
+}
+
+function graspDetectorInput(
+  assessment: HumanoidGraspAssessment | null = graspAssessment()
+): HumanoidMotionOptionDetectorInput {
+  return {
+    snapshot: robot,
+    observableObjects: [],
+    zones: [],
+    ...(assessment ? {
+      graspAssessments: [{
+        predicate_index: 0,
+        contract_sha256: humanoidGraspContractSha256(graspContract),
+        assessment
+      }]
+    } : {})
+  };
+}
+
 describe("humanoid motion option detector", () => {
   it("validates physical predicate contracts and stable steps", () => {
     expect(HumanoidMotionOptionContractSchema.parse(contract)).toEqual({
@@ -115,6 +234,193 @@ describe("humanoid motion option detector", () => {
         tolerance_m: 0.1
       }]
     })).toThrow();
+  });
+
+  it("validates grasp policy references without exposing mutable thresholds", () => {
+    const parsed = HumanoidMotionOptionContractSchema.parse(graspOptionContract);
+    expect(parsed.predicates[0]).toEqual(graspOptionContract.predicates[0]);
+    expect(humanoidGraspContractSha256(graspContract)).toBe(
+      createHash("sha256").update(JSON.stringify(graspContract)).digest("hex")
+    );
+
+    const stricter = structuredClone(graspOptionContract);
+    const predicate = stricter.predicates[0];
+    if (predicate?.type !== "grasp_verified") throw new Error("Missing grasp predicate");
+    predicate.grasp_contract_sha256 = humanoidGraspContractSha256({
+      ...graspContract,
+      minimum_lift_m: 0.08
+    });
+    expect(humanoidMotionOptionContractSha256(stricter)).not.toBe(
+      humanoidMotionOptionContractSha256(graspOptionContract)
+    );
+    expect(() => HumanoidMotionOptionContractSchema.parse({
+      ...graspOptionContract,
+      predicates: [{
+        ...graspOptionContract.predicates[0],
+        grasp_contract_sha256: "not-a-policy-hash"
+      }]
+    })).toThrow();
+  });
+
+  it("accepts only a runtime-verified grasp and preserves its complete evidence", () => {
+    const assessment = graspAssessment();
+    const detection = detectHumanoidMotionOption(
+      graspOptionContract,
+      graspDetectorInput(assessment)
+    );
+
+    expect(detection).toMatchObject({
+      status: "satisfied",
+      allSatisfied: true,
+      hasUncertain: false,
+      evidence: [{
+        predicateIndex: 0,
+        type: "grasp_verified",
+        status: "satisfied",
+        objectId: "crate",
+        hand: "left",
+        contractSha256: humanoidGraspContractSha256(graspContract),
+        reason: "grasp_verified",
+        assessment
+      }]
+    });
+  });
+
+  it("distinguishes a measured failed grasp from missing physical evidence", () => {
+    const failed = graspAssessment({
+      verified: false,
+      reason: "contacts_not_opposed",
+      contactStatus: "not_opposed"
+    });
+    expect(detectHumanoidMotionOption(
+      graspOptionContract,
+      graspDetectorInput(failed)
+    )).toMatchObject({
+      status: "unsatisfied",
+      hasUncertain: false,
+      evidence: [{
+        status: "unsatisfied",
+        reason: "contacts_not_opposed",
+        assessment: failed
+      }]
+    });
+
+    const uncertainAssessments = [
+      graspAssessment({
+        verified: false,
+        reason: "contact_normal_insufficient",
+        contactStatus: "insufficient_normal"
+      }),
+      graspAssessment({
+        verified: false,
+        reason: "support_evidence_insufficient",
+        supportStatus: "insufficient_normal"
+      }),
+      graspAssessment({
+        verified: false,
+        reason: "support_baseline_missing",
+        baselineProjection: null
+      })
+    ];
+    for (const assessment of uncertainAssessments) {
+      expect(detectHumanoidMotionOption(
+        graspOptionContract,
+        graspDetectorInput(assessment)
+      )).toMatchObject({
+        status: "uncertain",
+        allSatisfied: false,
+        hasUncertain: true,
+        evidence: [{ status: "uncertain", reason: assessment.reason, assessment }]
+      });
+    }
+  });
+
+  it("returns uncertain when the current grasp assessment is absent", () => {
+    expect(detectHumanoidMotionOption(
+      graspOptionContract,
+      graspDetectorInput(null)
+    )).toMatchObject({
+      status: "uncertain",
+      allSatisfied: false,
+      hasUncertain: true,
+      evidence: [{
+        type: "grasp_verified",
+        status: "uncertain",
+        assessment: null,
+        reason: "grasp_assessment_missing"
+      }]
+    });
+  });
+
+  it("rejects grasp assessments with duplicate or mismatched authority bindings", () => {
+    const valid = graspDetectorInput().graspAssessments![0]!;
+    expect(() => detectHumanoidMotionOption(graspOptionContract, {
+      ...graspDetectorInput(),
+      graspAssessments: [valid, valid]
+    })).toThrow(/Duplicate.*predicate index/);
+    expect(() => detectHumanoidMotionOption(graspOptionContract, {
+      ...graspDetectorInput(),
+      graspAssessments: [{
+        ...valid,
+        assessment: graspAssessment({ objectId: "parcel" })
+      }]
+    })).toThrow(/object does not match/);
+    expect(() => detectHumanoidMotionOption(graspOptionContract, {
+      ...graspDetectorInput(),
+      graspAssessments: [{
+        ...valid,
+        assessment: graspAssessment({ hand: "right" })
+      }]
+    })).toThrow(/hand does not match/);
+    expect(() => detectHumanoidMotionOption(graspOptionContract, {
+      ...graspDetectorInput(),
+      graspAssessments: [{ ...valid, contract_sha256: "0".repeat(64) }]
+    })).toThrow(/contract does not match/);
+
+    const duplicateObjectContract: HumanoidMotionOptionContract = {
+      ...graspOptionContract,
+      predicates: [
+        graspOptionContract.predicates[0]!,
+        graspOptionContract.predicates[0]!
+      ]
+    };
+    expect(() => detectHumanoidMotionOption(duplicateObjectContract, {
+      ...graspDetectorInput(),
+      graspAssessments: [valid, { ...valid, predicate_index: 1 }]
+    })).toThrow(/Duplicate.*object and hand/);
+
+    expect(() => detectHumanoidMotionOption(contract, {
+      snapshot: robot,
+      observableObjects: [observableCrate],
+      zones: [destination],
+      graspAssessments: [valid]
+    })).toThrow(/does not reference a grasp predicate/);
+  });
+
+  it("evaluates grasp evidence through explicit condition phases", () => {
+    const phased = HumanoidMotionOptionContractSchema.parse({
+      ...graspOptionContract,
+      phases: {
+        precondition: null,
+        during: {
+          condition: { op: "predicate", predicate_index: 0 }
+        },
+        terminal: {
+          condition: { op: "predicate", predicate_index: 0 }
+        }
+      }
+    });
+    const detection = detectHumanoidMotionOption(phased, graspDetectorInput());
+    expect(detection.phases).toMatchObject({
+      precondition: null,
+      during: { status: "satisfied", predicateIndexes: [0] },
+      terminal: { status: "satisfied", predicateIndexes: [0] }
+    });
+    expect(advanceHumanoidMotionOptionMonitor(
+      phased,
+      createHumanoidMotionOptionMonitorState(phased),
+      graspDetectorInput()
+    ).state).toMatchObject({ phase: "succeeded", terminalStableSteps: 1 });
   });
 
   it("evaluates named end effectors in world and pelvis frames", () => {
@@ -166,6 +472,85 @@ describe("humanoid motion option detector", () => {
         status: "satisfied"
       })
     ]);
+  });
+
+  it("requires a stable end-effector pose and treats quaternion signs as equivalent", () => {
+    const wristRotation = {
+      x: 0,
+      y: 0,
+      z: Math.sin(0.2),
+      w: Math.cos(0.2)
+    };
+    const poseRobot: HumanoidMotionOptionRobotSnapshot = {
+      ...robot,
+      links: {
+        ...robot.links,
+        right_wrist_yaw_link: {
+          ...robot.links.right_wrist_yaw_link!,
+          rotation: wristRotation
+        }
+      }
+    };
+    const poseContract: HumanoidMotionOptionContract = {
+      option_id: "right-wrist-pose",
+      stable_steps: 2,
+      predicates: [{
+        type: "end_effector_near_point",
+        end_effector: "right_wrist",
+        frame: "world",
+        target: { x: 1.4, y: 1.1, z: 1.8 },
+        tolerance_m: 0.001,
+        target_orientation: {
+          x: -wristRotation.x,
+          y: -wristRotation.y,
+          z: -wristRotation.z,
+          w: -wristRotation.w
+        },
+        orientation_tolerance_rad: 0.01
+      }]
+    };
+
+    const satisfied = detectHumanoidMotionOption(poseContract, {
+      snapshot: poseRobot,
+      observableObjects: [],
+      zones: []
+    });
+    expect(satisfied).toMatchObject({
+      allSatisfied: true,
+      evidence: [{
+        status: "satisfied",
+        orientationErrorRadians: expect.closeTo(0, 12),
+        orientationToleranceRadians: 0.01
+      }]
+    });
+
+    const wrongOrientation = structuredClone(poseContract);
+    const predicate = wrongOrientation.predicates[0];
+    if (predicate?.type !== "end_effector_near_point") throw new Error("Missing pose");
+    predicate.target_orientation = { x: 0, y: 0, z: 0, w: 1 };
+    predicate.orientation_tolerance_rad = 0.1;
+    const wrongInput = {
+      snapshot: poseRobot,
+      observableObjects: [],
+      zones: []
+    };
+    expect(detectHumanoidMotionOption(wrongOrientation, wrongInput)).toMatchObject({
+      allSatisfied: false,
+      evidence: [{ status: "unsatisfied", orientationErrorRadians: expect.closeTo(0.4, 10) }]
+    });
+    expect(advanceHumanoidMotionOptionMonitor(
+      wrongOrientation,
+      createHumanoidMotionOptionMonitorState(wrongOrientation),
+      wrongInput
+    ).state.terminalStableSteps).toBe(0);
+
+    expect(() => HumanoidMotionOptionContractSchema.parse({
+      ...poseContract,
+      predicates: [{
+        ...poseContract.predicates[0],
+        orientation_tolerance_rad: undefined
+      }]
+    })).toThrow(/provided together/);
   });
 
   it("fails closed when a pelvis-relative frame cannot be observed", () => {
@@ -299,6 +684,71 @@ describe("humanoid motion option detector", () => {
     });
   });
 
+  it("binds body and exact hand-surface predicates to the same observed solid", () => {
+    const solidContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "touch-observed-block",
+      stable_steps: 2,
+      predicates: [{
+        type: "body_contact_solid",
+        body: "left_wrist_yaw_link",
+        solid_id: "block-a",
+        minimum_normal_force: 5
+      }, {
+        type: "hand_contact_solid",
+        hand_surface: "left_hand_palm_link",
+        solid_id: "block-a",
+        minimum_normal_force: 5
+      }]
+    });
+    const solidContactRobot: HumanoidMotionOptionRobotSnapshot = {
+      ...robot,
+      contacts: [{
+        normalForce: 12,
+        firstBody: null,
+        secondBody: "left_wrist_yaw_link",
+        firstObject: null,
+        secondObject: null,
+        firstSolid: "block-a",
+        secondSolid: null,
+        firstHandLink: null,
+        secondHandLink: "left_hand_palm_link"
+      }]
+    };
+
+    expect(detectHumanoidMotionOption(solidContract, {
+      snapshot: solidContactRobot,
+      observableObjects: [],
+      observableSolidIds: ["block-a"],
+      zones: []
+    })).toMatchObject({
+      status: "satisfied",
+      evidence: [{
+        type: "body_contact_solid",
+        solidId: "block-a",
+        solidObservable: true,
+        maximumNormalForce: 12
+      }, {
+        type: "hand_contact_solid",
+        handSurface: "left_hand_palm_link",
+        solidId: "block-a",
+        solidObservable: true,
+        maximumNormalForce: 12
+      }]
+    });
+    expect(detectHumanoidMotionOption(solidContract, {
+      snapshot: solidContactRobot,
+      observableObjects: [],
+      observableSolidIds: [],
+      zones: []
+    })).toMatchObject({
+      status: "uncertain",
+      hasUncertain: true,
+      evidence: [{ reason: "solid_not_observable" }, {
+        reason: "solid_not_observable"
+      }]
+    });
+  });
+
   it("never uses hidden snapshot objects or contacts as observable success", () => {
     const snapshotWithHiddenObject = {
       ...robot,
@@ -410,6 +860,45 @@ describe("humanoid motion option detector", () => {
       allSatisfied: true,
       hasUncertain: false,
       evidence: [{ status: "satisfied", inside: false, expected: false }]
+    });
+  });
+
+  it("uses the physical object orientation when testing zone support and containment", () => {
+    const placedContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "rotated-object-in-zone",
+      stable_steps: 1,
+      predicates: [{
+        type: "object_in_zone",
+        object_id: "rod",
+        zone_id: "drop-zone",
+        expected: true,
+        tolerance_m: 0.01
+      }]
+    });
+    const detection = detectHumanoidMotionOption(placedContract, {
+      snapshot: robot,
+      observableObjects: [{
+        id: "rod",
+        position: { x: 1, y: 0.015, z: 3 },
+        rotation: {
+          x: 0,
+          y: 0,
+          z: Math.SQRT1_2,
+          w: Math.SQRT1_2
+        },
+        size: { x: 0.03, y: 0.27, z: 0.03 }
+      }],
+      zones: [{
+        id: "drop-zone",
+        center: { x: 1, y: -0.025, z: 3 },
+        size: { x: 1, y: 0.05, z: 1 }
+      }]
+    });
+
+    expect(detection).toMatchObject({
+      allSatisfied: true,
+      hasUncertain: false,
+      evidence: [{ status: "satisfied", inside: true }]
     });
   });
 

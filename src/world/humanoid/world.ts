@@ -1,26 +1,17 @@
 import type { Scenario, Vec3 } from "../../domain/schema.js";
+import type { ScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
 import {
-  NavigationMesh,
   type NavigationObstacle,
   type NavigationPlan
 } from "../navigation.js";
 import {
-  HUMANOID_NAVIGATION_PROFILE,
-  humanoidEnvironment
-} from "./environment.js";
-import {
   HumanoidWorldCheckpointSchema,
-  type HumanoidMotionExecutionProgress,
-  type HumanoidMotionOptionExecutionState,
   type HumanoidWorldCheckpoint
 } from "./checkpoint.js";
 import {
-  blockedHumanoidContacts,
-  humanoidContactKey,
-  humanoidObjectContacts,
   HumanoidMotionCandidateBatchSchema,
   HumanoidMotionPlanSchema,
-  missingRequiredHumanoidContacts,
+  humanoidGraspContactAuthorizationFailures,
   occupiedHumanoidChannels,
   prepareHumanoidMotion,
   TaskSpaceHumanoidMotionGenerator,
@@ -28,196 +19,219 @@ import {
   type HumanoidMotionCandidateBatch,
   type HumanoidBodyChannel,
   type HumanoidMotionGenerator,
-  type HumanoidMotionOptionCertificate,
+  type HumanoidMotionValidationOptions,
   type HumanoidMotionValidation,
   type PreparedHumanoidMotion
 } from "./motion-plan.js";
-import type { HumanoidMotionGeneratorDescriptor } from "./motion-generator-contract.js";
 import {
   humanoidMotionArtifactSummary,
   humanoidMotionArtifactSha256,
   hydrateHumanoidReference,
-  serializeHumanoidReference,
-  type HumanoidMotionArtifact
+  serializeHumanoidReference
 } from "./motion-artifact.js";
 import {
-  detectHumanoidMotionDrift,
-  humanoidMotionRolloutSha256,
-  type HumanoidMotionDriftEvidence,
-  type HumanoidMotionRollout
-} from "./motion-rollout.js";
-import {
-  advanceHumanoidMotionOptionMonitor,
   createHumanoidMotionOptionMonitorState,
-  detectHumanoidMotionOption,
-  humanoidMotionOptionContractSha256,
   type HumanoidMotionOptionContract,
-  type HumanoidMotionOptionDetection,
   type HumanoidMotionOptionDetectorInput,
   type HumanoidMotionOptionObservableObject
 } from "./motion-option.js";
 import {
   HumanoidObjectMemory,
-  type HumanoidObjectMemoryCheckpoint,
-  type HumanoidObjectToken
+  type HumanoidObjectMemoryCheckpoint
 } from "./object-memory.js";
 import {
   neutralHumanoidReference,
   releaseReferenceTracking,
-  targetReference,
+  stationaryHumanoidReference,
   type HumanoidReference
 } from "./reference.js";
 import {
   HumanoidSimulation,
+  type HumanoidSimulationState,
   type HumanoidSimulationSnapshot
 } from "./simulation.js";
+import { HumanoidRolloutSimulationPool } from "./rollout-simulation-pool.js";
+import { HumanoidNavigationPlanner } from "./navigation-planner.js";
+import { createHumanoidControlStepPacer } from "./control-step-pacer.js";
+import {
+  HumanoidAuthorityAdmissionError,
+  HumanoidAuthorityLoop,
+  type HumanoidAuthorityCommandHandle
+} from "./authority-loop.js";
+import {
+  humanoidAuthorityStateSha256,
+  type HumanoidAuthorityIdentity
+} from "./authority-state.js";
+import { HumanoidMotionExecution } from "./motion-execution.js";
+import {
+  HumanoidNavigationExecution,
+  carryNavigationFailure,
+  previewHumanoidNavigation
+} from "./navigation-execution.js";
+import { boundedNavigationChunk } from "./navigation-plan.js";
+import {
+  captureHumanoidCarryTaskSpaceTargets,
+  type HumanoidCarryTaskSpaceTarget
+} from "./carry-task-space-servo.js";
+import { humanoidMotionContactEvidenceSha256 } from "./motion-contact-evidence.js";
+import {
+  HumanoidGraspRegistry,
+  type HumanoidGraspRegistryCheckpoint
+} from "./grasp-registry.js";
+import {
+  humanoidCarriedObjectBindingSetSha256,
+  humanoidCarriedObjectContactConstraints,
+  humanoidCarriedObjectContinuationEvidence,
+  humanoidCarriedObjectUnauthorizedContacts,
+  type HumanoidCarriedObjectBindingSet
+} from "./carried-object-binding.js";
+import type {
+  StoredHumanoidMotionPlan,
+  StoredHumanoidNavigationPlan
+} from "./world-plan-state.js";
+import {
+  assertMotionOptionIntegrity,
+  isTerminalMotionOption,
+  storedMotionPhysicalSafety
+} from "./world-plan-state.js";
+import { restoreHumanoidWorldPlans } from "./world-plan-restore.js";
+import {
+  createHumanoidPlanTerminal,
+  humanoidPlanTerminalReceipt
+} from "./execution-terminal.js";
+import {
+  DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS,
+  humanoidMotionIntentSha256,
+  humanoidNavigationIntentSha256,
+  humanoidPlanExpiryRevision,
+  humanoidPlanIntentIsActive
+} from "./plan-lifecycle.js";
+import type {
+  HumanoidExecutionReceipt,
+  HumanoidExecutionOptions,
+  HumanoidFrameSink,
+  HumanoidWorldPersistenceState,
+  HumanoidWorldObservation,
+  HumanoidWorldOptions,
+  HumanoidWorldScenarioSynchronizationReceipt,
+  HumanoidWorldSnapshot,
+  NavigationPlanReceipt,
+  WholeBodyCandidatePlanReceipt,
+  WholeBodyPlanReceipt
+} from "./world-contract.js";
+import {
+  contactAwareG1GraspTargetsForBindings,
+  contactAwareG1GraspTargetsForOption,
+  mergeG1ContactAwareGraspTargets
+} from "./contact-aware-grasp-servo.js";
+import { HumanoidCarriedObjectLifecycle } from "./carried-object-lifecycle.js";
+import {
+  authorizeHumanoidCarriedObjectRelease,
+} from "./carried-object-release.js";
+import { carryMotionFailure } from "./carried-object-execution.js";
+import {
+  analyzeHumanoidScenarioSynchronization
+} from "./scenario-synchronization.js";
+import {
+  createHumanoidPhysicsResources,
+  createHumanoidWorldResources,
+  disposeHumanoidPhysicsResources,
+  disposeHumanoidWorldResources
+} from "./world-resources.js";
+import {
+  humanoidPhysicalRegion,
+  type HumanoidPhysicalRegion
+} from "./physical-region.js";
+import {
+  observableHumanoidSolidIds,
+  visibleHumanoidSolidTokens
+} from "./solid-observation.js";
+import { humanoidDynamicNavigationObstacles } from "./navigation-obstacles.js";
 
-export interface HumanoidWorldSnapshot {
+export type {
+  HumanoidExecutionReceipt,
+  HumanoidExecutionOptions,
+  HumanoidFrameSink,
+  HumanoidPersistenceSink,
+  HumanoidWorldPersistenceState,
+  HumanoidWorldObservation,
+  HumanoidWorldOptions,
+  HumanoidWorldScenarioSynchronizationReceipt,
+  HumanoidWorldSnapshot,
+  NavigationPlanReceipt,
+  WholeBodyCandidatePlanReceipt,
+  WholeBodyPlanReceipt
+} from "./world-contract.js";
+
+type PlanRevalidationEvidence = NonNullable<
+  HumanoidExecutionReceipt["detail"]["revalidation"]
+>;
+
+interface MotionPlanRevalidation {
+  accepted: boolean;
+  evidence: PlanRevalidationEvidence;
+  validation?: HumanoidMotionValidation;
+  reason?: string;
+}
+
+interface MotionPlanningContext {
   frame: number;
   worldRevision: number;
-  motionGenerator: HumanoidMotionGeneratorDescriptor;
-  robot: HumanoidSimulationSnapshot;
-  navigation: {
-    planId: string | null;
-    status: "idle" | "planned" | "executing" | "completed" | "blocked";
-    target: Vec3 | null;
-    waypoints: Vec3[];
-    waypointIndex: number | null;
-  };
+  stateSha256: string;
+  simulation: HumanoidSimulationState;
+  baseline: HumanoidReference;
+  visibleContactObjectIds: ReadonlySet<string>;
+  visibleContactSolidIds: ReadonlySet<string>;
+  graspRegistry: HumanoidGraspRegistryCheckpoint;
+  carriedObjectBindings: HumanoidCarriedObjectBindingSet;
+  carriedObjectTaskSpaceTargets: HumanoidCarryTaskSpaceTarget[];
 }
 
-export interface HumanoidWorldObservation {
-  frame: number;
-  worldRevision: number;
-  motionGenerator: HumanoidMotionGeneratorDescriptor;
-  sensor: ReturnType<HumanoidSimulation["senseObjects"]>["sensor"];
-  robot: Omit<HumanoidSimulationSnapshot, "objects">;
-  objectTokens: HumanoidObjectToken[];
-  navigation: HumanoidWorldSnapshot["navigation"];
-}
-
-export interface WholeBodyPlanReceipt {
+interface NavigationIntentValidation {
   accepted: boolean;
-  planId: string;
-  createdRevision: number;
-  channels: HumanoidBodyChannel[];
-  motion: ReturnType<typeof humanoidMotionArtifactSummary> | null;
-  validation: HumanoidMotionValidation;
-}
-
-interface WholeBodyCandidateEvaluation {
-  rank: number;
-  planId: string;
-  intent: string;
-  channels: HumanoidBodyChannel[];
-  motion: ReturnType<typeof humanoidMotionArtifactSummary> | null;
-  optionCertificate: HumanoidMotionOptionCertificate | null;
-  validation: HumanoidMotionValidation;
-}
-
-export interface WholeBodyCandidatePlanReceipt {
-  accepted: boolean;
-  planId: string;
-  selectedCandidateId: string | null;
-  selectedRank: number | null;
-  createdRevision: number;
-  channels: HumanoidBodyChannel[];
-  motion: ReturnType<typeof humanoidMotionArtifactSummary> | null;
-  option: {
-    contract: HumanoidMotionOptionContract;
-    certificate: HumanoidMotionOptionCertificate;
-  } | null;
-  selection: "model_rank_then_physics";
-  candidates: WholeBodyCandidateEvaluation[];
-}
-
-export interface HumanoidExecutionReceipt {
-  accepted: boolean;
-  code: "motion_completed" | "navigation_completed" | "plan_stale"
-    | "motion_failed" | "navigation_blocked" | "motion_option_succeeded"
-    | "motion_goal_unmet" | "motion_goal_uncertain"
-    | "motion_execution_drifted" | "motion_constraint_violated";
-  frames: number;
-  finalSnapshot: HumanoidWorldSnapshot;
-  detail: {
-    failures?: HumanoidMotionValidation["failures"];
-    reason?: string;
-    travelledDistance?: number;
-    motion?: ReturnType<typeof humanoidMotionArtifactSummary>;
-    option?: {
-      option_id: string;
-      status: HumanoidMotionOptionExecutionState["status"];
-      termination_reason: HumanoidMotionOptionExecutionState["terminationReason"];
-      full_frame_count: number;
-      executed_prefix_frame_count: number;
-      predicted_termination_frame: number;
-      actual_termination_frame: number | null;
-      artifact_sha256: string;
-      rollout_sha256: string;
-      drift_streak: number;
-      drift_evidence: HumanoidMotionDriftEvidence | null;
-      evidence: HumanoidMotionOptionExecutionState["lastEvidence"];
-    };
-  };
-}
-
-export interface NavigationPlanReceipt {
-  accepted: boolean;
-  planId: string;
-  createdRevision: number;
-  target: Vec3;
-  chunkTarget: Vec3;
-  waypoints: Vec3[];
-  distance: number;
+  start: Vec3;
+  plan: NavigationPlan | null;
   remainingDistance: number;
   reason?: string;
 }
 
-export type HumanoidFrameSink = (snapshot: HumanoidWorldSnapshot) => void | Promise<void>;
-
-interface StoredMotionPlan {
-  plan: HumanoidMotionPlan;
-  artifact: HumanoidMotionArtifact;
-  rollout: HumanoidMotionRollout | null;
-  createdRevision: number;
-  option: HumanoidMotionOptionExecutionState | null;
-  progress: HumanoidMotionExecutionProgress;
-}
-
-interface StoredNavigationPlan {
-  id: string;
-  plan: NavigationPlan;
-  requestedTarget: Vec3;
-  createdRevision: number;
-}
-
-export interface HumanoidWorldOptions {
-  motionGeneratorFactory?: () => Promise<HumanoidMotionGenerator>;
-}
-
-interface RouteRun {
-  completed: boolean;
-  reason?: string;
-  frames: number;
-  reference: HumanoidReference;
-  final: HumanoidSimulationSnapshot;
-  travelledDistance: number;
+interface NavigationPlanningContext {
+  frame: number;
+  worldRevision: number;
+  stateSha256: string;
+  start: Vec3;
+  simulation: HumanoidSimulationState;
+  baseline: HumanoidReference;
+  obstacles: NavigationObstacle[];
+  graspRegistry: HumanoidGraspRegistryCheckpoint;
+  carriedObjectBindings: HumanoidCarriedObjectBindingSet;
+  carriedObjectTaskSpaceTargets: HumanoidCarryTaskSpaceTarget[];
 }
 
 const NAVIGATION_CHUNK_DISTANCE = 3;
+const ACTIVE_OBJECT_LINEAR_SPEED_METERS_PER_SECOND = 0.03;
+const ACTIVE_OBJECT_ANGULAR_SPEED_RADIANS_PER_SECOND = 0.1;
 
 export class HumanoidWorld {
-  readonly #scenario: Scenario;
-  readonly #simulation: HumanoidSimulation;
-  readonly #navigation: NavigationMesh;
-  readonly #objectMemory: HumanoidObjectMemory;
+  #scenario: Scenario;
+  #simulation: HumanoidSimulation;
+  #rolloutPool: HumanoidRolloutSimulationPool;
+  #navigation: HumanoidNavigationPlanner;
+  #physicalRegion: HumanoidPhysicalRegion;
+  #objectMemory: HumanoidObjectMemory;
+  readonly #graspRegistry: HumanoidGraspRegistry;
   readonly #motionGenerator: HumanoidMotionGenerator;
-  readonly #motions = new Map<string, StoredMotionPlan>();
-  readonly #routes = new Map<string, StoredNavigationPlan>();
+  readonly #planIntentLeaseSeconds: number;
+  readonly #motions = new Map<string, StoredHumanoidMotionPlan>();
+  readonly #routes = new Map<string, StoredHumanoidNavigationPlan>();
+  readonly #authority: HumanoidAuthorityLoop<HumanoidWorldSnapshot>;
+  #carriedObjectLifecycle: HumanoidCarriedObjectLifecycle | null = null;
   #reference = neutralHumanoidReference();
   #frame = 0;
   #worldRevision = 0;
   #routeSequence = 0;
+  #planRegistryEpoch = 0;
+  #physicalSafety: HumanoidWorldSnapshot["physicalSafety"];
   #navigationState: HumanoidWorldSnapshot["navigation"] = {
     planId: null,
     status: "idle",
@@ -231,28 +245,46 @@ export class HumanoidWorld {
     checkpoint?: HumanoidWorldCheckpoint,
     options: HumanoidWorldOptions = {}
   ): Promise<HumanoidWorld> {
-    const [simulation, navigation, motionGenerator] = await Promise.all([
-      HumanoidSimulation.create(humanoidEnvironment(scenario)),
-      NavigationMesh.create(scenario, undefined, HUMANOID_NAVIGATION_PROFILE),
-      options.motionGeneratorFactory
-        ? options.motionGeneratorFactory()
-        : Promise.resolve(new TaskSpaceHumanoidMotionGenerator())
-    ]);
+    const activeScenario = options.scenarioChunks
+      ? analyzeHumanoidScenarioSynchronization({
+          current: scenario,
+          baseline: scenario,
+          chunks: options.scenarioChunks
+        }).scenario
+      : scenario;
+    let resources: Awaited<ReturnType<typeof createHumanoidWorldResources>> | undefined;
+    let motionGenerator: HumanoidMotionGenerator | undefined;
     try {
+      resources = await createHumanoidWorldResources(
+        activeScenario,
+        checkpoint
+          ? [checkpointRootAnchor(checkpoint)]
+          : undefined
+      );
+      motionGenerator = options.motionGeneratorFactory
+        ? await options.motionGeneratorFactory()
+        : new TaskSpaceHumanoidMotionGenerator();
       const world = new HumanoidWorld(
-        scenario,
-        simulation,
-        navigation,
+        activeScenario,
+        resources.simulation,
+        resources.rolloutPool,
+        resources.navigation,
+        resources.physicalRegion,
         motionGenerator,
-        checkpoint?.objectMemory
+        options.planIntentLeaseSeconds
+          ?? DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS,
+        checkpoint?.objectMemory,
+        checkpoint?.graspRegistry
       );
       if (checkpoint) world.#restore(checkpoint);
       else await world.#settle(80);
+      await world.#ensurePhysicalRegion();
       return world;
     } catch (error) {
-      navigation.dispose();
-      await simulation.dispose();
-      await motionGenerator.dispose();
+      await Promise.allSettled([
+        ...(resources ? [disposeHumanoidWorldResources(resources)] : []),
+        ...(motionGenerator ? [motionGenerator.dispose()] : [])
+      ]);
       throw error;
     }
   }
@@ -260,15 +292,35 @@ export class HumanoidWorld {
   private constructor(
     scenario: Scenario,
     simulation: HumanoidSimulation,
-    navigation: NavigationMesh,
+    rolloutPool: HumanoidRolloutSimulationPool,
+    navigation: HumanoidNavigationPlanner,
+    physicalRegion: HumanoidPhysicalRegion,
     motionGenerator: HumanoidMotionGenerator,
-    objectMemoryCheckpoint?: HumanoidObjectMemoryCheckpoint
+    planIntentLeaseSeconds: number,
+    objectMemoryCheckpoint?: HumanoidObjectMemoryCheckpoint,
+    graspRegistryCheckpoint?: HumanoidGraspRegistryCheckpoint
   ) {
     this.#scenario = scenario;
     this.#simulation = simulation;
+    this.#rolloutPool = rolloutPool;
     this.#navigation = navigation;
+    this.#physicalRegion = physicalRegion;
     this.#motionGenerator = motionGenerator;
+    this.#planIntentLeaseSeconds = planIntentLeaseSeconds;
     this.#objectMemory = new HumanoidObjectMemory(scenario, objectMemoryCheckpoint);
+    this.#graspRegistry = new HumanoidGraspRegistry({
+      portableObjectIds: scenario.objects
+        .filter((object) => object.portable)
+        .map((object) => object.id),
+      ...(graspRegistryCheckpoint
+        ? { checkpoint: graspRegistryCheckpoint }
+        : {})
+    });
+    this.#planExpiryRevision(0);
+    this.#authority = new HumanoidAuthorityLoop({
+      identity: () => this.#authorityIdentity(),
+      stationaryStep: () => this.#stepStationaryAuthority()
+    });
   }
 
   snapshot(): HumanoidWorldSnapshot {
@@ -276,20 +328,19 @@ export class HumanoidWorld {
       frame: this.#frame,
       worldRevision: this.#worldRevision,
       motionGenerator: structuredClone(this.#motionGenerator.descriptor),
+      ...(this.#physicalSafety
+        ? { physicalSafety: structuredClone(this.#physicalSafety) }
+        : {}),
       robot: this.#simulation.snapshot(),
+      grasp: this.#currentGraspState(),
       navigation: structuredClone(this.#navigationState)
     };
   }
 
   observe(): HumanoidWorldObservation {
     const snapshot = this.snapshot();
-    const sensed = this.#simulation.senseObjects(this.#scenario.visibility_radius);
-    this.#objectMemory.refresh(
-      snapshot.frame,
-      snapshot.worldRevision,
-      snapshot.robot.objects,
-      new Set(Object.keys(sensed.objects))
-    );
+    const sensed = this.#refreshCurrentObjectMemory();
+    const sensedSolids = this.#simulation.senseSolids(this.#scenario.visibility_radius);
     const { objects: _objects, ...robot } = snapshot.robot;
     return {
       frame: snapshot.frame,
@@ -302,6 +353,12 @@ export class HumanoidWorld {
         snapshot.frame,
         snapshot.worldRevision
       ),
+      solidTokens: visibleHumanoidSolidTokens({
+        scenario: this.#scenario,
+        sensed: sensedSolids,
+        contacts: snapshot.robot.contacts
+      }),
+      grasp: structuredClone(snapshot.grasp),
       navigation: structuredClone(snapshot.navigation)
     };
   }
@@ -314,6 +371,7 @@ export class HumanoidWorld {
       frame: this.#frame,
       worldRevision: this.#worldRevision,
       routeSequence: this.#routeSequence,
+      planRegistryEpoch: this.#planRegistryEpoch,
       simulation: {
         time: simulation.time,
         positions: [...simulation.positions],
@@ -321,55 +379,234 @@ export class HumanoidWorld {
         controls: [...simulation.controls],
         activations: [...simulation.activations],
         accelerationWarmstart: [...simulation.accelerationWarmstart],
+        ...(simulation.requestedActuatorTorques
+          ? { requestedActuatorTorques: [...simulation.requestedActuatorTorques] }
+          : {}),
+        ...(simulation.handCommandTargets
+          ? { handCommandTargets: [...simulation.handCommandTargets] }
+          : {}),
         controller: structuredClone(simulation.controller)
       },
       reference: serializeHumanoidReference(this.#reference),
       motions: [...this.#motions.values()].map((entry) => structuredClone(entry)),
       routes: [...this.#routes.values()].map((entry) => structuredClone(entry)),
       navigation: structuredClone(this.#navigationState),
+      graspRegistry: this.#currentGraspRegistryCheckpoint(),
+      carriedObjectLifecycle: this.#requiredCarriedObjectLifecycle().checkpoint(),
+      ...(this.#physicalSafety
+        ? { physicalSafety: structuredClone(this.#physicalSafety) }
+        : {}),
       objectMemory: this.#objectMemory.checkpoint()
     });
   }
 
+  capturePersistenceState(): Promise<HumanoidWorldPersistenceState> {
+    return this.#authority.capture(() => this.#capturePersistenceState());
+  }
+
+  async synchronizeScenarioChunks(
+    baseline: Scenario,
+    chunks: ScenarioChunkDeltaState
+  ): Promise<HumanoidWorldScenarioSynchronizationReceipt> {
+    const analysis = analyzeHumanoidScenarioSynchronization({
+      current: this.#scenario,
+      baseline,
+      chunks
+    });
+    if (!analysis.changed) {
+      return {
+        changed: false,
+        chunkRevision: analysis.chunkRevision,
+        resourceRebuilt: false,
+        changedDomains: [],
+        invalidatedPlanIds: []
+      };
+    }
+
+    const captured = await this.#authority.capture(() => {
+      if (this.#authority.busy) {
+        throw new Error("Scenario synchronization requires an idle physical authority loop");
+      }
+      return {
+        identity: this.#authorityIdentity(),
+        simulation: this.#simulation.captureState(),
+        physicalAnchors: this.#physicalAnchors(),
+        objectMemory: this.#objectMemory.checkpoint()
+      };
+    });
+    const nextObjectMemory = new HumanoidObjectMemory(
+      analysis.scenario,
+      captured.objectMemory
+    );
+    const nextResources = analysis.requiresResourceRebuild
+      ? await createHumanoidWorldResources(
+          analysis.scenario,
+          captured.physicalAnchors
+        )
+      : undefined;
+    let resourcesInstalled = false;
+    try {
+      nextResources?.simulation.restoreState(captured.simulation);
+      const previousResources = await this.#authority.capture(() => {
+        const actual = this.#authorityIdentity();
+        if (actual.revision !== captured.identity.revision
+          || actual.stateSha256 !== captured.identity.stateSha256) {
+          throw new Error("Physical state changed while scenario resources were rebuilding");
+        }
+        const previous = nextResources
+          ? {
+              simulation: this.#simulation,
+              rolloutPool: this.#rolloutPool,
+              navigation: this.#navigation,
+              physicalRegion: this.#physicalRegion
+            }
+          : undefined;
+        const invalidatedPlanIds = [
+          ...this.#motions.keys(),
+          ...this.#routes.keys()
+        ].sort();
+        this.#scenario = analysis.scenario;
+        this.#objectMemory = nextObjectMemory;
+        if (nextResources) {
+          this.#simulation = nextResources.simulation;
+          this.#rolloutPool = nextResources.rolloutPool;
+          this.#navigation = nextResources.navigation;
+          this.#physicalRegion = nextResources.physicalRegion;
+        }
+        this.#motions.clear();
+        this.#routes.clear();
+        this.#planRegistryEpoch += 1;
+        this.#physicalSafety = undefined;
+        this.#navigationState = {
+          planId: null,
+          status: "idle",
+          target: null,
+          waypoints: [],
+          waypointIndex: null
+        };
+        return { previous, invalidatedPlanIds };
+      });
+      resourcesInstalled = nextResources !== undefined;
+      if (previousResources.previous) {
+        await disposeHumanoidWorldResources(previousResources.previous);
+      }
+      return {
+        changed: true,
+        chunkRevision: analysis.chunkRevision,
+        resourceRebuilt: analysis.requiresResourceRebuild,
+        changedDomains: [...analysis.changedDomains],
+        invalidatedPlanIds: previousResources.invalidatedPlanIds
+      };
+    } catch (error) {
+      if (nextResources && !resourcesInstalled) {
+        await disposeHumanoidWorldResources(nextResources);
+      }
+      throw error;
+    }
+  }
+
+  #capturePersistenceState(): HumanoidWorldPersistenceState {
+    return {
+      world: this.snapshot(),
+      worldCheckpoint: this.checkpoint(),
+      authority: this.#authorityIdentity()
+    };
+  }
+
   consumablePlanIds(): string[] {
-    return [...this.#motions.keys(), ...this.#routes.keys()];
+    return [
+      ...[...this.#motions.entries()]
+        .filter(([, stored]) => stored.terminal !== null
+          || humanoidPlanIntentIsActive(
+            this.#worldRevision,
+            stored.expiresRevision
+          ))
+        .map(([planId]) => planId),
+      ...[...this.#routes.entries()]
+        .filter(([, stored]) => stored.terminal !== null
+          || stored.progress.committed_frame_count > 0
+          || humanoidPlanIntentIsActive(
+            this.#worldRevision,
+            stored.expiresRevision
+          ))
+        .map(([planId]) => planId)
+    ];
   }
 
   async planWholeBodyMotion(rawPlan: HumanoidMotionPlan): Promise<WholeBodyPlanReceipt> {
     const plan = HumanoidMotionPlanSchema.parse(rawPlan);
-    if (this.#motions.has(plan.id)) throw new Error(`Duplicate humanoid motion plan: ${plan.id}`);
-    const prepared = await prepareHumanoidMotion(
-      this.#simulation,
+    const context = await this.#authority.capture(() => {
+      if (this.#motions.has(plan.id)) {
+        throw new Error(`Duplicate humanoid motion plan: ${plan.id}`);
+      }
+      return this.#captureMotionPlanningContext();
+    });
+    const createdRevision = context.worldRevision;
+    const expiresRevision = this.#planExpiryRevision(createdRevision);
+    const intentSha256 = humanoidMotionIntentSha256(plan);
+    const prepared = await this.#prepareMotionIntent(
       plan,
-      this.#reference,
       {
-        contactObjectIds: this.#objectMemory.observedObjectIds(
-          this.#frame,
-          this.#worldRevision
-        )
+        contactObjectIds: context.visibleContactObjectIds,
+        contactSolidIds: context.visibleContactSolidIds
       },
-      this.#motionGenerator
+      context
     );
-    if (prepared.validation.feasible && prepared.artifact) {
-      this.#motions.set(plan.id, {
-        plan: structuredClone(plan),
-        artifact: structuredClone(prepared.artifact),
-        rollout: null,
-        createdRevision: this.#worldRevision,
-        option: null,
-        progress: {
-          nextFrameIndex: 0,
-          satisfiedContactKeys: [],
-          driftStreak: 0,
-          lastDrift: null,
-          failure: null
+    await this.#authority.capture(() => {
+      if (!humanoidPlanIntentIsActive(this.#worldRevision, expiresRevision)) {
+        throw new Error("Humanoid motion planning exceeded its intent lease");
+      }
+      if (this.#motions.has(plan.id)) {
+        throw new Error(`Duplicate humanoid motion plan: ${plan.id}`);
+      }
+      if (prepared.validation.feasible && prepared.artifact) {
+        const stored: StoredHumanoidMotionPlan = {
+          plan: structuredClone(plan),
+          artifact: structuredClone(prepared.artifact),
+          rollout: null,
+          createdRevision,
+          validatedRevision: createdRevision,
+          validatedStateSha256: context.stateSha256,
+          expiresRevision,
+          intentSha256,
+          revalidationCount: 0,
+          terminal: null,
+          option: null,
+          carriedObjectBindings: structuredClone(context.carriedObjectBindings),
+          carriedObjectTaskSpaceTargets: structuredClone(
+            context.carriedObjectTaskSpaceTargets
+          ),
+          carriedObjectContinuation: null,
+          carriedObjectUnauthorizedContacts: [],
+          progress: {
+            nextFrameIndex: 0,
+            satisfiedContactKeys: [],
+            satisfiedContactEvidenceSha256: humanoidMotionContactEvidenceSha256({
+              planId: plan.id,
+              intentSha256,
+              artifactSha256: humanoidMotionArtifactSha256(prepared.artifact),
+              nextFrameIndex: 0,
+              satisfiedContactKeys: []
+            }),
+            driftStreak: 0,
+            lastDrift: null,
+            failure: null
+          }
+        };
+        this.#motions.set(plan.id, stored);
+        this.#planRegistryEpoch += 1;
+        if (this.#worldRevision === createdRevision) {
+          stored.validatedStateSha256 = this.#authorityStateSha256();
         }
-      });
-    }
+      }
+    });
     return {
       accepted: prepared.validation.feasible,
       planId: plan.id,
-      createdRevision: this.#worldRevision,
+      createdRevision,
+      validatedStateSha256: context.stateSha256,
+      expiresRevision,
+      intentSha256,
       channels: occupiedHumanoidChannels(plan),
       motion: prepared.artifact
         ? humanoidMotionArtifactSummary(prepared.artifact)
@@ -382,15 +619,39 @@ export class HumanoidWorld {
     rawBatch: HumanoidMotionCandidateBatch
   ): Promise<WholeBodyCandidatePlanReceipt> {
     const batch = HumanoidMotionCandidateBatchSchema.parse(rawBatch);
-    for (const candidate of batch.candidates) {
-      if (this.#motions.has(candidate.id)) {
-        throw new Error(`Duplicate humanoid motion plan: ${candidate.id}`);
+    this.#graspRegistry.bindingsForOption(batch.termination, this.#frame);
+    const graspAuthorizationFailures = humanoidGraspContactAuthorizationFailures(
+      batch,
+      (contractSha256) => {
+        if (contractSha256 !== this.#graspRegistry.contractSha256) {
+          throw new Error(
+            "Humanoid grasp predicate contract hash does not match authority"
+          );
+        }
+        return this.#graspRegistry.contract.minimum_distinct_contact_links;
       }
-    }
-    const visibleContactObjects = this.#objectMemory.observedObjectIds(
-      this.#frame,
-      this.#worldRevision
     );
+    if (graspAuthorizationFailures.length > 0) {
+      const failure = graspAuthorizationFailures[0]!;
+      throw new Error(
+        `Humanoid grasp candidate ${failure.candidateIndex + 1} authorizes `
+        + `${failure.authorizedContactSurfaces.length} contact surfaces for `
+        + `${failure.objectId}/${failure.hand}; authority requires `
+        + failure.minimumDistinctContactSurfaces
+      );
+    }
+    const context = await this.#authority.capture(() => {
+      for (const candidate of batch.candidates) {
+        if (this.#motions.has(candidate.id)) {
+          throw new Error(`Duplicate humanoid motion plan: ${candidate.id}`);
+        }
+      }
+      return this.#captureMotionPlanningContext();
+    });
+    const createdRevision = context.worldRevision;
+    const expiresRevision = this.#planExpiryRevision(createdRevision);
+    const visibleContactObjects = context.visibleContactObjectIds;
+    const visibleContactSolids = context.visibleContactSolidIds;
     const prepared: Array<{
       rank: number;
       plan: HumanoidMotionPlan;
@@ -399,18 +660,17 @@ export class HumanoidWorld {
     }> = [];
     for (let index = 0; index < batch.candidates.length; index += 1) {
       const plan = batch.candidates[index]!;
-      const result = await prepareHumanoidMotion(
-        this.#simulation,
+      const result = await this.#prepareMotionIntent(
         plan,
-        this.#reference,
         {
           contactObjectIds: visibleContactObjects,
+          contactSolidIds: visibleContactSolids,
           motionOption: {
             contract: batch.termination,
             scenario: this.#scenario
           }
         },
-        this.#motionGenerator
+        context
       );
       prepared.push({
         rank: index + 1,
@@ -425,14 +685,29 @@ export class HumanoidWorld {
       && candidate.result.rollout !== null
       && candidate.result.optionCertificate !== null
     ));
-    if (selected?.result.artifact
-      && selected.result.rollout
-      && selected.result.optionCertificate) {
-      this.#motions.set(selected.plan.id, {
+    await this.#authority.capture(() => {
+      if (!humanoidPlanIntentIsActive(this.#worldRevision, expiresRevision)) {
+        throw new Error("Humanoid candidate planning exceeded its intent lease");
+      }
+      for (const candidate of batch.candidates) {
+        if (this.#motions.has(candidate.id)) {
+          throw new Error(`Duplicate humanoid motion plan: ${candidate.id}`);
+        }
+      }
+      if (selected?.result.artifact
+        && selected.result.rollout
+        && selected.result.optionCertificate) {
+        const stored: StoredHumanoidMotionPlan = {
         plan: structuredClone(selected.plan),
         artifact: structuredClone(selected.result.artifact),
         rollout: structuredClone(selected.result.rollout),
-        createdRevision: this.#worldRevision,
+        createdRevision,
+        validatedRevision: createdRevision,
+        validatedStateSha256: context.stateSha256,
+        expiresRevision,
+        intentSha256: humanoidMotionIntentSha256(selected.plan),
+          revalidationCount: 0,
+          terminal: null,
         option: {
           contract: structuredClone(batch.termination),
           certificate: structuredClone(selected.result.optionCertificate),
@@ -443,21 +718,45 @@ export class HumanoidWorld {
           terminationReason: null,
           lastEvidence: null
         },
+        carriedObjectBindings: structuredClone(context.carriedObjectBindings),
+        carriedObjectTaskSpaceTargets: structuredClone(
+          context.carriedObjectTaskSpaceTargets
+        ),
+        carriedObjectContinuation: null,
+        carriedObjectUnauthorizedContacts: [],
         progress: {
           nextFrameIndex: 0,
           satisfiedContactKeys: [],
+          satisfiedContactEvidenceSha256: humanoidMotionContactEvidenceSha256({
+            planId: selected.plan.id,
+            intentSha256: humanoidMotionIntentSha256(selected.plan),
+            artifactSha256: humanoidMotionArtifactSha256(
+              selected.result.artifact
+            ),
+            nextFrameIndex: 0,
+            satisfiedContactKeys: []
+          }),
           driftStreak: 0,
           lastDrift: null,
           failure: null
         }
-      });
-    }
+        };
+        this.#motions.set(selected.plan.id, stored);
+        this.#planRegistryEpoch += 1;
+        if (this.#worldRevision === createdRevision) {
+          stored.validatedStateSha256 = this.#authorityStateSha256();
+        }
+      }
+    });
     return {
       accepted: selected !== undefined,
       planId: selected?.plan.id ?? "",
       selectedCandidateId: selected?.plan.id ?? null,
       selectedRank: selected?.rank ?? null,
-      createdRevision: this.#worldRevision,
+      createdRevision,
+      validatedStateSha256: context.stateSha256,
+      expiresRevision,
+      intentSha256: selected ? humanoidMotionIntentSha256(selected.plan) : null,
       channels: selected?.channels ?? [],
       motion: selected?.result.artifact
         ? humanoidMotionArtifactSummary(selected.result.artifact)
@@ -473,6 +772,7 @@ export class HumanoidWorld {
         rank: candidate.rank,
         planId: candidate.plan.id,
         intent: candidate.plan.intent,
+        intentSha256: humanoidMotionIntentSha256(candidate.plan),
         channels: candidate.channels,
         motion: candidate.result.artifact
           ? humanoidMotionArtifactSummary(candidate.result.artifact)
@@ -487,375 +787,1272 @@ export class HumanoidWorld {
 
   async executeWholeBodyMotion(
     planId: string,
-    frameSink?: HumanoidFrameSink
+    frameSink?: HumanoidFrameSink,
+    options: HumanoidExecutionOptions = {}
   ): Promise<HumanoidExecutionReceipt> {
-    const stored = this.#motions.get(planId);
+    const initial = await this.#authority.capture(() => {
+      const stored = this.#motions.get(planId);
+      return {
+        stored,
+        terminalReceipt: stored?.terminal
+          ? humanoidPlanTerminalReceipt(stored.terminal, this.snapshot())
+          : null
+      };
+    });
+    const stored = initial.stored;
     if (!stored) throw new Error(`Unknown humanoid motion plan: ${planId}`);
-    if (stored.option) assertMotionOptionIntegrity(stored);
-    const expectedRevision = stored.createdRevision + stored.progress.nextFrameIndex;
-    if (expectedRevision !== this.#worldRevision) {
-      this.#motions.delete(planId);
-      return this.#receipt(false, "plan_stale", 0, {
-        reason: `expected_revision=${expectedRevision}, world_revision=${this.#worldRevision}`
-      });
-    }
-    if (stored.option && isTerminalMotionOption(stored.option)) {
-      if (stored.option.status === "succeeded"
-        && missingRequiredHumanoidContacts(
-          stored.plan.contact_constraints ?? [],
-          new Set(stored.progress.satisfiedContactKeys)
-        ).length > 0) {
-        stored.option.status = "goal_unmet";
-        stored.option.terminationReason = "motion_goal_unmet";
-      }
-      const receipt = this.#motionOptionReceipt(stored, 0);
-      this.#reference = releaseReferenceTracking(this.#reference);
-      this.#motions.delete(planId);
-      return receipt;
-    }
-    let frames = 0;
-    const failures: HumanoidMotionValidation["failures"] = stored.progress.failure
-      ? [validationFailure(stored.progress.failure)]
-      : [];
-    const constraints = stored.plan.contact_constraints ?? [];
-    const satisfiedContacts = new Set(stored.progress.satisfiedContactKeys);
-    let lastReference = this.#reference;
-    let lastOptionDetection: HumanoidMotionOptionDetection | null = null;
-    if (stored.option) stored.option.status = "executing";
-    const frameLimit = stored.option
-      ? stored.option.certificate.validated_frame_limit
-      : stored.artifact.frames.length;
-    for (
-      let index = stored.progress.nextFrameIndex;
-      index < frameLimit && failures.length === 0;
-      index += 1
-    ) {
-      const frame = stored.artifact.frames[index]!;
-      if (stored.option?.monitor.phase === "awaiting_precondition") {
-        const update = advanceHumanoidMotionOptionMonitor(
-          stored.option.contract,
-          stored.option.monitor,
-          this.#motionOptionDetectorInput(this.#simulation.snapshot())
-        );
-        stored.option.monitor = update.state;
-        stored.option.successStreak = update.state.terminalStableSteps;
-        lastOptionDetection = update.detection;
-        stored.option.lastEvidence = jsonOptionEvidence(
-          update.detection,
-          update.state
-        );
-        if (update.observationStatus !== "satisfied") {
-          const atSeconds = index === 0
-            ? 0
-            : stored.artifact.frames[index - 1]!.atSeconds;
-          const uncertain = update.observationStatus === "uncertain";
-          failures.push({
-            code: uncertain ? "motion_goal_uncertain" : "motion_constraint_violated",
-            atSeconds,
-            message: uncertain
-              ? "Motion option precondition is not observable before execution"
-              : "Motion option precondition is not satisfied before execution"
-          });
-          if (!uncertain) {
-            stored.progress.failure = {
-              code: "motion_constraint_violated",
-              atSeconds
-            };
-          }
-          stored.option.status = uncertain ? "goal_unmet" : "failed";
-          stored.option.actualTerminationFrame = index;
-          stored.option.terminationReason = uncertain
-            ? "motion_goal_uncertain"
-            : "motion_constraint_violated";
-          break;
-        }
-      }
-      const reference = hydrateHumanoidReference(frame.reference);
-      const snapshot = await this.#simulation.step(reference);
-      frames += 1;
-      lastReference = reference;
-      this.#reference = reference;
-      if (stored.option && stored.rollout) {
-        const predicted = stored.rollout.frames[index];
-        if (!predicted || Math.abs(predicted.atSeconds - frame.atSeconds) > 1e-9) {
-          throw new Error("Humanoid motion rollout frame does not match its artifact");
-        }
-        const drift = detectHumanoidMotionDrift(
-          snapshot,
-          predicted,
-          stored.rollout.limits
-        );
-        stored.progress.lastDrift = drift;
-        stored.progress.driftStreak = drift.drifted
-          ? stored.progress.driftStreak + 1
-          : 0;
-      }
-      for (const contact of humanoidObjectContacts(snapshot)) {
-        if (contact.objectId === null) continue;
-        if (constraints.some((constraint) => (
-          constraint.body === contact.body && constraint.object_id === contact.objectId
-        ))) {
-          satisfiedContacts.add(humanoidContactKey(contact.body, contact.objectId));
-        }
-      }
-      const blockedContacts = blockedHumanoidContacts(snapshot, constraints);
-      if (blockedContacts.length > 0) {
-        const bodies = [...new Set(blockedContacts.map((contact) => contact.body))];
-        const contacts = blockedContacts.map((contact) => ({ ...contact }));
-        const failure: HumanoidMotionValidation["failures"][number] = {
-          code: "environment_contact",
-          atSeconds: frame.atSeconds,
-          bodies,
-          contacts
-        };
-        failures.push(failure);
-        stored.progress.failure = {
-          code: "environment_contact",
-          atSeconds: frame.atSeconds,
-          bodies: [...bodies],
-          contacts: contacts.map((contact) => ({ ...contact }))
-        };
-      } else if (snapshot.fallen) {
-        const failure = { code: "fallen", atSeconds: frame.atSeconds } as const;
-        failures.push(failure);
-        stored.progress.failure = failure;
-      } else if (stored.option
-        && stored.rollout
-        && stored.progress.lastDrift?.drifted
-        && stored.progress.driftStreak >= stored.rollout.limits.consecutive_steps) {
-        const failure = {
-          code: "execution_drift",
-          atSeconds: frame.atSeconds,
-          drift: { ...stored.progress.lastDrift },
-          message: "Physical execution persistently diverged from its validated rollout"
-        } as const;
-        failures.push(failure);
-        stored.progress.failure = {
-          code: failure.code,
-          atSeconds: failure.atSeconds,
-          drift: { ...failure.drift }
-        };
-      }
-      stored.progress.nextFrameIndex = index + 1;
-      stored.progress.satisfiedContactKeys = [...satisfiedContacts];
-      if (stored.option) {
-        const detectorInput = this.#motionOptionDetectorInput(snapshot);
-        if (failures.length > 0) {
-          lastOptionDetection = detectHumanoidMotionOption(
-            stored.option.contract,
-            detectorInput
-          );
-          stored.option.lastEvidence = jsonOptionEvidence(
-            lastOptionDetection,
-            stored.option.monitor
-          );
+    if (initial.terminalReceipt) return initial.terminalReceipt;
+    const revalidation = await this.#revalidateMotionIntent(stored);
+    if (!revalidation.accepted) {
+      const preconditionFailure = stored.option
+        ? revalidation.validation?.failures.find((failure) => (
+            failure.code === "motion_constraint_violated"
+            && failure.atSeconds === 0
+          ))
+        : undefined;
+      if (stored.option && preconditionFailure) {
+        const terminalized = await this.#authority.capture(() => {
+          if (this.#motions.get(planId) !== stored || !stored.option) return null;
           stored.option.status = "failed";
-          stored.option.actualTerminationFrame = index + 1;
-          stored.option.terminationReason = stored.progress.failure?.code
-            ?? "environment_contact";
-        } else {
-          const update = advanceHumanoidMotionOptionMonitor(
-            stored.option.contract,
-            stored.option.monitor,
-            detectorInput
+          stored.option.actualTerminationFrame = 0;
+          stored.option.terminationReason = "motion_constraint_violated";
+          const receipt = this.#motionOptionReceipt(
+            stored,
+            0,
+            revalidation.validation?.failures ?? [],
+            revalidation.evidence
           );
-          stored.option.monitor = update.state;
-          stored.option.successStreak = update.state.terminalStableSteps;
-          lastOptionDetection = update.detection;
-          stored.option.lastEvidence = jsonOptionEvidence(
-            update.detection,
-            update.state
-          );
-          if (update.state.phase === "indeterminate") {
-            failures.push({
-              code: "motion_goal_uncertain",
-              atSeconds: frame.atSeconds,
-              message: "Motion option lost observable evidence for its during constraint"
-            });
-            stored.option.status = "goal_unmet";
-            stored.option.actualTerminationFrame = index + 1;
-            stored.option.terminationReason = "motion_goal_uncertain";
-          } else if (update.state.phase === "violated") {
-            const failure = {
-              code: "motion_constraint_violated",
-              atSeconds: frame.atSeconds,
-              message: "Motion option violated its during constraint"
-            } as const;
-            failures.push(failure);
-            stored.progress.failure = {
-              code: failure.code,
-              atSeconds: failure.atSeconds
-            };
-            stored.option.status = "failed";
-            stored.option.actualTerminationFrame = index + 1;
-            stored.option.terminationReason = failure.code;
-          }
-          const missingRequired = missingRequiredHumanoidContacts(
-            constraints,
-            satisfiedContacts
-          );
-          if (update.state.phase === "succeeded"
-            && missingRequired.length === 0
-            && snapshot.balance.support !== "none"
-            && failures.length === 0) {
-            stored.option.status = "succeeded";
-            stored.option.actualTerminationFrame = index + 1;
-            stored.option.terminationReason = "physical_success";
-          }
+          return this.#finalizeMotionPlan(stored, receipt, options.retainTerminal ?? false);
+        });
+        if (terminalized) {
+          return terminalized;
         }
       }
-      await this.#commitFrame(frameSink, undefined, { motionPlanId: planId });
-      if (stored.option && isTerminalMotionOption(stored.option)) break;
-    }
-    if (stored.option) {
-      if (!isTerminalMotionOption(stored.option)) {
-        const uncertain = lastOptionDetection?.hasUncertain ?? true;
-        stored.option.status = "goal_unmet";
-        stored.option.actualTerminationFrame = stored.progress.nextFrameIndex;
-        stored.option.terminationReason = uncertain
-          ? "motion_goal_uncertain"
-          : "motion_goal_unmet";
-        failures.push({
-          code: uncertain ? "motion_goal_uncertain" : "motion_goal_unmet",
-          atSeconds: stored.artifact.frames[
-            Math.max(0, stored.progress.nextFrameIndex - 1)
-          ]!.atSeconds,
-          message: uncertain
-            ? "Motion option ended without observable success evidence"
-            : "Motion option exhausted its verified horizon before physical success"
+      return this.#authority.capture(() => {
+        const receipt = this.#receipt(false, "plan_revalidation_failed", 0, {
+          reason: revalidation.reason
+            ?? "The unchanged model motion intent is no longer physically admissible",
+          ...(revalidation.validation
+            ? { failures: revalidation.validation.failures }
+            : {}),
+          revalidation: revalidation.evidence
         });
-      }
-      this.#reference = releaseReferenceTracking(lastReference);
-      const receipt = this.#motionOptionReceipt(stored, frames, failures);
-      this.#motions.delete(planId);
-      return receipt;
-    }
-    const missingContacts = missingRequiredHumanoidContacts(
-      constraints,
-      satisfiedContacts
-    );
-    if (failures.length === 0 && missingContacts.length > 0) {
-      failures.push({
-        code: "required_contact_missing",
-        atSeconds: stored.plan.duration_seconds,
-        constraints: missingContacts
+        return this.#finalizeMotionPlan(stored, receipt, options.retainTerminal ?? false);
       });
     }
-    this.#reference = releaseReferenceTracking(lastReference);
-    this.#motions.delete(planId);
-    return this.#receipt(
-      failures.length === 0,
-      failures.length === 0 ? "motion_completed" : "motion_failed",
-      frames,
-      {
-        motion: humanoidMotionArtifactSummary(stored.artifact),
-        ...(failures.length === 0 ? {} : { failures })
-      }
+    if (stored.option) assertMotionOptionIntegrity(stored);
+    const admission: HumanoidAuthorityIdentity = {
+      revision: stored.validatedRevision + stored.progress.nextFrameIndex,
+      stateSha256: revalidation.evidence.admission_state_sha256
+    };
+    const evidence: PlanRevalidationEvidence = {
+      ...revalidation.evidence,
+      admission_state_sha256: admission.stateSha256
+    };
+    const releaseAuthority = stored.option
+      ? authorizeHumanoidCarriedObjectRelease({
+          contract: stored.option.contract,
+          bindingSet: stored.carriedObjectBindings
+        })
+      : null;
+    const releaseTrackedObjectIds = new Set(
+      releaseAuthority?.bindings.map((binding) => binding.objectId) ?? []
     );
+    let execution: HumanoidMotionExecution | undefined;
+    let handle: HumanoidAuthorityCommandHandle<HumanoidExecutionReceipt>;
+    try {
+      handle = await this.#authority.submit({
+        id: `motion:${planId}`,
+        source: "motion",
+        admission,
+        ...(frameSink ? { frameSink } : {}),
+        admit: () => {
+          if (this.#motions.get(planId) !== stored) {
+            throw new Error(`Humanoid motion plan became unavailable: ${planId}`);
+          }
+          const expectedRevision = stored.validatedRevision
+            + stored.progress.nextFrameIndex;
+          if (expectedRevision !== this.#worldRevision) {
+            throw new Error(
+              `Humanoid motion plan is stale: expected_revision=${expectedRevision}, `
+              + `world_revision=${this.#worldRevision}`
+            );
+          }
+          if (releaseAuthority) {
+            const lifecycle = this.#requiredCarriedObjectLifecycle();
+            if (lifecycle.phase !== "release_pending"
+              && lifecycle.phase !== "released") {
+              lifecycle.beginRelease({
+                currentFrame: this.#frame,
+                currentWorldRevision: this.#worldRevision
+              });
+            }
+          }
+          execution = new HumanoidMotionExecution({
+            stored,
+            reference: this.#reference,
+            graspTargets: mergeG1ContactAwareGraspTargets(
+              contactAwareG1GraspTargetsForBindings({
+                bindings: stored.carriedObjectBindings.bindings,
+                graspRegistry: this.#graspRegistry
+              }),
+              stored.option
+                ? contactAwareG1GraspTargetsForOption({
+                    option: stored.option.contract,
+                    graspContract: this.#graspRegistry.contract
+                  })
+                : []
+            ),
+            carryTaskSpaceTargets: stored.carriedObjectTaskSpaceTargets,
+            detectorInput: (snapshot) => this.#motionOptionDetectorInput(
+              snapshot,
+              stored.option!.contract,
+              releaseTrackedObjectIds
+            ),
+            commitPhysicalFrame: (snapshot) => {
+              this.#commitFrameState({ motionPlanId: planId });
+              this.#observeGraspFrame(this.#frame, snapshot);
+              const continuation = humanoidCarriedObjectContinuationEvidence({
+                state: stored.carriedObjectBindings,
+                registry: this.#graspRegistry,
+                currentFrame: this.#frame,
+                currentWorldRevision: this.#worldRevision
+              });
+              const unauthorized = humanoidCarriedObjectUnauthorizedContacts(
+                stored.carriedObjectBindings,
+                snapshot.contacts
+              );
+              stored.carriedObjectContinuation = continuation;
+              stored.carriedObjectUnauthorizedContacts = unauthorized;
+              this.#observeCarriedObjectFrame(snapshot);
+              return carryMotionFailure({
+                continuation,
+                unauthorized,
+                snapshot,
+                releaseAuthority,
+                lifecyclePhase: this.#requiredCarriedObjectLifecycle().phase
+              });
+            }
+          });
+        },
+        step: async () => {
+          options.signal?.throwIfAborted();
+          if (!execution) throw new Error("Humanoid motion was not admitted");
+          await this.#ensurePhysicalRegion();
+          const step = await execution.step(this.#simulation);
+          this.#reference = execution.reference;
+          if (step.snapshot) {
+            const physicalSafety = storedMotionPhysicalSafety(stored);
+            if (physicalSafety) this.#physicalSafety = { planId, evidence: physicalSafety };
+          }
+          if (!step.done) {
+            const snapshot = this.snapshot();
+            await options.persistenceSink?.(this.#capturePersistenceState());
+            return {
+              ...(frameSink && !options.persistenceSink ? { snapshot } : {}),
+              done: false
+            };
+          }
+          const result = execution.result();
+          if (releaseAuthority && stored.option?.status !== "succeeded") {
+            this.#requiredCarriedObjectLifecycle().cancelRelease({
+              currentFrame: this.#frame,
+              currentWorldRevision: this.#worldRevision
+            });
+          }
+          this.#acquireSuccessfulOptionGrasp(stored);
+          const carrying = this.#requiredCarriedObjectLifecycle().active !== null;
+          this.#reference = carrying
+            ? result.reference
+            : releaseReferenceTracking(result.reference);
+          const physicalSafety = result.physicalSafety ?? storedMotionPhysicalSafety(stored);
+          const receipt = stored.option
+            ? this.#motionOptionReceipt(stored, result.frames, result.failures, evidence)
+            : this.#receipt(
+                result.failures.length === 0,
+                result.failures.length === 0 ? "motion_completed" : "motion_failed",
+                result.frames,
+                {
+                  motion: humanoidMotionArtifactSummary(stored.artifact),
+                  ...(physicalSafety ? { physical_safety: physicalSafety } : {}),
+                  ...(result.failures.length > 0 ? { failures: result.failures } : {}),
+                  carry: {
+                    binding_set: structuredClone(stored.carriedObjectBindings),
+                    continuation: stored.carriedObjectContinuation
+                      ? structuredClone(stored.carriedObjectContinuation)
+                      : null,
+                    unauthorized_contacts: structuredClone(
+                      stored.carriedObjectUnauthorizedContacts
+                    )
+                  },
+                  revalidation: evidence
+                }
+              );
+          const finalized = this.#finalizeMotionPlan(
+            stored,
+            receipt,
+            options.retainTerminal ?? false
+          );
+          if (step.snapshot) {
+            await options.persistenceSink?.(this.#capturePersistenceState());
+          }
+          return {
+            ...(step.snapshot && frameSink && !options.persistenceSink
+              ? { snapshot: finalized.finalSnapshot }
+              : {}),
+            done: true,
+            result: finalized
+          };
+        }
+      });
+    } catch (error) {
+      if (!(error instanceof HumanoidAuthorityAdmissionError)) throw error;
+      return this.#authority.capture(() => {
+        const receipt = this.#receipt(false, "plan_stale", 0, {
+          reason: error.message,
+          revalidation: {
+            ...evidence,
+            accepted: false,
+            admission_state_sha256: error.actual.stateSha256
+          }
+        });
+        return this.#finalizeMotionPlan(stored, receipt, options.retainTerminal ?? false);
+      });
+    }
+    return this.#driveAuthorityCommand(handle, options);
   }
 
-  async planNavigation(target: Vec3): Promise<NavigationPlanReceipt> {
-    const start = this.#simulation.snapshot().rootPosition;
+  async acknowledgeWholeBodyMotion(
+    planId: string,
+    resultSha256: string
+  ): Promise<boolean> {
+    return this.#authority.capture(() => {
+      const stored = this.#motions.get(planId);
+      if (!stored) return false;
+      if (!stored.terminal) {
+        throw new Error(`Humanoid motion plan is not terminal: ${planId}`);
+      }
+      if (stored.terminal.result_sha256 !== resultSha256) {
+        throw new Error(`Humanoid motion terminal acknowledgement mismatch: ${planId}`);
+      }
+      return this.#deleteMotionPlan(planId);
+    });
+  }
+
+  async #prepareMotionIntent(
+    plan: HumanoidMotionPlan,
+    options: HumanoidMotionValidationOptions,
+    context?: MotionPlanningContext
+  ): Promise<PreparedHumanoidMotion> {
+    const source = context ?? this.#captureMotionPlanningContext();
+    const previewGraspRegistry = new HumanoidGraspRegistry({
+      portableObjectIds: source.graspRegistry.portable_object_ids,
+      contract: source.graspRegistry.contract,
+      checkpoint: source.graspRegistry
+    });
+    return this.#rolloutPool.lease(source.simulation, (simulation) => (
+      prepareHumanoidMotion(
+        simulation,
+        plan,
+        source.baseline,
+        {
+          ...options,
+          graspRegistry: previewGraspRegistry,
+          worldFrame: source.frame,
+          worldRevision: source.worldRevision,
+          carriedObjectBindings: source.carriedObjectBindings,
+          carriedObjectTaskSpaceTargets: source.carriedObjectTaskSpaceTargets
+        },
+        this.#motionGenerator
+      )
+    ));
+  }
+
+  #captureMotionPlanningContext(): MotionPlanningContext {
+    const simulation = this.#simulation.captureState();
+    const snapshot = this.#simulation.snapshot();
+    const baseline = hydrateHumanoidReference(
+      serializeHumanoidReference(this.#reference)
+    );
+    const visibleContactObjectIds = new Set(this.#objectMemory.observedObjectIds(
+      this.#frame,
+      this.#worldRevision
+    ));
+    const visibleContactSolidIds = new Set(observableHumanoidSolidIds(
+      this.#simulation.senseSolids(this.#scenario.visibility_radius),
+      snapshot.contacts
+    ));
+    const graspRegistry = this.#currentGraspRegistryCheckpoint();
+    const carriedObjectBindings = this.#currentCarriedObjectBindings();
+    const carriedObjectTaskSpaceTargets = captureHumanoidCarryTaskSpaceTargets({
+      snapshot,
+      bindings: carriedObjectBindings
+    });
+    return {
+      frame: this.#frame,
+      worldRevision: this.#worldRevision,
+      stateSha256: humanoidAuthorityStateSha256({
+        simulation,
+        reference: baseline,
+        visibleContactObjectIds,
+        visibleContactSolidIds,
+        planRegistryEpoch: this.#planRegistryEpoch,
+        graspRegistry,
+        carriedObjectBindings
+      }),
+      simulation,
+      baseline,
+      visibleContactObjectIds,
+      visibleContactSolidIds,
+      graspRegistry,
+      carriedObjectBindings,
+      carriedObjectTaskSpaceTargets
+    };
+  }
+
+  async #revalidateMotionIntent(
+    stored: StoredHumanoidMotionPlan
+  ): Promise<MotionPlanRevalidation> {
+    if (stored.intentSha256 !== humanoidMotionIntentSha256(stored.plan)) {
+      throw new Error("Humanoid motion intent changed after model planning");
+    }
+    const context = await this.#authority.capture(() => {
+      return this.#captureMotionPlanningContext();
+    });
+    const previousValidationRevision = stored.validatedRevision;
+    let validationRevision = stored.validatedRevision;
+    let validationStateSha256 = stored.validatedStateSha256;
+    let admissionStateSha256 = context.stateSha256;
+    const evidence = (
+      performed: boolean,
+      accepted: boolean,
+      revalidationCount: number
+    ): PlanRevalidationEvidence => ({
+      performed,
+      accepted,
+      intent_sha256: stored.intentSha256,
+      planning_revision: stored.createdRevision,
+      previous_validation_revision: previousValidationRevision,
+      validation_revision: validationRevision,
+      validation_state_sha256: validationStateSha256,
+      admission_state_sha256: admissionStateSha256,
+      expires_revision: stored.expiresRevision,
+      revalidation_count: revalidationCount
+    });
+    if (this.#motions.get(stored.plan.id) !== stored) {
+      return {
+        accepted: false,
+        reason: "humanoid_motion_plan_no_longer_registered",
+        evidence: evidence(false, false, stored.revalidationCount)
+      };
+    }
+    if (!humanoidPlanIntentIsActive(context.worldRevision, stored.expiresRevision)) {
+      return {
+        accepted: false,
+        reason: `intent_expired_at_revision=${stored.expiresRevision}, world_revision=${context.worldRevision}`,
+        evidence: evidence(false, false, stored.revalidationCount)
+      };
+    }
+    const expectedRevision = stored.validatedRevision + stored.progress.nextFrameIndex;
+    if (expectedRevision === context.worldRevision
+      && (stored.progress.nextFrameIndex > 0
+        || stored.validatedStateSha256 === context.stateSha256)) {
+      return {
+        accepted: true,
+        evidence: evidence(false, true, stored.revalidationCount)
+      };
+    }
+    if (stored.progress.nextFrameIndex > 0) {
+      return {
+        accepted: false,
+        reason: `partially_executed_intent_expected_revision=${expectedRevision}, world_revision=${context.worldRevision}`,
+        evidence: evidence(false, false, stored.revalidationCount)
+      };
+    }
+    const nextRevalidationCount = stored.revalidationCount + 1;
+    validationRevision = context.worldRevision;
+    validationStateSha256 = context.stateSha256;
+    const prepared = await this.#prepareMotionIntent(
+      stored.plan,
+      {
+        contactObjectIds: context.visibleContactObjectIds,
+        contactSolidIds: context.visibleContactSolidIds,
+        ...(stored.option
+          ? {
+              motionOption: {
+                contract: stored.option.contract,
+                scenario: this.#scenario
+              }
+            }
+          : {})
+      },
+      context
+    );
+    const optionReady = !stored.option
+      || prepared.rollout !== null && prepared.optionCertificate !== null;
+    if (!prepared.validation.feasible || !prepared.artifact || !optionReady) {
+      return {
+        accepted: false,
+        reason: "unchanged_intent_failed_latest_state_validation",
+        validation: prepared.validation,
+        evidence: evidence(true, false, nextRevalidationCount)
+      };
+    }
+    const applied = await this.#authority.capture(() => {
+      const identity = this.#authorityIdentity();
+      admissionStateSha256 = identity.stateSha256;
+      if (this.#motions.get(stored.plan.id) !== stored
+        || identity.revision !== context.worldRevision
+        || identity.stateSha256 !== context.stateSha256) {
+        return false;
+      }
+      stored.artifact = structuredClone(prepared.artifact!);
+      stored.rollout = prepared.rollout ? structuredClone(prepared.rollout) : null;
+      stored.validatedRevision = context.worldRevision;
+      stored.validatedStateSha256 = context.stateSha256;
+      stored.revalidationCount = nextRevalidationCount;
+      stored.carriedObjectBindings = structuredClone(
+        context.carriedObjectBindings
+      );
+      stored.carriedObjectTaskSpaceTargets = structuredClone(
+        context.carriedObjectTaskSpaceTargets
+      );
+      stored.carriedObjectContinuation = null;
+      stored.carriedObjectUnauthorizedContacts = [];
+      stored.progress = {
+        nextFrameIndex: 0,
+        satisfiedContactKeys: [],
+        satisfiedContactEvidenceSha256: humanoidMotionContactEvidenceSha256({
+          planId: stored.plan.id,
+          intentSha256: stored.intentSha256,
+          artifactSha256: humanoidMotionArtifactSha256(prepared.artifact!),
+          nextFrameIndex: 0,
+          satisfiedContactKeys: []
+        }),
+        driftStreak: 0,
+        lastDrift: null,
+        failure: null
+      };
+      if (stored.option) {
+        if (!prepared.optionCertificate) {
+          throw new Error("Validated humanoid option is missing its certificate");
+        }
+        stored.option = {
+          contract: structuredClone(stored.option.contract),
+          certificate: structuredClone(prepared.optionCertificate),
+          monitor: createHumanoidMotionOptionMonitorState(stored.option.contract),
+          status: "planned",
+          successStreak: 0,
+          actualTerminationFrame: null,
+          terminationReason: null,
+          lastEvidence: null
+        };
+      }
+      return true;
+    });
+    if (!applied) {
+      return {
+        accepted: false,
+        reason: "world_state_changed_during_motion_revalidation",
+        validation: prepared.validation,
+        evidence: evidence(true, false, nextRevalidationCount)
+      };
+    }
+    return {
+      accepted: true,
+      validation: prepared.validation,
+      evidence: evidence(true, true, nextRevalidationCount)
+    };
+  }
+
+  async #validateNavigationIntent(
+    target: Vec3,
+    context?: NavigationPlanningContext
+  ): Promise<NavigationIntentValidation> {
+    const source = context ?? this.#captureNavigationPlanningContext();
+    const start = { ...source.start };
     let completePlan: NavigationPlan;
     try {
-      completePlan = this.#navigation.plan(start, target, this.#dynamicNavigationObstacles());
+      completePlan = await this.#navigation.plan(
+        start,
+        target,
+        source.obstacles
+      );
     } catch (error) {
       return {
         accepted: false,
-        planId: "",
-        createdRevision: this.#worldRevision,
-        target: { ...target },
-        chunkTarget: { ...start },
-        waypoints: [],
-        distance: 0,
+        start,
+        plan: null,
         remainingDistance: 0,
         reason: error instanceof Error ? error.message : String(error)
       };
     }
-    const plan = navigationChunk(completePlan, NAVIGATION_CHUNK_DISTANCE);
+    const plan = boundedNavigationChunk(completePlan, NAVIGATION_CHUNK_DISTANCE);
     const remainingDistance = Math.max(0, completePlan.distance - plan.distance);
-    const state = this.#simulation.captureState();
-    let preview: RouteRun;
-    try {
-      preview = await this.#followRoute(plan, this.#reference);
-    } finally {
-      this.#simulation.restoreState(state);
-    }
-    if (!preview.completed) {
+    const previewGraspRegistry = new HumanoidGraspRegistry({
+      portableObjectIds: source.graspRegistry.portable_object_ids,
+      contract: source.graspRegistry.contract,
+      checkpoint: source.graspRegistry
+    });
+    const preview = await this.#rolloutPool.lease(
+      source.simulation,
+      (simulation) => previewHumanoidNavigation(
+        plan,
+        source.baseline,
+        simulation,
+        previewGraspRegistry,
+        source.frame,
+        source.worldRevision,
+        source.carriedObjectBindings,
+        source.carriedObjectTaskSpaceTargets
+      )
+    );
+    return {
+      accepted: preview.completed,
+      start,
+      plan,
+      remainingDistance,
+      ...(preview.completed
+        ? {}
+        : {
+            reason: `${preview.reason ?? "physical_preview_failed"}`
+              + `; preview_frames=${preview.frames}`
+              + `; preview_travelled_m=${preview.travelledDistance.toFixed(6)}`
+          })
+    };
+  }
+
+  #captureNavigationPlanningContext(): NavigationPlanningContext {
+    const simulation = this.#simulation.captureState();
+    const snapshot = this.#simulation.snapshot();
+    const baseline = hydrateHumanoidReference(
+      serializeHumanoidReference(this.#reference)
+    );
+    const graspRegistry = this.#currentGraspRegistryCheckpoint();
+    const carriedObjectBindings = this.#currentCarriedObjectBindings();
+    const carriedObjectIds = new Set(
+      carriedObjectBindings.bindings.map((binding) => binding.object_id)
+    );
+    return {
+      frame: this.#frame,
+      worldRevision: this.#worldRevision,
+      stateSha256: humanoidAuthorityStateSha256({
+        simulation,
+        reference: baseline,
+        visibleContactObjectIds: this.#objectMemory.observedObjectIds(
+          this.#frame,
+          this.#worldRevision
+        ),
+        visibleContactSolidIds: observableHumanoidSolidIds(
+          this.#simulation.senseSolids(this.#scenario.visibility_radius),
+          snapshot.contacts
+        ),
+        planRegistryEpoch: this.#planRegistryEpoch,
+        graspRegistry,
+        carriedObjectBindings
+      }),
+      start: { ...snapshot.rootPosition },
+      simulation,
+      baseline,
+      obstacles: humanoidDynamicNavigationObstacles({
+        scenario: this.#scenario,
+        objectSnapshots: snapshot.objects,
+        excludedPortableObjectIds: carriedObjectIds
+      }),
+      graspRegistry,
+      carriedObjectBindings,
+      carriedObjectTaskSpaceTargets: captureHumanoidCarryTaskSpaceTargets({
+        snapshot: this.#simulation.snapshot(),
+        bindings: carriedObjectBindings
+      })
+    };
+  }
+
+  async planNavigation(target: Vec3): Promise<NavigationPlanReceipt> {
+    const context = await this.#authority.capture(() => {
+      return this.#captureNavigationPlanningContext();
+    });
+    const createdRevision = context.worldRevision;
+    const expiresRevision = this.#planExpiryRevision(createdRevision);
+    const intentSha256 = humanoidNavigationIntentSha256(target);
+    const validation = await this.#validateNavigationIntent(target, context);
+    if (!validation.accepted || !validation.plan) {
       return {
         accepted: false,
         planId: "",
-        createdRevision: this.#worldRevision,
+        createdRevision,
+        validatedStateSha256: context.stateSha256,
+        expiresRevision,
+        intentSha256,
         target: { ...target },
-        chunkTarget: { ...plan.resolvedTarget },
-        waypoints: plan.waypoints.map((point) => ({ ...point })),
-        distance: plan.distance,
-        remainingDistance,
-        reason: preview.reason ?? "physical_preview_failed"
+        chunkTarget: {
+          ...(validation.plan?.resolvedTarget ?? validation.start)
+        },
+        waypoints: validation.plan?.waypoints.map((point) => ({ ...point })) ?? [],
+      distance: validation.plan?.distance ?? 0,
+      remainingDistance: validation.remainingDistance,
+      carry: navigationCarryReceipt(context.carriedObjectBindings),
+      reason: validation.reason ?? "physical_preview_failed"
       };
     }
-    const planId = `humanoid-route-${this.#routeSequence++}`;
-    this.#routes.set(planId, {
-      id: planId,
-      plan,
-      requestedTarget: { ...target },
-      createdRevision: this.#worldRevision
+    const plan = validation.plan;
+    let planId = "";
+    await this.#authority.capture(() => {
+      if (!humanoidPlanIntentIsActive(this.#worldRevision, expiresRevision)) {
+        throw new Error("Humanoid navigation planning exceeded its intent lease");
+      }
+      planId = `humanoid-route-${this.#routeSequence++}`;
+      const stored: StoredHumanoidNavigationPlan = {
+        id: planId,
+        plan,
+        requestedTarget: { ...target },
+        createdRevision,
+        validatedRevision: createdRevision,
+        validatedStateSha256: context.stateSha256,
+        expiresRevision,
+        intentSha256,
+        revalidationCount: 0,
+        carriedObjectBindings: structuredClone(context.carriedObjectBindings),
+        carriedObjectTaskSpaceTargets: structuredClone(
+          context.carriedObjectTaskSpaceTargets
+        ),
+        carriedObjectContinuation: null,
+        carriedObjectUnauthorizedContacts: [],
+        progress: {
+          version: 1,
+          start_root_position: { ...context.start },
+          waypoint_index: Math.min(1, plan.waypoints.length - 1),
+          committed_frame_count: 0,
+          stopping_frame_count: 0
+        },
+        terminal: null
+      };
+      this.#routes.set(planId, stored);
+      this.#planRegistryEpoch += 1;
+      if (this.#worldRevision === createdRevision) {
+        stored.validatedStateSha256 = this.#authorityStateSha256();
+      }
+      this.#navigationState = {
+        planId,
+        status: "planned",
+        target: { ...target },
+        waypoints: plan.waypoints.map((point) => ({ ...point })),
+        waypointIndex: 1
+      };
     });
-    this.#navigationState = {
-      planId,
-      status: "planned",
-      target: { ...target },
-      waypoints: plan.waypoints.map((point) => ({ ...point })),
-      waypointIndex: 1
-    };
     return {
       accepted: true,
       planId,
-      createdRevision: this.#worldRevision,
+      createdRevision,
+      validatedStateSha256: context.stateSha256,
+      expiresRevision,
+      intentSha256,
       target: { ...target },
       chunkTarget: { ...plan.resolvedTarget },
       waypoints: plan.waypoints.map((point) => ({ ...point })),
       distance: plan.distance,
-      remainingDistance
+      remainingDistance: validation.remainingDistance,
+      carry: navigationCarryReceipt(context.carriedObjectBindings)
     };
   }
 
   async executeNavigation(
     planId: string,
-    frameSink?: HumanoidFrameSink
+    frameSink?: HumanoidFrameSink,
+    options: HumanoidExecutionOptions = {}
   ): Promise<HumanoidExecutionReceipt> {
-    const stored = this.#routes.get(planId);
+    const captured = await this.#authority.capture(() => {
+      const stored = this.#routes.get(planId);
+      return {
+        stored,
+        context: this.#captureNavigationPlanningContext(),
+        terminalReceipt: stored?.terminal
+          ? humanoidPlanTerminalReceipt(stored.terminal, this.snapshot())
+          : null
+      };
+    });
+    const stored = captured.stored;
     if (!stored) throw new Error(`Unknown humanoid navigation plan: ${planId}`);
-    if (stored.createdRevision !== this.#worldRevision) {
-      this.#routes.delete(planId);
-      this.#navigationState.status = "blocked";
-      return this.#receipt(false, "plan_stale", 0, {
-        reason: `plan_revision=${stored.createdRevision}, world_revision=${this.#worldRevision}`
+    if (captured.terminalReceipt) return captured.terminalReceipt;
+    if (stored.intentSha256 !== humanoidNavigationIntentSha256(stored.requestedTarget)) {
+      throw new Error("Humanoid navigation intent changed after model planning");
+    }
+    const previousValidationRevision = stored.validatedRevision;
+    let validationRevision = stored.validatedRevision;
+    let validationStateSha256 = stored.validatedStateSha256;
+    const admissionStateSha256 = captured.context.stateSha256;
+    const revalidationEvidence = (
+      performed: boolean,
+      accepted: boolean,
+      revalidationCount: number
+    ): PlanRevalidationEvidence => ({
+      performed,
+      accepted,
+      intent_sha256: stored.intentSha256,
+      planning_revision: stored.createdRevision,
+      previous_validation_revision: previousValidationRevision,
+      validation_revision: validationRevision,
+      validation_state_sha256: validationStateSha256,
+      admission_state_sha256: admissionStateSha256,
+      expires_revision: stored.expiresRevision,
+      revalidation_count: revalidationCount
+    });
+    const expectedRevision = stored.validatedRevision
+      + stored.progress.committed_frame_count;
+    if (stored.progress.committed_frame_count > 0
+      && expectedRevision !== captured.context.worldRevision) {
+      return this.#authority.capture(() => {
+        const receipt = this.#receipt(false, "plan_stale", 0, {
+          reason: `partially_executed_route_expected_revision=${expectedRevision}, world_revision=${captured.context.worldRevision}`,
+          revalidation: revalidationEvidence(false, false, stored.revalidationCount)
+        });
+        return this.#finalizeNavigationPlan(
+          stored,
+          receipt,
+          options.retainTerminal ?? false
+        );
       });
     }
-    this.#navigationState.status = "executing";
-    const run = await this.#followRoute(stored.plan, this.#reference, async (snapshot, index) => {
-      this.#navigationState.waypointIndex = index;
-      await this.#commitFrame(frameSink, snapshot, { routePlanId: planId });
-    });
-    this.#reference = run.reference;
-    this.#routes.delete(planId);
-    this.#navigationState.status = run.completed ? "completed" : "blocked";
-    return this.#receipt(
-      run.completed,
-      run.completed ? "navigation_completed" : "navigation_blocked",
-      run.frames,
-      {
-        ...(run.reason ? { reason: run.reason } : {}),
-        travelledDistance: run.travelledDistance
+    if (stored.progress.committed_frame_count === 0
+      && !humanoidPlanIntentIsActive(
+        captured.context.worldRevision,
+        stored.expiresRevision
+      )) {
+      return this.#authority.capture(() => {
+        const receipt = this.#receipt(false, "plan_stale", 0, {
+          reason: `intent_expired_at_revision=${stored.expiresRevision}, world_revision=${captured.context.worldRevision}`,
+          revalidation: revalidationEvidence(false, false, stored.revalidationCount)
+        });
+        return this.#finalizeNavigationPlan(
+          stored,
+          receipt,
+          options.retainTerminal ?? false
+        );
+      });
+    }
+    let revalidation = revalidationEvidence(false, true, stored.revalidationCount);
+    if (stored.progress.committed_frame_count === 0
+      && (stored.validatedRevision !== captured.context.worldRevision
+      || stored.validatedStateSha256 !== captured.context.stateSha256)) {
+      const validation = await this.#validateNavigationIntent(
+        stored.requestedTarget,
+        captured.context
+      );
+      const nextRevalidationCount = stored.revalidationCount + 1;
+      validationRevision = captured.context.worldRevision;
+      validationStateSha256 = captured.context.stateSha256;
+      if (!validation.accepted || !validation.plan) {
+        revalidation = revalidationEvidence(true, false, nextRevalidationCount);
+        return this.#authority.capture(() => {
+          const receipt = this.#receipt(false, "plan_revalidation_failed", 0, {
+            reason: validation.reason
+              ?? "The unchanged navigation target is no longer physically admissible",
+            revalidation
+          });
+          return this.#finalizeNavigationPlan(
+            stored,
+            receipt,
+            options.retainTerminal ?? false
+          );
+        });
       }
+      const applied = await this.#authority.capture(() => {
+        const identity = this.#authorityIdentity();
+        if (this.#routes.get(planId) !== stored
+          || identity.revision !== captured.context.worldRevision
+          || identity.stateSha256 !== captured.context.stateSha256) {
+          return false;
+        }
+        stored.plan = structuredClone(validation.plan!);
+        stored.validatedRevision = identity.revision;
+        stored.validatedStateSha256 = identity.stateSha256;
+        stored.revalidationCount = nextRevalidationCount;
+        stored.carriedObjectBindings = structuredClone(
+          captured.context.carriedObjectBindings
+        );
+        stored.carriedObjectTaskSpaceTargets = structuredClone(
+          captured.context.carriedObjectTaskSpaceTargets
+        );
+        stored.carriedObjectContinuation = null;
+        stored.carriedObjectUnauthorizedContacts = [];
+        stored.progress = {
+          version: 1,
+          start_root_position: { ...validation.start },
+          waypoint_index: Math.min(1, validation.plan!.waypoints.length - 1),
+          committed_frame_count: 0,
+          stopping_frame_count: 0
+        };
+        this.#navigationState = {
+          planId,
+          status: "planned",
+          target: { ...stored.requestedTarget },
+          waypoints: stored.plan.waypoints.map((point) => ({ ...point })),
+          waypointIndex: 1
+        };
+        return true;
+      });
+      if (!applied) {
+        return this.#authority.capture(() => {
+          const receipt = this.#receipt(false, "plan_stale", 0, {
+            reason: "world_state_changed_during_navigation_revalidation",
+            revalidation: {
+              ...revalidationEvidence(true, false, nextRevalidationCount),
+              admission_state_sha256: this.#authorityStateSha256()
+            }
+          });
+          return this.#finalizeNavigationPlan(
+            stored,
+            receipt,
+            options.retainTerminal ?? false
+          );
+        });
+      }
+      revalidation = revalidationEvidence(true, true, nextRevalidationCount);
+    }
+    const admission: HumanoidAuthorityIdentity = {
+      revision: stored.validatedRevision + stored.progress.committed_frame_count,
+      stateSha256: revalidation.admission_state_sha256
+    };
+    revalidation = {
+      ...revalidation,
+      admission_state_sha256: admission.stateSha256
+    };
+    let execution: HumanoidNavigationExecution | undefined;
+    let handle: HumanoidAuthorityCommandHandle<HumanoidExecutionReceipt>;
+    try {
+      handle = await this.#authority.submit({
+        id: `navigation:${planId}`,
+        source: "navigation",
+        admission,
+        ...(frameSink ? { frameSink } : {}),
+        admit: () => {
+          if (this.#routes.get(planId) !== stored) {
+            throw new Error(`Humanoid navigation plan became unavailable: ${planId}`);
+          }
+          execution = new HumanoidNavigationExecution({
+            plan: stored.plan,
+            reference: this.#reference,
+            simulation: this.#simulation,
+            progress: stored.progress,
+            contactConstraints: humanoidCarriedObjectContactConstraints(
+              stored.carriedObjectBindings
+            ),
+            graspTargets: contactAwareG1GraspTargetsForBindings({
+              bindings: stored.carriedObjectBindings.bindings,
+              graspRegistry: this.#graspRegistry
+            }),
+            carryTaskSpaceTargets: stored.carriedObjectTaskSpaceTargets
+          });
+          this.#navigationState.status = "executing";
+        },
+        step: async () => {
+          options.signal?.throwIfAborted();
+          if (!execution) throw new Error("Humanoid navigation was not admitted");
+          await this.#ensurePhysicalRegion();
+          const prepared = await execution.prepareFrame(this.#simulation);
+          this.#reference = execution.reference;
+          const step = prepared
+            ? (() => {
+                this.#commitFrameState({ routePlanId: planId });
+                this.#observeGraspFrame(this.#frame, prepared.snapshot);
+                const continuation = humanoidCarriedObjectContinuationEvidence({
+                  state: stored.carriedObjectBindings,
+                  registry: this.#graspRegistry,
+                  currentFrame: this.#frame,
+                  currentWorldRevision: this.#worldRevision
+                });
+                const unauthorized = humanoidCarriedObjectUnauthorizedContacts(
+                  stored.carriedObjectBindings,
+                  prepared.snapshot.contacts
+                );
+                stored.carriedObjectContinuation = continuation;
+                stored.carriedObjectUnauthorizedContacts = unauthorized;
+                this.#observeCarriedObjectFrame(prepared.snapshot);
+                return execution!.commitPreparedFrame(
+                  carryNavigationFailure(continuation, unauthorized, prepared.snapshot)
+                );
+              })()
+            : {
+                waypointIndex: stored.progress.waypoint_index,
+                done: true
+              };
+          if (prepared) {
+            stored.progress = execution.checkpoint();
+            this.#navigationState.waypointIndex = step.waypointIndex;
+          }
+          if (!step.done) {
+            const snapshot = this.snapshot();
+            await options.persistenceSink?.(this.#capturePersistenceState());
+            return {
+              ...(frameSink && !options.persistenceSink ? { snapshot } : {}),
+              done: false
+            };
+          }
+          const result = execution.result();
+          this.#navigationState.status = result.completed ? "completed" : "blocked";
+          const receipt = this.#receipt(
+            result.completed,
+            result.completed ? "navigation_completed" : "navigation_blocked",
+            result.frames,
+            {
+              ...(result.reason ? { reason: result.reason } : {}),
+              travelledDistance: result.travelledDistance,
+              carry: {
+                binding_set: structuredClone(stored.carriedObjectBindings),
+                continuation: stored.carriedObjectContinuation
+                  ? structuredClone(stored.carriedObjectContinuation)
+                  : null,
+                unauthorized_contacts: structuredClone(
+                  stored.carriedObjectUnauthorizedContacts
+                )
+              },
+              revalidation
+            }
+          );
+          const finalized = this.#finalizeNavigationPlan(
+            stored,
+            receipt,
+            options.retainTerminal ?? false
+          );
+          await options.persistenceSink?.(this.#capturePersistenceState());
+          return {
+            ...(step.snapshot && frameSink && !options.persistenceSink
+              ? { snapshot: finalized.finalSnapshot }
+              : {}),
+            done: true,
+            result: finalized
+          };
+        }
+      });
+    } catch (error) {
+      if (!(error instanceof HumanoidAuthorityAdmissionError)) throw error;
+      return this.#authority.capture(() => {
+        const receipt = this.#receipt(false, "plan_stale", 0, {
+          reason: error.message,
+          revalidation: {
+            ...revalidation,
+            accepted: false,
+            admission_state_sha256: error.actual.stateSha256
+          }
+        });
+        return this.#finalizeNavigationPlan(
+          stored,
+          receipt,
+          options.retainTerminal ?? false
+        );
+      });
+    }
+    return this.#driveAuthorityCommand(handle, options);
+  }
+
+  async acknowledgeNavigation(
+    planId: string,
+    resultSha256: string
+  ): Promise<boolean> {
+    return this.#authority.capture(() => {
+      const stored = this.#routes.get(planId);
+      if (!stored) return false;
+      if (!stored.terminal) {
+        throw new Error(`Humanoid navigation plan is not terminal: ${planId}`);
+      }
+      if (stored.terminal.result_sha256 !== resultSha256) {
+        throw new Error(`Humanoid navigation terminal acknowledgement mismatch: ${planId}`);
+      }
+      const deleted = this.#deleteRoutePlan(planId);
+      if (this.#navigationState.planId === planId) {
+        this.#navigationState.planId = null;
+        this.#navigationState.waypointIndex = null;
+      }
+      return deleted;
+    });
+  }
+
+  async advanceStationary(frameSink?: HumanoidFrameSink): Promise<HumanoidWorldSnapshot | null> {
+    const tick = await this.#authority.tick(frameSink);
+    return tick.snapshot;
+  }
+
+  async #driveAuthorityCommand<Result>(
+    handle: HumanoidAuthorityCommandHandle<Result>,
+    options: HumanoidExecutionOptions
+  ): Promise<Result> {
+    const pacer = createHumanoidControlStepPacer({
+      controlStepSeconds: this.#simulation.controllerDescriptor().controlStepSeconds,
+      realtime: options.realtime ?? false,
+      ...(options.signal ? { signal: options.signal } : {})
+    });
+    try {
+      while (!handle.settled) {
+        await pacer.waitForNextStep();
+        if (handle.settled) break;
+        await this.#authority.tick();
+      }
+      const result = await handle.result;
+      await handle.publication;
+      return result;
+    } catch (error) {
+      await this.#authority.cancel(handle.id, error);
+      throw error;
+    }
+  }
+
+  #deleteMotionPlan(planId: string): boolean {
+    const deleted = this.#motions.delete(planId);
+    if (deleted) this.#planRegistryEpoch += 1;
+    return deleted;
+  }
+
+  #finalizeMotionPlan(
+    stored: StoredHumanoidMotionPlan,
+    receipt: HumanoidExecutionReceipt,
+    retainTerminal: boolean
+  ): HumanoidExecutionReceipt {
+    const planId = stored.plan.id;
+    if (!retainTerminal) {
+      this.#deleteMotionPlan(planId);
+      return receipt;
+    }
+    if (stored.terminal) {
+      return humanoidPlanTerminalReceipt(stored.terminal, this.snapshot());
+    }
+    const terminal = createHumanoidPlanTerminal({
+      planId,
+      totalFrames: stored.progress.nextFrameIndex,
+      receipt
+    });
+    stored.terminal = terminal;
+    if (!this.#motions.has(planId)) {
+      this.#motions.set(planId, stored);
+      this.#planRegistryEpoch += 1;
+    }
+    return {
+      ...receipt,
+      terminalResultSha256: terminal.result_sha256
+    };
+  }
+
+  #deleteRoutePlan(planId: string): boolean {
+    const deleted = this.#routes.delete(planId);
+    if (deleted) this.#planRegistryEpoch += 1;
+    return deleted;
+  }
+
+  #finalizeNavigationPlan(
+    stored: StoredHumanoidNavigationPlan,
+    receipt: HumanoidExecutionReceipt,
+    retainTerminal: boolean
+  ): HumanoidExecutionReceipt {
+    const planId = stored.id;
+    if (!retainTerminal) {
+      this.#deleteRoutePlan(planId);
+      if (this.#navigationState.planId === planId) {
+        this.#navigationState.planId = null;
+        this.#navigationState.waypointIndex = null;
+      }
+      return receipt;
+    }
+    if (stored.terminal) {
+      return humanoidPlanTerminalReceipt(stored.terminal, this.snapshot());
+    }
+    const terminal = createHumanoidPlanTerminal({
+      planId,
+      totalFrames: stored.progress.committed_frame_count,
+      receipt
+    });
+    stored.terminal = terminal;
+    if (!this.#routes.has(planId)) {
+      this.#routes.set(planId, stored);
+      this.#planRegistryEpoch += 1;
+    }
+    return {
+      ...receipt,
+      terminalResultSha256: terminal.result_sha256
+    };
+  }
+
+  #authorityIdentity(): HumanoidAuthorityIdentity {
+    return {
+      revision: this.#worldRevision,
+      stateSha256: this.#authorityStateSha256()
+    };
+  }
+
+  #authorityStateSha256(): string {
+    const carriedObjectBindings = this.#currentCarriedObjectBindings();
+    const snapshot = this.#simulation.snapshot();
+    return humanoidAuthorityStateSha256({
+      simulation: this.#simulation.captureState(),
+      reference: this.#reference,
+      visibleContactObjectIds: this.#objectMemory.observedObjectIds(
+        this.#frame,
+        this.#worldRevision
+      ),
+      visibleContactSolidIds: observableHumanoidSolidIds(
+        this.#simulation.senseSolids(this.#scenario.visibility_radius),
+        snapshot.contacts
+      ),
+      planRegistryEpoch: this.#planRegistryEpoch,
+      graspRegistry: this.#currentGraspRegistryCheckpoint(),
+      carriedObjectBindings
+    });
+  }
+
+  #currentGraspRegistryCheckpoint(): HumanoidGraspRegistryCheckpoint {
+    const checkpoint = this.#graspRegistry.checkpoint();
+    if (checkpoint.last_frame !== this.#frame) {
+      throw new Error(
+        `Humanoid grasp registry frame is not authoritative: `
+        + `${String(checkpoint.last_frame)} != ${this.#frame}`
+      );
+    }
+    return checkpoint;
+  }
+
+  #currentGraspState(): HumanoidWorldSnapshot["grasp"] {
+    return {
+      contractSha256: this.#graspRegistry.contractSha256,
+      assessments: this.#graspRegistry.assessmentsForFrame(this.#frame)
+    };
+  }
+
+  #currentCarriedObjectBindings(): HumanoidCarriedObjectBindingSet {
+    return this.#requiredCarriedObjectLifecycle().bindingSet(
+      this.#frame,
+      this.#worldRevision
     );
   }
 
+  #acquireSuccessfulOptionGrasp(stored: StoredHumanoidMotionPlan): void {
+    if (stored.option?.status !== "succeeded"
+      || this.#requiredCarriedObjectLifecycle().active !== null) return;
+    const verified = new Set(this.#graspRegistry.assessmentsForFrame(this.#frame)
+      .filter((assessment) => assessment.grasp_verified)
+      .map((assessment) => `${assessment.object_id}\0${assessment.hand}`));
+    const requests = stored.option.contract.predicates.flatMap((predicate) => (
+      predicate.type === "grasp_verified"
+        && verified.has(`${predicate.object_id}\0${predicate.hand}`)
+        ? [{ object_id: predicate.object_id, hand: predicate.hand }]
+        : []
+    ));
+    if (requests.length === 0) return;
+    this.#requiredCarriedObjectLifecycle().acquire({
+      currentFrame: this.#frame,
+      currentWorldRevision: this.#worldRevision,
+      requests
+    });
+  }
+
+  #requiredCarriedObjectLifecycle(): HumanoidCarriedObjectLifecycle {
+    if (!this.#carriedObjectLifecycle) {
+      throw new Error("Humanoid carried-object lifecycle is not initialized");
+    }
+    return this.#carriedObjectLifecycle;
+  }
+
+  #observeGraspFrame(
+    frame: number,
+    snapshot: HumanoidSimulationSnapshot
+  ): void {
+    this.#graspRegistry.observe(frame, snapshot);
+  }
+
+  #observeCarriedObjectFrame(snapshot: HumanoidSimulationSnapshot): void {
+    this.#requiredCarriedObjectLifecycle().observe({
+      currentFrame: this.#frame,
+      currentWorldRevision: this.#worldRevision,
+      contacts: snapshot.contacts
+    });
+  }
+
+  #refreshCurrentObjectMemory(): ReturnType<HumanoidSimulation["senseObjects"]> {
+    const snapshot = this.#simulation.snapshot();
+    const sensed = this.#simulation.senseObjects(this.#scenario.visibility_radius);
+    this.#objectMemory.refresh(
+      this.#frame,
+      this.#worldRevision,
+      snapshot.objects,
+      new Set(Object.keys(sensed.objects))
+    );
+    return sensed;
+  }
+
+  #physicalAnchors(
+    snapshot: HumanoidSimulationSnapshot = this.#simulation.snapshot()
+  ): Array<Pick<Vec3, "x" | "z">> {
+    const carriedObjectIds = new Set(
+      this.#carriedObjectLifecycle?.active?.bindings.map(({ object_id }) => object_id)
+        ?? []
+    );
+    return [
+      { x: snapshot.rootPosition.x, z: snapshot.rootPosition.z },
+      ...Object.values(snapshot.objects)
+        .filter((object) => carriedObjectIds.has(object.id)
+          || Math.hypot(
+            object.linearVelocity.x,
+            object.linearVelocity.y,
+            object.linearVelocity.z
+          ) >= ACTIVE_OBJECT_LINEAR_SPEED_METERS_PER_SECOND
+          || Math.hypot(
+            object.angularVelocity.x,
+            object.angularVelocity.y,
+            object.angularVelocity.z
+          ) >= ACTIVE_OBJECT_ANGULAR_SPEED_RADIANS_PER_SECOND)
+        .map(({ position }) => ({ x: position.x, z: position.z }))
+    ];
+  }
+
+  async #ensurePhysicalRegion(): Promise<void> {
+    const anchors = this.#physicalAnchors();
+    const requested = humanoidPhysicalRegion(this.#scenario, anchors);
+    if (requested.key === this.#physicalRegion.key) return;
+    const captured = this.#simulation.captureState();
+    const next = await createHumanoidPhysicsResources(this.#scenario, anchors);
+    let installed = false;
+    try {
+      next.simulation.restoreState(captured);
+      const previous = {
+        simulation: this.#simulation,
+        rolloutPool: this.#rolloutPool,
+        physicalRegion: this.#physicalRegion
+      };
+      this.#simulation = next.simulation;
+      this.#rolloutPool = next.rolloutPool;
+      this.#physicalRegion = next.physicalRegion;
+      installed = true;
+      await disposeHumanoidPhysicsResources(previous);
+    } catch (error) {
+      if (!installed) await disposeHumanoidPhysicsResources(next);
+      throw error;
+    }
+  }
+
+  async #stepStationaryAuthority(): Promise<HumanoidWorldSnapshot> {
+    await this.#ensurePhysicalRegion();
+    this.#reference = stationaryHumanoidReference(this.#reference);
+    const snapshot = await this.#simulation.step(this.#reference);
+    this.#commitFrameState();
+    this.#observeGraspFrame(this.#frame, snapshot);
+    this.#observeCarriedObjectFrame(snapshot);
+    return this.snapshot();
+  }
+
+  #planExpiryRevision(createdRevision: number): number {
+    return humanoidPlanExpiryRevision({
+      createdRevision,
+      controlStepSeconds: this.#simulation.controllerDescriptor().controlStepSeconds,
+      leaseSeconds: this.#planIntentLeaseSeconds
+    });
+  }
+
   async dispose(): Promise<void> {
-    this.#navigation.dispose();
+    await this.#authority.dispose();
     await Promise.all([
-      this.#simulation.dispose(),
+      disposeHumanoidWorldResources({
+        simulation: this.#simulation,
+        rolloutPool: this.#rolloutPool,
+        navigation: this.#navigation,
+        physicalRegion: this.#physicalRegion
+      }),
       this.#motionGenerator.dispose()
     ]);
   }
@@ -863,11 +2060,17 @@ export class HumanoidWorld {
   async #settle(steps: number): Promise<void> {
     for (let index = 0; index < steps; index += 1) {
       await this.#simulation.step(this.#reference);
-      this.#frame += 1;
     }
-    if (this.#simulation.snapshot().fallen) {
+    const snapshot = this.#simulation.snapshot();
+    if (snapshot.fallen) {
       throw new Error("Humanoid could not reach a stable initial stance");
     }
+    this.#observeGraspFrame(0, snapshot);
+    this.#carriedObjectLifecycle = new HumanoidCarriedObjectLifecycle({
+      registry: this.#graspRegistry,
+      currentFrame: 0,
+      currentWorldRevision: 0
+    });
   }
 
   #restore(rawCheckpoint: HumanoidWorldCheckpoint): void {
@@ -891,142 +2094,138 @@ export class HumanoidWorld {
       accelerationWarmstart: Float64Array.from(
         checkpoint.simulation.accelerationWarmstart
       ),
+      ...(checkpoint.simulation.requestedActuatorTorques
+        ? {
+            requestedActuatorTorques: Float64Array.from(
+              checkpoint.simulation.requestedActuatorTorques
+            )
+          }
+        : {}),
+      ...(checkpoint.simulation.handCommandTargets
+        ? {
+            handCommandTargets: Float64Array.from(
+              checkpoint.simulation.handCommandTargets
+            )
+          }
+        : {}),
       controller: structuredClone(checkpoint.simulation.controller)
     });
     this.#reference = hydrateHumanoidReference(checkpoint.reference);
     this.#frame = checkpoint.frame;
     this.#worldRevision = checkpoint.worldRevision;
     this.#routeSequence = checkpoint.routeSequence;
-    this.#motions.clear();
-    for (const entry of checkpoint.motions) {
-      const expectedRevision = entry.createdRevision + entry.progress.nextFrameIndex;
-      if (expectedRevision === checkpoint.worldRevision) {
-        const restored = structuredClone(entry);
-        restored.progress.satisfiedContactKeys = [];
-        this.#motions.set(entry.plan.id, restored);
+    this.#planRegistryEpoch = checkpoint.planRegistryEpoch;
+    this.#physicalSafety = checkpoint.physicalSafety
+      ? structuredClone(checkpoint.physicalSafety)
+      : undefined;
+    if (JSON.stringify(this.#graspRegistry.checkpoint())
+      !== JSON.stringify(checkpoint.graspRegistry)) {
+      throw new Error("Humanoid grasp registry restore did not preserve its checkpoint");
+    }
+    this.#currentGraspRegistryCheckpoint();
+    this.#carriedObjectLifecycle = new HumanoidCarriedObjectLifecycle({
+      registry: this.#graspRegistry,
+      currentFrame: this.#frame,
+      currentWorldRevision: this.#worldRevision,
+      checkpoint: checkpoint.carriedObjectLifecycle
+    });
+    if (!checkpoint.carriedObjectLifecycle) {
+      const legacyRequests = this.#graspRegistry.assessmentsForFrame(this.#frame)
+        .filter((assessment) => assessment.grasp_verified)
+        .map((assessment) => ({
+          object_id: assessment.object_id,
+          hand: assessment.hand
+        }));
+      if (legacyRequests.length > 0) {
+        this.#carriedObjectLifecycle.acquire({
+          currentFrame: this.#frame,
+          currentWorldRevision: this.#worldRevision,
+          requests: legacyRequests
+        });
       }
+    }
+    const restoredStateSha256 = this.#authorityStateSha256();
+    const restoredPlans = restoreHumanoidWorldPlans({
+      checkpoint,
+      snapshot: this.#simulation.snapshot(),
+      graspRegistry: this.#graspRegistry,
+      currentBindings: this.#currentCarriedObjectBindings(),
+      restoredStateSha256,
+      planExpiryRevision: (createdRevision) => this.#planExpiryRevision(createdRevision)
+    });
+    this.#motions.clear();
+    for (const [planId, stored] of restoredPlans.motions) {
+      this.#motions.set(planId, stored);
     }
     this.#routes.clear();
-    for (const entry of checkpoint.routes) {
-      if (entry.createdRevision === checkpoint.worldRevision) {
-        this.#routes.set(entry.id, structuredClone(entry));
-      }
+    for (const [planId, stored] of restoredPlans.routes) {
+      this.#routes.set(planId, stored);
     }
-    this.#navigationState = structuredClone(checkpoint.navigation);
-    const navigationPlanId = this.#navigationState.planId;
-    if (this.#navigationState.status === "executing"
-      || (this.#navigationState.status === "planned"
-        && (navigationPlanId === null || !this.#routes.has(navigationPlanId)))) {
-      if (navigationPlanId) this.#routes.delete(navigationPlanId);
-      this.#navigationState.planId = null;
-      this.#navigationState.status = "blocked";
-      this.#navigationState.waypointIndex = null;
-    }
+    this.#planRegistryEpoch = restoredPlans.planRegistryEpoch;
+    this.#physicalSafety = restoredPlans.physicalSafety;
+    this.#navigationState = restoredPlans.navigation;
   }
 
-  async #followRoute(
-    plan: NavigationPlan,
-    initialReference: HumanoidReference,
-    onFrame?: (snapshot: HumanoidSimulationSnapshot, waypointIndex: number) => Promise<void>
-  ): Promise<RouteRun> {
-    const start = this.#simulation.snapshot();
-    let final = start;
-    let reference = initialReference;
-    let waypointIndex = Math.min(1, plan.waypoints.length - 1);
-    let frames = 0;
-    const maximumFrames = Math.ceil(Math.min(60, plan.distance / 0.12 + 8) / 0.02);
-    while (frames < maximumFrames && waypointIndex < plan.waypoints.length) {
-      const waypoint = plan.waypoints[waypointIndex]!;
-      const dx = waypoint.x - final.rootPosition.x;
-      const dz = waypoint.z - final.rootPosition.z;
-      const distance = Math.hypot(dx, dz);
-      if (distance <= 0.18) {
-        waypointIndex += 1;
-        continue;
-      }
-      const yaw = yawFromQuaternion(final.rootRotation);
-      const desiredYaw = Math.atan2(dx, dz);
-      const yawError = normalizeAngle(desiredYaw - yaw);
-      const localForward = dx * Math.sin(yaw) + dz * Math.cos(yaw);
-      const localLateral = dx * Math.cos(yaw) - dz * Math.sin(yaw);
-      reference = targetReference(reference, {
-        rootVelocity: [
-          clamp(localForward * 0.9, -0.3, 0.48),
-          clamp(localLateral * 0.8, -0.22, 0.22)
-        ],
-        rootYawVelocity: clamp(yawError * 1.8, -1, 1)
-      });
-      final = await this.#simulation.step(reference);
-      frames += 1;
-      await onFrame?.(final, waypointIndex);
-      if (final.fallen) {
-        return routeResult(false, "fallen", frames, reference, start, final);
-      }
-      const blockedContacts = blockedHumanoidContacts(final, []);
-      if (blockedContacts.length > 0) {
-        return routeResult(
-          false,
-          `environment_contact:${blockedContacts.map((contact) => (
-            `${contact.body}:${contact.objectId ?? "environment"}`
-          )).join(",")}`,
-          frames,
-          reference,
-          start,
-          final
-        );
-      }
-    }
-    if (waypointIndex < plan.waypoints.length) {
-      const waypoint = plan.waypoints[waypointIndex]!;
-      return routeResult(
-        false,
-        `navigation_timeout:position=${point(final.rootPosition)},target=${point(waypoint)}`,
-        frames,
-        reference,
-        start,
-        final
-      );
-    }
-    reference = targetReference(reference, {
-      rootVelocity: [0, 0],
-      rootYawVelocity: 0
-    });
-    for (let index = 0; index < 30; index += 1) {
-      final = await this.#simulation.step(reference);
-      frames += 1;
-      await onFrame?.(final, plan.waypoints.length - 1);
-      if (final.fallen) return routeResult(false, "fallen_while_stopping", frames, reference, start, final);
-      if (blockedHumanoidContacts(final, []).length > 0) {
-        return routeResult(false, "contact_while_stopping", frames, reference, start, final);
-      }
-    }
-    return routeResult(true, undefined, frames, reference, start, final);
-  }
-
-  async #commitFrame(
-    sink?: HumanoidFrameSink,
-    _snapshot?: HumanoidSimulationSnapshot,
+  #commitFrameState(
     activePlan: { motionPlanId?: string; routePlanId?: string } = {}
-  ): Promise<void> {
+  ): void {
     this.#frame += 1;
     this.#worldRevision += 1;
     this.#pruneUnconsumablePlans(activePlan);
-    await sink?.(this.snapshot());
   }
 
   #pruneUnconsumablePlans(activePlan: {
     motionPlanId?: string;
     routePlanId?: string;
   }): void {
+    const physicalExecutionCommitted = activePlan.motionPlanId !== undefined
+      || activePlan.routePlanId !== undefined;
+    let registryChanged = false;
     for (const [planId, stored] of this.#motions) {
       if (planId === activePlan.motionPlanId) continue;
-      const expectedRevision = stored.createdRevision + stored.progress.nextFrameIndex;
-      if (expectedRevision !== this.#worldRevision) this.#motions.delete(planId);
+      if (stored.terminal) continue;
+      if (physicalExecutionCommitted) {
+        this.#motions.delete(planId);
+        registryChanged = true;
+        continue;
+      }
+      if (stored.progress.nextFrameIndex > 0) {
+        const expectedRevision = stored.validatedRevision
+          + stored.progress.nextFrameIndex;
+        if (expectedRevision !== this.#worldRevision) {
+          this.#motions.delete(planId);
+          registryChanged = true;
+        }
+        continue;
+      }
+      if (!humanoidPlanIntentIsActive(this.#worldRevision, stored.expiresRevision)) {
+        this.#motions.delete(planId);
+        registryChanged = true;
+      }
     }
     for (const [planId, stored] of this.#routes) {
       if (planId === activePlan.routePlanId) continue;
-      if (stored.createdRevision !== this.#worldRevision) this.#routes.delete(planId);
+      if (stored.terminal) continue;
+      if (physicalExecutionCommitted) {
+        this.#routes.delete(planId);
+        registryChanged = true;
+        continue;
+      }
+      if (stored.progress.committed_frame_count > 0) {
+        const expectedRevision = stored.validatedRevision
+          + stored.progress.committed_frame_count;
+        if (expectedRevision !== this.#worldRevision) {
+          this.#routes.delete(planId);
+          registryChanged = true;
+        }
+        continue;
+      }
+      if (!humanoidPlanIntentIsActive(this.#worldRevision, stored.expiresRevision)) {
+        this.#routes.delete(planId);
+        registryChanged = true;
+      }
     }
+    if (registryChanged) this.#planRegistryEpoch += 1;
     const navigationPlanId = this.#navigationState.planId;
     if (navigationPlanId
       && navigationPlanId !== activePlan.routePlanId
@@ -1037,59 +2236,71 @@ export class HumanoidWorld {
     }
   }
 
-  #dynamicNavigationObstacles(): NavigationObstacle[] {
-    const objects = this.#simulation.snapshot().objects;
-    return this.#scenario.objects
-      .filter((object) => object.portable)
-      .map((object) => ({
-        id: `object-${object.id}`,
-        center: { ...(objects[object.id]?.position ?? object.position) },
-        halfExtents: {
-          x: object.size.x / 2,
-          y: object.size.y / 2,
-          z: object.size.z / 2
-        },
-        yaw: 0
-      }));
-  }
-
   #motionOptionDetectorInput(
-    snapshot: HumanoidSimulationSnapshot
+    snapshot: HumanoidSimulationSnapshot,
+    option: HumanoidMotionOptionContract,
+    trackedObjectIds: ReadonlySet<string> = new Set()
   ): HumanoidMotionOptionDetectorInput {
     const sensed = this.#simulation.senseObjects(
       this.#scenario.visibility_radius
     );
-    const observedFrame = this.#frame + 1;
-    const observedWorldRevision = this.#worldRevision + 1;
+    const sensedSolids = this.#simulation.senseSolids(
+      this.#scenario.visibility_radius
+    );
+    const observedFrame = this.#frame;
+    const observedWorldRevision = this.#worldRevision;
     this.#objectMemory.refresh(
       observedFrame,
       observedWorldRevision,
       snapshot.objects,
       new Set(Object.keys(sensed.objects))
     );
-    const observableObjects: HumanoidMotionOptionObservableObject[] = this.#objectMemory
+    const observableObjects = new Map(this.#objectMemory
       .observableObjectStates(observedFrame, observedWorldRevision)
-      .map((object) => ({
+      .map((object): [string, HumanoidMotionOptionObservableObject] => [object.id, {
         id: object.id,
         position: { ...object.pose.position },
+        rotation: { ...object.pose.rotation },
         size: { ...object.size }
-      }));
+      }]));
+    for (const objectId of trackedObjectIds) {
+      if (observableObjects.has(objectId)) continue;
+      const state = snapshot.objects[objectId];
+      const descriptor = this.#scenario.objects.find((object) => object.id === objectId);
+      if (!state || !descriptor) continue;
+      observableObjects.set(objectId, {
+        id: objectId,
+        position: { ...state.position },
+        rotation: { ...state.rotation },
+        size: { ...descriptor.size }
+      });
+    }
     return {
       snapshot,
-      observableObjects,
-      zones: this.#scenario.zones
+      observableObjects: [...observableObjects.values()],
+      observableSolidIds: observableHumanoidSolidIds(
+        sensedSolids,
+        snapshot.contacts
+      ),
+      zones: this.#scenario.zones,
+      graspAssessments: this.#graspRegistry.bindingsForOption(
+        option,
+        observedFrame
+      )
     };
   }
 
   #motionOptionReceipt(
-    stored: StoredMotionPlan,
+    stored: StoredHumanoidMotionPlan,
     frames: number,
-    failures: HumanoidMotionValidation["failures"] = []
+    failures: HumanoidMotionValidation["failures"] = [],
+    revalidation?: PlanRevalidationEvidence
   ): HumanoidExecutionReceipt {
     const option = stored.option;
     if (!option || !isTerminalMotionOption(option)) {
       throw new Error("Humanoid motion option has no terminal physical result");
     }
+    const physicalSafety = storedMotionPhysicalSafety(stored);
     const accepted = option.status === "succeeded";
     const code: HumanoidExecutionReceipt["code"] = accepted
       ? "motion_option_succeeded"
@@ -1104,7 +2315,18 @@ export class HumanoidWorld {
           : "motion_goal_unmet";
     return this.#receipt(accepted, code, frames, {
       motion: humanoidMotionArtifactSummary(stored.artifact),
+      ...(physicalSafety ? { physical_safety: physicalSafety } : {}),
       ...(failures.length === 0 ? {} : { failures }),
+      ...(revalidation ? { revalidation } : {}),
+      carry: {
+        binding_set: structuredClone(stored.carriedObjectBindings),
+        continuation: stored.carriedObjectContinuation
+          ? structuredClone(stored.carriedObjectContinuation)
+          : null,
+        unauthorized_contacts: structuredClone(
+          stored.carriedObjectUnauthorizedContacts
+        )
+      },
       option: {
         option_id: option.contract.option_id,
         status: option.status,
@@ -1140,160 +2362,25 @@ export class HumanoidWorld {
   }
 }
 
-function navigationChunk(plan: NavigationPlan, maximumDistance: number): NavigationPlan {
-  if (plan.distance <= maximumDistance || plan.waypoints.length < 2) {
-    return structuredClone(plan);
+function checkpointRootAnchor(
+  checkpoint: HumanoidWorldCheckpoint
+): Pick<Vec3, "x" | "z"> {
+  const z = checkpoint.simulation.positions[0];
+  const x = checkpoint.simulation.positions[1];
+  if (!Number.isFinite(x) || !Number.isFinite(z)) {
+    throw new Error("Humanoid checkpoint is missing a finite root position");
   }
-  const waypoints: Vec3[] = [{ ...plan.waypoints[0]! }];
-  let distance = 0;
-  for (let index = 1; index < plan.waypoints.length; index += 1) {
-    const from = plan.waypoints[index - 1]!;
-    const to = plan.waypoints[index]!;
-    const segment = Math.hypot(to.x - from.x, to.z - from.z);
-    if (distance + segment <= maximumDistance) {
-      waypoints.push({ ...to });
-      distance += segment;
-      continue;
-    }
-    const remaining = maximumDistance - distance;
-    const ratio = segment <= 1e-9 ? 0 : remaining / segment;
-    const endpoint = {
-      x: from.x + (to.x - from.x) * ratio,
-      y: from.y + (to.y - from.y) * ratio,
-      z: from.z + (to.z - from.z) * ratio
-    };
-    waypoints.push(endpoint);
-    return {
-      waypoints,
-      distance: maximumDistance,
-      resolvedTarget: { ...endpoint },
-      projectionDistance: 0
-    };
-  }
-  return structuredClone(plan);
+  return { x: x!, z: z! };
 }
 
-function routeResult(
-  completed: boolean,
-  reason: string | undefined,
-  frames: number,
-  reference: HumanoidReference,
-  start: HumanoidSimulationSnapshot,
-  final: HumanoidSimulationSnapshot
-): RouteRun {
+function navigationCarryReceipt(
+  state: HumanoidCarriedObjectBindingSet
+): NavigationPlanReceipt["carry"] {
   return {
-    completed,
-    ...(reason ? { reason } : {}),
-    frames,
-    reference,
-    final,
-    travelledDistance: Math.hypot(
-      final.rootPosition.x - start.rootPosition.x,
-      final.rootPosition.z - start.rootPosition.z
-    )
+    binding_set_sha256: humanoidCarriedObjectBindingSetSha256(state),
+    bindings: state.bindings.map((binding) => ({
+      object_id: binding.object_id,
+      hand: binding.hand
+    }))
   };
-}
-
-function yawFromQuaternion(rotation: HumanoidSimulationSnapshot["rootRotation"]): number {
-  return Math.atan2(
-    2 * (rotation.w * rotation.y + rotation.x * rotation.z),
-    1 - 2 * (rotation.y * rotation.y + rotation.z * rotation.z)
-  );
-}
-
-function normalizeAngle(value: number): number {
-  return Math.atan2(Math.sin(value), Math.cos(value));
-}
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value));
-}
-
-function point(value: Vec3): string {
-  return `${value.x.toFixed(3)},${value.y.toFixed(3)},${value.z.toFixed(3)}`;
-}
-
-function validationFailure(
-  failure: NonNullable<HumanoidMotionExecutionProgress["failure"]>
-): HumanoidMotionValidation["failures"][number] {
-  if (failure.code === "fallen") {
-    return { code: "fallen", atSeconds: failure.atSeconds };
-  }
-  if (failure.code === "execution_drift") {
-    return {
-      code: "execution_drift",
-      atSeconds: failure.atSeconds,
-      ...(failure.drift ? { drift: { ...failure.drift } } : {}),
-      message: "Physical execution persistently diverged from its validated rollout"
-    };
-  }
-  if (failure.code === "motion_constraint_violated") {
-    return {
-      code: "motion_constraint_violated",
-      atSeconds: failure.atSeconds,
-      message: "Motion option violated its during constraint"
-    };
-  }
-  return {
-    code: "environment_contact",
-    atSeconds: failure.atSeconds,
-    ...(failure.bodies ? { bodies: [...failure.bodies] } : {}),
-    ...(failure.contacts
-      ? { contacts: failure.contacts.map((contact) => ({ ...contact })) }
-      : {})
-  };
-}
-
-function isTerminalMotionOption(
-  option: HumanoidMotionOptionExecutionState
-): boolean {
-  return option.status === "succeeded"
-    || option.status === "failed"
-    || option.status === "goal_unmet";
-}
-
-function assertMotionOptionIntegrity(stored: StoredMotionPlan): void {
-  const option = stored.option;
-  if (!option) return;
-  if (!stored.rollout) {
-    throw new Error("Humanoid motion option is missing its validated rollout");
-  }
-  const certificate = option.certificate;
-  const predictedFrame = stored.artifact.frames[
-    certificate.predicted_termination_frame - 1
-  ];
-  const valid = certificate.artifact_sha256
-      === humanoidMotionArtifactSha256(stored.artifact)
-    && certificate.contract_sha256
-      === humanoidMotionOptionContractSha256(option.contract)
-    && option.monitor.contractSha256 === certificate.contract_sha256
-    && option.successStreak === option.monitor.terminalStableSteps
-    && certificate.rollout_sha256
-      === humanoidMotionRolloutSha256(stored.rollout)
-    && certificate.rollout_frame_count === stored.rollout.frames.length
-    && certificate.rollout_frame_count === stored.artifact.frames.length
-    && certificate.drift_consecutive_steps
-      === stored.rollout.limits.consecutive_steps
-    && certificate.validated_frame_limit === stored.artifact.frames.length
-    && certificate.predicted_termination_frame >= certificate.stable_steps
-    && certificate.predicted_termination_frame <= certificate.validated_frame_limit
-    && certificate.stable_steps === option.contract.stable_steps
-    && predictedFrame !== undefined
-    && Math.abs(predictedFrame.atSeconds - certificate.predicted_at_seconds) <= 1e-9;
-  if (!valid) {
-    throw new Error("Humanoid motion option certificate integrity check failed");
-  }
-}
-
-function jsonOptionEvidence(
-  detection: HumanoidMotionOptionDetection,
-  monitor: HumanoidMotionOptionExecutionState["monitor"]
-): HumanoidMotionOptionExecutionState["lastEvidence"] {
-  return JSON.parse(JSON.stringify({
-    predicates: detection.evidence,
-    phases: detection.phases,
-    monitor
-  })) as HumanoidMotionOptionExecutionState[
-    "lastEvidence"
-  ];
 }

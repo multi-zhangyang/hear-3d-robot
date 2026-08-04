@@ -5,6 +5,8 @@ import type {
 } from "../../domain/schema.js";
 import {
   inverseQuaternion,
+  multiplyQuaternion,
+  normalizeQuaternion,
   rotateVector,
   subtract
 } from "../geometry.js";
@@ -51,4 +53,21 @@ export function humanoidEndEffectorPosition(
     inverseQuaternion(pelvis.rotation),
     subtract(link.position, pelvis.position)
   );
+}
+
+export function humanoidEndEffectorRotation(
+  snapshot: EndEffectorRobotSnapshot,
+  endEffector: HumanoidEndEffector,
+  frame: "world" | "pelvis"
+): Quaternion | null {
+  const link = snapshot.links[humanoidEndEffectorBody(endEffector)];
+  if (!link?.rotation) return null;
+  if (frame === "world") return normalizeQuaternion(link.rotation);
+
+  const pelvis = snapshot.links.pelvis;
+  if (!pelvis?.rotation) return null;
+  return normalizeQuaternion(multiplyQuaternion(
+    inverseQuaternion(pelvis.rotation),
+    link.rotation
+  ));
 }

@@ -1,15 +1,18 @@
 import type {
   HumanoidActionReceipt,
   HumanoidRunDetails,
+  ScenarioChunkDeltaState,
   HumanoidWorldSnapshot,
   RuntimeEvent,
   TaskNode
 } from "./types";
 import {
+  activeAutonomousCycleFrom,
   asRecord,
   contextMemoryFrom,
   embodiedMemoryFrom,
   failOpenNodes,
+  goalDAGFrom,
   humanoidActionReceiptFrom,
   humanoidCheckerFrom,
   humanoidGoalProgressFrom,
@@ -117,6 +120,59 @@ export function reduceHumanoidRunDetails(input: HumanoidReducerInput): HumanoidR
       } : next;
     }
 
+    case "humanoid_goal_state_updated": {
+      const goalDAG = goalDAGFrom(data?.goal_dag);
+      if (!goalDAG || next.checkpoint.version !== 6) return next;
+      const worldFrame = typeof data?.world_frame === "number" ? data.world_frame : null;
+      const worldRevision = typeof data?.world_revision === "number" ? data.world_revision : null;
+      const aligned = worldFrame === next.checkpoint.world.frame
+        && worldRevision === next.checkpoint.world.worldRevision;
+      const progress = data?.goal_progress === null
+        ? null
+        : aligned ? humanoidGoalProgressFrom(data?.goal_progress) : null;
+      const checker = data?.checker === null
+        ? null
+        : aligned ? humanoidCheckerFrom(data?.checker) : null;
+      const activeCycle = data?.active_cycle === null
+        ? null
+        : activeAutonomousCycleFrom(data?.active_cycle);
+      return {
+        ...next,
+        checkpoint: {
+          ...next.checkpoint,
+          goal_dag: goalDAG,
+          ...(data && Object.hasOwn(data, "active_cycle")
+            ? { active_cycle: activeCycle }
+            : {}),
+          goal_progress: progress,
+          checker,
+          updated_at: event.at
+        }
+      };
+    }
+
+    case "autonomous_cycle_started": {
+      const activeCycle = activeAutonomousCycleFrom(data?.cycle);
+      return activeCycle ? {
+        ...next,
+        checkpoint: {
+          ...next.checkpoint,
+          active_cycle: activeCycle,
+          updated_at: event.at
+        }
+      } : next;
+    }
+
+    case "autonomous_cycle_interrupted":
+      return {
+        ...next,
+        checkpoint: {
+          ...next.checkpoint,
+          active_cycle: null,
+          updated_at: event.at
+        }
+      };
+
     case "embodied_episode_recorded": {
       const memory = embodiedMemoryFrom(data?.embodied_memory);
       return memory ? {
@@ -155,7 +211,25 @@ export function reduceHumanoidRunDetails(input: HumanoidReducerInput): HumanoidR
     case "humanoid_action_committed": {
       const receipt = humanoidActionReceiptFrom(data?.receipt);
       const checker = humanoidCheckerFrom(data?.checker);
-      return receipt ? applyReceipt(next, receipt, checker, event.at, input.limits.actions) : next;
+      if (!receipt) return next;
+      const committed = applyReceipt(next, receipt, checker, event.at, input.limits.actions);
+      const scenarioChunks = nextScenarioChunks(
+        committed.scenario_chunks,
+        data?.scenario_chunks
+      );
+      return scenarioChunks
+        ? { ...committed, scenario_chunks: scenarioChunks }
+        : committed;
+    }
+
+    case "humanoid_scenario_synchronized": {
+      const scenarioChunks = nextScenarioChunks(
+        next.scenario_chunks,
+        data?.scenario_chunks
+      );
+      return scenarioChunks
+        ? { ...next, scenario_chunks: scenarioChunks }
+        : next;
     }
 
     case "autonomous_cycle_completed": {
@@ -168,6 +242,7 @@ export function reduceHumanoidRunDetails(input: HumanoidReducerInput): HumanoidR
         checkpoint: {
           ...next.checkpoint,
           cycle_index: cycleIndex,
+          active_cycle: null,
           last_cycle: data?.output ?? next.checkpoint.last_cycle,
           checker: checker ?? next.checkpoint.checker,
           updated_at: event.at
@@ -195,9 +270,12 @@ export function reduceHumanoidRunDetails(input: HumanoidReducerInput): HumanoidR
     }
 
     case "run_failed":
+    case "run_paused":
     case "run_interrupted": {
-      const status = event.type === "run_failed" ? "failed" as const : "interrupted" as const;
-      const error = typeof data?.error === "string"
+      const status = event.type === "run_failed"
+        ? "failed" as const
+        : event.type === "run_paused" ? "paused" as const : "interrupted" as const;
+      const reason = typeof data?.error === "string"
         ? data.error
         : typeof data?.reason === "string" ? data.reason : "运行已结束，但服务端未提供原因";
       return {
@@ -207,8 +285,8 @@ export function reduceHumanoidRunDetails(input: HumanoidReducerInput): HumanoidR
           status,
           active_agent_id: null,
           active_agent_ids: [],
-          ...(status === "failed" ? { nodes: failOpenNodes(next.checkpoint.nodes, error, event.at) } : {}),
-          error,
+          ...(status === "failed" ? { nodes: failOpenNodes(next.checkpoint.nodes, reason, event.at) } : {}),
+          error: status === "paused" ? null : reason,
           updated_at: event.at
         }
       };
@@ -217,6 +295,41 @@ export function reduceHumanoidRunDetails(input: HumanoidReducerInput): HumanoidR
     default:
       return next;
   }
+}
+
+function scenarioChunksFrom(value: unknown): ScenarioChunkDeltaState | null {
+  const record = asRecord(value);
+  if (!record || record.version !== 1
+    || typeof record.scenario_seed !== "number"
+    || !Number.isSafeInteger(record.scenario_seed)
+    || record.scenario_seed < 0
+    || typeof record.scenario_sha256 !== "string"
+    || !/^[a-f0-9]{64}$/.test(record.scenario_sha256)
+    || record.manifest_version !== 1
+    || typeof record.revision !== "number"
+    || !Number.isSafeInteger(record.revision)
+    || record.revision < 0
+    || !Array.isArray(record.changed_chunk_ids)
+    || !record.changed_chunk_ids.every((id) => typeof id === "string" && id.length > 0)
+    || new Set(record.changed_chunk_ids).size !== record.changed_chunk_ids.length
+    || !Array.isArray(record.chunks)) return null;
+  return structuredClone(value) as ScenarioChunkDeltaState;
+}
+
+function nextScenarioChunks(
+  current: ScenarioChunkDeltaState,
+  value: unknown
+): ScenarioChunkDeltaState | null {
+  const candidate = scenarioChunksFrom(value);
+  if (!candidate
+    || candidate.scenario_seed !== current.scenario_seed
+    || candidate.scenario_sha256 !== current.scenario_sha256
+    || candidate.manifest_version !== current.manifest_version
+    || candidate.revision < current.revision) return null;
+  if (candidate.revision === current.revision) {
+    return JSON.stringify(candidate) === JSON.stringify(current) ? current : null;
+  }
+  return candidate;
 }
 
 function applyReceipt(

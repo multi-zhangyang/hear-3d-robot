@@ -5,6 +5,7 @@ import { presentAction, receiptFrames, shortTime, type ActionCategory } from "./
 const FILTERS: Array<{ key: "all" | ActionCategory; label: string }> = [
   { key: "all", label: "全部" },
   { key: "move", label: "身体运动" },
+  { key: "mutate", label: "世界变化" },
   { key: "plan", label: "规划" },
   { key: "sense", label: "感知" },
   { key: "verify", label: "目标检查" }
@@ -71,5 +72,6 @@ function glyph(category: ActionCategory): string {
   if (category === "sense") return "◉";
   if (category === "plan") return "⌁";
   if (category === "move") return "➜";
+  if (category === "mutate") return "◆";
   return "✓";
 }

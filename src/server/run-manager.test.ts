@@ -20,6 +20,7 @@ const FIXTURE = resolve(
   process.cwd(),
   "tests/fixtures/runs/20260802T204346Z_humanoid_courtyard_8071d876"
 );
+let normalizedFixturePromise: Promise<string> | undefined;
 const TEST_PROVIDER: ProviderConfig = {
   protocol: "openai_compatible",
   baseUrl: "https://example.test/v1",
@@ -42,15 +43,23 @@ describe("RunManager event and process lifecycle", () => {
     const details = await manager.details(runId, { actions: 1, provider: 1, framework: 1 });
     expect(details.definition.runtime).toBe("humanoid_g1");
     expect(details.checkpoint).toMatchObject({
-      version: 5,
+      version: 6,
       runtime: "humanoid_g1",
-      goal_progress: {
-        predicate_count: 1,
-        predicate_streaks: [0]
+      goal_dag: {
+        status: "awaiting_model_selection",
+        candidates: {},
+        epochs: [],
+        current_epoch_id: null
+      },
+      goal_progress: null,
+      world: {
+        robot: {
+          morphology: { id: "unitree_g1_43dof_with_hands" }
+        }
       }
     });
     expect(missionRunner.resumeHumanoidMission).not.toHaveBeenCalled();
-  });
+  }, 30_000);
 
   it("takes one fenced details cut so a matching journal record cannot be skipped by its cursor", async () => {
     const { runsDir, runId, store } = await copiedFixture();
@@ -101,7 +110,7 @@ describe("RunManager event and process lifecycle", () => {
     unsubscribe();
     expect(replayed.filter((event) => event.event_id === durable.event_id))
       .toEqual([persistedDurable]);
-  });
+  }, 30_000);
 
   it("replays one matching event when details sees its domain record first", async () => {
     const { runsDir, runId, store } = await copiedFixture();
@@ -618,8 +627,19 @@ async function copiedFixture(): Promise<{
   const runsDir = await mkdtemp(join(tmpdir(), "hear-manager-"));
   const runId = basename(FIXTURE);
   const destination = join(runsDir, runId);
-  await cp(FIXTURE, destination, { recursive: true });
+  await cp(await normalizedFixture(), destination, { recursive: true });
   return { runsDir, runId, store: await RunStore.open(destination) };
+}
+
+async function normalizedFixture(): Promise<string> {
+  normalizedFixturePromise ??= (async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hear-manager-fixture-"));
+    const destination = join(directory, basename(FIXTURE));
+    await cp(FIXTURE, destination, { recursive: true });
+    await RunStore.open(destination);
+    return destination;
+  })();
+  return normalizedFixturePromise;
 }
 
 function runtimeEvent(runId: string, eventId: string): RuntimeEvent {

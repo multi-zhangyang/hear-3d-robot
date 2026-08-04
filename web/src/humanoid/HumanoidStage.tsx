@@ -18,8 +18,10 @@ function HumanoidStageComponent(props: HumanoidStageProps): React.JSX.Element {
   const controllerRef = useRef<HumanoidStageController | null>(null);
   const modeRef = useRef(mode);
   const liveRef = useRef(props.live);
+  const scenarioChunksRef = useRef(props.details.scenario_chunks);
   modeRef.current = mode;
   liveRef.current = props.live;
+  scenarioChunksRef.current = props.details.scenario_chunks;
   const frame = useHumanoidHudFrame(props.frameBuffer, props.details.checkpoint.world);
 
   useEffect(() => {
@@ -37,6 +39,7 @@ function HumanoidStageComponent(props: HumanoidStageProps): React.JSX.Element {
           .then(({ createHumanoidStage }) => createHumanoidStage(
             host,
             props.details.definition.scenario,
+            scenarioChunksRef.current,
             props.details.checkpoint.world,
             props.frameBuffer,
             liveRef.current,
@@ -52,6 +55,7 @@ function HumanoidStageComponent(props: HumanoidStageProps): React.JSX.Element {
             }
             controller = created;
             controllerRef.current = created;
+            created.updateScenarioChunks(scenarioChunksRef.current);
             created.setCameraMode(modeRef.current);
             setLoading(false);
           })
@@ -74,6 +78,9 @@ function HumanoidStageComponent(props: HumanoidStageProps): React.JSX.Element {
 
   useEffect(() => controllerRef.current?.setLive(props.live), [props.live]);
   useEffect(() => controllerRef.current?.setCameraMode(mode), [mode]);
+  useEffect(() => {
+    controllerRef.current?.updateScenarioChunks(props.details.scenario_chunks);
+  }, [props.details.scenario_chunks]);
 
   return (
     <section className="humanoid-stage" aria-label={props.live ? "实时人形世界" : "人形世界回顾"}>
@@ -100,6 +107,7 @@ function HumanoidStageComponent(props: HumanoidStageProps): React.JSX.Element {
           <span><small>帧</small><b>{frame.frame.toLocaleString("zh-CN")}</b></span>
           <span><small>支撑</small><b>{supportLabel(frame.robot.balance.support)}</b></span>
           <span><small>接触</small><b>{frame.robot.contactCount}</b></span>
+          <span><small>区块</small><b>R{props.details.scenario_chunks.revision}</b></span>
           <span><small>直立</small><b>{Math.round(frame.robot.balance.upright * 100)}%</b></span>
         </div>
       </div>

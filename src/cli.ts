@@ -9,6 +9,7 @@ import {
   type ProviderConfig
 } from "./config/load.js";
 import { GoalSchema } from "./domain/schema.js";
+import { HumanoidRunModeSchema } from "./domain/run-mode.js";
 import type { MutationFence } from "./persistence/mutation-fence.js";
 import { resolveRunDirectory } from "./persistence/run-store.js";
 import {
@@ -16,6 +17,7 @@ import {
   startHumanoidMission
 } from "./runtime/humanoid-mission-runner.js";
 import { errorMessage } from "./runtime/error-message.js";
+import { RunPauseRequestedError } from "./runtime/run-pause.js";
 import {
   acquireOperatorLease,
   type OperatorLeaseOptions
@@ -64,6 +66,7 @@ async function main(argv: string[]): Promise<void> {
       const scenarioId = required(options, "scenario");
       const goal = GoalSchema.parse(JSON.parse(required(options, "goal")));
       const seed = options.seed === undefined ? undefined : parseSeed(options.seed);
+      const runMode = HumanoidRunModeSchema.parse(options.mode ?? "mission");
       const [catalog, provider, server] = await Promise.all([
         loadRuntimeCatalog(),
         Promise.resolve(loadProviderConfig()),
@@ -76,6 +79,7 @@ async function main(argv: string[]): Promise<void> {
         goal,
         catalog,
         provider,
+        runMode,
         ...(seed === undefined ? {} : { seed }),
         signal,
         mutationFence
@@ -199,7 +203,9 @@ export async function withMissionSignals<T>(
   const lease = await acquireOperatorLease(runsDir, leaseOptions);
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, lease.signal]);
-  const interrupt = (): void => controller.abort(new Error("Mission interrupted by process signal"));
+  const interrupt = (): void => controller.abort(
+    new RunPauseRequestedError("Mission paused by process signal")
+  );
   process.on("SIGINT", interrupt);
   process.on("SIGTERM", interrupt);
   try {
@@ -217,8 +223,8 @@ function printHelp(): void {
     "HEAR",
     "",
     "  hear scenarios",
-    "  hear run --scenario ID --mission TEXT --goal JSON [--seed N] --confirm",
-    "  hear resume --run RUN_ID [--fresh-context] --confirm",
+    "  hear run --scenario ID --mission TEXT --goal JSON [--mode mission|continuous] [--seed N] --confirm",
+    "  hear resume --run RUN_ID --confirm",
     "  hear operator [--host HOST] [--port PORT] [--dev]",
     ""
   ].join("\n"));

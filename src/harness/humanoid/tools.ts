@@ -10,13 +10,18 @@ import {
   type HumanoidActionName
 } from "./actions.js";
 import type { JsonValue } from "../../domain/schema.js";
+import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import { invalidToolInputResult } from "../tool-input-recovery.js";
 import type {
+  HumanoidActionInvoker,
   HumanoidActionReceipt,
-  HumanoidActionRuntime
 } from "./runtime.js";
+import {
+  HUMANOID_EXPERIENCE_OUTCOMES,
+  HUMANOID_GOAL_PREDICATE_TYPES
+} from "./embodied-recall.js";
 
-export type HumanoidActionInvoker = Pick<HumanoidActionRuntime, "invoke">;
+export type { HumanoidActionInvoker } from "./runtime.js";
 
 const HumanoidEmbodiedRecallInputSchema = z.object({
   source_refs: z.array(
@@ -25,6 +30,23 @@ const HumanoidEmbodiedRecallInputSchema = z.object({
     .describe("要精确召回的 episode:N 或 action:transactionId 来源标识"),
   before_sequence: z.number().int().positive().nullable().optional()
     .describe("分页时只返回指定 episode sequence 之前的历史"),
+  before_experience_sequence: z.number().int().positive().nullable().optional()
+    .describe("语义经验分页时只返回指定 experience sequence 之前的历史"),
+  outcomes: z.array(z.enum(HUMANOID_EXPERIENCE_OUTCOMES)).max(3)
+    .nullable().optional()
+    .describe("按真实执行结果筛选经验；同一字段内为任一匹配"),
+  predicate_types: z.array(z.enum(HUMANOID_GOAL_PREDICATE_TYPES)).max(7)
+    .nullable().optional()
+    .describe("按当时模型 Goal 的谓词类型筛选经验"),
+  object_ids: z.array(z.string().trim().min(1).max(160)).max(32)
+    .nullable().optional()
+    .describe("按当时 Goal 引用的对象筛选经验"),
+  solid_ids: z.array(z.string().trim().min(1).max(160)).max(32)
+    .nullable().optional()
+    .describe("按当时 Goal 或世界修改引用的静态方块筛选经验"),
+  zone_ids: z.array(z.string().trim().min(1).max(160)).max(32)
+    .nullable().optional()
+    .describe("按当时 Goal 引用的区域筛选经验"),
   limit: z.number().int().min(1).max(64)
     .describe("本次最多返回的历史事件数")
 }).strict().superRefine((input, context) => {
@@ -43,12 +65,54 @@ const HumanoidEmbodiedRecallInputSchema = z.object({
       message: "Recall limit must cover every requested source reference"
     });
   }
+  for (const field of [
+    "outcomes",
+    "predicate_types",
+    "object_ids",
+    "solid_ids",
+    "zone_ids"
+  ] as const) {
+    const values = input[field];
+    if (values && new Set(values).size !== values.length) {
+      context.addIssue({
+        code: "custom",
+        path: [field],
+        message: "Embodied semantic recall filters must be unique"
+      });
+    }
+  }
+  const semantic = input.before_experience_sequence != null
+    || (input.outcomes?.length ?? 0) > 0
+    || (input.predicate_types?.length ?? 0) > 0
+    || (input.object_ids?.length ?? 0) > 0
+    || (input.solid_ids?.length ?? 0) > 0
+    || (input.zone_ids?.length ?? 0) > 0;
+  if (semantic && (input.source_refs?.length ?? 0) > 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["source_refs"],
+      message: "Exact source recall and semantic experience filters are separate queries"
+    });
+  }
+  if (semantic && input.before_sequence != null) {
+    context.addIssue({
+      code: "custom",
+      path: ["before_sequence"],
+      message: "Semantic experience recall uses before_experience_sequence"
+    });
+  }
 });
 
 export interface HumanoidEmbodiedRecallInvoker {
   recallEmbodiedHistory(request: {
     source_refs?: string[];
     before_sequence?: number;
+    before_experience_sequence?: number;
+    outcomes?: Array<typeof HUMANOID_EXPERIENCE_OUTCOMES[number]>;
+    predicate_types?: Array<typeof HUMANOID_GOAL_PREDICATE_TYPES[number]>;
+    object_ids?: string[];
+    solid_ids?: string[];
+    zone_ids?: string[];
     limit: number;
   }): Promise<JsonValue>;
 }
@@ -71,7 +135,7 @@ export function createHumanoidEmbodiedRecallTool(
   const name = "recall_embodied_history";
   return tool<typeof HumanoidEmbodiedRecallInputSchema, unknown, string>({
     name,
-    description: "只读召回带来源标识的具身历史，包括完成的 episode 与 actions.jsonl 中真实的 execute_* 成功、停滞或失败回执。返回内容始终标记 historical_only=true，不代表当前传感、当前可见性或当前物理状态。",
+    description: "只读召回带来源标识的具身历史。既可按 episode:N 或 action:transactionId 精确读取，也可按真实结果、Goal 谓词、对象、静态方块和区域检索持久经验。所有结果均为 historical_only，不代表当前传感或当前物理状态。",
     parameters: HumanoidEmbodiedRecallInputSchema,
     strict: true,
     timeoutBehavior: "raise_exception",
@@ -82,6 +146,16 @@ export function createHumanoidEmbodiedRecallTool(
         ...(input.before_sequence != null
           ? { before_sequence: input.before_sequence }
           : {}),
+        ...(input.before_experience_sequence != null
+          ? { before_experience_sequence: input.before_experience_sequence }
+          : {}),
+        ...(input.outcomes?.length ? { outcomes: input.outcomes } : {}),
+        ...(input.predicate_types?.length
+          ? { predicate_types: input.predicate_types }
+          : {}),
+        ...(input.object_ids?.length ? { object_ids: input.object_ids } : {}),
+        ...(input.solid_ids?.length ? { solid_ids: input.solid_ids } : {}),
+        ...(input.zone_ids?.length ? { zone_ids: input.zone_ids } : {}),
         limit: input.limit
       })
     )
@@ -108,7 +182,12 @@ function humanoidActionTool(
         name,
         input,
         transactionId,
-        agentId
+        agentId,
+        {
+          tool_call_id: transactionId,
+          tool_name: name,
+          arguments_sha256: modelPayloadSha256(input)
+        }
       );
       return JSON.stringify(receipt);
     }

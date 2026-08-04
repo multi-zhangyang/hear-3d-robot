@@ -23,6 +23,8 @@
 
 .activity-pulse.failed > span { color: #e8a06f; }
 .activity-pulse.failed i { background: #e87868; }
+.activity-pulse.recovering > span { color: #dfc375; }
+.activity-pulse.recovering i { background: #d9b85f; box-shadow: 0 0 12px rgb(217 184 95 / 32%); }
 .activity-pulse strong { display: flex; align-items: baseline; gap: 7px; color: #f0f6f3; font-size: 18px; }
 .activity-pulse strong small { color: #77847e; font-size: 9px; font-weight: 500; text-transform: uppercase; }
 

@@ -22,6 +22,12 @@ describe("world materialization", () => {
       .toHaveLength(4);
     expect(first.obstacles.some((obstacle) => obstacle.id.startsWith("world_block_")))
       .toBe(true);
+    expect(first.chunk_manifest).toMatchObject({
+      version: 1,
+      grid: { columns: 3, rows: 3 }
+    });
+    expect(first.chunk_manifest.chunks.flatMap(({ entity_ids }) => entity_ids.obstacles).sort())
+      .toEqual(first.obstacles.map(({ id }) => id).sort());
     expect(ScenarioSchema.safeParse(first).success).toBe(true);
   });
 
@@ -70,6 +76,8 @@ describe("world materialization", () => {
     expect(first).toEqual(second);
     expect(first).not.toBe(second);
     expect(first.seed).toBe(17);
+    expect(first.chunk_manifest).toEqual(second.chunk_manifest);
+    expect(first.chunk_manifest.grid).toEqual({ columns: 2, rows: 2 });
   });
 
   it("draws platform-random unsigned 32-bit run seeds", () => {

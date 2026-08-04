@@ -1,15 +1,62 @@
 import { randomUUID } from "node:crypto";
+import { Mutex } from "async-mutex";
 import type {
   ContextCompactionSummary,
   ContextMemoryState,
   Goal,
   JsonValue,
+  Scenario,
   TaskNode
 } from "../../domain/schema.js";
+import { goalSha256 } from "../../domain/goal-identity.js";
+import {
+  autonomousCycleRef,
+  createActiveAutonomousCycle,
+  sameAutonomousCycle,
+  type ActiveAutonomousCycle,
+  type AutonomousCycleRef
+} from "../../domain/autonomous-cycle.js";
+import {
+  completeGoalEpoch,
+  proposeGoalCandidate,
+  restoreGoalDAG,
+  selectGoalCandidate as selectDomainGoalCandidate
+} from "../../domain/goal-epoch.js";
+import {
+  retireGoalEpoch as retireDomainGoalEpoch
+} from "../../domain/goal-epoch-retirement.js";
+import {
+  modelPayloadSha256,
+  type ModelDecisionRef
+} from "../../domain/model-call-authority.js";
+import type { AgentManifest } from "../../domain/agent-manifest.js";
+import {
+  actionCommitPayloadSha256,
+  stageActionCommit
+} from "../../domain/action-commit-outbox.js";
+import {
+  acknowledgeTerminalActionExecution,
+  actionExecutionFingerprintSha256,
+  activeActionExecutions,
+  terminalizeActionExecution
+} from "../../domain/action-execution-ledger.js";
+import {
+  actionTransactionFingerprintSha256,
+  createActionTransactionIdentity,
+  rebuildActionTransactionIdentities,
+  type ActionTransactionIdentity
+} from "../../domain/action-transaction-identity.js";
+import {
+  ScenarioBlockRemovalTransactionSchema,
+  type ScenarioBlockRemovalTransaction
+} from "../../domain/scenario-block-removal.js";
+import { materializeScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta.js";
 import {
   HumanoidEmbodiedEpisodeSchema,
+  HumanoidEmbodiedExperienceSchema,
   PersistedHumanoidActionReceiptSchema,
   type HumanoidEmbodiedEpisode,
+  type HumanoidEmbodiedExperience,
   type HumanoidRunCheckpoint
 } from "../../domain/humanoid-run.js";
 import type { RunStore } from "../../persistence/run-store.js";
@@ -17,47 +64,107 @@ import {
   createLifecycleEvent,
   reconcileLifecycleOutbox
 } from "../../persistence/lifecycle-outbox.js";
+import { reconcileActionCommitOutbox } from "../../persistence/action-commit-reconciler.js";
 import type { RuntimeEvent, RuntimeEventSink } from "../../runtime/events.js";
 import {
   advanceHumanoidGoal,
   assertHumanoidGoalProgressIntegrity,
+  createHumanoidGoalProgress,
   inspectHumanoidGoal
 } from "../../runtime/humanoid-checker.js";
+import { HumanoidPhysicsClock } from "../../world/humanoid/physics-clock.js";
 import type { HumanoidWorld, HumanoidWorldSnapshot } from "../../world/humanoid/world.js";
 import type { LongRunContextRuntime } from "../context-runtime.js";
 import {
   HumanoidActionRuntime,
+  humanoidActionFingerprint,
+  type HumanoidActionToolCallAuthority,
   type HumanoidActionReceipt
 } from "./runtime.js";
 import {
   appendEmbodiedEpisode,
-  recentEmbodiedEpisodes,
+  rememberEmbodiedActionExperience,
   retainRecentActionReceipts
 } from "./embodied-memory.js";
+import { createHumanoidContextAnchor } from "./context-anchor.js";
+import {
+  recallHumanoidEmbodiedHistory,
+  type HumanoidEmbodiedRecallRequest
+} from "./embodied-recall.js";
+import {
+  assertPendingActionReceipt,
+  cycleSummary,
+  embodiedActionJournalReceipt,
+  json,
+  object,
+  physicalExecutionReceipt,
+  previousCycleEvidence,
+  requiresHumanoidClockPause
+} from "./run-runtime-persistence.js";
 import { reconcileHumanoidHierarchyCapabilities } from "./run-checkpoint.js";
+import {
+  GoalEvidenceArtifactSchema,
+  createActionGoalEvidence,
+  createGoalEvaluationEvidence,
+  type GoalEvidenceArtifact
+} from "./goal-evidence.js";
+import { resolveHumanoidMissionCompletion } from "./mission-completion-evidence.js";
+import type {
+  GoalManagerRuntime,
+  GoalToolCallAuthority
+} from "./goal-manager-tools.js";
+import {
+  captureHumanoidPhysicalWorldDelta,
+  projectHumanoidPhysicalWorldDelta,
+  reconcileHumanoidPhysicalWorldDelta
+} from "./physical-world-delta.js";
+import {
+  prepareAuthorizedBlockRemoval
+} from "./block-removal-authority.js";
+import {
+  projectHumanoidBlockRemoval,
+  reconcileHumanoidBlockRemoval
+} from "./block-removal-commit.js";
+import {
+  resolveHumanoidCycleCompletionReadiness,
+  validateHumanoidCycleCausalEvidence,
+  type HumanoidCycleCausalEvidence,
+  type HumanoidCycleCompletionReadiness
+} from "./cycle-causal-evidence.js";
+import { HumanoidModelAuthority } from "./model-authority.js";
+import { HumanoidPhysicalExecutionRuntime } from "./physical-execution-runtime.js";
 
-const FRAME_CHECKPOINT_INTERVAL = 10;
-const EMBODIED_RECALL_PAGE_SIZE = 64;
-
-export interface HumanoidEmbodiedRecallRequest {
-  source_refs?: string[];
-  before_sequence?: number;
-  limit: number;
-}
-
-type HistoricalHumanoidAction = HumanoidActionReceipt & {
-  source_ref: string;
-  historical_only: true;
-};
+export type HumanoidCoordinatorPhase =
+  | "goal_selection"
+  | "observe_or_plan"
+  | "plan"
+  | "replan_or_retire"
+  | "execute_plan"
+  | "post_execution"
+  | "complete_cycle";
 
 export class HumanoidRunRuntime implements LongRunContextRuntime {
   readonly #store: RunStore;
-  readonly #goal: Goal;
+  readonly #missionGoal: Goal;
   readonly #world: HumanoidWorld;
   readonly #eventSink: RuntimeEventSink;
   readonly #signal: AbortSignal | undefined;
+  readonly #physicalExecution: HumanoidPhysicalExecutionRuntime;
   readonly #actions: HumanoidActionRuntime;
+  readonly #physicsClock: HumanoidPhysicsClock;
+  readonly #actionMutex = new Mutex();
+  readonly #goalStateMutex = new Mutex();
   #checkpoint: HumanoidRunCheckpoint;
+  #scenario: Scenario;
+  #checkpointWriteTail: Promise<void> = Promise.resolve();
+  #continuousPhysicsEnabled = false;
+  #modelAuthority: HumanoidModelAuthority | undefined;
+  #goalEvidence = new Map<string, GoalEvidenceArtifact>();
+  #persistedGoalEvidenceRefs = new Set<string>();
+  #contextGoalEvidenceRefs = new Map<string, string>();
+  #actionTransactionIdentities = new Map<string, ActionTransactionIdentity>();
+  #actionTransactionIdentitiesLoaded = false;
+  #durableActionReceiptCache = new Map<string, HumanoidActionReceipt>();
 
   constructor(input: {
     store: RunStore;
@@ -68,20 +175,59 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     signal?: AbortSignal;
   }) {
     this.#store = input.store;
-    this.#goal = structuredClone(input.goal);
+    this.#missionGoal = structuredClone(input.goal);
     this.#world = input.world;
     this.#checkpoint = reconcileHumanoidHierarchyCapabilities(input.checkpoint);
-    assertHumanoidGoalProgressIntegrity(
-      this.#goal,
-      this.#world.snapshot(),
-      this.#checkpoint.goal_progress
-    );
+    this.#scenario = structuredClone(input.store.definition.scenario);
+    if (goalSha256(this.#missionGoal) !== goalSha256(this.#checkpoint.mission_goal)) {
+      throw new Error("Humanoid mission Goal does not match the persisted run constraint");
+    }
+    this.#assertActiveGoalProgress();
     this.#eventSink = input.eventSink ?? (() => undefined);
     this.#signal = input.signal;
+    this.#physicalExecution = new HumanoidPhysicalExecutionRuntime({
+      runId: this.runId,
+      world: this.#world,
+      checkpoint: () => this.#checkpoint,
+      scenario: () => this.#scenario,
+      activeGoal: () => this.#activeGoal(),
+      requiredActiveCycle: () => this.#requiredActiveCycleRef(),
+      persist: (refreshWorld) => this.#persist(refreshWorld),
+      emitFrame: ({ world, checker, goalProgress, source }) => this.emit(
+        "humanoid_world_frame",
+        json({
+          world,
+          checker,
+          goal_progress: goalProgress,
+          frame_source: source
+        }),
+        randomUUID(),
+        false
+      ),
+      ...(this.#signal ? { signal: this.#signal } : {})
+    });
     this.#actions = new HumanoidActionRuntime(this.#world, {
       receipts: this.#checkpoint.committed_actions,
-      frameSink: (frame) => this.#recordFrame(frame),
-      receiptSink: (receipt) => this.#commitReceipt(receipt)
+      frameSink: (frame) => this.#physicalExecution.recordFrame(frame, "execution"),
+      physicalFrameSink: (cut) => this.#physicalExecution.recordPhysicalCut(cut),
+      receiptSink: (receipt) => this.#commitReceipt(receipt),
+      beforePhysicalExecution: (intent) => this.#physicalExecution.admit(intent),
+      receiptNormalizer: (receipt) => this.#physicalExecution.normalizeReceipt(receipt),
+      prepareBlockRemoval: (request) => this.#prepareBlockRemoval(request),
+      realtimeExecution: true,
+      retainPhysicalTerminals: true,
+      ...(this.#signal ? { signal: this.#signal } : {})
+    });
+    this.#physicsClock = new HumanoidPhysicsClock({
+      world: this.#world,
+      frameSink: (frame) => this.#physicalExecution.recordFrame(frame, "stationary"),
+      onError: async (error) => {
+        await this.recordProvider({
+          status: "continuous_physics_stopped",
+          error: error instanceof Error ? error.message : String(error),
+          automatic_actuation: false
+        }, this.rootAgentId);
+      }
     });
   }
 
@@ -105,8 +251,301 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     return structuredClone(this.#checkpoint);
   }
 
-  invoke(...args: Parameters<HumanoidActionRuntime["invoke"]>): ReturnType<HumanoidActionRuntime["invoke"]> {
-    return this.#actions.invoke(...args);
+  async initializeGoalAutonomy(manifest: AgentManifest): Promise<void> {
+    await this.#reconcileActionCommits();
+    this.#scenario = materializeScenarioChunkDeltaState(
+      this.#store.definition.scenario,
+      await this.#store.readScenarioChunkDeltaState()
+    );
+    const [rawEvidence, rawModelCalls, rawActionIdentities] = await Promise.all([
+      this.#store.readJournal("goal_evidence"),
+      this.#store.readJournal("model_calls"),
+      this.#store.readJournal("action_identities")
+    ]);
+    const evidence = new Map<string, GoalEvidenceArtifact>();
+    for (const rawArtifact of rawEvidence) {
+      const artifact = GoalEvidenceArtifactSchema.parse(rawArtifact);
+      const ref = artifact.evidence.ref;
+      if (evidence.has(ref)) {
+        throw new Error(`Duplicate durable Goal evidence reference: ${ref}`);
+      }
+      evidence.set(ref, artifact);
+    }
+    const actionTransactionIdentities = rebuildActionTransactionIdentities(
+      rawActionIdentities,
+      this.runId
+    );
+    this.#goalEvidence = evidence;
+    this.#persistedGoalEvidenceRefs = new Set(evidence.keys());
+    this.#modelAuthority = HumanoidModelAuthority.restore({
+      manifest,
+      nodes: this.#checkpoint.nodes,
+      records: rawModelCalls,
+      appendRecord: (record) => this.#store.append("model_calls", json(record))
+    });
+    this.#actionTransactionIdentities = actionTransactionIdentities;
+    this.#actionTransactionIdentitiesLoaded = true;
+    this.#checkpoint.goal_dag = restoreGoalDAG(
+      this.#checkpoint.goal_dag,
+      this.#goalHarness()
+    );
+    for (const receipt of Object.values(this.#checkpoint.committed_actions)) {
+      if (physicalExecutionReceipt(receipt) || receipt.action === "remove_world_block") {
+        this.#rememberEmbodiedActionExperience(receipt, false);
+      }
+    }
+    this.#assertActiveGoalProgress();
+  }
+
+  async submitGoalCandidates(
+    input: Parameters<GoalManagerRuntime["submitGoalCandidates"]>[0],
+    authority: GoalToolCallAuthority
+  ): Promise<JsonValue> {
+    return this.#goalStateMutex.runExclusive(async () => {
+      if (this.#checkpoint.goal_dag.status !== "awaiting_model_selection") {
+        throw new Error("Goal candidates cannot be submitted while a Goal epoch is active");
+      }
+      const source = this.#goalModelSource(authority, "submit_goal_candidates");
+      const evidence = this.#requiredContextGoalEvidence(source.agent_id);
+      await this.#persistGoalEvidence([evidence.ref]);
+      let next = this.#checkpoint.goal_dag;
+      const candidateIds: string[] = [];
+      for (const candidate of input.candidates) {
+        const before = new Set(Object.keys(next.candidates));
+        try {
+          next = proposeGoalCandidate(next, {
+            proposal_id: candidate.proposal_id,
+            source,
+            goal: candidate.goal,
+            mission_link: candidate.mission_link,
+            dependency_candidate_ids: candidate.dependency_candidate_ids,
+            proposal_evidence_refs: [evidence.ref],
+            created_world_revision: evidence.artifact.evidence.world_revision
+          }, this.#goalHarness());
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Goal candidate ${JSON.stringify(candidate.proposal_id)} rejected: ${message}`,
+            { cause: error }
+          );
+        }
+        const created = Object.keys(next.candidates).find((id) => !before.has(id));
+        if (!created) throw new Error("Goal candidate proposal produced no durable identity");
+        candidateIds.push(created);
+      }
+      this.#checkpoint.goal_dag = next;
+      this.#checkpoint.goal_progress = null;
+      this.#checkpoint.checker = null;
+      await this.#persist();
+      await this.#emitGoalState("candidates_submitted");
+      return json({
+        status: "goal_candidates_submitted",
+        candidate_ids: candidateIds,
+        goal_dag_state_sha256: next.state_sha256
+      });
+    });
+  }
+
+  async selectGoalCandidate(
+    input: Parameters<GoalManagerRuntime["selectGoalCandidate"]>[0],
+    authority: GoalToolCallAuthority
+  ): Promise<JsonValue> {
+    return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      const selectedBy = this.#goalModelSource(authority, "select_goal_candidate");
+      const candidate = this.#checkpoint.goal_dag.candidates[input.candidate_id];
+      if (!candidate || candidate.status !== "proposed") {
+        throw new Error(`Goal candidate is unavailable: ${input.candidate_id}`);
+      }
+      if (candidate.source.model_call_id === selectedBy.model_call_id) {
+        throw new Error("Goal selection requires a distinct model response after proposal");
+      }
+      const evidence = this.#requiredContextGoalEvidence(selectedBy.agent_id);
+      await this.#persistGoalEvidence([evidence.ref]);
+      const next = selectDomainGoalCandidate(this.#checkpoint.goal_dag, {
+        candidate_id: input.candidate_id,
+        selected_by: selectedBy,
+        selection_evidence_refs: [evidence.ref],
+        created_world_revision: evidence.artifact.evidence.world_revision
+      }, this.#goalHarness());
+      await this.#refreshWorldPersistenceState();
+      this.#checkpoint.goal_dag = next;
+      this.#checkpoint.goal_progress = createHumanoidGoalProgress(
+        candidate.goal,
+        this.#checkpoint.world
+      );
+      this.#checkpoint.checker = inspectHumanoidGoal(
+        candidate.goal,
+        this.#scenario,
+        this.#checkpoint.world,
+        this.#checkpoint.goal_progress
+      );
+      const cycle = this.#createActiveCycle();
+      await this.#persist();
+      await this.#emitGoalState("candidate_selected");
+      await this.#emitCycleStarted(cycle);
+      return json({
+        status: "goal_candidate_selected",
+        epoch_id: next.current_epoch_id,
+        cycle_id: cycle.cycle_id,
+        candidate_id: candidate.candidate_id,
+        goal: candidate.goal,
+        goal_dag_state_sha256: next.state_sha256
+      });
+    }));
+  }
+
+  async retireGoalEpoch(
+    input: Parameters<GoalManagerRuntime["retireGoalEpoch"]>[0],
+    authority: GoalToolCallAuthority
+  ): Promise<JsonValue> {
+    return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      const retiredBy = this.#goalModelSource(authority, "retire_goal_epoch");
+      await this.#persistGoalEvidence(input.evidence_refs);
+      const artifacts = input.evidence_refs.map((ref) => this.#requiredGoalEvidence(ref));
+      const revisions = new Set(artifacts.map((artifact) => artifact.evidence.world_revision));
+      if (revisions.size !== 1) {
+        throw new Error("Goal retirement evidence must belong to one world revision");
+      }
+      const resolvedWorldRevision = artifacts[0]!.evidence.world_revision;
+      const activeEpochId = this.#checkpoint.goal_dag.current_epoch_id;
+      const next = retireDomainGoalEpoch(this.#checkpoint.goal_dag, {
+        status: input.status,
+        retired_by: retiredBy,
+        reason: input.reason,
+        resolution_evidence_refs: input.evidence_refs,
+        resolved_world_revision: resolvedWorldRevision
+      }, this.#goalHarness());
+      await this.#refreshWorldPersistenceState();
+      const interruptedCycle = this.#checkpoint.active_cycle;
+      this.#checkpoint.goal_dag = next;
+      this.#checkpoint.goal_progress = null;
+      this.#checkpoint.checker = null;
+      this.#checkpoint.active_cycle = null;
+      await this.#persist();
+      await this.#emitGoalState("epoch_retired");
+      if (interruptedCycle) {
+        await this.emit("autonomous_cycle_interrupted", json({
+          cycle: interruptedCycle,
+          reason: "goal_epoch_retired",
+          retirement_status: input.status
+        }));
+      }
+      return json({
+        status: "goal_epoch_retired",
+        epoch_id: activeEpochId,
+        retirement_status: input.status,
+        reason: input.reason,
+        resolved_world_revision: resolvedWorldRevision,
+        goal_dag_state_sha256: next.state_sha256
+      });
+    }));
+  }
+
+  validateGoalTransition(): JsonValue {
+    const latest = this.#checkpoint.goal_dag.epochs.at(-1);
+    if (this.#checkpoint.goal_dag.status !== "awaiting_model_selection"
+      || this.#checkpoint.goal_dag.current_epoch_id !== null
+      || !latest
+      || latest.status === "completed"
+      || latest.status === "active") {
+      throw new Error("No evidence-backed Goal retirement is ready to complete");
+    }
+    return json({
+      epoch_id: latest.epoch_id,
+      candidate_id: latest.candidate_id,
+      status: latest.status,
+      reason: latest.retirement_reason,
+      resolved_world_revision: latest.resolved_world_revision,
+      evidence_refs: latest.physical_evidence_refs.resolution,
+      goal_dag_state_sha256: this.#checkpoint.goal_dag.state_sha256
+    });
+  }
+
+  async ensureAutonomousCycle(): Promise<ActiveAutonomousCycle | undefined> {
+    return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      if (this.#checkpoint.goal_dag.status !== "active") return undefined;
+      if (this.#checkpoint.active_cycle) {
+        return structuredClone(this.#checkpoint.active_cycle);
+      }
+      await this.#refreshWorldPersistenceState();
+      const cycle = this.#createActiveCycle();
+      await this.#persist(false);
+      await this.#emitCycleStarted(cycle);
+      return structuredClone(cycle);
+    }));
+  }
+
+  missionGoalCompleted(): boolean {
+    return resolveHumanoidMissionCompletion(
+      this.#checkpoint,
+      this.#goalEvidence.values()
+    ) !== null;
+  }
+
+  async invoke(
+    action: Parameters<HumanoidActionRuntime["invoke"]>[0],
+    rawInput: unknown,
+    transactionId: string,
+    agentId: string,
+    authority: HumanoidActionToolCallAuthority
+  ): ReturnType<HumanoidActionRuntime["invoke"]> {
+    return this.#actionMutex.runExclusive(async () => {
+      await this.#assertKnownTransactionFingerprint(
+        action,
+        rawInput,
+        transactionId,
+        agentId
+      );
+      const decision = this.#actionModelSource(
+        authority,
+        action,
+        rawInput,
+        transactionId,
+        agentId
+      );
+      const durableReceipt = await this.#durableReceiptForInvocation(
+        action,
+        rawInput,
+        transactionId,
+        agentId,
+        decision
+      );
+      if (durableReceipt) return durableReceipt;
+      this.#assertDecisionCycleActive(decision);
+      this.#physicsClock.throwIfFailed();
+      this.#physicalExecution.assertExecutionOwner(transactionId);
+      if (!requiresHumanoidClockPause(action)) {
+        return this.#actions.invoke(
+          action,
+          rawInput,
+          transactionId,
+          agentId,
+          decision
+        );
+      }
+      const resumeClock = this.#continuousPhysicsEnabled;
+      await this.#physicsClock.stop();
+      try {
+        return await this.#actions.invoke(
+          action,
+          rawInput,
+          transactionId,
+          agentId,
+          decision
+        );
+      } finally {
+        if (resumeClock
+          && this.#checkpoint.status === "running"
+          && activeActionExecutions(this.#checkpoint.action_execution_ledger).length === 0) {
+          this.#physicsClock.start();
+        }
+      }
+    });
+  }
+
+  async stopContinuousPhysics(): Promise<void> {
+    this.#continuousPhysicsEnabled = false;
+    await this.#physicsClock.stop();
   }
 
   receipt(transactionId: string): HumanoidActionReceipt | undefined {
@@ -116,154 +555,72 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   async recallEmbodiedHistory(
     request: HumanoidEmbodiedRecallRequest
   ): Promise<JsonValue> {
-    const requestedRefs = new Set(request.source_refs ?? []);
-    const requestedEpisodeRefs = new Set(
-      [...requestedRefs].filter((sourceRef) => sourceRef.startsWith("episode:"))
-    );
-    const requestedActionRefs = new Set(
-      [...requestedRefs].filter((sourceRef) => sourceRef.startsWith("action:"))
-    );
-    const episodes = new Map<string, HumanoidEmbodiedEpisode>();
-    let actionBeforeTime: string | undefined;
-    const consider = (rawEpisode: HumanoidEmbodiedEpisode): void => {
-      const episode = HumanoidEmbodiedEpisodeSchema.parse(rawEpisode);
-      const sourceRef = episode.source_ref ?? `episode:${episode.sequence}`;
-      if (requestedRefs.size === 0
-        && request.before_sequence === episode.sequence) {
-        actionBeforeTime = episode.recorded_at;
-      }
-      if (request.before_sequence !== undefined
-        && episode.sequence >= request.before_sequence) return;
-      if (requestedRefs.size > 0 && !requestedEpisodeRefs.has(sourceRef)) return;
-      episodes.set(sourceRef, { ...episode, source_ref: sourceRef });
-    };
-    for (const episode of [...this.#checkpoint.embodied_memory.recent_episodes].reverse()) {
-      consider(episode);
-    }
-
-    const enoughEpisodes = (): boolean => requestedRefs.size > 0
-      ? [...requestedEpisodeRefs].every((sourceRef) => episodes.has(sourceRef))
-      : episodes.size >= request.limit;
-    if (!enoughEpisodes()) {
-      const tail = await this.#store.readJournalTail("episodes", 1);
-      for (let end = tail.total; end > 0 && !enoughEpisodes();) {
-        const from = Math.max(0, end - EMBODIED_RECALL_PAGE_SIZE);
-        const page = await this.#store.readJournalPage("episodes", from, end - from);
-        for (let index = page.entries.length - 1; index >= 0; index -= 1) {
-          consider(HumanoidEmbodiedEpisodeSchema.parse(page.entries[index]));
-          if (enoughEpisodes()) break;
-        }
-        end = from;
-      }
-    }
-
-    const actions = new Map<string, HistoricalHumanoidAction>();
-    const enoughActions = (): boolean => requestedRefs.size > 0
-      ? [...requestedActionRefs].every((sourceRef) => actions.has(sourceRef))
-      : actions.size >= request.limit;
-    if (!enoughActions()) {
-      const tail = await this.#store.readJournalTail("actions", 1);
-      for (let end = tail.total; end > 0 && !enoughActions();) {
-        const from = Math.max(0, end - EMBODIED_RECALL_PAGE_SIZE);
-        const page = await this.#store.readJournalPage("actions", from, end - from);
-        for (let index = page.entries.length - 1; index >= 0; index -= 1) {
-          const receipt = executeActionJournalReceipt(page.entries[index]!);
-          if (!receipt) continue;
-          if (requestedRefs.size === 0
-            && actionBeforeTime !== undefined
-            && receipt.committedAt >= actionBeforeTime) continue;
-          const sourceRef = `action:${receipt.transactionId}`;
-          if (requestedRefs.size > 0 && !requestedActionRefs.has(sourceRef)) continue;
-          actions.set(sourceRef, {
-            ...receipt,
-            source_ref: sourceRef,
-            historical_only: true
-          });
-          if (enoughActions()) break;
-        }
-        end = from;
-      }
-    }
-
-    const selectedRecords = [
-      ...[...episodes.values()].map((episode) => ({
-        kind: "episode" as const,
-        sourceRef: episode.source_ref!,
-        recordedAt: episode.recorded_at,
-        value: episode
-      })),
-      ...[...actions.values()].map((action) => ({
-        kind: "action" as const,
-        sourceRef: action.source_ref,
-        recordedAt: action.committedAt,
-        value: action
-      }))
-    ].sort((left, right) => (
-      right.recordedAt.localeCompare(left.recordedAt)
-        || right.kind.localeCompare(left.kind)
-        || right.sourceRef.localeCompare(left.sourceRef)
-    )).slice(0, request.limit);
-    const selectedEpisodes = selectedRecords.flatMap((record) => (
-      record.kind === "episode" ? [record.value as HumanoidEmbodiedEpisode] : []
-    ));
-    const selectedActions = selectedRecords.flatMap((record) => (
-      record.kind === "action" ? [record.value as HistoricalHumanoidAction] : []
-    ));
-    const returnedRefs = new Set(selectedRecords.map((record) => record.sourceRef));
-    return json({
-      historical_only: true,
-      current_world_revision: this.#world.snapshot().worldRevision,
-      ordered_source_refs: selectedRecords.map((record) => record.sourceRef),
-      episodes: selectedEpisodes,
-      actions: selectedActions,
-      missing_source_refs: [...requestedRefs].filter((sourceRef) => (
-        !returnedRefs.has(sourceRef)
-      )),
-      next_before_sequence: requestedRefs.size === 0
-        && selectedEpisodes.length > 0
-        && Math.min(...selectedEpisodes.map((episode) => episode.sequence)) > 1
-        ? Math.min(...selectedEpisodes.map((episode) => episode.sequence))
-        : null
+    return recallHumanoidEmbodiedHistory({
+      store: this.#store,
+      memory: this.#checkpoint.embodied_memory,
+      currentWorldRevision: this.#world.snapshot().worldRevision,
+      request
     });
   }
 
   validateCycleEvidence(
     evidenceTransactionIds: readonly string[]
   ): HumanoidActionReceipt {
-    const evidence = evidenceTransactionIds.map((transactionId) => {
-      const receipt = this.#checkpoint.committed_actions[transactionId];
-      if (!receipt) throw new Error(`Unknown humanoid cycle evidence: ${transactionId}`);
-      return receipt;
+    return structuredClone(
+      this.#validateCycleCausalEvidence(evidenceTransactionIds).execution
+    );
+  }
+
+  cycleCompletionReadiness(): HumanoidCycleCompletionReadiness {
+    return resolveHumanoidCycleCompletionReadiness({
+      committedActions: this.#checkpoint.committed_actions,
+      previousCycle: this.#checkpoint.last_cycle,
+      activeCycle: this.#activeCycleRef(),
+      currentWorld: this.#world.snapshot()
     });
-    const currentRevision = this.#world.snapshot().worldRevision;
-    const execution = evidence.findLast((receipt) => (
-      completedPhysicalExecution(receipt)
-      && receipt.worldAfterRevision === currentRevision
-    ));
-    if (!execution) {
-      throw new Error(
-        `Autonomous cycle requires accepted execution evidence at world revision ${currentRevision}`
-      );
-    }
-    if (previousCycleEvidence(this.#checkpoint.last_cycle).has(execution.transactionId)) {
-      throw new Error(`Humanoid execution evidence was already consumed: ${execution.transactionId}`);
-    }
+  }
+
+  coordinatorPhase(): HumanoidCoordinatorPhase {
+    if (this.#checkpoint.goal_dag.status !== "active") return "goal_selection";
+    const activeCycle = this.#activeCycleRef();
+    if (!activeCycle) return "goal_selection";
     const receipts = Object.values(this.#checkpoint.committed_actions);
-    const executionIndex = receipts.findIndex((receipt) => (
-      receipt.transactionId === execution.transactionId
+    const cycleReceipts = receipts.filter((receipt) => (
+      sameAutonomousCycle(receipt.cycle, activeCycle)
     ));
-    const pendingPlan = receipts.slice(executionIndex + 1).find((receipt) => (
-      receipt.accepted
-      && (receipt.action === "plan_whole_body_motion"
-        || receipt.action === "plan_whole_body_motion_candidates"
-        || receipt.action === "plan_humanoid_navigation")
-    ));
-    if (pendingPlan) {
-      throw new Error(
-        `Autonomous cycle has an unconsumed accepted plan: ${pendingPlan.transactionId}`
-      );
+    const completion = this.cycleCompletionReadiness();
+    if (completion.status === "ready") {
+      return completion.observed_after_execution
+        ? "complete_cycle"
+        : "post_execution";
     }
-    return structuredClone(execution);
+    const latestExecutionIndex = cycleReceipts.findLastIndex(physicalExecutionReceipt);
+    const latestAcceptedPlanIndex = cycleReceipts.findLastIndex((receipt) => (
+      receipt.accepted && isHumanoidPlanningReceipt(receipt)
+    ));
+    if (latestAcceptedPlanIndex > latestExecutionIndex) return "execute_plan";
+    const phaseStart = Math.max(0, latestExecutionIndex + 1);
+    const observed = cycleReceipts.slice(phaseStart).some((receipt) => (
+      receipt.accepted && receipt.action === "observe_humanoid"
+    ));
+    if (!observed) return "observe_or_plan";
+    const rejectedPlan = cycleReceipts.slice(phaseStart).some((receipt) => (
+      !receipt.accepted && isHumanoidPlanningReceipt(receipt)
+    ));
+    return rejectedPlan ? "replan_or_retire" : "plan";
+  }
+
+  #validateCycleCausalEvidence(
+    evidenceTransactionIds: readonly string[]
+  ): HumanoidCycleCausalEvidence {
+    const currentWorld = this.#world.snapshot();
+    return validateHumanoidCycleCausalEvidence({
+      evidenceTransactionIds,
+      committedActions: this.#checkpoint.committed_actions,
+      previousCycle: this.#checkpoint.last_cycle,
+      activeCycle: this.#activeCycleRef(),
+      currentWorld
+    });
   }
 
   snapshot(): HumanoidWorldSnapshot {
@@ -296,56 +653,26 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   contextAnchor(agentId: string): JsonValue {
     const node = this.activeNode(agentId);
+    const observation = this.#world.observe();
     const world = this.#world.snapshot();
-    const checker = inspectHumanoidGoal(
-      this.#goal,
-      this.#store.definition.scenario,
-      world,
-      this.#checkpoint.goal_progress
-    );
-    const recentReceipts = Object.values(this.#checkpoint.committed_actions)
-      .slice(-16)
-      .map((receipt) => ({
-        transaction_id: receipt.transactionId,
-        agent_id: receipt.agentId,
-        action: receipt.action,
-        accepted: receipt.accepted,
-        code: receipt.code,
-        world_before_revision: receipt.worldBeforeRevision,
-        world_after_revision: receipt.worldAfterRevision,
-        frame_count: receipt.frameCount
-      }));
-    return json({
+    const activeGoal = this.#activeGoal();
+    const result = createHumanoidContextAnchor({
       mission: this.#store.definition.mission,
-      scenario_id: this.#store.definition.scenario_id,
-      goal: this.#goal,
-      cycle_index: this.#checkpoint.cycle_index,
-      world_frame: world.frame,
-      world_revision: world.worldRevision,
-      robot: {
-        root_position: world.robot.rootPosition,
-        root_rotation: world.robot.rootRotation,
-        fallen: world.robot.fallen,
-        balance: world.robot.balance,
-        feet: world.robot.feet,
-        navigation: world.navigation
-      },
-      goal_state: checker,
-      recent_physical_episodes: recentEmbodiedEpisodes(
-        this.#checkpoint.embodied_memory
-      ).map((episode) => ({
-        ...episode,
-        historical_only: true
-      })),
-      active_agent: {
-        id: node.id,
-        name: node.name,
-        objective: node.objective,
-        capabilities: node.capabilities,
-        status: node.status
-      },
-      recent_receipts: recentReceipts
+      runMode: this.#store.definition.run_mode,
+      scenarioId: this.#store.definition.scenario_id,
+      scenario: this.#scenario,
+      missionGoal: this.#missionGoal,
+      checkpoint: this.#checkpoint,
+      ...(activeGoal ? { activeGoal } : {}),
+      node,
+      observation,
+      world,
+      cycleCompletion: this.cycleCompletionReadiness(),
+      coordinatorPhase: this.coordinatorPhase()
     });
+    this.#rememberGoalEvidence(result.worldEvidence);
+    this.#contextGoalEvidenceRefs.set(agentId, result.worldEvidence.evidence.ref);
+    return result.anchor;
   }
 
   assertContextSummaryEvidence(summary: ContextCompactionSummary): void {
@@ -379,19 +706,63 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     await this.emit("context_memory_updated", { context_memory: json(state) });
   }
 
-  async recordModelCallStarted(agentId: string): Promise<void> {
-    this.#signal?.throwIfAborted();
-    const node = this.#node(agentId);
-    node.model_calls_used += 1;
-    node.updated_at = new Date().toISOString();
-    this.#checkpoint.total_model_calls += 1;
-    await this.#persist();
-    await this.emit("model_request_started", {
-      agent_id: agentId,
-      agent_name: node.name,
-      purpose: "agent_decision",
-      node_model_calls: node.model_calls_used,
-      total_model_calls: this.#checkpoint.total_model_calls
+  async recordModelCallStarted(agentId: string): Promise<string> {
+    return this.#goalStateMutex.runExclusive(async () => {
+      this.#signal?.throwIfAborted();
+      const cycle = this.#activeCycleRef();
+      const record = await this.#requiredModelAuthority().recordStarted(agentId, cycle);
+      const node = this.#node(agentId);
+      node.model_calls_used += 1;
+      node.updated_at = record.at;
+      this.#checkpoint.total_model_calls += 1;
+      await this.#persist();
+      await this.emit("model_request_started", {
+        agent_id: agentId,
+        agent_name: node.name,
+        model_call_id: record.model_call_id,
+        ...(cycle ? { cycle } : {}),
+        purpose: "agent_decision",
+        node_model_calls: node.model_calls_used,
+        total_model_calls: this.#checkpoint.total_model_calls
+      });
+      return record.model_call_id;
+    });
+  }
+
+  async recordModelCallCompleted(input: {
+    modelCallId: string;
+    agentId: string;
+    responseId: string;
+    responseOutputSha256: string;
+    toolCalls: Array<{
+      toolCallId: string;
+      toolName: string;
+      argumentsSha256: string;
+    }>;
+  }): Promise<void> {
+    await this.#goalStateMutex.runExclusive(async () => {
+      const record = await this.#requiredModelAuthority().recordCompleted(input);
+      await this.emit("model_request_completed", {
+        agent_id: input.agentId,
+        model_call_id: input.modelCallId,
+        response_id: input.responseId,
+        ...(record.cycle ? { cycle: record.cycle } : {}),
+        tool_call_count: input.toolCalls.length
+      });
+    });
+  }
+
+  async recordModelCallFailed(modelCallId: string, agentId: string): Promise<void> {
+    await this.#goalStateMutex.runExclusive(async () => {
+      const record = await this.#requiredModelAuthority().recordFailed(
+        modelCallId,
+        agentId
+      );
+      await this.emit("model_request_failed", {
+        agent_id: agentId,
+        model_call_id: modelCallId,
+        ...(record.cycle ? { cycle: record.cycle } : {})
+      });
     });
   }
 
@@ -425,6 +796,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   async start(resumed: boolean): Promise<void> {
+    await this.#reconcileActionCommits();
     const at = new Date().toISOString();
     this.#checkpoint.status = "running";
     this.#checkpoint.error = null;
@@ -449,64 +821,178 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       persistCheckpoint: () => this.#persist(),
       eventSink: this.#eventSink
     });
+    await this.#recoverPendingPhysicalExecution();
+    this.#continuousPhysicsEnabled = true;
+    const pendingExecution = activeActionExecutions(
+      this.#checkpoint.action_execution_ledger
+    )[0];
+    if (!pendingExecution) this.#physicsClock.start();
+    const controller = this.#world.snapshot().robot.controller;
+    await this.emit(
+      pendingExecution ? "continuous_physics_deferred" : "continuous_physics_started",
+      {
+      control_step_seconds: controller.controlStepSeconds,
+      physics_step_seconds: controller.physicsStepSeconds,
+      planning_policy: "live_authority_isolated_rollout_revalidation",
+      ...(pendingExecution
+        ? { execution_transaction_id: pendingExecution.transaction_id }
+        : {})
+      }
+    );
+  }
+
+  async #recoverPendingPhysicalExecution(): Promise<void> {
+    const pending = activeActionExecutions(
+      this.#checkpoint.action_execution_ledger
+    );
+    if (pending.length === 0) return;
+    if (pending.length > 1) {
+      throw new Error("Multiple physical executions cannot share one humanoid runtime");
+    }
+    const execution = pending[0]!;
+    const input = {
+      planning_transaction_id: execution.admission.planning_transaction_id
+    };
+    const fingerprint = humanoidActionFingerprint(
+      execution.action,
+      execution.agent_id,
+      input
+    );
+    if (actionExecutionFingerprintSha256(fingerprint)
+      !== execution.action_fingerprint_sha256) {
+      throw new Error(
+        `Durable physical execution input cannot be reconstructed: ${execution.transaction_id}`
+      );
+    }
+    await this.emit("physical_execution_recovery_started", json({
+      transaction_id: execution.transaction_id,
+      planning_transaction_id: execution.admission.planning_transaction_id,
+      plan_id: execution.admission.plan_id,
+      action: execution.action,
+      committed_frame_count: execution.progress.committed_frame_count
+    }));
+    const receipt = await this.invoke(
+      execution.action,
+      input,
+      execution.transaction_id,
+      execution.agent_id,
+      {
+        tool_call_id: execution.transaction_id,
+        tool_name: execution.action,
+        arguments_sha256: modelPayloadSha256(input)
+      }
+    );
+    await this.emit("physical_execution_recovered", json({
+      transaction_id: receipt.transactionId,
+      action: receipt.action,
+      accepted: receipt.accepted,
+      code: receipt.code,
+      frame_count: receipt.frameCount,
+      world_revision: receipt.worldAfterRevision
+    }));
   }
 
   async completeCycle(output: string): Promise<boolean> {
-    let cycle: JsonValue;
-    try {
-      cycle = json(JSON.parse(output));
-    } catch {
-      cycle = output;
-    }
-    const checker = inspectHumanoidGoal(
-      this.#goal,
-      this.#store.definition.scenario,
-      this.#world.snapshot(),
-      this.#checkpoint.goal_progress
-    );
-    const world = this.#world.snapshot();
-    const evidence = previousCycleEvidence(cycle);
-    const execution = Object.values(this.#checkpoint.committed_actions).findLast((receipt) => (
-      evidence.has(receipt.transactionId)
-      && completedPhysicalExecution(receipt)
-      && receipt.worldAfterRevision === world.worldRevision
-    ));
-    if (!execution) {
-      throw new Error("Autonomous cycle completion lacks current physical execution evidence");
-    }
-    this.#checkpoint.cycle_index += 1;
-    this.#checkpoint.last_cycle = cycle;
-    this.#checkpoint.checker = checker;
-    const memory = appendEmbodiedEpisode({
-      state: this.#checkpoint.embodied_memory,
-      sequence: this.#checkpoint.cycle_index,
-      execution,
-      modelSummary: cycleSummary(cycle),
-      world,
-      goalSuccess: checker.success
-    });
-    await this.#persistEmbodiedEpisode(memory.episode);
-    this.#checkpoint.embodied_memory = memory.state;
-    const actionWindow = retainRecentActionReceipts(
-      this.#checkpoint.committed_actions
-    );
-    this.#checkpoint.committed_actions = actionWindow.receipts;
-    await this.#persist(true);
-    await this.#store.append("checker", json(checker));
-    await this.emit("embodied_episode_recorded", {
-      episode: json(memory.episode),
-      embodied_memory: json(memory.state),
-      retained_episodes: memory.state.recent_episodes.length,
-      total_episodes: memory.state.total_episodes,
-      pruned_checkpoint_receipts: actionWindow.removed,
-      historical_only: false
-    });
-    await this.emit("autonomous_cycle_completed", {
-      cycle_index: this.#checkpoint.cycle_index,
-      output: cycle,
-      checker: json(checker)
-    });
-    return checker.success;
+    return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      let cycle: JsonValue;
+      try {
+        cycle = json(JSON.parse(output));
+      } catch {
+        cycle = output;
+      }
+      const activeGoal = this.#requiredActiveGoal();
+      const progress = this.#checkpoint.goal_progress;
+      if (!progress) throw new Error("Active Goal progress is unavailable");
+      const world = this.#world.snapshot();
+      const checker = inspectHumanoidGoal(
+        activeGoal,
+        this.#scenario,
+        world,
+        progress
+      );
+      const activeCycle = this.#requiredActiveCycleRef();
+      const evidence = previousCycleEvidence(cycle);
+      const causalEvidence = this.#validateCycleCausalEvidence([...evidence]);
+      const execution = causalEvidence.execution;
+      const actionEvidenceRef = `action:${execution.transactionId}`;
+      if (!this.#goalEvidence.has(actionEvidenceRef)) {
+        throw new Error(
+          `Autonomous cycle execution has no durable Goal evidence: ${execution.transactionId}`
+        );
+      }
+      const mutationEvidenceRefs = causalEvidence.worldMutations.map((mutation) => (
+        `action:${mutation.transactionId}`
+      ));
+      for (const ref of mutationEvidenceRefs) {
+        if (!this.#goalEvidence.has(ref)) {
+          throw new Error(`Autonomous cycle world mutation has no durable Goal evidence: ${ref}`);
+        }
+      }
+      const goalEvidenceRefs = [actionEvidenceRef, ...mutationEvidenceRefs];
+      if (checker.success) {
+        const epochId = this.#checkpoint.goal_dag.current_epoch_id;
+        if (!epochId) throw new Error("Active Goal epoch identity is unavailable");
+        const evaluation = createGoalEvaluationEvidence({
+          epochId,
+          goalContentSha256: goalSha256(activeGoal),
+          worldFrame: world.frame,
+          worldRevision: world.worldRevision,
+          evaluation: json(checker)
+        });
+        this.#rememberGoalEvidence(evaluation);
+        await this.#persistGoalEvidence([evaluation.evidence.ref]);
+        goalEvidenceRefs.push(evaluation.evidence.ref);
+        this.#checkpoint.goal_dag = completeGoalEpoch(this.#checkpoint.goal_dag, {
+          resolution_evidence_refs: [evaluation.evidence.ref],
+          resolved_world_revision: world.worldRevision
+        }, this.#goalHarness());
+        this.#checkpoint.goal_progress = null;
+        this.#checkpoint.checker = null;
+      }
+
+      this.#checkpoint.cycle_index = activeCycle.cycle_index;
+      this.#checkpoint.last_cycle = cycle;
+      if (!checker.success) this.#checkpoint.checker = checker;
+      const memory = appendEmbodiedEpisode({
+        state: this.#checkpoint.embodied_memory,
+        sequence: this.#checkpoint.cycle_index,
+        execution,
+        modelSummary: cycleSummary(cycle),
+        world,
+        goalSuccess: checker.success,
+        cycle: activeCycle,
+        goalEvidenceRefs,
+        worldMutations: causalEvidence.worldMutations
+      });
+      await this.#persistEmbodiedEpisode(memory.episode);
+      this.#checkpoint.embodied_memory = memory.state;
+      this.#checkpoint.active_cycle = null;
+      const actionWindow = retainRecentActionReceipts(
+        this.#checkpoint.committed_actions
+      );
+      this.#checkpoint.committed_actions = actionWindow.receipts;
+
+      await this.#persist();
+      await this.#store.append("checker", json(checker));
+      await this.emit("embodied_episode_recorded", {
+        episode: json(memory.episode),
+        embodied_memory: json(memory.state),
+        retained_episodes: memory.state.recent_episodes.length,
+        total_episodes: memory.state.total_episodes,
+        pruned_checkpoint_receipts: actionWindow.removed,
+        historical_only: false
+      });
+      await this.emit("autonomous_cycle_completed", {
+        cycle_index: this.#checkpoint.cycle_index,
+        cycle: json(activeCycle),
+        causal_trace: json(memory.episode.causal_trace ?? null),
+        output: cycle,
+        checker: json(checker),
+        goal_epoch_completed: checker.success
+      });
+      if (checker.success) await this.#emitGoalState("epoch_completed");
+      return checker.success;
+    }));
   }
 
   async succeed(output: string): Promise<void> {
@@ -521,11 +1007,17 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     await this.#finish("interrupted", null, error, "run_interrupted");
   }
 
+  async pause(reason: string): Promise<void> {
+    await this.#finish("paused", null, null, "run_paused", reason);
+  }
+
   async recordFramework(scope: string, event: JsonValue, agentId?: string): Promise<void> {
     const runtimeEventId = randomUUID();
+    const cycle = this.#activeCycleRef();
     const record = {
       scope,
       ...(agentId ? { agent_id: agentId } : {}),
+      ...(cycle ? { cycle } : {}),
       event,
       at: new Date().toISOString(),
       runtime_event_id: runtimeEventId
@@ -536,9 +1028,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   async recordProvider(event: JsonValue, agentId?: string): Promise<void> {
     const runtimeEventId = randomUUID();
+    const cycle = this.#activeCycleRef();
     const record = {
       ...(agentId ? { agent_id: agentId } : {}),
       ...object(event),
+      ...(cycle ? { cycle } : {}),
       at: new Date().toISOString(),
       runtime_event_id: runtimeEventId
     };
@@ -568,54 +1062,443 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     await this.#eventSink(persisted!);
   }
 
-  async #recordFrame(frame: HumanoidWorldSnapshot): Promise<void> {
-    const advanced = advanceHumanoidGoal(
-      this.#goal,
-      this.#store.definition.scenario,
-      frame,
-      this.#checkpoint.goal_progress
-    );
-    this.#checkpoint.world = structuredClone(frame);
-    this.#checkpoint.goal_progress = advanced.progress;
-    this.#checkpoint.checker = advanced.checker;
-    if (frame.frame % FRAME_CHECKPOINT_INTERVAL === 0) {
-      this.#checkpoint.world_checkpoint = this.#world.checkpoint();
-      await this.#persist();
+  async #durableReceiptForInvocation(
+    action: Parameters<HumanoidActionRuntime["invoke"]>[0],
+    rawInput: unknown,
+    rawTransactionId: string,
+    rawAgentId: string,
+    decision: ModelDecisionRef
+  ): Promise<HumanoidActionReceipt | undefined> {
+    await this.#ensureActionTransactionIdentities();
+    const transactionId = rawTransactionId.trim();
+    const agentId = rawAgentId.trim();
+    const identity = this.#actionTransactionIdentities.get(transactionId);
+    if (!identity) return undefined;
+    const fingerprint = humanoidActionFingerprint(action, agentId, rawInput);
+    if (identity.agent_id !== agentId
+      || identity.action !== action
+      || identity.action_fingerprint_sha256
+        !== actionTransactionFingerprintSha256(fingerprint)) {
+      throw new Error(`Humanoid action transaction conflict: ${transactionId}`);
     }
-    this.#signal?.throwIfAborted();
-    await this.emit("humanoid_world_frame", json({
-      world: frame,
-      checker: advanced.checker,
-      goal_progress: advanced.progress
-    }), randomUUID(), false);
+    const cached = this.#actions.receipt(transactionId)
+      ?? this.#durableActionReceiptCache.get(transactionId);
+    if (cached) {
+      this.#assertDurableReceiptIdentity(identity, cached, decision);
+      return structuredClone(cached);
+    }
+    const receipt = await this.#readDurableActionReceipt(identity, decision);
+    this.#durableActionReceiptCache.set(transactionId, receipt);
+    return structuredClone(receipt);
+  }
+
+  async #assertKnownTransactionFingerprint(
+    action: Parameters<HumanoidActionRuntime["invoke"]>[0],
+    rawInput: unknown,
+    rawTransactionId: string,
+    rawAgentId: string
+  ): Promise<void> {
+    await this.#ensureActionTransactionIdentities();
+    const transactionId = rawTransactionId.trim();
+    const agentId = rawAgentId.trim();
+    const identity = this.#actionTransactionIdentities.get(transactionId);
+    if (!identity) return;
+    const fingerprint = humanoidActionFingerprint(action, agentId, rawInput);
+    if (identity.agent_id !== agentId
+      || identity.action !== action
+      || identity.action_fingerprint_sha256
+        !== actionTransactionFingerprintSha256(fingerprint)) {
+      throw new Error(`Humanoid action transaction conflict: ${transactionId}`);
+    }
+  }
+
+  async #ensureActionTransactionIdentities(): Promise<void> {
+    if (this.#actionTransactionIdentitiesLoaded) return;
+    const records = await this.#store.readJournal("action_identities");
+    this.#actionTransactionIdentities = rebuildActionTransactionIdentities(
+      records,
+      this.runId
+    );
+    this.#actionTransactionIdentitiesLoaded = true;
+  }
+
+  async #readDurableActionReceipt(
+    identity: ActionTransactionIdentity,
+    decision: ModelDecisionRef
+  ): Promise<HumanoidActionReceipt> {
+    const matches = (record: JsonValue): HumanoidActionReceipt | undefined => {
+      if (record === null || typeof record !== "object" || Array.isArray(record)
+        || record.transactionId !== identity.transaction_id) return undefined;
+      if (actionCommitPayloadSha256(record) !== identity.action_record_sha256
+        || record.runtime_event_id !== identity.runtime_event_id) {
+        throw new Error(
+          `Durable action receipt identity conflict: ${identity.transaction_id}`
+        );
+      }
+      const { runtime_event_id: _runtimeEventId, ...rawReceipt } = record;
+      const receipt = PersistedHumanoidActionReceiptSchema.parse(rawReceipt);
+      this.#assertDurableReceiptIdentity(identity, receipt, decision);
+      return receipt;
+    };
+    const tail = await this.#store.readJournalTail("actions", 256);
+    for (let index = tail.entries.length - 1; index >= 0; index -= 1) {
+      const receipt = matches(tail.entries[index]!);
+      if (receipt) return receipt;
+    }
+    let end = tail.total - tail.entries.length;
+    while (end > 0) {
+      const from = Math.max(0, end - 256);
+      const page = await this.#store.readJournalPage("actions", from, end - from);
+      for (let index = page.entries.length - 1; index >= 0; index -= 1) {
+        const receipt = matches(page.entries[index]!);
+        if (receipt) return receipt;
+      }
+      end = from;
+    }
+    throw new Error(`Durable action receipt is missing: ${identity.transaction_id}`);
+  }
+
+  #assertDurableReceiptIdentity(
+    identity: ActionTransactionIdentity,
+    receipt: HumanoidActionReceipt,
+    decision: ModelDecisionRef
+  ): void {
+    const authorityCycle = this.#requiredModelAuthority().cycleForModelCall(
+      decision.model_call_id
+    );
+    if (receipt.transactionId !== identity.transaction_id
+      || receipt.agentId !== identity.agent_id
+      || receipt.action !== identity.action
+      || actionTransactionFingerprintSha256(receipt.fingerprint)
+        !== identity.action_fingerprint_sha256
+      || !receipt.decision
+      || modelPayloadSha256(receipt.decision) !== modelPayloadSha256(decision)
+      || !authorityCycle
+      || !sameAutonomousCycle(receipt.cycle, authorityCycle)
+      || actionCommitPayloadSha256(json(receipt)) !== identity.receipt_sha256) {
+      throw new Error(
+        `Durable action receipt conflicts with tombstone: ${identity.transaction_id}`
+      );
+    }
+  }
+
+  async #prepareBlockRemoval(input: {
+    transactionId: string;
+    agentId: string;
+    solidId: string;
+    executionTransactionId: string;
+  }): Promise<ScenarioBlockRemovalTransaction> {
+    const chunks = await this.#store.readScenarioChunkDeltaState();
+    return prepareAuthorizedBlockRemoval({
+      scenario: this.#store.definition.scenario,
+      chunks,
+      currentWorld: this.#world.snapshot(),
+      activeCycle: this.#requiredActiveCycleRef(),
+      removalTransactionId: input.transactionId,
+      agentId: input.agentId,
+      solidId: input.solidId,
+      executionTransactionId: input.executionTransactionId,
+      committedActions: this.#checkpoint.committed_actions
+    });
   }
 
   async #commitReceipt(receipt: HumanoidActionReceipt): Promise<void> {
+    const activeCycle = this.#requiredActiveCycleRef();
+    if (!receipt.decision || !sameAutonomousCycle(receipt.cycle, activeCycle)) {
+      throw new Error(
+        `Humanoid action has no cycle-bound model decision authority: ${receipt.transactionId}`
+      );
+    }
+    this.#assertActionDecisionRef(
+      receipt.decision,
+      receipt.action,
+      receipt.input,
+      receipt.transactionId,
+      receipt.agentId,
+      activeCycle
+    );
+    const pending = this.#checkpoint.action_commit_outbox.pending[receipt.transactionId];
+    if (pending) {
+      assertPendingActionReceipt(pending.action_record, receipt);
+      await this.#reconcileActionCommits();
+      return;
+    }
+    const committed = this.#checkpoint.committed_actions[receipt.transactionId];
+    if (committed) {
+      if (actionCommitPayloadSha256(json(committed))
+        !== actionCommitPayloadSha256(json(receipt))) {
+        throw new Error(`Committed humanoid action conflicts with retry: ${receipt.transactionId}`);
+      }
+      await this.#reconcileActionCommits();
+      return;
+    }
     const node = this.#node(receipt.agentId);
     node.steps_used += 1;
     node.status = "ready";
     node.updated_at = new Date().toISOString();
     this.#checkpoint.committed_actions[receipt.transactionId] = structuredClone(receipt);
-    this.#checkpoint.world = this.#world.snapshot();
-    this.#checkpoint.world_checkpoint = this.#world.checkpoint();
-    this.#checkpoint.checker = inspectHumanoidGoal(
-      this.#goal,
-      this.#store.definition.scenario,
-      this.#checkpoint.world,
-      this.#checkpoint.goal_progress
-    );
-    await this.#persist();
+    const physicalExecution = this.#checkpoint.action_execution_ledger.active[
+      receipt.transactionId
+    ];
+    if (physicalExecution) {
+      await this.#physicalExecution.synchronizeProgress(receipt.transactionId);
+    } else {
+      if (physicalExecutionReceipt(receipt)
+        && object(receipt.detail).automatic_actuation !== false) {
+        throw new Error(
+          `Physical receipt cannot commit without an execution ledger: ${receipt.transactionId}`
+        );
+      }
+      await this.#refreshWorldPersistenceState();
+    }
+    const activeGoal = this.#activeGoal();
     const runtimeEventId = randomUUID();
     const record = {
       ...receipt,
       runtime_event_id: runtimeEventId
     };
-    await this.#store.append("actions", json(record));
-    await this.emit("humanoid_action_committed", json({
-      receipt: record,
-      world: this.#checkpoint.world,
-      checker: this.#checkpoint.checker
-    }), runtimeEventId);
+    const revisionLag = Math.max(
+      0,
+      this.#checkpoint.world.worldRevision - receipt.worldAfterRevision
+    );
+    const actionEvidence = createActionGoalEvidence({
+      transactionId: receipt.transactionId,
+      worldFrame: Math.max(0, this.#checkpoint.world.frame - revisionLag),
+      worldRevision: receipt.worldAfterRevision,
+      receipt: json(receipt)
+    });
+    this.#rememberGoalEvidence(actionEvidence);
+    const experience = physicalExecutionReceipt(receipt)
+      || receipt.action === "remove_world_block"
+      ? this.#rememberEmbodiedActionExperience(receipt, true)
+      : undefined;
+    let physicalWorldDelta: ReturnType<typeof captureHumanoidPhysicalWorldDelta> = undefined;
+    let projectedScenarioChunks: ReturnType<
+      typeof projectHumanoidPhysicalWorldDelta
+    > | undefined = undefined;
+    const blockRemoval = receipt.accepted && receipt.action === "remove_world_block"
+      ? ScenarioBlockRemovalTransactionSchema.parse(
+          object(receipt.detail).removal_transaction
+        )
+      : undefined;
+    if (physicalExecution && blockRemoval) {
+      throw new Error("One humanoid action cannot commit physical and block-removal deltas");
+    }
+    const currentScenarioChunks = physicalExecution || blockRemoval
+      ? await this.#store.readScenarioChunkDeltaState()
+      : undefined;
+    if (physicalExecution && receipt.frameCount > 0 && currentScenarioChunks) {
+      physicalWorldDelta = captureHumanoidPhysicalWorldDelta({
+        scenario: this.#store.definition.scenario,
+        chunks: currentScenarioChunks,
+        world: this.#checkpoint.world,
+        transactionId: receipt.transactionId
+      });
+      if (physicalWorldDelta) {
+        projectedScenarioChunks = projectHumanoidPhysicalWorldDelta(
+          this.#store.definition.scenario,
+          currentScenarioChunks,
+          physicalWorldDelta
+        );
+      }
+    }
+    if (blockRemoval && currentScenarioChunks) {
+      projectedScenarioChunks = projectHumanoidBlockRemoval(
+        this.#store,
+        currentScenarioChunks,
+        blockRemoval
+      );
+    }
+    const checkerScenario = projectedScenarioChunks
+      ? materializeScenarioChunkDeltaState(
+          this.#store.definition.scenario,
+          projectedScenarioChunks
+        )
+      : this.#scenario;
+    this.#checkpoint.checker = activeGoal && this.#checkpoint.goal_progress
+      ? inspectHumanoidGoal(
+          activeGoal,
+          checkerScenario,
+          this.#checkpoint.world,
+          this.#checkpoint.goal_progress
+        )
+      : null;
+    const runtimeEvent = {
+      event_id: runtimeEventId,
+      run_id: this.runId,
+      type: "humanoid_action_committed" as const,
+      at: new Date().toISOString(),
+      data: json({
+        receipt: record,
+        world: this.#checkpoint.world,
+        checker: this.#checkpoint.checker,
+        ...(physicalWorldDelta
+          ? { physical_world_delta: physicalWorldDelta }
+          : {}),
+        ...(blockRemoval ? { block_removal: blockRemoval } : {}),
+        ...(projectedScenarioChunks
+          ? { scenario_chunks: projectedScenarioChunks }
+          : {}),
+        ...(experience
+          ? {
+              experience,
+              embodied_memory: this.#checkpoint.embodied_memory
+            }
+          : {})
+      })
+    };
+    this.#checkpoint.action_commit_outbox = stageActionCommit(
+      this.#checkpoint.action_commit_outbox,
+      {
+        transactionId: receipt.transactionId,
+        runtimeEventId,
+        actionRecord: json(record),
+        goalEvidenceRef: actionEvidence.evidence.ref,
+        goalEvidenceRecord: json(actionEvidence),
+        ...(experience
+          ? {
+              experienceRef: experience.source_ref,
+              experienceRecord: json(experience)
+            }
+          : {}),
+        ...(physicalWorldDelta ? { physicalWorldDelta } : {}),
+        ...(blockRemoval ? { blockRemoval } : {}),
+        runtimeEvent
+      }
+    );
+    if (physicalExecution) {
+      const staged = this.#checkpoint.action_commit_outbox.pending[receipt.transactionId];
+      if (!staged) throw new Error("Physical action commit was not staged");
+      this.#checkpoint.action_execution_ledger = terminalizeActionExecution(
+        this.#checkpoint.action_execution_ledger,
+        {
+          transactionId: receipt.transactionId,
+          commit: staged
+        }
+      );
+    }
+    await this.#persist();
+    await this.#reconcileActionCommits();
+  }
+
+  async #reconcileActionCommits(): Promise<void> {
+    const staged = Object.values(this.#checkpoint.action_commit_outbox.pending);
+    let reconciledScenarioState = false;
+    for (const entry of staged) {
+      if (entry.physical_world_delta) {
+        await reconcileHumanoidPhysicalWorldDelta(
+          this.#store,
+          entry.physical_world_delta
+        );
+        reconciledScenarioState = true;
+      }
+      if (entry.block_removal) {
+        await reconcileHumanoidBlockRemoval(
+          this.#store,
+          entry.block_removal
+        );
+        reconciledScenarioState = true;
+      }
+      this.#rememberGoalEvidence(
+        GoalEvidenceArtifactSchema.parse(entry.goal_evidence_record)
+      );
+      const receipt = embodiedActionJournalReceipt(entry.action_record);
+      if (receipt) {
+        const experience = this.#rememberEmbodiedActionExperience(receipt, true);
+        if (entry.experience_record !== undefined) {
+          const stagedExperience = HumanoidEmbodiedExperienceSchema.parse(
+            entry.experience_record
+          );
+          if (!experience
+            || JSON.stringify(stagedExperience) !== JSON.stringify(experience)) {
+            throw new Error(
+              `Staged embodied experience conflicts with ${receipt.transactionId}`
+            );
+          }
+        }
+      }
+    }
+    let synchronizedChunks: Awaited<
+      ReturnType<RunStore["readScenarioChunkDeltaState"]>
+    > | undefined;
+    let synchronization: Awaited<
+      ReturnType<HumanoidWorld["synchronizeScenarioChunks"]>
+    > | undefined;
+    if (reconciledScenarioState) {
+      synchronizedChunks = await this.#store.readScenarioChunkDeltaState();
+      this.#scenario = materializeScenarioChunkDeltaState(
+        this.#store.definition.scenario,
+        synchronizedChunks
+      );
+      synchronization = await this.#world.synchronizeScenarioChunks(
+        this.#store.definition.scenario,
+        synchronizedChunks
+      );
+      const activeGoal = this.#activeGoal();
+      this.#checkpoint.checker = activeGoal && this.#checkpoint.goal_progress
+        ? inspectHumanoidGoal(
+            activeGoal,
+            this.#scenario,
+            this.#world.snapshot(),
+            this.#checkpoint.goal_progress
+          )
+        : null;
+    }
+    const reconciled = await reconcileActionCommitOutbox({
+      store: this.#store,
+      outbox: this.#checkpoint.action_commit_outbox,
+      persist: async (outbox) => {
+        const previous = this.#checkpoint.action_commit_outbox;
+        const previousLedger = this.#checkpoint.action_execution_ledger;
+        let nextLedger = previousLedger;
+        for (const [transactionId] of Object.entries(previous.pending)) {
+          if (outbox.pending[transactionId]) continue;
+          const execution = nextLedger.active[transactionId];
+          if (!execution) continue;
+          if (execution.status !== "terminal" || !execution.terminal) {
+            throw new Error(
+              `Action commit cannot acknowledge active execution: ${transactionId}`
+            );
+          }
+          nextLedger = acknowledgeTerminalActionExecution(
+            nextLedger,
+            transactionId,
+            execution.terminal
+          );
+        }
+        this.#checkpoint.action_commit_outbox = outbox;
+        this.#checkpoint.action_execution_ledger = nextLedger;
+        try {
+          await this.#persist();
+        } catch (error) {
+          this.#checkpoint.action_commit_outbox = previous;
+          this.#checkpoint.action_execution_ledger = previousLedger;
+          throw error;
+        }
+      },
+      publish: async (event) => {
+        try {
+          await this.#eventSink(event);
+        } catch {
+          return;
+        }
+      }
+    });
+    this.#checkpoint.action_commit_outbox = reconciled;
+    for (const entry of staged) {
+      this.#persistedGoalEvidenceRefs.add(entry.goal_evidence_ref);
+      this.#rememberActionTransactionIdentity(
+        createActionTransactionIdentity(entry)
+      );
+    }
+    await this.#physicalExecution.acknowledgeTerminals(staged);
+    if (synchronizedChunks && synchronization?.changed) {
+      await this.#persist();
+      await this.emit("humanoid_scenario_synchronized", json({
+        scenario_chunks: synchronizedChunks,
+        synchronization
+      }));
+    }
   }
 
   async #recordCompactionCalls(
@@ -650,19 +1533,52 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     await this.#store.append("episodes", json(parsed));
   }
 
+  #rememberEmbodiedActionExperience(
+    receipt: HumanoidActionReceipt,
+    required: boolean
+  ): HumanoidEmbodiedExperience | undefined {
+    const epochId = receipt.cycle?.goal_epoch_id;
+    const epoch = epochId
+      ? this.#checkpoint.goal_dag.epochs.find((entry) => entry.epoch_id === epochId)
+      : undefined;
+    const candidate = epoch
+      ? this.#checkpoint.goal_dag.candidates[epoch.candidate_id]
+      : undefined;
+    if (!receipt.decision || !receipt.cycle || !candidate) {
+      if (required) {
+        throw new Error(
+          `Embodied experience has no model-selected Goal epoch: ${receipt.transactionId}`
+        );
+      }
+      return undefined;
+    }
+    const remembered = rememberEmbodiedActionExperience({
+      state: this.#checkpoint.embodied_memory,
+      execution: receipt,
+      goal: candidate.goal
+    });
+    this.#checkpoint.embodied_memory = remembered.state;
+    return remembered.experience;
+  }
+
   async #finish(
-    status: "succeeded" | "failed" | "interrupted",
+    status: "succeeded" | "failed" | "interrupted" | "paused",
     output: string | null,
     error: string | null,
-    eventType: "run_succeeded" | "run_failed" | "run_interrupted"
+    eventType: "run_succeeded" | "run_failed" | "run_interrupted" | "run_paused",
+    reason?: string
   ): Promise<void> {
+    this.#continuousPhysicsEnabled = false;
+    await this.#physicsClock.stop();
     const at = new Date().toISOString();
     this.#checkpoint.status = status;
     this.#checkpoint.final_output = output;
     this.#checkpoint.error = error;
     this.#checkpoint.active_agent_id = null;
     this.#checkpoint.active_agent_ids = [];
-    this.#node(this.rootAgentId).status = status === "succeeded" ? "completed" : "failed";
+    this.#node(this.rootAgentId).status = status === "succeeded"
+      ? "completed"
+      : status === "paused" ? "waiting" : "failed";
     this.#checkpoint.pending_lifecycle_events.push(createLifecycleEvent({
       runId: this.runId,
       type: eventType,
@@ -670,15 +1586,246 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       data: {
         runtime: "humanoid_g1",
         ...(output ? { output } : {}),
-        ...(error ? { error } : {})
+        ...(error ? { error } : {}),
+        ...(reason ? { reason } : {})
       }
     }));
-    await this.#persist(true);
+    await this.#persist();
     await reconcileLifecycleOutbox({
       store: this.#store,
       checkpoint: this.#checkpoint,
       persistCheckpoint: () => this.#persist(),
       eventSink: this.#eventSink
+    });
+  }
+
+  #activeCycleRef(): AutonomousCycleRef | undefined {
+    return this.#checkpoint.active_cycle
+      ? autonomousCycleRef(this.#checkpoint.active_cycle)
+      : undefined;
+  }
+
+  #requiredActiveCycleRef(): AutonomousCycleRef {
+    const cycle = this.#activeCycleRef();
+    if (!cycle) throw new Error("No autonomous cycle is active");
+    return cycle;
+  }
+
+  #createActiveCycle(): ActiveAutonomousCycle {
+    if (this.#checkpoint.active_cycle) {
+      throw new Error(
+        `Autonomous cycle is already active: ${this.#checkpoint.active_cycle.cycle_id}`
+      );
+    }
+    const goalEpochId = this.#checkpoint.goal_dag.current_epoch_id;
+    if (this.#checkpoint.goal_dag.status !== "active" || !goalEpochId) {
+      throw new Error("An autonomous cycle requires an active Goal epoch");
+    }
+    const cycle = createActiveAutonomousCycle({
+      cycleIndex: this.#checkpoint.cycle_index + 1,
+      goalEpochId,
+      worldFrame: this.#checkpoint.world.frame,
+      worldRevision: this.#checkpoint.world.worldRevision
+    });
+    this.#checkpoint.active_cycle = cycle;
+    return cycle;
+  }
+
+  async #emitCycleStarted(cycle: ActiveAutonomousCycle): Promise<void> {
+    await this.emit("autonomous_cycle_started", json({ cycle }));
+  }
+
+  #activeGoal(): Goal | undefined {
+    const epochId = this.#checkpoint.goal_dag.current_epoch_id;
+    if (!epochId) return undefined;
+    const epoch = this.#checkpoint.goal_dag.epochs.find(
+      (candidate) => candidate.epoch_id === epochId
+    );
+    if (!epoch || epoch.status !== "active") return undefined;
+    const candidate = this.#checkpoint.goal_dag.candidates[epoch.candidate_id];
+    return candidate?.status === "active" ? candidate.goal : undefined;
+  }
+
+  #requiredActiveGoal(): Goal {
+    const goal = this.#activeGoal();
+    if (!goal) throw new Error("No model-selected Goal epoch is active");
+    return goal;
+  }
+
+  #requiredModelAuthority(): HumanoidModelAuthority {
+    if (!this.#modelAuthority) {
+      throw new Error("Goal autonomy has not been initialized from an Agent manifest");
+    }
+    return this.#modelAuthority;
+  }
+
+  #goalHarness() {
+    return this.#requiredModelAuthority().goalHarness({
+      evidence: this.#goalEvidence,
+      scenario: this.#store.definition.scenario
+    });
+  }
+
+  #goalModelSource(
+    toolAuthority: GoalToolCallAuthority,
+    expectedToolName: string
+  ) {
+    return this.#requiredModelAuthority().goalModelSource(
+      toolAuthority,
+      expectedToolName
+    );
+  }
+
+  #actionModelSource(
+    toolAuthority: HumanoidActionToolCallAuthority,
+    expectedToolName: Parameters<HumanoidActionRuntime["invoke"]>[0],
+    input: unknown,
+    transactionId: string,
+    agentId: string
+  ): ModelDecisionRef {
+    return this.#requiredModelAuthority().actionModelSource({
+      toolAuthority,
+      expectedToolName,
+      actionInput: input,
+      transactionId,
+      agentId
+    });
+  }
+
+  #assertDecisionCycleActive(decision: ModelDecisionRef): void {
+    this.#requiredModelAuthority().assertDecisionCycleActive(
+      decision,
+      this.#requiredActiveCycleRef()
+    );
+  }
+
+  #assertActionDecisionRef(
+    rawDecision: ModelDecisionRef,
+    expectedToolName: Parameters<HumanoidActionRuntime["invoke"]>[0],
+    input: unknown,
+    transactionId: string,
+    agentId: string,
+    cycle: AutonomousCycleRef
+  ): void {
+    this.#requiredModelAuthority().assertActionDecision({
+      rawDecision,
+      expectedToolName,
+      actionInput: input,
+      transactionId,
+      agentId,
+      cycle
+    });
+  }
+
+  #requiredGoalEvidence(ref: string): GoalEvidenceArtifact {
+    const artifact = this.#goalEvidence.get(ref);
+    if (!artifact) throw new Error(`Goal evidence is unavailable: ${ref}`);
+    return artifact;
+  }
+
+  #requiredContextGoalEvidence(agentId: string): {
+    ref: string;
+    artifact: GoalEvidenceArtifact;
+  } {
+    const ref = this.#contextGoalEvidenceRefs.get(agentId);
+    if (!ref) {
+      throw new Error(`Agent has no current Harness evidence binding: ${agentId}`);
+    }
+    return { ref, artifact: this.#requiredGoalEvidence(ref) };
+  }
+
+  #rememberGoalEvidence(rawArtifact: GoalEvidenceArtifact): void {
+    const artifact = GoalEvidenceArtifactSchema.parse(rawArtifact);
+    const ref = artifact.evidence.ref;
+    const existing = this.#goalEvidence.get(ref);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(artifact)) {
+      throw new Error(`Goal evidence reference was rebound: ${ref}`);
+    }
+    if (!existing) this.#goalEvidence.set(ref, artifact);
+  }
+
+  #rememberActionTransactionIdentity(identity: ActionTransactionIdentity): void {
+    const existing = this.#actionTransactionIdentities.get(identity.transaction_id);
+    if (existing && existing.identity_sha256 !== identity.identity_sha256) {
+      throw new Error(
+        `Action transaction identity was rebound: ${identity.transaction_id}`
+      );
+    }
+    if (!existing) {
+      this.#actionTransactionIdentities.set(
+        identity.transaction_id,
+        structuredClone(identity)
+      );
+    }
+  }
+
+  async #persistGoalEvidence(refs: readonly string[]): Promise<void> {
+    const artifacts = [...new Set(refs)].flatMap((ref) => {
+      const artifact = this.#requiredGoalEvidence(ref);
+      return this.#persistedGoalEvidenceRefs.has(ref) ? [] : [artifact];
+    });
+    if (artifacts.length === 0) return;
+    await this.#store.appendMany("goal_evidence", artifacts.map((artifact) => json(artifact)));
+    for (const artifact of artifacts) {
+      this.#persistedGoalEvidenceRefs.add(artifact.evidence.ref);
+    }
+  }
+
+  async #emitGoalState(
+    reason: "candidates_submitted" | "candidate_selected" | "epoch_completed" | "epoch_retired"
+  ): Promise<void> {
+    await this.emit("humanoid_goal_state_updated", json({
+      reason,
+      goal_dag: this.#checkpoint.goal_dag,
+      active_goal: this.#activeGoal() ?? null,
+      active_cycle: this.#checkpoint.active_cycle ?? null,
+      goal_progress: this.#checkpoint.goal_progress,
+      checker: this.#checkpoint.checker,
+      world_frame: this.#checkpoint.world.frame,
+      world_revision: this.#checkpoint.world.worldRevision
+    }));
+  }
+
+  #assertActiveGoalProgress(): void {
+    const activeGoal = this.#activeGoal();
+    if (!activeGoal) {
+      if (this.#checkpoint.goal_dag.status !== "awaiting_model_selection"
+        || this.#checkpoint.goal_progress !== null
+        || this.#checkpoint.checker !== null) {
+        throw new Error(
+          "A run without an active Goal epoch cannot retain checker or progress state"
+        );
+      }
+      return;
+    }
+    if (this.#checkpoint.goal_dag.status !== "active"
+      || !this.#checkpoint.goal_progress) {
+      throw new Error("An active Goal epoch requires persisted physical progress");
+    }
+    assertHumanoidGoalProgressIntegrity(
+      activeGoal,
+      this.#checkpoint.world,
+      this.#checkpoint.goal_progress
+    );
+    if (this.#checkpoint.checker
+      && goalSha256(this.#checkpoint.checker.goal) !== goalSha256(activeGoal)) {
+      throw new Error("Humanoid checker belongs to another Goal epoch");
+    }
+  }
+
+  async #withPhysicsPaused<T>(operation: () => Promise<T>): Promise<T> {
+    return this.#actionMutex.runExclusive(async () => {
+      const resumeClock = this.#continuousPhysicsEnabled;
+      await this.#physicsClock.stop();
+      try {
+        return await operation();
+      } finally {
+        if (resumeClock
+          && this.#checkpoint.status === "running"
+          && activeActionExecutions(this.#checkpoint.action_execution_ledger).length === 0) {
+          this.#physicsClock.start();
+        }
+      }
     });
   }
 
@@ -688,63 +1835,41 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     return node;
   }
 
-  async #persist(refreshWorld = false): Promise<void> {
-    if (refreshWorld) {
-      this.#checkpoint.world = this.#world.snapshot();
-      this.#checkpoint.world_checkpoint = this.#world.checkpoint();
+  async #refreshWorldPersistenceState(): Promise<void> {
+    const captured = await this.#world.capturePersistenceState();
+    const activeGoal = this.#activeGoal();
+    if (activeGoal && this.#checkpoint.goal_progress) {
+      const advanced = advanceHumanoidGoal(
+        activeGoal,
+        this.#scenario,
+        captured.world,
+        this.#checkpoint.goal_progress
+      );
+      this.#checkpoint.goal_progress = advanced.progress;
+      this.#checkpoint.checker = advanced.checker;
+    } else if (!activeGoal) {
+      this.#checkpoint.goal_progress = null;
+      this.#checkpoint.checker = null;
     }
-    assertHumanoidGoalProgressIntegrity(
-      this.#goal,
-      this.#checkpoint.world,
-      this.#checkpoint.goal_progress
-    );
+    this.#checkpoint.world = captured.world;
+    this.#checkpoint.world_checkpoint = captured.worldCheckpoint;
+  }
+
+  async #persist(refreshWorld = true): Promise<void> {
+    if (refreshWorld) await this.#refreshWorldPersistenceState();
+    this.#assertActiveGoalProgress();
     this.#checkpoint.updated_at = new Date().toISOString();
-    await this.#store.writeCheckpoint(this.#checkpoint);
+    const snapshot = structuredClone(this.#checkpoint);
+    const write = this.#checkpointWriteTail
+      .catch(() => undefined)
+      .then(() => this.#store.writeCheckpoint(snapshot));
+    this.#checkpointWriteTail = write;
+    await write;
   }
 }
 
-function object(value: JsonValue): Record<string, JsonValue> {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value
-    : { value };
-}
-
-function json(value: unknown): JsonValue {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) return null;
-  return JSON.parse(serialized) as JsonValue;
-}
-
-function previousCycleEvidence(value: JsonValue): Set<string> {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return new Set();
-  const ids = value.evidence_transaction_ids;
-  if (!Array.isArray(ids)) return new Set();
-  return new Set(ids.filter((entry): entry is string => typeof entry === "string"));
-}
-
-function cycleSummary(value: JsonValue): string {
-  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    const summary = value.summary;
-    if (typeof summary === "string" && summary.trim()) return summary.trim();
-  }
-  return "完成一次有物理回执的人形自主循环";
-}
-
-function completedPhysicalExecution(receipt: HumanoidActionReceipt): boolean {
-  return receipt.accepted && (
-    receipt.action === "execute_whole_body_motion"
-      ? receipt.code === "motion_option_succeeded"
-      : receipt.action === "execute_humanoid_navigation"
-        && receipt.code === "navigation_completed"
-  );
-}
-
-function executeActionJournalReceipt(value: JsonValue): HumanoidActionReceipt | undefined {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("Humanoid action journal contains a non-object record");
-  }
-  if (value.action !== "execute_whole_body_motion"
-    && value.action !== "execute_humanoid_navigation") return undefined;
-  const { runtime_event_id: _runtimeEventId, ...receipt } = value;
-  return PersistedHumanoidActionReceiptSchema.parse(receipt);
+function isHumanoidPlanningReceipt(receipt: HumanoidActionReceipt): boolean {
+  return receipt.action === "plan_whole_body_motion"
+    || receipt.action === "plan_whole_body_motion_candidates"
+    || receipt.action === "plan_humanoid_navigation";
 }

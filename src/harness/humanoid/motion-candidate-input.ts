@@ -1,9 +1,11 @@
 import { z } from "zod";
 import {
   HumanoidEndEffectorSchema,
+  QuaternionSchema,
   Vec3Schema
 } from "../../domain/schema.js";
 import { HUMANOID_BODY_NAMES } from "../../world/humanoid/model.js";
+import { G1_HAND_CONTACT_SURFACE_NAMES } from "../../world/humanoid/morphology.js";
 import {
   duplicateHumanoidMotionCandidateIndexes,
   HumanoidMotionCandidateBatchSchema,
@@ -16,8 +18,12 @@ const PredicateTypeSchema = z.enum([
   "body_near_point",
   "end_effector_near_point",
   "body_contact_object",
+  "body_contact_solid",
+  "hand_contact_solid",
   "object_near_point",
-  "object_in_zone"
+  "object_in_zone",
+  "grasp_verified",
+  "object_settled_on_support"
 ]);
 
 const ModelMotionPredicateSchema = z.object({
@@ -30,12 +36,24 @@ const ModelMotionPredicateSchema = z.object({
     .describe("仅末端谓词使用，否则填 null"),
   object_id: z.string().trim().min(1).nullable()
     .describe("仅物体谓词使用，否则填 null"),
+  solid_id: z.string().trim().min(1).nullable()
+    .describe("仅静态实体接触谓词使用，否则填 null"),
+  hand_surface: z.enum(G1_HAND_CONTACT_SURFACE_NAMES).nullable()
+    .describe("仅精确手部接触谓词使用，否则填 null"),
+  hand: z.enum(["left", "right"]).nullable()
+    .describe("仅 grasp_verified 使用，否则填 null"),
+  grasp_contract_sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable()
+    .describe("仅 grasp_verified 使用，逐字复制当前观察中的权威契约哈希，否则填 null"),
   zone_id: z.string().trim().min(1).nullable()
     .describe("仅区域谓词使用，否则填 null"),
   target: Vec3Schema.nullable()
     .describe("仅位置谓词使用，否则填 null"),
   tolerance_m: z.number().finite().nonnegative().max(5).nullable()
     .describe("仅位置或区域谓词使用，否则填 null"),
+  target_orientation: QuaternionSchema.nullable()
+    .describe("末端姿态目标可选使用，否则填 null"),
+  orientation_tolerance_rad: z.number().finite().positive().max(Math.PI).nullable()
+    .describe("末端姿态容差可选使用，否则填 null"),
   minimum_normal_force: z.number().finite().positive().nullable()
     .describe("仅接触谓词使用，否则填 null"),
   expected: z.boolean().nullable()
@@ -43,6 +61,9 @@ const ModelMotionPredicateSchema = z.object({
 }).strict().superRefine((predicate, context) => {
   const required = requiredPredicateFields(predicate.type);
   for (const field of PREDICATE_VALUE_FIELDS) {
+    if (field === "target_orientation" || field === "orientation_tolerance_rad") {
+      continue;
+    }
     const value = predicate[field];
     if (required.has(field) ? value === null : value !== null) {
       context.addIssue({
@@ -53,6 +74,22 @@ const ModelMotionPredicateSchema = z.object({
           : `${field} must be null for ${predicate.type}`
       });
     }
+  }
+  const hasOrientation = predicate.target_orientation !== null;
+  const hasOrientationTolerance = predicate.orientation_tolerance_rad !== null;
+  if (predicate.type !== "end_effector_near_point"
+    && (hasOrientation || hasOrientationTolerance)) {
+    context.addIssue({
+      code: "custom",
+      path: ["target_orientation"],
+      message: "Orientation fields are only valid for end_effector_near_point"
+    });
+  } else if (hasOrientation !== hasOrientationTolerance) {
+    context.addIssue({
+      code: "custom",
+      path: [hasOrientation ? "orientation_tolerance_rad" : "target_orientation"],
+      message: "End-effector orientation and tolerance must be provided together"
+    });
   }
   if (predicate.tolerance_m === 0 && predicate.type !== "object_in_zone") {
     context.addIssue({
@@ -136,9 +173,15 @@ const PREDICATE_VALUE_FIELDS = [
   "end_effector",
   "frame",
   "object_id",
+  "solid_id",
+  "hand_surface",
+  "hand",
+  "grasp_contract_sha256",
   "zone_id",
   "target",
   "tolerance_m",
+  "target_orientation",
+  "orientation_tolerance_rad",
   "minimum_normal_force",
   "expected"
 ] as const satisfies readonly (keyof ModelMotionPredicate)[];
@@ -203,7 +246,14 @@ function normalizePredicate(predicate: ModelMotionPredicate): unknown {
       end_effector: predicate.end_effector,
       frame: predicate.frame,
       target: predicate.target,
-      tolerance_m: predicate.tolerance_m
+      tolerance_m: predicate.tolerance_m,
+      ...(predicate.target_orientation !== null
+        && predicate.orientation_tolerance_rad !== null
+        ? {
+            target_orientation: predicate.target_orientation,
+            orientation_tolerance_rad: predicate.orientation_tolerance_rad
+          }
+        : {})
     };
   }
   if (predicate.type === "body_contact_object") {
@@ -214,12 +264,42 @@ function normalizePredicate(predicate: ModelMotionPredicate): unknown {
       minimum_normal_force: predicate.minimum_normal_force
     };
   }
+  if (predicate.type === "body_contact_solid") {
+    return {
+      type: predicate.type,
+      body: predicate.body,
+      solid_id: predicate.solid_id,
+      minimum_normal_force: predicate.minimum_normal_force
+    };
+  }
+  if (predicate.type === "hand_contact_solid") {
+    return {
+      type: predicate.type,
+      hand_surface: predicate.hand_surface,
+      solid_id: predicate.solid_id,
+      minimum_normal_force: predicate.minimum_normal_force
+    };
+  }
   if (predicate.type === "object_near_point") {
     return {
       type: predicate.type,
       object_id: predicate.object_id,
       target: predicate.target,
       tolerance_m: predicate.tolerance_m
+    };
+  }
+  if (predicate.type === "grasp_verified") {
+    return {
+      type: predicate.type,
+      object_id: predicate.object_id,
+      hand: predicate.hand,
+      grasp_contract_sha256: predicate.grasp_contract_sha256
+    };
+  }
+  if (predicate.type === "object_settled_on_support") {
+    return {
+      type: predicate.type,
+      object_id: predicate.object_id
     };
   }
   return {
@@ -266,6 +346,18 @@ function requiredPredicateFields(
   }
   if (type === "body_contact_object") {
     return new Set(["body", "object_id", "minimum_normal_force"]);
+  }
+  if (type === "body_contact_solid") {
+    return new Set(["body", "solid_id", "minimum_normal_force"]);
+  }
+  if (type === "hand_contact_solid") {
+    return new Set(["hand_surface", "solid_id", "minimum_normal_force"]);
+  }
+  if (type === "grasp_verified") {
+    return new Set(["object_id", "hand", "grasp_contract_sha256"]);
+  }
+  if (type === "object_settled_on_support") {
+    return new Set(["object_id"]);
   }
   if (type === "object_near_point") {
     return new Set(["object_id", "target", "tolerance_m"]);

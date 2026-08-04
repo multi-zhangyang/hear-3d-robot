@@ -2,8 +2,13 @@ import loadMujoco from "@mujoco/mujoco";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import {
+  g1PhysicsModelXml
+} from "./hand-collision-geometry.js";
 
 export type MujocoModule = Awaited<ReturnType<typeof loadMujoco>>;
+export type MujocoModel = InstanceType<MujocoModule["MjModel"]>;
+export type MujocoData = InstanceType<MujocoModule["MjData"]>;
 
 export interface HumanoidSceneSolid {
   id: string;
@@ -21,7 +26,7 @@ let runtimePromise: Promise<MujocoModule> | undefined;
 let sceneSequence = 0;
 
 export function humanoidModelPath(): string {
-  return `${VIRTUAL_ROOT}/scene_29dof.xml`;
+  return `${VIRTUAL_ROOT}/scene_with_hands_physics.xml`;
 }
 
 export function createHumanoidScenePath(
@@ -38,6 +43,13 @@ export function removeHumanoidScene(runtime: MujocoModule, path: string): void {
   runtime.FS.unlink(path);
 }
 
+export function humanoidSceneSolidGeomName(index: number, id: string): string {
+  if (!Number.isSafeInteger(index) || index < 0) {
+    throw new Error("Humanoid scene solid index must be a nonnegative integer");
+  }
+  return `world-solid-${index}-${xmlName(id)}`;
+}
+
 export function loadHumanoidMujoco(): Promise<MujocoModule> {
   runtimePromise ??= initializeMujoco();
   return runtimePromise;
@@ -45,15 +57,31 @@ export function loadHumanoidMujoco(): Promise<MujocoModule> {
 
 async function initializeMujoco(): Promise<MujocoModule> {
   const runtime = await loadMujoco();
+  let sourceModel: string | undefined;
   runtime.FS.mkdirTree(`${VIRTUAL_ROOT}/meshes`, 0o777);
+  runtime.FS.mkdirTree(`${VIRTUAL_ROOT}/assets`, 0o777);
   for (const entry of await readdir(ASSET_ROOT, { recursive: true, withFileTypes: true })) {
     if (!entry.isFile()) continue;
     const source = path.join(entry.parentPath, entry.name);
     const relative = path.relative(ASSET_ROOT, source).split(path.sep).join("/");
     const target = `${VIRTUAL_ROOT}/${relative}`;
     runtime.FS.mkdirTree(target.slice(0, target.lastIndexOf("/")), 0o777);
-    runtime.FS.writeFile(target, await readFile(source));
+    const contents = await readFile(source);
+    if (relative === "g1_with_hands.xml") sourceModel = contents.toString("utf8");
+    if (relative.startsWith("meshes/") && relative.endsWith(".STL")) {
+      runtime.FS.writeFile(`${VIRTUAL_ROOT}/assets/${entry.name}`, contents);
+    }
+    runtime.FS.writeFile(target, contents);
   }
+  if (!sourceModel) throw new Error("G1 43DoF source model is missing");
+  runtime.FS.writeFile(
+    `${VIRTUAL_ROOT}/g1_with_hands_physics.xml`,
+    new TextEncoder().encode(g1PhysicsModelXml(sourceModel))
+  );
+  runtime.FS.writeFile(
+    humanoidModelPath(),
+    new TextEncoder().encode(sceneXml([], []))
+  );
   return runtime;
 }
 
@@ -65,7 +93,7 @@ function sceneXml(
     assertSolid(solid);
     const position = [solid.center.z, solid.center.x, solid.center.y];
     const halfSize = [solid.size.z / 2, solid.size.x / 2, solid.size.y / 2];
-    return `    <geom name="world-solid-${index}-${xmlName(solid.id)}" type="box" pos="${numbers(position)}" size="${numbers(halfSize)}" friction="0.9 0.01 0.001" rgba="0.34 0.38 0.31 1"/>`;
+    return `    <geom name="${humanoidSceneSolidGeomName(index, solid.id)}" type="box" pos="${numbers(position)}" size="${numbers(halfSize)}" friction="0.9 0.01 0.001" rgba="0.34 0.38 0.31 1"/>`;
   }).join("\n");
   const dynamicBodies = objects.map((object, index) => {
     assertSolid(object);
@@ -79,8 +107,8 @@ function sceneXml(
       <geom name="world-object-geom-${index}" type="box" size="${numbers(halfSize)}" mass="${Number(object.mass.toFixed(6))}" friction="0.8 0.01 0.001" rgba="0.64 0.44 0.23 1"/>
     </body>`;
   }).join("\n");
-  return `<mujoco model="g1_29dof world">
-  <include file="g1_29dof.xml"/>
+  return `<mujoco model="g1_43dof world">
+  <include file="g1_with_hands_physics.xml"/>
   <statistic center="0 0 0.7" extent="4"/>
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>

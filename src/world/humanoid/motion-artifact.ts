@@ -5,6 +5,12 @@ import {
   assertHumanoidReference,
   type HumanoidReference
 } from "./reference.js";
+import { G1HandArtifactCommandSchema } from "./hand-coordination.js";
+import { G1_HAND_JOINT_NAMES } from "./morphology.js";
+import {
+  HumanoidTaskSpaceServoDescriptorSchema,
+  HumanoidTaskSpaceServoTargetsSchema
+} from "./task-space-servo.js";
 
 const FiniteJointArraySchema = z.array(z.number().finite())
   .length(HUMANOID_JOINT_NAMES.length);
@@ -22,17 +28,43 @@ export const HumanoidReferenceStateSchema = z.object({
   rootPitch: z.number().finite()
 }).strict();
 
-export const HumanoidMotionArtifactSchema = z.object({
+const HumanoidMotionArtifactFrameV1Schema = z.object({
+  atSeconds: z.number().finite().positive(),
+  reference: HumanoidReferenceStateSchema,
+  taskSpaceTargets: HumanoidTaskSpaceServoTargetsSchema.optional()
+}).strict();
+
+const HumanoidMotionArtifactFrameV2Schema = z.object({
+  atSeconds: z.number().finite().positive(),
+  reference: HumanoidReferenceStateSchema,
+  handCommand: G1HandArtifactCommandSchema,
+  taskSpaceTargets: HumanoidTaskSpaceServoTargetsSchema.optional()
+}).strict();
+
+const HumanoidMotionArtifactV1Schema = z.object({
   version: z.literal(1),
   protocol: z.literal("humanoid-motion-v1"),
   generator: z.string().trim().min(1),
   controlStepSeconds: z.number().finite().positive(),
   durationSeconds: z.number().finite().positive(),
-  frames: z.array(z.object({
-    atSeconds: z.number().finite().positive(),
-    reference: HumanoidReferenceStateSchema
-  }).strict()).min(1)
-}).strict().superRefine((artifact, context) => {
+  taskSpaceServo: HumanoidTaskSpaceServoDescriptorSchema.optional(),
+  frames: z.array(HumanoidMotionArtifactFrameV1Schema).min(1)
+}).strict();
+
+const HumanoidMotionArtifactV2Schema = z.object({
+  version: z.literal(2),
+  protocol: z.literal("humanoid-motion-v2"),
+  generator: z.string().trim().min(1),
+  controlStepSeconds: z.number().finite().positive(),
+  durationSeconds: z.number().finite().positive(),
+  taskSpaceServo: HumanoidTaskSpaceServoDescriptorSchema.optional(),
+  frames: z.array(HumanoidMotionArtifactFrameV2Schema).min(1)
+}).strict();
+
+export const HumanoidMotionArtifactSchema = z.discriminatedUnion("version", [
+  HumanoidMotionArtifactV1Schema,
+  HumanoidMotionArtifactV2Schema
+]).superRefine((artifact, context) => {
   let previous = 0;
   for (let index = 0; index < artifact.frames.length; index += 1) {
     const atSeconds = artifact.frames[index]!.atSeconds;
@@ -53,10 +85,23 @@ export const HumanoidMotionArtifactSchema = z.object({
       message: "Humanoid motion artifact must end at its declared duration"
     });
   }
+  const hasServoTargets = artifact.frames.some(
+    (frame) => frame.taskSpaceTargets !== undefined
+  );
+  if (hasServoTargets !== (artifact.taskSpaceServo !== undefined)) {
+    context.addIssue({
+      code: "custom",
+      path: [hasServoTargets ? "taskSpaceServo" : "frames"],
+      message: hasServoTargets
+        ? "Task-space servo frames require an authority descriptor"
+        : "A task-space servo descriptor requires executable frame targets"
+    });
+  }
 });
 
 export type HumanoidReferenceState = z.infer<typeof HumanoidReferenceStateSchema>;
 export type HumanoidMotionArtifact = z.infer<typeof HumanoidMotionArtifactSchema>;
+export type HumanoidMotionArtifactFrame = HumanoidMotionArtifact["frames"][number];
 
 export function serializeHumanoidReference(
   reference: HumanoidReference
@@ -119,5 +164,19 @@ export function humanoidMotionArtifactSha256(
   artifact: HumanoidMotionArtifact
 ): string {
   const parsed = HumanoidMotionArtifactSchema.parse(artifact);
-  return createHash("sha256").update(JSON.stringify(parsed)).digest("hex");
+  const canonical = parsed.version === 1
+    ? parsed
+    : {
+        ...parsed,
+        frames: parsed.frames.map((frame) => ({
+          ...frame,
+          handCommand: {
+            coordination: frame.handCommand.coordination,
+            jointTargets: Object.fromEntries(G1_HAND_JOINT_NAMES.map((name) => (
+              [name, frame.handCommand.jointTargets[name]]
+            )))
+          }
+        }))
+      };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }

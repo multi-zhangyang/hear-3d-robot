@@ -2,10 +2,17 @@ import {
   HUMANOID_END_EFFECTORS,
   type JsonValue
 } from "../../domain/schema.js";
+import {
+  modelPayloadSha256,
+  type ModelDecisionRef
+} from "../../domain/model-call-authority.js";
+import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
+import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
 import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.js";
 import type { HumanoidBodyChannel } from "../../world/humanoid/motion-plan.js";
 import {
   type HumanoidFrameSink,
+  type HumanoidPersistenceSink,
   type HumanoidWorld,
   type HumanoidWorldObservation,
   type HumanoidWorldSnapshot
@@ -16,14 +23,45 @@ import {
 } from "./actions.js";
 import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
 import { normalizeHumanoidMotionCandidateBatchInput } from "./motion-candidate-input.js";
+import { BlockRemovalAuthorityError } from "./block-removal-authority.js";
 
 type HumanoidPlanningActionName = "plan_whole_body_motion"
   | "plan_whole_body_motion_candidates"
   | "plan_humanoid_navigation";
 
+type HumanoidPhysicalActionName = "execute_whole_body_motion"
+  | "execute_humanoid_navigation";
+
+export interface HumanoidPhysicalExecutionIntent {
+  transactionId: string;
+  agentId: string;
+  action: HumanoidPhysicalActionName;
+  fingerprint: string;
+  planningTransactionId: string;
+  planId: string;
+}
+
+export interface HumanoidActionToolCallAuthority {
+  tool_call_id: string;
+  tool_name: string;
+  arguments_sha256: string;
+}
+
+export interface HumanoidActionInvoker {
+  invoke(
+    name: HumanoidActionName,
+    rawInput: unknown,
+    transactionId: string,
+    agentId: string,
+    authority: HumanoidActionToolCallAuthority
+  ): Promise<HumanoidActionReceipt>;
+}
+
 export interface HumanoidActionReceipt {
   transactionId: string;
   agentId: string;
+  decision?: ModelDecisionRef | undefined;
+  cycle?: AutonomousCycleRef | undefined;
   action: HumanoidActionName;
   input: JsonValue;
   fingerprint: string;
@@ -39,38 +77,80 @@ export interface HumanoidActionReceipt {
 
 export interface HumanoidActionRuntimeOptions {
   frameSink?: HumanoidFrameSink;
+  physicalFrameSink?: HumanoidPersistenceSink;
   receiptSink?: (receipt: HumanoidActionReceipt) => void | Promise<void>;
+  beforePhysicalExecution?: (
+    intent: HumanoidPhysicalExecutionIntent
+  ) => void | Promise<void>;
+  receiptNormalizer?: (
+    receipt: HumanoidActionReceipt
+  ) => HumanoidActionReceipt | Promise<HumanoidActionReceipt>;
+  prepareBlockRemoval?: (input: {
+    transactionId: string;
+    agentId: string;
+    solidId: string;
+    executionTransactionId: string;
+  }) => ScenarioBlockRemovalTransaction | Promise<ScenarioBlockRemovalTransaction>;
   receipts?: Readonly<Record<string, HumanoidActionReceipt>>;
+  realtimeExecution?: boolean;
+  retainPhysicalTerminals?: boolean;
+  signal?: AbortSignal;
 }
 
 export class HumanoidActionRuntime {
   readonly #world: HumanoidWorld;
   readonly #frameSink: HumanoidFrameSink | undefined;
+  readonly #physicalFrameSink: HumanoidPersistenceSink | undefined;
   readonly #receiptSink: HumanoidActionRuntimeOptions["receiptSink"];
+  readonly #beforePhysicalExecution: HumanoidActionRuntimeOptions[
+    "beforePhysicalExecution"
+  ];
+  readonly #receiptNormalizer: HumanoidActionRuntimeOptions["receiptNormalizer"];
+  readonly #prepareBlockRemoval: HumanoidActionRuntimeOptions["prepareBlockRemoval"];
+  readonly #realtimeExecution: boolean;
+  readonly #retainPhysicalTerminals: boolean;
+  readonly #signal: AbortSignal | undefined;
   readonly #receipts = new Map<string, HumanoidActionReceipt>();
   readonly #transactions = new Map<string, {
     fingerprint: string;
+    decisionSha256: string | undefined;
     promise: Promise<HumanoidActionReceipt>;
   }>();
+  readonly #receiptCommits = new Map<string, Promise<void>>();
+  readonly #uncommittedReceiptIds = new Set<string>();
   readonly #planChannels = new Map<string, HumanoidBodyChannel[]>();
   readonly #inFlightTransactions = new Set<string>();
 
   constructor(world: HumanoidWorld, options: HumanoidActionRuntimeOptions = {}) {
     this.#world = world;
     this.#frameSink = options.frameSink;
+    this.#physicalFrameSink = options.physicalFrameSink;
     this.#receiptSink = options.receiptSink;
+    this.#beforePhysicalExecution = options.beforePhysicalExecution;
+    this.#receiptNormalizer = options.receiptNormalizer;
+    this.#prepareBlockRemoval = options.prepareBlockRemoval;
+    this.#realtimeExecution = options.realtimeExecution ?? false;
+    this.#retainPhysicalTerminals = options.retainPhysicalTerminals ?? false;
+    this.#signal = options.signal;
     for (const [transactionId, source] of Object.entries(options.receipts ?? {})) {
       const receipt = structuredClone(source);
       if (receipt.transactionId !== transactionId) {
         throw new Error(`Humanoid receipt identity mismatch: ${transactionId}`);
       }
-      const fingerprint = actionFingerprint(receipt.action, receipt.agentId, receipt.input);
+      const fingerprint = humanoidActionFingerprint(
+        receipt.action,
+        receipt.agentId,
+        receipt.input
+      );
       if (receipt.fingerprint !== fingerprint) {
         throw new Error(`Humanoid receipt fingerprint mismatch: ${transactionId}`);
       }
       this.#receipts.set(transactionId, receipt);
       this.#transactions.set(transactionId, {
         fingerprint,
+        decisionSha256: receipt.decision
+          ? modelPayloadSha256(receipt.decision)
+          : undefined,
         promise: Promise.resolve(receipt)
       });
       if (receipt.accepted
@@ -99,21 +179,32 @@ export class HumanoidActionRuntime {
     name: HumanoidActionName,
     rawInput: unknown,
     transactionId: string,
-    agentId: string
+    agentId: string,
+    decision?: ModelDecisionRef
   ): Promise<HumanoidActionReceipt> {
     const normalizedTransactionId = transactionId.trim();
     const normalizedAgentId = agentId.trim();
     if (!normalizedTransactionId) throw new Error("Humanoid action transaction id is required");
     if (!normalizedAgentId) throw new Error("Humanoid action agent id is required");
-    const fingerprint = actionFingerprint(name, normalizedAgentId, rawInput);
+    const fingerprint = humanoidActionFingerprint(name, normalizedAgentId, rawInput);
+    const decisionSha256 = decision ? modelPayloadSha256(decision) : undefined;
     const existing = this.#transactions.get(normalizedTransactionId);
     if (existing) {
-      if (existing.fingerprint !== fingerprint) {
+      if (existing.fingerprint !== fingerprint
+        || existing.decisionSha256 !== decisionSha256) {
         throw new Error(
           `Humanoid action transaction conflict: ${normalizedTransactionId}`
         );
       }
-      return structuredClone(await existing.promise);
+      const receipt = await existing.promise;
+      await this.#ensureReceiptCommitted(receipt);
+      return structuredClone(receipt);
+    }
+    const unresolved = this.#uncommittedReceiptIds.values().next().value;
+    if (unresolved !== undefined) {
+      throw new Error(
+        `Humanoid action commit is unresolved; retry transaction ${unresolved} before executing another action`
+      );
     }
     this.#inFlightTransactions.add(normalizedTransactionId);
     const promise = this.#invokeOnce(
@@ -121,11 +212,18 @@ export class HumanoidActionRuntime {
       rawInput,
       normalizedTransactionId,
       normalizedAgentId,
-      fingerprint
+      fingerprint,
+      decision
     );
-    this.#transactions.set(normalizedTransactionId, { fingerprint, promise });
+    this.#transactions.set(normalizedTransactionId, {
+      fingerprint,
+      decisionSha256,
+      promise
+    });
     try {
-      return structuredClone(await promise);
+      const receipt = await promise;
+      await this.#ensureReceiptCommitted(receipt);
+      return structuredClone(receipt);
     } catch (error) {
       if (!this.#receipts.has(normalizedTransactionId)) {
         this.#transactions.delete(normalizedTransactionId);
@@ -148,6 +246,9 @@ export class HumanoidActionRuntime {
         && activePlanIds.has(planId)) {
         protectedTransactions.add(transactionId);
       }
+    }
+    for (const transactionId of this.#uncommittedReceiptIds) {
+      protectedTransactions.add(transactionId);
     }
     const recentTransactions = new Set(
       [...this.#receipts.keys()].slice(-MAX_CHECKPOINT_ACTION_RECEIPTS)
@@ -174,39 +275,75 @@ export class HumanoidActionRuntime {
     rawInput: unknown,
     transactionId: string,
     agentId: string,
-    fingerprint: string
+    fingerprint: string,
+    decision: ModelDecisionRef | undefined
   ): Promise<HumanoidActionReceipt> {
     const before = this.#world.snapshot();
-    const result = await this.#execute(name, rawInput);
-    const after = this.#world.snapshot();
-    const receipt: HumanoidActionReceipt = {
+    const result = await this.#execute(name, rawInput, {
       transactionId,
       agentId,
+      fingerprint
+    });
+    const after = this.#world.snapshot();
+    const baseReceipt: HumanoidActionReceipt = {
+      transactionId,
+      agentId,
+      ...(decision ? { decision: structuredClone(decision) } : {}),
       action: name,
       input: jsonValue(rawInput),
       fingerprint,
       accepted: result.accepted,
       code: result.code,
       worldBeforeRevision: before.worldRevision,
-      worldAfterRevision: after.worldRevision,
-      frameCount: after.frame - before.frame,
+      worldAfterRevision: result.causalWorldAfterRevision
+        ?? after.worldRevision,
+      frameCount: result.causalFrameCount ?? 0,
       channels: result.channels,
       detail: jsonValue(result.detail),
       committedAt: new Date().toISOString()
     };
+    const receipt = this.#receiptNormalizer
+      ? await this.#receiptNormalizer(structuredClone(baseReceipt))
+      : baseReceipt;
+    assertNormalizedReceiptIdentity(baseReceipt, receipt);
     this.#receipts.set(transactionId, receipt);
-    await this.#receiptSink?.(structuredClone(receipt));
+    if (this.#receiptSink) this.#uncommittedReceiptIds.add(transactionId);
     return structuredClone(receipt);
+  }
+
+  async #ensureReceiptCommitted(receipt: HumanoidActionReceipt): Promise<void> {
+    const receiptSink = this.#receiptSink;
+    if (!receiptSink || !this.#uncommittedReceiptIds.has(receipt.transactionId)) return;
+    let commit = this.#receiptCommits.get(receipt.transactionId);
+    if (!commit) {
+      commit = Promise.resolve()
+        .then(() => receiptSink(structuredClone(receipt)))
+        .then(() => {
+          this.#uncommittedReceiptIds.delete(receipt.transactionId);
+        })
+        .finally(() => {
+          this.#receiptCommits.delete(receipt.transactionId);
+        });
+      this.#receiptCommits.set(receipt.transactionId, commit);
+    }
+    await commit;
   }
 
   async #execute(
     name: HumanoidActionName,
-    rawInput: unknown
+    rawInput: unknown,
+    invocation: {
+      transactionId: string;
+      agentId: string;
+      fingerprint: string;
+    }
   ): Promise<{
     accepted: boolean;
     code: string;
     channels: HumanoidBodyChannel[];
     detail: unknown;
+    causalFrameCount?: number;
+    causalWorldAfterRevision?: number;
   }> {
     if (name === "observe_humanoid") {
       HumanoidActionInputs.observe_humanoid.parse(rawInput);
@@ -228,6 +365,8 @@ export class HumanoidActionRuntime {
         detail: {
           plan_id: result.planId,
           created_revision: result.createdRevision,
+          expires_revision: result.expiresRevision,
+          intent_sha256: result.intentSha256,
           motion: result.motion,
           validation: {
             feasible: result.validation.feasible,
@@ -254,6 +393,8 @@ export class HumanoidActionRuntime {
           plan_id: result.planId,
           objective: batch.objective,
           created_revision: result.createdRevision,
+          expires_revision: result.expiresRevision,
+          intent_sha256: result.intentSha256,
           selection: result.selection,
           selected_candidate_id: result.selectedCandidateId,
           selected_rank: result.selectedRank,
@@ -265,6 +406,7 @@ export class HumanoidActionRuntime {
             rank: candidate.rank,
             plan_id: candidate.planId,
             intent: candidate.intent,
+            intent_sha256: candidate.intentSha256,
             selected: candidate.planId === result.selectedCandidateId,
             channels: candidate.channels,
             motion: candidate.motion,
@@ -303,18 +445,42 @@ export class HumanoidActionRuntime {
           }
         };
       }
-      const result = await this.#world.executeWholeBodyMotion(reference.planId, this.#frameSink);
-      this.#planChannels.delete(reference.planId);
+      await this.#beforePhysicalExecution?.({
+        transactionId: invocation.transactionId,
+        agentId: invocation.agentId,
+        action: name,
+        fingerprint: invocation.fingerprint,
+        planningTransactionId: input.planning_transaction_id,
+        planId: reference.planId
+      });
+      const result = await this.#world.executeWholeBodyMotion(
+        reference.planId,
+        this.#frameSink,
+        {
+          realtime: this.#realtimeExecution,
+          retainTerminal: this.#retainPhysicalTerminals,
+          ...(this.#physicalFrameSink
+            ? { persistenceSink: this.#physicalFrameSink }
+            : {}),
+          ...(this.#signal ? { signal: this.#signal } : {})
+        }
+      );
+      if (!this.#retainPhysicalTerminals) this.#planChannels.delete(reference.planId);
       return {
         accepted: result.accepted,
         code: result.code,
         channels,
+        causalFrameCount: result.frames,
+        causalWorldAfterRevision: result.finalSnapshot.worldRevision,
         detail: {
           planning_transaction_id: input.planning_transaction_id,
           planning_action: reference.planningAction,
           ...reference.candidateSelection,
           plan_id: reference.planId,
           frames: result.frames,
+          ...(result.terminalResultSha256
+            ? { terminal_result_sha256: result.terminalResultSha256 }
+            : {}),
           result: result.detail,
           final: conciseRobot(result.finalSnapshot.robot)
         }
@@ -331,14 +497,55 @@ export class HumanoidActionRuntime {
         detail: {
           plan_id: result.planId,
           created_revision: result.createdRevision,
+          expires_revision: result.expiresRevision,
+          intent_sha256: result.intentSha256,
           target: result.target,
           chunk_target: result.chunkTarget,
           waypoints: result.waypoints,
           distance: result.distance,
           remaining_distance: result.remainingDistance,
+          carry: result.carry,
           ...(result.reason ? { reason: result.reason } : {})
         }
       };
+    }
+    if (name === "remove_world_block") {
+      const input = HumanoidActionInputs.remove_world_block.parse(rawInput);
+      if (!this.#prepareBlockRemoval) {
+        throw new Error("Block-removal authority is unavailable");
+      }
+      try {
+        const transaction = await this.#prepareBlockRemoval({
+          transactionId: invocation.transactionId,
+          agentId: invocation.agentId,
+          solidId: input.solid_id,
+          executionTransactionId: input.execution_transaction_id
+        });
+        return {
+          accepted: true,
+          code: "world_block_removal_authorized",
+          channels: [],
+          detail: {
+            solid_id: input.solid_id,
+            execution_transaction_id: input.execution_transaction_id,
+            automatic_actuation: false,
+            removal_transaction: transaction
+          }
+        };
+      } catch (error) {
+        if (!(error instanceof BlockRemovalAuthorityError)) throw error;
+        return {
+          accepted: false,
+          code: error.code,
+          channels: [],
+          detail: {
+            solid_id: input.solid_id,
+            execution_transaction_id: input.execution_transaction_id,
+            automatic_actuation: false,
+            reason: error.message
+          }
+        };
+      }
     }
     const input = HumanoidActionInputs.execute_humanoid_navigation.parse(rawInput);
     const reference = this.#planningReference(
@@ -361,17 +568,41 @@ export class HumanoidActionRuntime {
         }
       };
     }
-    const result = await this.#world.executeNavigation(reference.planId, this.#frameSink);
-    this.#planChannels.delete(reference.planId);
+    await this.#beforePhysicalExecution?.({
+      transactionId: invocation.transactionId,
+      agentId: invocation.agentId,
+      action: name,
+      fingerprint: invocation.fingerprint,
+      planningTransactionId: input.planning_transaction_id,
+      planId: reference.planId
+    });
+    const result = await this.#world.executeNavigation(
+      reference.planId,
+      this.#frameSink,
+      {
+        realtime: this.#realtimeExecution,
+        retainTerminal: this.#retainPhysicalTerminals,
+        ...(this.#physicalFrameSink
+          ? { persistenceSink: this.#physicalFrameSink }
+          : {}),
+        ...(this.#signal ? { signal: this.#signal } : {})
+      }
+    );
+    if (!this.#retainPhysicalTerminals) this.#planChannels.delete(reference.planId);
     return {
       accepted: result.accepted,
       code: result.code,
       channels: ["locomotion"],
+      causalFrameCount: result.frames,
+      causalWorldAfterRevision: result.finalSnapshot.worldRevision,
       detail: {
         planning_transaction_id: input.planning_transaction_id,
         planning_action: reference.planningAction,
         plan_id: reference.planId,
         frames: result.frames,
+        ...(result.terminalResultSha256
+          ? { terminal_result_sha256: result.terminalResultSha256 }
+          : {}),
         result: result.detail,
         final: conciseRobot(result.finalSnapshot.robot)
       }
@@ -471,6 +702,18 @@ function planIdFromReceipt(receipt: HumanoidActionReceipt): string | undefined {
 
 function modelObservation(snapshot: HumanoidWorldObservation): unknown {
   const robot = snapshot.robot;
+  const embodiedObjectIds = new Set([
+    ...snapshot.objectTokens.flatMap((token) => (
+      token.status === "visible" && token.observable
+        ? [token.id]
+        : []
+    )),
+    ...snapshot.grasp.assessments.flatMap((assessment) => (
+      assessment.evidence.contact.status === "missing"
+        ? []
+        : [assessment.object_id]
+    ))
+  ]);
   return {
     frame: snapshot.frame,
     world_revision: snapshot.worldRevision,
@@ -540,11 +783,32 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
         distance_to_left_wrist: token.relation.distanceToLeftWrist,
         distance_to_right_wrist: token.relation.distanceToRightWrist
       },
-      current_contacts: token.currentContacts.map((contact) => ({
-        body: contact.body,
-        normal_force: contact.normalForce
-      }))
+      current_contacts: token.currentContacts.map((contact) => (
+        "body" in contact
+          ? {
+              body: contact.body,
+              normal_force: contact.normalForce
+            }
+          : {
+              hand_surface: contact.handSurface,
+              normal_force: contact.normalForce
+            }
+      ))
     })),
+    solid_tokens: snapshot.solidTokens.map((token) => ({
+      id: token.id,
+      source_id: token.sourceId,
+      kind: token.kind,
+      center: token.center,
+      size: token.size,
+      current_contacts: token.currentContacts
+    })),
+    grasp: {
+      contractSha256: snapshot.grasp.contractSha256,
+      assessments: snapshot.grasp.assessments.filter((assessment) => (
+        embodiedObjectIds.has(assessment.object_id)
+      ))
+    },
     contacts: robot.contacts,
     navigation: snapshot.navigation
   };
@@ -605,12 +869,27 @@ function rejectedPlanningReference(
   };
 }
 
-function actionFingerprint(
+export function humanoidActionFingerprint(
   action: HumanoidActionName,
   agentId: string,
   input: unknown
 ): string {
   return `${action}\n${agentId}\n${stableJson(input)}`;
+}
+
+function assertNormalizedReceiptIdentity(
+  source: HumanoidActionReceipt,
+  normalized: HumanoidActionReceipt
+): void {
+  if (normalized.transactionId !== source.transactionId
+    || normalized.agentId !== source.agentId
+    || normalized.action !== source.action
+    || normalized.fingerprint !== source.fingerprint
+    || stableJson(normalized.input) !== stableJson(source.input)) {
+    throw new Error(
+      `Humanoid receipt normalizer changed action identity: ${source.transactionId}`
+    );
+  }
 }
 
 function stableJson(value: unknown): string {
