@@ -103,6 +103,7 @@ export function createHumanoidContextAnchor(input: {
         feet: input.world.robot.feet,
         navigation: input.world.navigation
       },
+      interaction: input.observation.interaction,
       goal_state: checker,
       recent_physical_episodes: recentEmbodiedEpisodes(
         input.checkpoint.embodied_memory

@@ -71,11 +71,29 @@ const RunDefinitionSchema = z.object({
   created_at: z.string().datetime()
 });
 const AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const AgentStateEnvelopeSchema = z.object({
+const AgentSessionStateIdentitySchema = z.object({
+  item_count: z.number().int().nonnegative(),
+  items_sha256: z.string().regex(/^[a-f0-9]{64}$/)
+}).strict();
+const AgentSessionStateBaselineSchema = z.record(
+  z.string().regex(AGENT_ID_PATTERN),
+  AgentSessionStateIdentitySchema
+);
+const AgentStateEnvelopeV1Schema = z.object({
   version: z.literal(1),
   checkpoint_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   state: z.string().min(1)
 }).strict();
+const AgentStateEnvelopeV2Schema = z.object({
+  version: z.literal(2),
+  checkpoint_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  session_baseline: AgentSessionStateBaselineSchema,
+  state: z.string().min(1)
+}).strict();
+const AgentStateEnvelopeSchema = z.union([
+  AgentStateEnvelopeV2Schema,
+  AgentStateEnvelopeV1Schema
+]);
 
 export type RunDefinition = z.infer<typeof RunDefinitionSchema>;
 
@@ -115,7 +133,12 @@ export interface RunStoreOptions {
 export interface AgentStateRecord {
   state: string;
   checkpointFingerprint?: string;
+  sessionBaseline?: AgentSessionStateBaseline;
 }
+
+export type AgentSessionStateBaseline = z.infer<
+  typeof AgentSessionStateBaselineSchema
+>;
 
 export interface DurableRuntimeEventRecord {
   event_id: string;
@@ -370,14 +393,28 @@ export class RunStore {
     await this.#scanJournal(name, visit);
   }
 
-  async writeAgentState(state: string, checkpointFingerprint?: string): Promise<void> {
+  async writeAgentState(
+    state: string,
+    checkpointFingerprint?: string,
+    sessionBaseline?: AgentSessionStateBaseline
+  ): Promise<void> {
+    if (sessionBaseline !== undefined && checkpointFingerprint === undefined) {
+      throw new Error("Agent Session baseline requires a checkpoint fingerprint");
+    }
     const persisted = checkpointFingerprint === undefined
       ? state
-      : JSON.stringify(AgentStateEnvelopeSchema.parse({
-          version: 1,
-          checkpoint_fingerprint: checkpointFingerprint,
-          state
-        }));
+      : JSON.stringify(sessionBaseline === undefined
+          ? AgentStateEnvelopeV1Schema.parse({
+              version: 1,
+              checkpoint_fingerprint: checkpointFingerprint,
+              state
+            })
+          : AgentStateEnvelopeV2Schema.parse({
+              version: 2,
+              checkpoint_fingerprint: checkpointFingerprint,
+              session_baseline: sessionBaseline,
+              state
+            }));
     await this.#runMutation(
       () => atomicText(resolve(this.runDir, "agent-state.json"), persisted)
     );
@@ -395,7 +432,10 @@ export class RunStore {
         if (envelope.success) {
           return {
             state: envelope.data.state,
-            checkpointFingerprint: envelope.data.checkpoint_fingerprint
+            checkpointFingerprint: envelope.data.checkpoint_fingerprint,
+            ...(envelope.data.version === 2
+              ? { sessionBaseline: envelope.data.session_baseline }
+              : {})
           };
         }
       } catch {

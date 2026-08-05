@@ -147,6 +147,7 @@ import {
   visibleHumanoidSolidTokens
 } from "./solid-observation.js";
 import { humanoidDynamicNavigationObstacles } from "./navigation-obstacles.js";
+import { createHumanoidInteractionObservation } from "./interaction-observation.js";
 
 export type {
   HumanoidExecutionReceipt,
@@ -341,6 +342,11 @@ export class HumanoidWorld {
     const snapshot = this.snapshot();
     const sensed = this.#refreshCurrentObjectMemory();
     const sensedSolids = this.#simulation.senseSolids(this.#scenario.visibility_radius);
+    const objectTokens = this.#objectMemory.tokens(
+      snapshot.robot,
+      snapshot.frame,
+      snapshot.worldRevision
+    );
     const { objects: _objects, ...robot } = snapshot.robot;
     return {
       frame: snapshot.frame,
@@ -348,17 +354,23 @@ export class HumanoidWorld {
       motionGenerator: structuredClone(snapshot.motionGenerator),
       sensor: sensed.sensor,
       robot,
-      objectTokens: this.#objectMemory.tokens(
-        snapshot.robot,
-        snapshot.frame,
-        snapshot.worldRevision
-      ),
+      objectTokens,
       solidTokens: visibleHumanoidSolidTokens({
         scenario: this.#scenario,
         sensed: sensedSolids,
         contacts: snapshot.robot.contacts
       }),
       grasp: structuredClone(snapshot.grasp),
+      interaction: createHumanoidInteractionObservation({
+        frame: snapshot.frame,
+        worldRevision: snapshot.worldRevision,
+        scenario: this.#scenario,
+        robot: snapshot.robot,
+        objectTokens,
+        grasp: snapshot.grasp,
+        graspContract: this.#graspRegistry.contract,
+        carried: this.#requiredCarriedObjectLifecycle().checkpoint()
+      }),
       navigation: structuredClone(snapshot.navigation)
     };
   }

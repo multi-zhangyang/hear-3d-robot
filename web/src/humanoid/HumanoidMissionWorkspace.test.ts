@@ -7,6 +7,7 @@ import {
   HUMANOID_BODY_CHANNELS,
   HumanoidMissionWorkspace,
   activeHumanoidGrasps,
+  humanoidManipulationTelemetry,
   movingHumanoidChannels
 } from "./HumanoidMissionWorkspace";
 
@@ -93,6 +94,58 @@ describe("人形身体通道", () => {
     expect(html).toContain("已抓稳 · 接触 8 帧 · 抬离 6 帧");
     expect(html).toContain("抓取保持进度");
     expect(html).toContain(">8/6<");
+  });
+
+  it("以当前物理证据呈现全身交互闭环", () => {
+    const world = worldSnapshot();
+    world.robot.objects["test-crate"] = {
+      id: "test-crate",
+      position: { x: 0.3, y: 0.2, z: 0.4 },
+      rotation: { x: 0, y: 0, z: 0, w: 1 },
+      linearVelocity: { x: 0, y: 0, z: 0 },
+      angularVelocity: { x: 0, y: 0, z: 0 }
+    };
+    world.grasp.assessments = [graspAssessment(0, true)];
+    const details = runDetails(world);
+    details.checkpoint.version = 5;
+    details.checkpoint.goal = {
+      summary: "稳放箱体",
+      predicates: [{
+        type: "object_placed",
+        object_id: "test-crate",
+        zone_id: "arrival",
+        tolerance: 0.05
+      }]
+    };
+    details.checkpoint.checker = {
+      success: false,
+      checks: [{ name: "1:object_placed", passed: false, actual: {} }]
+    } as HumanoidRunDetails["checkpoint"]["checker"];
+
+    expect(humanoidManipulationTelemetry(
+      world,
+      details.checkpoint.goal,
+      details.checkpoint.checker
+    )).toEqual({
+      objectId: "test-crate",
+      present: true,
+      contact: true,
+      grasped: true,
+      placed: false
+    });
+
+    const frameBuffer = new HumanoidFrameBuffer();
+    frameBuffer.reset(world);
+    const html = renderToStaticMarkup(createElement(HumanoidMissionWorkspace, {
+      details,
+      frameBuffer,
+      streamState: "connected"
+    }));
+    expect(html).toContain("实时全身交互闭环");
+    expect(html).toContain("全身交互");
+    expect(html).toContain("目标");
+    expect(html).toContain("持握");
+    expect(html).toContain("落位");
   });
 });
 

@@ -27,7 +27,19 @@ describe("RunStore journal windows", () => {
       state: "enveloped-state",
       checkpointFingerprint: fingerprint
     });
-    expect(await store.readAgentState()).toBe("enveloped-state");
+    const sessionBaseline = {
+      "humanoid-coordinator": {
+        item_count: 3,
+        items_sha256: "b".repeat(64)
+      }
+    };
+    await store.writeAgentState("aligned-state", fingerprint, sessionBaseline);
+    expect(await store.readAgentStateRecord()).toEqual({
+      state: "aligned-state",
+      checkpointFingerprint: fingerprint,
+      sessionBaseline
+    });
+    expect(await store.readAgentState()).toBe("aligned-state");
     await store.clearAgentState();
     expect(await store.readAgentState()).toBeUndefined();
     await store.clearAgentState();

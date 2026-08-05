@@ -75,10 +75,21 @@ describe("humanoid agent hierarchy", () => {
         observation: {
           zone_ids: ["courtyard_beacon"],
           visible_object_ids: ["courtyard_crate"],
+          objects: [
+            { id: "courtyard_crate", portable: true },
+            { id: "fixed-bench", portable: false }
+          ],
           solids: [
             { id: "stone_column", kind: "block" },
             { id: "wall", kind: "wall" }
           ]
+        }
+      },
+      interaction: {
+        carrying: {
+          phase: "carrying",
+          bindings: [{ object_id: "courtyard_crate", hand: "left" }],
+          continuation_verified: true
         }
       }
     });
@@ -91,7 +102,11 @@ describe("humanoid agent hierarchy", () => {
       `"candidate_sequence":7,"proposal_id":"mission-navigation","candidate_id":"${candidateId}"`
     );
     expect(rendered).toContain(
-      '"visible_object_ids":["courtyard_crate"],"removable_block_ids":["stone_column"]'
+      '"visible_object_ids":["courtyard_crate"],"portable_object_ids":["courtyard_crate"],"removable_block_ids":["stone_column"]'
+    );
+    expect(rendered).toContain('"predicate_types":["robot_at","robot_in_zone"');
+    expect(rendered).toContain(
+      '"carrying":{"phase":"carrying","object_ids":["courtyard_crate"],"continuation_verified":true}'
     );
     expect(rendered).toContain("候选提交和选择会由 Harness 绑定本次证据");
   });
@@ -295,10 +310,13 @@ describe("humanoid agent hierarchy", () => {
     executorDelegationAvailable = true;
     expect(await enabled("delegate_physics_executor")).toBe(true);
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "object_in_zone、not grasp_verified 与 object_settled_on_support"
+      "object_in_zone、object_released 与 object_settled_on_support"
     ));
     expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
       "不得改 tolerance、删减谓词或拼接额外条件"
+    ));
+    expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
+      "一个 active Goal 可以跨越多次观察、规划、抓取、导航和执行周期"
     ));
     expect(hierarchy.executor.instructions).toEqual(expect.stringContaining(
       "plan_humanoid_navigation 调用 execute_humanoid_navigation"

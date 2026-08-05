@@ -224,6 +224,10 @@ export class HumanoidWorldScene {
         object.rotation.z,
         object.rotation.w
       );
+      updateObjectInteractionMaterial(
+        visual.mesh,
+        humanoidObjectInteractionState(snapshot, id)
+      );
       if (activeChunk.id !== visual.chunkId) {
         const group = this.#chunkGroups.get(activeChunk.id);
         if (!group) throw new Error(`Missing visual group for ${activeChunk.id}`);
@@ -369,6 +373,41 @@ function objectMesh(object: ScenarioVisualObject): THREE.Mesh {
     })
   ));
   return mesh;
+}
+
+export type HumanoidObjectInteractionState = "idle" | "contact" | "verified";
+
+export function humanoidObjectInteractionState(
+  snapshot: HumanoidWorldSnapshot,
+  objectId: string
+): HumanoidObjectInteractionState {
+  const assessments = snapshot.grasp?.assessments?.filter((assessment) => (
+    assessment.frame === snapshot.frame && assessment.object_id === objectId
+  )) ?? [];
+  if (assessments.some((assessment) => assessment.grasp_verified)) return "verified";
+  return assessments.some((assessment) => assessment.evidence.contact.status !== "missing")
+    ? "contact"
+    : "idle";
+}
+
+function updateObjectInteractionMaterial(
+  mesh: THREE.Mesh,
+  state: HumanoidObjectInteractionState
+): void {
+  const material = mesh.material;
+  if (!(material instanceof THREE.MeshStandardMaterial)) return;
+  if (state === "verified") {
+    material.emissive.setHex(0x42d9b8);
+    material.emissiveIntensity = 0.8;
+    return;
+  }
+  if (state === "contact") {
+    material.emissive.setHex(0xd9ad50);
+    material.emissiveIntensity = 0.55;
+    return;
+  }
+  material.emissive.setHex(0x000000);
+  material.emissiveIntensity = 0;
 }
 
 function blockColor(id: string): number {

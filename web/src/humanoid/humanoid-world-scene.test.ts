@@ -6,7 +6,10 @@ import type {
   ScenarioDefinition
 } from "../types";
 import type { G1Rig } from "./g1-rig";
-import { HumanoidWorldScene } from "./humanoid-world-scene";
+import {
+  HumanoidWorldScene,
+  humanoidObjectInteractionState
+} from "./humanoid-world-scene";
 
 describe("HumanoidWorldScene chunk residency", () => {
   it("creates only nearby chunk meshes and releases them after migration", () => {
@@ -33,6 +36,26 @@ describe("HumanoidWorldScene chunk residency", () => {
     expect(world.root.getObjectByName("placed_step")).toBeDefined();
 
     world.dispose();
+  });
+
+  it("derives object highlighting only from current physical grasp evidence", () => {
+    const snapshot = snapshotAt(2);
+    snapshot.frame = 9;
+    snapshot.grasp = {
+      contractSha256: "a".repeat(64),
+      assessments: [{
+        frame: 9,
+        object_id: "moving_object",
+        hand: "left",
+        grasp_verified: false,
+        evidence: { contact: { status: "opposed" } }
+      }] as HumanoidWorldSnapshot["grasp"]["assessments"]
+    };
+    expect(humanoidObjectInteractionState(snapshot, "moving_object")).toBe("contact");
+    snapshot.grasp.assessments[0]!.grasp_verified = true;
+    expect(humanoidObjectInteractionState(snapshot, "moving_object")).toBe("verified");
+    snapshot.grasp.assessments[0]!.frame = 8;
+    expect(humanoidObjectInteractionState(snapshot, "moving_object")).toBe("idle");
   });
 });
 

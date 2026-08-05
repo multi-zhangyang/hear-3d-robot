@@ -11,12 +11,18 @@ on:
         options:
           - mission
           - autonomy
+          - manipulation
           - endurance
           - all
       scenario:
         description: Scenario identifier
         required: true
         default: humanoid_courtyard
+        type: string
+      manipulation_scenario:
+        description: Authored object-manipulation scenario identifier
+        required: true
+        default: humanoid_workyard
         type: string
       seed:
         description: Optional unsigned world seed
@@ -55,6 +61,7 @@ jobs:
       AI_MAX_OUTPUT_TOKENS: ${{ vars.HEAR_LIVE_AI_MAX_OUTPUT_TOKENS }}
       AI_COMPACT_TRIGGER_TOKENS: ${{ vars.HEAR_LIVE_AI_COMPACT_TRIGGER_TOKENS }}
       HEAR_LIVE_SCENARIO: ${{ inputs.scenario }}
+      HEAR_LIVE_MANIPULATION_SCENARIO: ${{ inputs.manipulation_scenario }}
       HEAR_LIVE_SEED: ${{ inputs.seed }}
       HEAR_LIVE_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
       HEAR_LIVE_RUN_COUNT: ${{ inputs.run_count }}
@@ -85,12 +92,16 @@ jobs:
             autonomy)
               HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/autonomy.json" pnpm run test:live:autonomy
               ;;
+            manipulation)
+              HEAR_LIVE_SCENARIO="$HEAR_LIVE_MANIPULATION_SCENARIO" HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/manipulation.json" pnpm run test:live:manipulation
+              ;;
             endurance)
               HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/endurance.json" pnpm run test:live:endurance
               ;;
             all)
               HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/mission.json" pnpm run test:live:mission
               HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/autonomy.json" pnpm run test:live:autonomy
+              HEAR_LIVE_SCENARIO="$HEAR_LIVE_MANIPULATION_SCENARIO" HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/manipulation.json" pnpm run test:live:manipulation
               HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/endurance.json" pnpm run test:live:endurance
               ;;
           esac

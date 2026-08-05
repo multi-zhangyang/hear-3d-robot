@@ -15,6 +15,7 @@ import {
   quaternionAngularDistance
 } from "../world/geometry.js";
 import { assessHumanoidObjectSettledOnSupport } from "../world/humanoid/object-settled-support.js";
+import { humanoidObjectInsideZone } from "../world/humanoid/object-zone-relation.js";
 import type { HumanoidWorldSnapshot } from "../world/humanoid/world.js";
 import { GoalValidationError } from "./goal-validation.js";
 
@@ -263,7 +264,15 @@ function evaluatePredicates(
       const descriptor = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
       const zone = scenario.zones.find((candidate) => candidate.id === predicate.zone_id);
       const inside = object !== undefined && descriptor !== undefined && zone !== undefined
-        && objectInsideZone(object.position, descriptor.size, zone, predicate.tolerance);
+        && humanoidObjectInsideZone({
+          object: {
+            position: object.position,
+            rotation: object.rotation,
+            size: descriptor.size
+          },
+          zone,
+          tolerance: predicate.tolerance
+        });
       return evaluation(
         name,
         object !== undefined && zone !== undefined && inside === predicate.expected,
@@ -285,7 +294,15 @@ function evaluatePredicates(
       const descriptor = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
       const zone = scenario.zones.find((candidate) => candidate.id === predicate.zone_id);
       const inside = object !== undefined && descriptor !== undefined && zone !== undefined
-        && objectInsideZone(object.position, descriptor.size, zone, predicate.tolerance);
+        && humanoidObjectInsideZone({
+          object: {
+            position: object.position,
+            rotation: object.rotation,
+            size: descriptor.size
+          },
+          zone,
+          tolerance: predicate.tolerance
+        });
       const currentAssessments = world.grasp.assessments.filter((assessment) => (
         assessment.frame === world.frame
           && assessment.object_id === predicate.object_id
@@ -444,21 +461,6 @@ function check(name: string, passed: boolean, actual: unknown): {
   actual: JsonValue;
 } {
   return { name, passed, actual: json(actual) };
-}
-
-function objectInsideZone(
-  position: { x: number; y: number; z: number },
-  size: { x: number; y: number; z: number },
-  zone: Scenario["zones"][number],
-  tolerance: number
-): boolean {
-  const bottom = position.y - size.y / 2;
-  const surface = zone.center.y + zone.size.y / 2;
-  return Math.abs(position.x - zone.center.x) + size.x / 2
-      <= zone.size.x / 2 + tolerance
-    && Math.abs(position.z - zone.center.z) + size.z / 2
-      <= zone.size.z / 2 + tolerance
-    && Math.abs(bottom - surface) <= Math.max(tolerance, 0.025);
 }
 
 function planarDistance(

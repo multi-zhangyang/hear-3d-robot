@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { Session, AgentInputItem } from "@openai/agents";
 import { writeTextAtomically } from "./atomic-file.js";
@@ -12,12 +13,18 @@ interface SessionData {
   items: AgentInputItem[];
 }
 
+export interface FileSessionItemsIdentity {
+  itemCount: number;
+  itemsSha256: string;
+}
+
 export class FileSession implements Session {
   readonly #path: string;
   readonly #sessionId: string;
   readonly #mutationFence: MutationFence | undefined;
   #pending: Promise<void> = Promise.resolve();
   #cache: SessionData | undefined;
+  #itemsIdentity: FileSessionItemsIdentity | undefined;
 
   constructor(path: string, sessionId: string, mutationFence?: MutationFence) {
     this.#path = path;
@@ -30,10 +37,24 @@ export class FileSession implements Session {
   }
 
   async getItems(limit?: number): Promise<AgentInputItem[]> {
-    await this.#pending;
-    const items = (await this.#read()).items;
-    const selected = limit === undefined ? items : items.slice(-limit);
-    return structuredClone(selected);
+    return this.#serialize(async () => {
+      const items = (await this.#read()).items;
+      const selected = limit === undefined ? items : items.slice(-limit);
+      return structuredClone(selected);
+    });
+  }
+
+  /** Returns a cached content identity without cloning a long Session history. */
+  async getItemsIdentity(): Promise<FileSessionItemsIdentity> {
+    return this.#serialize(async () => {
+      if (this.#itemsIdentity) return { ...this.#itemsIdentity };
+      const items = (await this.#read()).items;
+      this.#itemsIdentity = {
+        itemCount: items.length,
+        itemsSha256: createHash("sha256").update(canonicalJson(items)).digest("hex")
+      };
+      return { ...this.#itemsIdentity };
+    });
   }
 
   async addItems(items: AgentInputItem[]): Promise<void> {
@@ -68,9 +89,13 @@ export class FileSession implements Session {
   }
 
   async #mutate(operation: () => Promise<void>): Promise<void> {
+    await this.#serialize(operation);
+  }
+
+  async #serialize<T>(operation: () => Promise<T>): Promise<T> {
     const current = this.#pending.then(operation);
-    this.#pending = current.catch(() => undefined);
-    await current;
+    this.#pending = current.then(() => undefined, () => undefined);
+    return current;
   }
 
   async #read(): Promise<SessionData> {
@@ -95,11 +120,13 @@ export class FileSession implements Session {
         () => writeTextAtomically(this.#path, `${JSON.stringify(data)}\n`)
       );
       this.#cache = structuredClone(data);
+      this.#itemsIdentity = undefined;
     } catch (error) {
       // A durability error may be reported after rename has already published
       // the new file. Drop the in-memory view so a later retry cannot overwrite
       // that visible state from a stale cache.
       this.#cache = undefined;
+      this.#itemsIdentity = undefined;
       throw error;
     }
   }
@@ -107,6 +134,21 @@ export class FileSession implements Session {
   #empty(): SessionData {
     return { version: 1, session_id: this.#sessionId, items: [] };
   }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "null";
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.entries(value)
+    .sort(([left], [right]) => compareCodePoints(left, right))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+    .join(",")}}`;
+}
+
+function compareCodePoints(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isMissing(error: unknown): boolean {

@@ -22,9 +22,9 @@ import {
 import { assessHumanoidObjectReleased } from "./object-release.js";
 import {
   normalizeQuaternion,
-  orientedBoxWorldHalfExtents,
   quaternionAngularDistance
 } from "../geometry.js";
+import { humanoidObjectInsideZone } from "./object-zone-relation.js";
 import {
   HumanoidMotionOptionContractSchema,
   humanoidMotionOptionConditionMetrics,
@@ -807,7 +807,11 @@ function detectPredicate(
       reason: "zone_not_found"
     };
   }
-  const inside = objectInsideZone(object, zone, predicate.tolerance_m);
+  const inside = humanoidObjectInsideZone({
+    object,
+    zone,
+    tolerance: predicate.tolerance_m
+  });
   return {
     predicateIndex,
     type: predicate.type,
@@ -966,21 +970,6 @@ function maximumSolidHandContactForce(
     if (matches) maximum = Math.max(maximum, contact.normalForce);
   }
   return maximum;
-}
-
-function objectInsideZone(
-  object: HumanoidMotionOptionObservableObject,
-  zone: HumanoidMotionOptionZone,
-  tolerance: number
-): boolean {
-  const halfExtents = orientedBoxWorldHalfExtents(object.size, object.rotation);
-  const bottom = object.position.y - halfExtents.y;
-  const surface = zone.center.y + zone.size.y / 2;
-  return Math.abs(object.position.x - zone.center.x) + halfExtents.x
-      <= zone.size.x / 2 + tolerance
-    && Math.abs(object.position.z - zone.center.z) + halfExtents.z
-      <= zone.size.z / 2 + tolerance
-    && Math.abs(bottom - surface) <= Math.max(tolerance, 0.025);
 }
 
 function uniqueById<T extends { id: string }>(

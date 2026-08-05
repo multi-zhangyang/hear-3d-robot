@@ -9,6 +9,7 @@ import type {
 } from "@openai/agents";
 import {
   AGENT_MODEL_ROLES,
+  DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
   providerConfigForRole,
   type AgentModelRole,
   type ModelProviderConfig,
@@ -280,7 +281,8 @@ function modelIdentity(
     reset_tool_choice: source.resetToolChoice,
     tool_use_behavior: source.toolUseBehavior,
     settings: {
-      request_timeout_ms: provider.requestTimeoutMs ?? 90_000,
+      request_timeout_ms:
+        provider.requestTimeoutMs ?? DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
       temperature: provider.temperature,
       ...(provider.maxOutputTokens === undefined
         ? {}

@@ -144,6 +144,35 @@
 .humanoid-state-grid span.active b { color: #64ddc5; }
 .balance-track { height: 3px; overflow: hidden; border-radius: 3px; background: #263139; }
 .balance-track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #e3b958, #51d8ba); }
+.humanoid-manipulation-state {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 9px;
+  border: 1px solid rgba(92, 209, 183, .14);
+  border-radius: 10px;
+  background: rgba(47, 148, 128, .045);
+}
+.humanoid-manipulation-state > div { display: flex; align-items: baseline; justify-content: space-between; }
+.humanoid-manipulation-state > div small { color: #687781; font-size: 9px; }
+.humanoid-manipulation-state > div b { color: #cbd8d8; font-size: 10px; font-weight: 600; }
+.humanoid-manipulation-state ol {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.humanoid-manipulation-state li {
+  padding-top: 5px;
+  border-top: 2px solid #2b373e;
+  color: #607079;
+  font-size: 8px;
+  text-align: center;
+}
+.humanoid-manipulation-state li.active { border-color: #d2aa51; color: #d3bd87; }
+.humanoid-manipulation-state li.complete { border-color: #4ed7b9; color: #71d9c3; }
 .humanoid-grasp-state { display: grid; gap: 5px; margin-top: 10px; }
 .humanoid-grasp-state > span {
   display: grid;

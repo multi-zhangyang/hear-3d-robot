@@ -80,6 +80,38 @@ describe("world materialization", () => {
     expect(first.chunk_manifest.grid).toEqual({ columns: 2, rows: 2 });
   });
 
+  it("materializes the authored full-body manipulation world", async () => {
+    const catalog = await loadRuntimeCatalog();
+    const scenario = catalog.materialize("humanoid_workyard", 29);
+    expect(scenario.bounds).toEqual({ width: 28, depth: 22 });
+    const rod = scenario.objects.find(({ id }) => id === "assembly_rod")!;
+    const stand = scenario.objects.find(({ id }) => id === "pickup_stand")!;
+    expect(rod).toMatchObject({
+      portable: true,
+      position: { x: 4.2, y: 0.67, z: 4.8 },
+      size: { x: 0.03, y: 0.22, z: 0.03 }
+    });
+    expect(stand).toMatchObject({
+      portable: false,
+      position: { x: 4.2, y: 0.555, z: 4.8 },
+      size: { x: 0.12, y: 0.01, z: 0.12 }
+    });
+    expect(rod.position.y - rod.size.y / 2).toBeCloseTo(
+      stand.position.y + stand.size.y / 2
+    );
+    expect(Math.hypot(
+      rod.position.x - scenario.robot.x,
+      rod.position.z - scenario.robot.z
+    )).toBeGreaterThan(0.8);
+    expect(scenario.default_goal.predicates).toEqual([{
+      type: "object_placed",
+      object_id: "assembly_rod",
+      zone_id: "assembly_bay",
+      tolerance: 0.05
+    }]);
+    expect(ScenarioSchema.safeParse(scenario).success).toBe(true);
+  });
+
   it("draws platform-random unsigned 32-bit run seeds", () => {
     const seeds = Array.from({ length: 16 }, () => drawSeed());
     expect(seeds.every((seed) => Number.isInteger(seed) && seed >= 0 && seed <= 0xffff_ffff)).toBe(true);

@@ -107,3 +107,48 @@ scenarios:
           - type: robot_in_zone
             zone_id: courtyard_beacon
             tolerance: 0.2
+
+  humanoid_workyard:
+    kind: authored
+    runtime: humanoid_g1
+    title: 人形装配场
+    scenario:
+      title: 人形装配场
+      bounds: { width: 28, depth: 22 }
+      visibility_radius: 8
+      robot: { x: 4, z: 4, yaw: 0 }
+      obstacles:
+        - id: north_storage
+          center: { x: 13, y: 1.2, z: 4 }
+          size: { x: 5, y: 2.4, z: 1.2 }
+        - id: central_pillar
+          center: { x: 13, y: 1.5, z: 11 }
+          size: { x: 1.4, y: 3, z: 1.4 }
+        - id: south_storage
+          center: { x: 20, y: 0.8, z: 17 }
+          size: { x: 4.5, y: 1.6, z: 1.4 }
+      objects:
+        - id: pickup_stand
+          kind: stand
+          color: "#76877c"
+          position: { x: 4.2, y: 0.555, z: 4.8 }
+          size: { x: 0.12, y: 0.01, z: 0.12 }
+          portable: false
+        - id: assembly_rod
+          kind: workpiece
+          color: "#d18a45"
+          position: { x: 4.2, y: 0.67, z: 4.8 }
+          size: { x: 0.03, y: 0.22, z: 0.03 }
+          portable: true
+      zones:
+        - id: assembly_bay
+          color: "#52b995"
+          center: { x: 4.2, y: -0.025, z: 6.4 }
+          size: { x: 1.4, y: 0.05, z: 1.4 }
+      default_goal:
+        summary: 将装配杆稳放到装配区域。
+        predicates:
+          - type: object_placed
+            object_id: assembly_rod
+            zone_id: assembly_bay
+            tolerance: 0.05

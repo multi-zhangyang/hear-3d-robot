@@ -3,9 +3,10 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { Model } from "@openai/agents";
 import { aisdk } from "@openai/agents-extensions/ai-sdk";
-import type {
-  ModelProviderConfig,
-  ProviderConfig
+import {
+  DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
+  type ModelProviderConfig,
+  type ProviderConfig
 } from "../config/load.js";
 
 export interface ProviderIdentity {
@@ -14,7 +15,9 @@ export interface ProviderIdentity {
 }
 
 export function createConfiguredModel(config: ModelProviderConfig): Model {
-  const timedFetch = requestTimedFetch(config.requestTimeoutMs ?? 90_000);
+  const timedFetch = requestTimedFetch(
+    config.requestTimeoutMs ?? DEFAULT_MODEL_REQUEST_TIMEOUT_MS
+  );
   if (config.protocol === "openai_compatible") {
     const provider = createOpenAICompatible({
       name: "configured-openai-compatible",

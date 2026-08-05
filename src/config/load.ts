@@ -20,6 +20,8 @@ import { materializeScenario } from "../world/world-generator.js";
 
 const bundledConfigDirectory = fileURLToPath(new URL("../../config/", import.meta.url));
 
+export const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 300_000;
+
 export const AGENT_MODEL_ROLES = [
   "goal_manager",
   "coordinator",
@@ -128,7 +130,10 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
     baseUrl: env.AI_BASE_URL,
     model: env.AI_MODEL,
     apiKey: env.AI_API_KEY,
-    requestTimeoutMs: numberFromEnv(env.AI_REQUEST_TIMEOUT_MS, 90_000),
+    requestTimeoutMs: numberFromEnv(
+      env.AI_REQUEST_TIMEOUT_MS,
+      DEFAULT_MODEL_REQUEST_TIMEOUT_MS
+    ),
     temperature: numberFromEnv(env.AI_TEMPERATURE, 0.2),
     maxOutputTokens,
     contextWindowTokens,
@@ -244,7 +249,7 @@ function loadAgentModelConfig(
     apiKey: stringFromEnv(env[`${prefix}API_KEY`], inherited.apiKey),
     requestTimeoutMs: numberFromEnv(
       env[`${prefix}REQUEST_TIMEOUT_MS`],
-      inherited.requestTimeoutMs ?? 90_000
+      inherited.requestTimeoutMs ?? DEFAULT_MODEL_REQUEST_TIMEOUT_MS
     ),
     temperature: numberFromEnv(env[`${prefix}TEMPERATURE`], inherited.temperature),
     maxOutputTokens,

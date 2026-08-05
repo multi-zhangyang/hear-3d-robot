@@ -19,12 +19,17 @@ import { ScenarioSchema } from "../domain/schema.js";
 import {
   createHumanoidAgentManifest
 } from "../harness/agent-manifest.js";
-import { createHumanoidAgentHierarchy } from "../harness/humanoid/agents.js";
+import {
+  createHumanoidAgentHierarchy,
+  HUMANOID_AGENT_IDS
+} from "../harness/humanoid/agents.js";
 import { createHumanoidRunCheckpoint } from "../harness/humanoid/run-checkpoint.js";
+import { ModelDecisionStallError } from "../harness/model-telemetry.js";
 import { createConfiguredModel } from "../model/factory.js";
 import { FileSession } from "../persistence/file-session.js";
 import { RunStore } from "../persistence/run-store.js";
 import { HumanoidWorld } from "../world/humanoid/world.js";
+import { captureHumanoidSessionStateIdentity } from "./humanoid-agent-state.js";
 import { resumeHumanoidMission } from "./humanoid-mission-runner.js";
 import { RunPauseRequestedError } from "./run-pause.js";
 
@@ -215,12 +220,30 @@ describe("humanoid mission initialization recovery", () => {
 
   it("interrupts after the bounded transport recovery window is exhausted", async () => {
     const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    const sessionItems = new Map(Object.values(HUMANOID_AGENT_IDS).map((agentId) => (
+      [agentId, [{ role: "user" as const, content: `baseline:${agentId}` }]]
+    )));
+    await Promise.all([...sessionItems.entries()].map(async ([agentId, items]) => {
+      await missionSession(store, manifest.epoch_id, agentId).addItems(items);
+    }));
     const transportError = Object.assign(new Error("connection reset"), {
       code: "ECONNRESET"
     });
-    runnerControl.run.mockRejectedValue(transportError);
+    runnerControl.run.mockImplementation(async (_agent, runInput) => {
+      const inputText = typeof runInput === "string" ? runInput : "serialized RunState";
+      await Promise.all(Object.values(HUMANOID_AGENT_IDS).map(async (agentId) => {
+        await missionSession(store, manifest.epoch_id, agentId).addItems([{
+          role: "user",
+          content: `failed:${runnerControl.run.mock.calls.length}:${inputText}`
+        }]);
+      }));
+      throw transportError;
+    });
 
-    await expect(resume(store, provider())).rejects.toBe(transportError);
+    await expect(resume(store, config)).rejects.toBe(transportError);
 
     const checkpoint = await store.readHumanoidCheckpoint();
     expect(checkpoint.status).toBe("interrupted");
@@ -230,7 +253,154 @@ describe("humanoid mission initialization recovery", () => {
     expect(providerEvents.filter((entry) => (
       isRecord(entry) && entry.status === "transport_interrupted"
     ))).toHaveLength(8);
+    for (const [agentId, items] of sessionItems) {
+      expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual(items);
+    }
     expect(await lifecycleTypes(store)).toEqual(["run_resumed", "run_interrupted"]);
+  }, 30_000);
+
+  it("keeps Session histories intact when the checkpoint rejects a RunState", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    const sessions = new Map(Object.values(HUMANOID_AGENT_IDS).map((agentId) => (
+      [agentId, missionSession(store, manifest.epoch_id, agentId)]
+    )));
+    await Promise.all([...sessions.entries()].map(async ([agentId, session]) => {
+      await session.addItems([{ role: "user", content: `baseline:${agentId}` }]);
+    }));
+    const sessionBaseline = await captureHumanoidSessionStateIdentity(sessions);
+    await Promise.all([...sessions.entries()].map(async ([agentId, session]) => {
+      await session.addItems([{ role: "assistant", content: `durable-suffix:${agentId}` }]);
+    }));
+    await store.writeAgentState(
+      "checkpoint-incompatible-state",
+      "a".repeat(64),
+      sessionBaseline
+    );
+    const inspectionComplete = new Error("Session inspection complete");
+    runnerControl.run.mockImplementationOnce(async () => {
+      for (const [agentId, session] of sessions) {
+        expect(await session.getItems()).toEqual([
+          { role: "user", content: `baseline:${agentId}` },
+          { role: "assistant", content: `durable-suffix:${agentId}` }
+        ]);
+      }
+      throw inspectionComplete;
+    });
+
+    await expect(resume(store, config)).rejects.toBe(inspectionComplete);
+
+    expect(await store.readAgentStateRecord()).toBeUndefined();
+    for (const [agentId, session] of sessions) {
+      expect(await session.getItems()).toEqual([
+        { role: "user", content: `baseline:${agentId}` },
+        { role: "assistant", content: `durable-suffix:${agentId}` }
+      ]);
+    }
+  });
+
+  it("removes failed decision branches before resetting one stalled Agent", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    const sessions = new Map(Object.values(HUMANOID_AGENT_IDS).map((agentId) => (
+      [agentId, missionSession(store, manifest.epoch_id, agentId)] as const
+    )));
+    await Promise.all([...sessions.entries()].map(async ([agentId, session]) => {
+      await session.addItems([{ role: "user", content: `baseline:${agentId}` }]);
+    }));
+    runnerControl.run.mockImplementation(async () => {
+      await Promise.all([...sessions.entries()].map(async ([agentId, session]) => {
+        await session.addItems([{
+          role: "assistant",
+          content: `failed-decision:${runnerControl.run.mock.calls.length}:${agentId}`
+        }]);
+      }));
+      throw new ModelDecisionStallError(
+        HUMANOID_AGENT_IDS.motion,
+        "motion decision stalled"
+      );
+    });
+
+    await expect(resume(store, config)).rejects.toThrow("motion decision stalled");
+
+    expect(runnerControl.run).toHaveBeenCalledTimes(4);
+    for (const agentId of sessions.keys()) {
+      expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual(
+        agentId === HUMANOID_AGENT_IDS.motion
+          ? []
+          : [{ role: "user", content: `baseline:${agentId}` }]
+      );
+    }
+    const recoveries = (await store.readJournal("provider")).filter((entry) => (
+      isRecord(entry) && entry.status === "model_decision_recovery"
+    ));
+    expect(recoveries).toHaveLength(3);
+  });
+
+  it("restores Sessions to the last persisted RunState before retrying", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    const baselineItems = new Map(Object.values(HUMANOID_AGENT_IDS).map((agentId) => (
+      [agentId, [{ role: "user" as const, content: `baseline:${agentId}` }]]
+    )));
+    await Promise.all([...baselineItems.entries()].map(async ([agentId, items]) => {
+      await missionSession(store, manifest.epoch_id, agentId).addItems(items);
+    }));
+    const transportError = Object.assign(new Error("nested connection reset"), {
+      code: "ECONNRESET"
+    });
+    runnerControl.run.mockImplementationOnce(async (
+      _agent,
+      _runInput,
+      options: { session: FileSession }
+    ) => {
+      await options.session.addItems([{
+        role: "user",
+        content: "aligned:humanoid-coordinator"
+      }]);
+      return {
+        state: { toString: () => "invalid-but-persisted-sdk-state" },
+        completed: Promise.resolve(),
+        finalOutput: undefined,
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "raw_model_stream_event",
+            data: { type: "response.output_text.delta", delta: "partial" }
+          };
+          await options.session.addItems([{
+            role: "user",
+            content: "suffix-after-state:humanoid-coordinator"
+          }]);
+          throw transportError;
+        }
+      };
+    });
+
+    await expect(resume(store, config)).rejects.toThrow();
+
+    expect(runnerControl.run).toHaveBeenCalledTimes(1);
+    for (const [agentId, items] of baselineItems) {
+      expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual([
+        ...items,
+        ...(agentId === HUMANOID_AGENT_IDS.coordinator
+          ? [{ role: "user" as const, content: `aligned:${agentId}` }]
+          : [])
+      ]);
+    }
+    expect(await store.readAgentStateRecord()).toMatchObject({
+      state: "invalid-but-persisted-sdk-state",
+      sessionBaseline: Object.fromEntries(Object.values(HUMANOID_AGENT_IDS).map(
+        (agentId) => [agentId, {
+          item_count: agentId === HUMANOID_AGENT_IDS.coordinator ? 2 : 1
+        }]
+      ))
+    });
   }, 30_000);
 });
 
@@ -304,6 +474,19 @@ function createManifest(config: ProviderConfig) {
     provider: config,
     epochId: "11111111-1111-4111-8111-111111111111"
   });
+}
+
+function missionSession(
+  store: RunStore,
+  epochId: string,
+  agentId: string
+): FileSession {
+  return new FileSession(
+    agentId === HUMANOID_AGENT_IDS.coordinator
+      ? store.sessionPath()
+      : store.workerSessionPath(agentId),
+    `${store.definition.run_id}:${epochId}:${agentId}`
+  );
 }
 
 async function resume(

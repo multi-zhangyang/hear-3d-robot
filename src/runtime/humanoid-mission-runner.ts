@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readdir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
@@ -54,6 +54,13 @@ import { errorMessage } from "./error-message.js";
 import { isRunPauseRequested } from "./run-pause.js";
 import { assertGoalSupported } from "./goal-validation.js";
 import { assertHumanoidGoalSupported } from "./humanoid-checker.js";
+import {
+  captureHumanoidSessionBaseline,
+  captureHumanoidSessionStateIdentity,
+  humanoidAgentStateFingerprint,
+  restoreHumanoidSessionBaseline,
+  restoreHumanoidSessionStateBaseline
+} from "./humanoid-agent-state.js";
 import {
   ConsecutiveTransportRecovery,
   isTransportInterruption,
@@ -339,15 +346,12 @@ async function executeHumanoidMission(input: {
       };
     }
 
-    let serializedState = await resumableAgentState(input.runtime);
+    let serializedState = await resumableAgentState(input.runtime, sessions);
     let decisionRecoveries = 0;
     for (;;) {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
-      const baseline = {
-        fingerprint: humanoidCheckpointFingerprint(input.runtime.checkpoint),
-        sessionItems: await coordinatorSession.getItems()
-      };
+      const sessionBaseline = await captureHumanoidSessionBaseline(sessions);
       try {
         const runInput = serializedState
           ? await RunState.fromString(hierarchy.coordinator, serializedState)
@@ -363,9 +367,13 @@ async function executeHumanoidMission(input: {
         });
         for await (const event of stream) {
           await persistAgentEvent(HUMANOID_AGENT_IDS.coordinator, event);
+          const persistedSessionBaseline = await captureHumanoidSessionStateIdentity(
+            sessions
+          );
           await input.runtime.store.writeAgentState(
             stream.state.toString(),
-            humanoidCheckpointFingerprint(input.runtime.checkpoint)
+            humanoidAgentStateFingerprint(input.runtime.checkpoint),
+            persistedSessionBaseline
           );
         }
         await stream.completed;
@@ -406,8 +414,10 @@ async function executeHumanoidMission(input: {
       } catch (error) {
         if (input.signal?.aborted) throw error;
         const decisionStall = modelDecisionStallFrom(error);
-        if (decisionStall
-          && decisionRecoveries < MAX_MODEL_DECISION_RECOVERIES) {
+        if (decisionStall) {
+          await restoreHumanoidSessionBaseline(sessions, sessionBaseline);
+        }
+        if (decisionStall && decisionRecoveries < MAX_MODEL_DECISION_RECOVERIES) {
           decisionRecoveries += 1;
           contextManager.startFreshSdkTurn(decisionStall.agentId);
           await sessionForAgent(decisionStall.agentId).clearSession();
@@ -427,15 +437,13 @@ async function executeHumanoidMission(input: {
           continue;
         }
         if (!isTransportInterruption(error)) throw error;
-        const recoveryAttempt = transportRecovery.nextAttempt();
-        if (recoveryAttempt === null) throw error;
-        const persisted = await resumableAgentState(input.runtime);
-        const unchanged = baseline.fingerprint
-          === humanoidCheckpointFingerprint(input.runtime.checkpoint);
-        if (!persisted && unchanged) {
-          await coordinatorSession.replaceItems(baseline.sessionItems);
+        const persisted = await resumableAgentState(input.runtime, sessions);
+        if (persisted === undefined) {
+          await restoreHumanoidSessionBaseline(sessions, sessionBaseline);
         }
         serializedState = persisted;
+        const recoveryAttempt = transportRecovery.nextAttempt();
+        if (recoveryAttempt === null) throw error;
         const retry = transportRetryPlan(error, recoveryAttempt);
         await input.runtime.recordProvider({
           status: "transport_interrupted",
@@ -584,10 +592,22 @@ async function persistStreamEvent(
   if (provider) await runtime.recordProvider(provider, agentId);
 }
 
-async function resumableAgentState(runtime: HumanoidRunRuntime): Promise<string | undefined> {
+async function resumableAgentState(
+  runtime: HumanoidRunRuntime,
+  sessions: ReadonlyMap<string, FileSession>
+): Promise<string | undefined> {
   const record = await runtime.store.readAgentStateRecord();
   if (!record) return undefined;
-  if (record.checkpointFingerprint !== humanoidCheckpointFingerprint(runtime.checkpoint)) {
+  if (record.sessionBaseline === undefined
+    || record.checkpointFingerprint !== humanoidAgentStateFingerprint(runtime.checkpoint)) {
+    await runtime.store.clearAgentState();
+    return undefined;
+  }
+  const sessionsCompatible = await restoreHumanoidSessionStateBaseline(
+    sessions,
+    record.sessionBaseline
+  );
+  if (!sessionsCompatible) {
     await runtime.store.clearAgentState();
     return undefined;
   }
@@ -633,32 +653,6 @@ function assertCycleOutput(output: string | undefined): {
     throw new Error("Humanoid coordinator did not complete a verified runtime transition");
   }
   return { status };
-}
-
-function humanoidCheckpointFingerprint(checkpoint: {
-  world: { frame: number; worldRevision: number };
-  goal_dag: { state_sha256: string };
-  goal_progress: {
-    goal_sha256: string;
-    last_world_frame: number;
-    last_world_revision: number;
-    predicate_streaks: number[];
-  } | null;
-  committed_actions: Record<string, unknown>;
-  context_memory: { total_compactions: number };
-  cycle_index: number;
-  active_cycle: { cycle_id: string } | null;
-}): string {
-  return createHash("sha256").update(JSON.stringify({
-    frame: checkpoint.world.frame,
-    worldRevision: checkpoint.world.worldRevision,
-    goalDAGStateSha256: checkpoint.goal_dag.state_sha256,
-    goalProgress: checkpoint.goal_progress,
-    committedActions: Object.keys(checkpoint.committed_actions).sort(),
-    totalCompactions: checkpoint.context_memory.total_compactions,
-    cycleIndex: checkpoint.cycle_index,
-    activeCycleId: checkpoint.active_cycle?.cycle_id ?? null
-  })).digest("hex");
 }
 
 function formatFrequency(stepSeconds: number): string {

@@ -809,6 +809,7 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
         embodiedObjectIds.has(assessment.object_id)
       ))
     },
+    interaction: snapshot.interaction,
     contacts: robot.contacts,
     navigation: snapshot.navigation
   };

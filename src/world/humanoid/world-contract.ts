@@ -19,6 +19,7 @@ import type { HumanoidObjectToken } from "./object-memory.js";
 import type { HumanoidSolidToken } from "./solid-observation.js";
 import type { HumanoidPhysicalSafetyEvidence } from "./physical-safety.js";
 import type { HumanoidWorldGraspState } from "./grasp-world-state.js";
+import type { HumanoidInteractionObservation } from "./interaction-observation.js";
 import type {
   HumanoidCarriedObjectBindingSet,
   HumanoidCarriedObjectContinuationEvidence,
@@ -57,6 +58,7 @@ export interface HumanoidWorldObservation {
   objectTokens: HumanoidObjectToken[];
   solidTokens: HumanoidSolidToken[];
   grasp: HumanoidWorldGraspState;
+  interaction: HumanoidInteractionObservation;
   navigation: HumanoidWorldSnapshot["navigation"];
 }
 

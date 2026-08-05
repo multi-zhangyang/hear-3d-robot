@@ -35,6 +35,7 @@
     "test:live": "pnpm run test:live:mission",
     "test:live:mission": "pnpm run build:server && node tests/live-autonomy.mjs",
     "test:live:autonomy": "pnpm run build:server && node tests/live-autonomy-portfolio.mjs",
+    "test:live:manipulation": "pnpm run build:server && node tests/live-manipulation.mjs",
     "test:live:endurance": "pnpm run build:server && node tests/live-endurance.mjs",
     "test:live:portfolio": "pnpm run test:live:autonomy",
     "test:browser": "pnpm run build:web && playwright test",

@@ -36,6 +36,7 @@ import {
 import { preflightAgentToolInput } from "../tool-input-recovery.js";
 import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.js";
 import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
+import { GOAL_HISTORY_PREDICATE_TYPES } from "./goal-history.js";
 
 const SpecialistTaskSchema = z.object({
   objective: z.string().trim().min(1)
@@ -134,6 +135,14 @@ export function goalManagerInvocationInput(
   const solids = Array.isArray(observation.solids)
     ? observation.solids.map(jsonRecord)
     : [];
+  const objects = Array.isArray(observation.objects)
+    ? observation.objects.map(jsonRecord)
+    : [];
+  const interaction = jsonRecord(root.interaction);
+  const carrying = jsonRecord(interaction.carrying);
+  const carryBindings = Array.isArray(carrying.bindings)
+    ? carrying.bindings.map(jsonRecord)
+    : [];
   const exact = {
     run_mode: root.run_mode ?? null,
     mission_goal: root.mission_goal ?? null,
@@ -148,12 +157,22 @@ export function goalManagerInvocationInput(
       truncated: projection.history_truncated === true
     },
     observable_goal_surface: {
-      embodiment_predicates: ["robot_at", "end_effector_at"],
+      predicate_types: [...GOAL_HISTORY_PREDICATE_TYPES],
       zone_ids: stringArray(observation.zone_ids),
       visible_object_ids: stringArray(observation.visible_object_ids),
+      portable_object_ids: objects.flatMap((object) => (
+        object.portable === true && typeof object.id === "string" ? [object.id] : []
+      )),
       removable_block_ids: solids.flatMap((solid) => (
         solid.kind === "block" && typeof solid.id === "string" ? [solid.id] : []
-      ))
+      )),
+      carrying: {
+        phase: carrying.phase ?? null,
+        object_ids: carryBindings.flatMap((binding) => (
+          typeof binding.object_id === "string" ? [binding.object_id] : []
+        )),
+        continuation_verified: carrying.continuation_verified ?? null
+      }
     }
   };
   return [
@@ -724,13 +743,14 @@ function goalManagerInstructions(): string {
   return [
     "你是人形层级智能体的自主目标管理节点，拥有独立模型、独立 Session 和长期 Goal DAG。",
     "mission 与 mission_goal 是长期约束，不是当前 active Goal。你必须自行决定下一阶段如何推进它，并在每个候选的 mission_link 中说明关联；Harness 不会生成、补全、排序或替换候选。",
-    "run_mode=mission 时，任务只有在一个经过物理验收且内容与 mission_goal 完全一致的 Goal 完成后才会结束；可以先选择阶段 Goal，但条件成熟后必须提交并选择精确的 mission_goal。run_mode=continuous 时，完成当前 Goal 后继续基于新观察选择下一 Goal。",
+    "run_mode=mission 时，任务只有在一个经过物理验收且内容与 mission_goal 完全一致的 Goal 完成后才会结束；一个 active Goal 可以跨越多次观察、规划、抓取、导航和执行周期，不需要把每个动作阶段都改写成新 Goal。只有当前物理证据证明最终 Goal 尚不可观察或存在必须先独立验收的因果前置条件时，才选择阶段 Goal；条件成熟后必须提交并选择精确的 mission_goal。run_mode=continuous 时，完成当前 Goal 后继续基于新观察选择下一 Goal。",
     "阶段 Goal 必须有当前证据支持且确实有助于 mission_goal；不要把普通障碍物想象成必经阻塞。导航能够绕行时优先选择直接可验收的移动或 mission_goal，只有真实规划/接触证据表明具名静态方块必须被处理时，才选择 block_removed。",
     "Goal 中每个 predicate 都是必须真实完成的合取义务，不是说明或确认字段。不得为了显得完整而加入 mission_goal 未要求的物体、接触、抓取、方块或区域谓词；若候选包含 mission_goal 的任一谓词，该候选必须逐字段保持完整 mission_goal，不得改 tolerance、删减谓词或拼接额外条件。",
     "run_mode=mission 且 mission_goal 的谓词已有对应能力、当前没有规划拒绝证明其受阻时，候选中必须包含完整 mission_goal，并优先选择它；阶段 Goal 只用于有当前物理证据的必要前置条件，不能无端扩大任务范围。",
     "goal_dag.status=awaiting_model_selection 时，先调用 submit_goal_candidates 一次提交 2–3 个内容不同的候选；Harness 会把提交与随后选择分别绑定到对应模型请求所见的当前物理证据，不要求你转录证据哈希。候选间不能引用本批 proposal_id 或尚未生成的 candidate_id；dependency_candidate_ids 只能逐字引用 existing_goal_candidate_ids，列表为空时每个候选都必须填写 []。每个谓词必须能由当前证据和后续 checker 真实观察。goal_context.observation 提供当前可见物体、视觉或接触可观察静态方块的真实位姿、关系、接触和区域；block_removed 只能逐字引用当前 solids 中 kind=block 的 id。goal_context.autonomy 提供有界历史计数与能力面，它不包含 Harness 评分或候选。",
     "候选必须根据当前可供性和长期约束产生，并主动比较近期 Goal 的对象、区域、谓词组合和结果；context_projection.history_truncated=true 或需要核对更早结果时，调用 recall_goal_history 检索完整持久 Goal DAG。召回只用于历史比较，不能代替当前观察。除非恢复、依赖或当前物理状态确有必要，不要重复相同目标内容。自主差异来自你的模型选择，不得用随机坐标、随机电机动作或固定目标表冒充新颖性。",
-    "提交成功后必须在新的模型响应中调用 select_goal_candidate，逐字复制回执中所选候选的 candidate_sequence；该短序号与持久哈希身份一对一对应，不能猜测。必须显式选择一个依赖已完成的候选；不能让程序随机选择，也不能把固定候选或 mission_goal 原样塞入。",
+    "提交成功后必须在新的模型响应中调用 select_goal_candidate，逐字复制回执中所选候选的 candidate_sequence；该短序号与持久哈希身份一对一对应，不能猜测。必须显式选择一个依赖已完成的候选；不能让程序随机选择，也不能让 Harness 替你插入固定候选。",
+    "涉及便携物体时必须按当前物理依赖判断 Goal：未持握物体就不能把远离该物体、仅进入目标区域当成放置任务的充分前置；observable_goal_surface.carrying 只有在列出该物体且 continuation_verified=true 时才证明它可随导航继续携带。可见且可操作的目标物体、其双腕距离、当前抓取评估与目标区域共同决定是直接选择完整 mission_goal，还是先选择 object_grasped 等可验收前置 Goal；不得用固定抓取顺序替代这一判断。",
     "goal_dag.status=active 时不得提交或选择新目标。只有当前观察与物理 action receipt 支持时，才能调用 retire_goal_epoch；blocked 必须引用当前 revision 的 action receipt。退役不会自动选择替代目标。",
     "retire_goal_epoch 的 evidence_refs、select_goal_candidate 的 candidate_sequence 与所有 dependency_candidate_ids 必须逐字使用上下文或工具回执中真实存在的标识，不得猜测。",
     "最终结果必须来自 select_goal_candidate 或 retire_goal_epoch 工具。"
@@ -749,7 +769,7 @@ function motionInstructions(): string {
   return [
     "你是全身运动参考智能体，拥有独立模型与上下文。",
     "每次模型响应直接调用一个正式工具，不复述任务、工具 schema 或推理过程。一次委派只规划当前状态下可以真实执行的下一阶段，不试图在一个动作制品中完成整条任务链。",
-    "需要时先调用 observe_humanoid，再根据实时关节、Link、双脚接触、平衡、可见物体、带 age_revisions 的记忆和导航状态决定连续全身目标。",
+    "需要时先调用 observe_humanoid，再根据实时关节、Link、双脚接触、平衡、可见物体、带 age_revisions 的记忆和导航状态决定连续全身目标。interaction 只提供当前权威的目标区域、携带生命周期、抓取阈值以及物体相对骨盆和双腕的几何关系，不包含推荐动作；你必须自行选择阶段、手、坐标、时序与候选顺序。",
     "非导航动作必须使用 plan_whole_body_motion_candidates，一次提交共同 termination 和 2 至 3 个真正不同、按你偏好排序的连续全身候选；使用 plan_humanoid_navigation 输出你选择的世界目标。不要生成、猜测或复制任何关节角；运动后端负责由任务空间目标求解连续全身参考。",
     "若委派目标包含接近、接触、操作、离开或继续导航等多个阶段，或目标明显超出单个 8 秒 Option 的可达范围，先自主选择当前阶段的可达目标；需要长距离接近时调用 plan_humanoid_navigation，进入真实可操作范围后再由后续周期规划接触或操作。",
     "纯导航阶段不要混入手腕、脚踝或抓取目标；直接调用 plan_humanoid_navigation。导航 target.y 使用当前地面或规划回执给出的地面高度，不能复制机器人根高度或障碍物中心高度；若回执给出 partial_endpoint、projected target 或 chunk_target，只能基于这些真实可行性证据重新选择下一段地面目标。",
@@ -764,7 +784,7 @@ function motionInstructions(): string {
     "只填写本次确实要控制的通道；不控制某个手腕或脚踝时不要复制它的当前位置，省略的通道由当前全身参考连续保持。",
     "计划有意触碰动态物体或静态方块时，必须用 contact_constraints 精确声明 object_id 或 solid_id 以及接触面：普通身体 Link 使用 body，掌面或指面使用 hand_surface；静态目标必须逐字复制当前 solid_tokens 中的 id，不得用 wrist body 冒充掌面，也不得授权任意环境接触。",
     "抓取只能用 grasp_verified 作为物理终止谓词，并逐字复制当前观察中 grasp.contractSha256；每个候选必须为同一只手和同一物体授权足够多的不同掌指 hand_surface，同时通过 hand_coordination 连续闭合。模型不能降低抓取阈值，普通 body_contact_object、接触一次或手腕靠近都不代表抓取成功。",
-    "真实放置的 terminal 必须组合 object_in_zone、not grasp_verified 与 object_settled_on_support：物体处于目标区域、已由当前物理抓取评估证实脱手，并在非人形支撑面上以权威接触法向、聚合向上支撑力、线速度和角速度连续稳定。object_settled_on_support 只填写 object_id，模型不能提供阈值；候选仍需为释放前的同手掌指接触提供精确 hand_surface 授权，张手过程必须由候选自己的 hand_coordination 产生，Harness 不会自动释放。",
+    "真实放置的 terminal 必须组合 object_in_zone、object_released 与 object_settled_on_support：物体处于目标区域、当前物理抓取评估证实指定手已经脱离，并在非人形支撑面上以权威接触法向、聚合向上支撑力、线速度和角速度连续稳定。object_released 必须填写真实携带该物体的手；object_settled_on_support 只填写 object_id，模型不能提供阈值。候选仍需为释放前的同手掌指接触提供精确 hand_surface 授权，张手过程必须由候选自己的 hand_coordination 产生，Harness 不会自动释放。",
     "remembered 物体位置不是当前传感事实；改变物体前先重新观察，使该对象成为 visible。",
     "历史具身事件只用于比较策略结果；任何新的运动候选都必须根据当前 world_revision 重新观察和规划。",
     "可调用 recall_embodied_history 按 episode:N、action:transactionId、sequence，或按真实 outcome、Goal predicate、object_id、solid_id、zone_id 查询历史；action 来源保留真实 execute_* 与世界 mutation 的 accepted、失败 code、frameCount、世界版本和物理 result。返回值始终是 historical_only，旧失败不能充当当前传感、当前可见性或当前物理状态；召回后必须根据新的当前观察重新生成候选。",

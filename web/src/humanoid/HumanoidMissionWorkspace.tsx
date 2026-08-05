@@ -58,6 +58,11 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
   const context = checkpoint.context_memory;
   const contextUsage = activeContextUsage(context);
   const activeGrasps = activeHumanoidGrasps(frame);
+  const manipulation = humanoidManipulationTelemetry(
+    frame,
+    goal,
+    checkpoint.checker
+  );
 
   return (
     <section className="mission-world humanoid-mission-world" aria-label={live ? "实时人形任务" : "人形任务回顾"}>
@@ -108,6 +113,20 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
         <div className="balance-track">
           <span style={{ width: `${Math.max(0, Math.min(100, frame.robot.balance.upright * 100))}%` }} />
         </div>
+        {manipulation && (
+          <div className="humanoid-manipulation-state" aria-label="实时全身交互闭环">
+            <div>
+              <small>全身交互</small>
+              <b>{entityLabel(manipulation.objectId)}</b>
+            </div>
+            <ol>
+              <li className={manipulation.present ? "active" : ""}>目标</li>
+              <li className={manipulation.contact ? "active" : ""}>接触</li>
+              <li className={manipulation.grasped ? "active" : ""}>持握</li>
+              <li className={manipulation.placed ? "complete" : ""}>落位</li>
+            </ol>
+          </div>
+        )}
         {activeGrasps.length > 0 && (
           <div className="humanoid-grasp-state" aria-label="实时抓取状态">
             {activeGrasps.map((assessment) => (
@@ -255,6 +274,46 @@ function graspPredicateProgress(
   return assessment
     ? `${assessment.evidence.relative_pose.stable_frames}/${assessment.evidence.lifted_hold_frames}`
     : null;
+}
+
+export interface HumanoidManipulationTelemetry {
+  objectId: string;
+  present: boolean;
+  contact: boolean;
+  grasped: boolean;
+  placed: boolean;
+}
+
+export function humanoidManipulationTelemetry(
+  frame: HumanoidWorldSnapshot,
+  goal: { predicates: GoalPredicate[] } | null | undefined,
+  checker: HumanoidRunDetails["checkpoint"]["checker"]
+): HumanoidManipulationTelemetry | null {
+  const predicateIndex = goal?.predicates.findIndex((predicate) => (
+    predicate.type === "object_grasped"
+      || predicate.type === "object_at"
+      || predicate.type === "object_in_zone"
+      || predicate.type === "object_placed"
+  )) ?? -1;
+  if (predicateIndex < 0 || !goal) return null;
+  const predicate = goal.predicates[predicateIndex]!;
+  if (predicate.type !== "object_grasped"
+    && predicate.type !== "object_at"
+    && predicate.type !== "object_in_zone"
+    && predicate.type !== "object_placed") return null;
+  const assessments = frame.grasp.assessments.filter((assessment) => (
+    assessment.frame === frame.frame && assessment.object_id === predicate.object_id
+  ));
+  return {
+    objectId: predicate.object_id,
+    present: frame.robot.objects[predicate.object_id] !== undefined,
+    contact: assessments.some((assessment) => (
+      assessment.evidence.contact.status !== "missing"
+    )),
+    grasped: assessments.some((assessment) => assessment.grasp_verified),
+    placed: predicate.type === "object_placed"
+      && checker?.checks[predicateIndex]?.passed === true
+  };
 }
 
 function forceLabel(force: number): string {
