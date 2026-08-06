@@ -100,6 +100,7 @@ import {
   type HumanoidMotionPlan
 } from "./motion-plan-schema.js";
 import {
+  HumanoidMotionGenerationError,
   plannedHandCommandAtTime,
   TaskSpaceHumanoidMotionGenerator,
   type HumanoidMotionGenerator
@@ -110,7 +111,6 @@ export {
   HumanoidContactConstraintSchema,
   HumanoidMotionCandidateBatchSchema,
   HumanoidMotionPlanSchema,
-  duplicateHumanoidMotionCandidateIndexes,
   humanoidGraspContactAuthorizationFailures,
   type HumanoidContactConstraint,
   type HumanoidMotionCandidateBatch,
@@ -263,7 +263,9 @@ export async function prepareHumanoidMotion(
       validation: validationResult(
         [{
           code: "invalid_reference",
-          atSeconds: 0,
+          atSeconds: generationError instanceof HumanoidMotionGenerationError
+            ? generationError.atSeconds
+            : 0,
           message: generationError instanceof Error
             ? generationError.message
             : String(generationError ?? "Motion generator returned no artifact")

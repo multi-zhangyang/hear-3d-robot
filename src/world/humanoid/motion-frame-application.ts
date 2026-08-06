@@ -65,7 +65,13 @@ export async function applyHumanoidMotionArtifactFrame(
     if (controlled) simulation.applyHandServoJointTargets(controlled.jointTargets);
     graspServoEvidence = controlled?.evidence;
   }
-  const snapshot = await simulation.step(reference);
+  const snapshot = await simulation.step(reference, {
+    trackedJointPolicyCommand: Math.hypot(...reference.rootVelocity) > 1e-9
+        && ((options.carryTaskSpaceTargets?.length ?? 0) > 0
+          || (options.graspTargets?.length ?? 0) > 0)
+      ? "neutral"
+      : "measured"
+  });
   return {
     reference,
     snapshot,

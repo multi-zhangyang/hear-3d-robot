@@ -1,6 +1,7 @@
 import {
   HUMANOID_END_EFFECTORS,
-  type JsonValue
+  type JsonValue,
+  type Vec3
 } from "../../domain/schema.js";
 import {
   modelPayloadSha256,
@@ -8,6 +9,7 @@ import {
 } from "../../domain/model-call-authority.js";
 import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
+import { yawFromQuaternion } from "../../world/geometry.js";
 import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.js";
 import type { HumanoidBodyChannel } from "../../world/humanoid/motion-plan.js";
 import {
@@ -24,6 +26,12 @@ import {
 import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
 import { normalizeHumanoidMotionCandidateBatchInput } from "./motion-candidate-input.js";
 import { BlockRemovalAuthorityError } from "./block-removal-authority.js";
+import {
+  navigationTransitClearanceContext,
+  navigationTransitClearanceFromRejection,
+  navigationTransitClearanceMotionRejection,
+  type NavigationTransitClearanceRequirement
+} from "./navigation-transit-clearance.js";
 
 type HumanoidPlanningActionName = "plan_whole_body_motion"
   | "plan_whole_body_motion_candidates"
@@ -31,6 +39,26 @@ type HumanoidPlanningActionName = "plan_whole_body_motion"
 
 type HumanoidPhysicalActionName = "execute_whole_body_motion"
   | "execute_humanoid_navigation";
+
+interface ManipulationBasePlacementRequirement {
+  observedWorldRevision: number;
+  objects: Array<{
+    objectId: string;
+    objectCenterWorld: Vec3;
+    placements: HumanoidWorldObservation["manipulationBasePlacements"];
+  }>;
+}
+
+interface RepeatedPlanningFailure {
+  action: HumanoidPlanningActionName;
+  fingerprint: string;
+  physicalExecutionRevision: number;
+  count: number;
+  lastCode: string;
+}
+
+const MANIPULATION_APPROACH_RADIUS_METERS = 1;
+const MANIPULATION_BASE_TARGET_TOLERANCE_METERS = 0.04;
 
 export interface HumanoidPhysicalExecutionIntent {
   transactionId: string;
@@ -45,9 +73,14 @@ export interface HumanoidActionToolCallAuthority {
   tool_call_id: string;
   tool_name: string;
   arguments_sha256: string;
+  normalized_arguments_sha256?: string;
 }
 
 export interface HumanoidActionInvoker {
+  isActionAvailable?(
+    name: HumanoidActionName,
+    agentId: string
+  ): boolean;
   invoke(
     name: HumanoidActionName,
     rawInput: unknown,
@@ -120,6 +153,22 @@ export class HumanoidActionRuntime {
   readonly #uncommittedReceiptIds = new Set<string>();
   readonly #planChannels = new Map<string, HumanoidBodyChannel[]>();
   readonly #inFlightTransactions = new Set<string>();
+  readonly #observationRevisionByAgent = new Map<string, number>();
+  readonly #planningAttemptRevisionByAgent = new Map<string, number>();
+  readonly #manipulationBasePlacementRequirementByAgent = new Map<
+    string,
+    ManipulationBasePlacementRequirement
+  >();
+  readonly #navigationTransitClearanceRequirementByAgent = new Map<
+    string,
+    NavigationTransitClearanceRequirement
+  >();
+  readonly #planningFailureByFingerprint = new Map<
+    string,
+    RepeatedPlanningFailure
+  >();
+  readonly #latestPlanningFailureKeyByAgent = new Map<string, string>();
+  #latestPhysicalExecutionRevision = 0;
 
   constructor(world: HumanoidWorld, options: HumanoidActionRuntimeOptions = {}) {
     this.#world = world;
@@ -146,6 +195,29 @@ export class HumanoidActionRuntime {
         throw new Error(`Humanoid receipt fingerprint mismatch: ${transactionId}`);
       }
       this.#receipts.set(transactionId, receipt);
+      if (receipt.accepted && receipt.action === "observe_humanoid") {
+        if (receipt.agentId !== "humanoid-motion-reference") {
+          this.#observationRevisionByAgent.set(
+            receipt.agentId,
+            Math.max(
+              this.#observationRevisionByAgent.get(receipt.agentId) ?? 0,
+              receipt.worldAfterRevision
+            )
+          );
+        }
+      }
+      if (receipt.accepted
+        && (receipt.action === "execute_whole_body_motion"
+          || receipt.action === "execute_humanoid_navigation")) {
+        this.#latestPhysicalExecutionRevision = Math.max(
+          this.#latestPhysicalExecutionRevision,
+          receipt.worldAfterRevision
+        );
+        this.#planningFailureByFingerprint.clear();
+        this.#latestPlanningFailureKeyByAgent.clear();
+      }
+      this.#recordPlanningOutcome(receipt);
+      this.#recordNavigationTransitClearance(receipt);
       this.#transactions.set(transactionId, {
         fingerprint,
         decisionSha256: receipt.decision
@@ -173,6 +245,89 @@ export class HumanoidActionRuntime {
   receipt(transactionId: string): HumanoidActionReceipt | undefined {
     const receipt = this.#receipts.get(transactionId);
     return receipt ? structuredClone(receipt) : undefined;
+  }
+
+  isActionAvailable(name: HumanoidActionName, agentId: string): boolean {
+    const normalizedAgentId = agentId.trim();
+    if (normalizedAgentId !== "humanoid-motion-reference") return true;
+    if (name === "plan_humanoid_navigation"
+      && this.#navigationTransitClearanceRequirementByAgent.has(normalizedAgentId)) {
+      return false;
+    }
+    const observedRevision = this.#observationRevisionByAgent.get(
+      normalizedAgentId
+    );
+    if (name === "observe_humanoid") {
+      const lastPlanningAttempt = this.#planningAttemptRevisionByAgent.get(
+        normalizedAgentId
+      );
+      return observedRevision === undefined
+        || observedRevision < this.#latestPhysicalExecutionRevision
+        || (lastPlanningAttempt ?? -1) >= observedRevision;
+    }
+    if (!isPlanningAction(name)) return true;
+    if (observedRevision === undefined
+      || observedRevision < this.#latestPhysicalExecutionRevision) {
+      return false;
+    }
+    const latestFailureKey = this.#latestPlanningFailureKeyByAgent.get(
+      normalizedAgentId
+    );
+    const latestFailure = latestFailureKey === undefined
+      ? undefined
+      : this.#planningFailureByFingerprint.get(latestFailureKey);
+    if (latestFailure?.action === name
+      && latestFailure.physicalExecutionRevision
+        === this.#latestPhysicalExecutionRevision
+      && latestFailure.count >= 3) {
+      return false;
+    }
+    return true;
+  }
+
+  planningToolState(agentId: string): JsonValue {
+    const normalizedAgentId = agentId.trim();
+    const latestFailureKey = this.#latestPlanningFailureKeyByAgent.get(
+      normalizedAgentId
+    );
+    const latestFailure = latestFailureKey === undefined
+      ? undefined
+      : this.#planningFailureByFingerprint.get(latestFailureKey);
+    const cooldown = latestFailure
+      && latestFailure.physicalExecutionRevision
+        === this.#latestPhysicalExecutionRevision
+      && latestFailure.count >= 3
+      ? {
+          action: latestFailure.action,
+          code: "repeated_planning_failure",
+          repeated_failure_count: latestFailure.count,
+          previous_code: latestFailure.lastCode,
+          physical_execution_revision: latestFailure.physicalExecutionRevision,
+          clears_after: "a materially different planning action or physical execution",
+          recovery: latestFailure.action === "plan_humanoid_navigation"
+            ? "Navigation is temporarily unavailable. Use plan_whole_body_motion_candidates for a physically different task-space posture strategy before retrying navigation; do not encode pure root navigation as a whole-body workaround."
+            : "Whole-body planning is temporarily unavailable. Use a materially different navigation strategy before retrying whole-body planning."
+        }
+      : null;
+    const transitClearance = this.#navigationTransitClearanceRequirementByAgent.get(
+      normalizedAgentId
+    );
+    return jsonValue({
+      planning_actions: [
+        "plan_whole_body_motion_candidates",
+        "plan_humanoid_navigation"
+      ].map((action) => ({
+        action,
+        available: this.isActionAvailable(
+          action as HumanoidActionName,
+          normalizedAgentId
+        )
+      })),
+      cooldown,
+      transit_clearance: transitClearance
+        ? navigationTransitClearanceContext(transitClearance)
+        : null
+    });
   }
 
   async invoke(
@@ -307,8 +462,78 @@ export class HumanoidActionRuntime {
       : baseReceipt;
     assertNormalizedReceiptIdentity(baseReceipt, receipt);
     this.#receipts.set(transactionId, receipt);
+    if (receipt.accepted
+      && (receipt.action === "execute_whole_body_motion"
+        || receipt.action === "execute_humanoid_navigation")) {
+      this.#latestPhysicalExecutionRevision = Math.max(
+        this.#latestPhysicalExecutionRevision,
+        receipt.worldAfterRevision
+      );
+      this.#planningFailureByFingerprint.clear();
+      this.#latestPlanningFailureKeyByAgent.clear();
+    }
+    this.#recordPlanningOutcome(receipt);
+    this.#recordNavigationTransitClearance(receipt);
     if (this.#receiptSink) this.#uncommittedReceiptIds.add(transactionId);
     return structuredClone(receipt);
+  }
+
+  #recordPlanningOutcome(receipt: HumanoidActionReceipt): void {
+    if (receipt.agentId !== "humanoid-motion-reference"
+      || !isPlanningAction(receipt.action)) {
+      return;
+    }
+    if (receipt.accepted) {
+      this.#planningFailureByFingerprint.clear();
+      this.#latestPlanningFailureKeyByAgent.clear();
+      return;
+    }
+    const physicalFingerprint = planningFailureFingerprint(
+      receipt.action,
+      receipt.agentId,
+      receipt.input,
+      receipt.fingerprint
+    );
+    const key = planningFailureKey(receipt.agentId, physicalFingerprint);
+    const previous = this.#planningFailureByFingerprint.get(key);
+    const repeated = previous?.action === receipt.action
+      && previous.physicalExecutionRevision === this.#latestPhysicalExecutionRevision;
+    this.#planningFailureByFingerprint.set(key, {
+      action: receipt.action,
+      fingerprint: physicalFingerprint,
+      physicalExecutionRevision: this.#latestPhysicalExecutionRevision,
+      count: repeated ? previous.count + 1 : 1,
+      lastCode: receipt.code === "repeated_planning_failure" && previous
+        ? previous.lastCode
+        : receipt.code
+    });
+    this.#latestPlanningFailureKeyByAgent.set(receipt.agentId, key);
+  }
+
+  #recordNavigationTransitClearance(receipt: HumanoidActionReceipt): void {
+    const motionAgentId = "humanoid-motion-reference";
+    if (receipt.accepted
+      && (receipt.action === "execute_whole_body_motion"
+        || receipt.action === "execute_humanoid_navigation")) {
+      this.#navigationTransitClearanceRequirementByAgent.delete(motionAgentId);
+      return;
+    }
+    if (receipt.agentId !== motionAgentId
+      || receipt.action !== "plan_humanoid_navigation"
+      || receipt.accepted) return;
+    const detail = jsonObject(receipt.detail);
+    const requirement = navigationTransitClearanceFromRejection({
+      reason: detail?.reason,
+      transactionId: receipt.transactionId,
+      worldRevision: receipt.worldAfterRevision,
+      snapshot: this.#world.snapshot()
+    });
+    if (requirement) {
+      this.#navigationTransitClearanceRequirementByAgent.set(
+        motionAgentId,
+        requirement
+      );
+    }
   }
 
   async #ensureReceiptCommitted(receipt: HumanoidActionReceipt): Promise<void> {
@@ -345,18 +570,109 @@ export class HumanoidActionRuntime {
     causalFrameCount?: number;
     causalWorldAfterRevision?: number;
   }> {
+    if (isPlanningAction(name)
+      && invocation.agentId === "humanoid-motion-reference") {
+      const observedRevision = this.#observationRevisionByAgent.get(
+        invocation.agentId
+      );
+      if (observedRevision === undefined
+        || observedRevision < this.#latestPhysicalExecutionRevision) {
+        return {
+          accepted: false,
+          code: "fresh_motion_observation_required",
+          channels: [],
+          detail: {
+            automatic_actuation: false,
+            motion_agent_id: invocation.agentId,
+            observed_world_revision: observedRevision ?? null,
+            latest_physical_execution_revision:
+              this.#latestPhysicalExecutionRevision,
+            recovery: "Call observe_humanoid from the Motion Agent before planning. The Harness will not share another Agent's observation or generate motion parameters."
+          }
+        };
+      }
+      this.#planningAttemptRevisionByAgent.set(
+        invocation.agentId,
+        this.#world.snapshot().worldRevision
+      );
+      const repeatedFailure = this.#planningFailureByFingerprint.get(
+        planningFailureKey(
+          invocation.agentId,
+          planningFailureFingerprint(
+            name,
+            invocation.agentId,
+            rawInput,
+            invocation.fingerprint
+          )
+        )
+      );
+      if (repeatedFailure
+        && repeatedFailure.physicalExecutionRevision
+          === this.#latestPhysicalExecutionRevision
+        && repeatedFailure.count >= 2) {
+        return {
+          accepted: false,
+          code: "repeated_planning_failure",
+          channels: [],
+          detail: {
+            automatic_actuation: false,
+            repeated_action: name,
+            repeated_failure_count: repeatedFailure.count,
+            previous_code: repeatedFailure.lastCode,
+            physical_execution_revision: this.#latestPhysicalExecutionRevision,
+            recovery: "This exact action and complete physical input already failed repeatedly without an intervening execution. Choose materially different physical parameters or another available planning tool; changing only labels or identifiers is not a new strategy."
+          }
+        };
+      }
+    }
     if (name === "observe_humanoid") {
       HumanoidActionInputs.observe_humanoid.parse(rawInput);
+      const observation = invocation.agentId === "humanoid-motion-reference"
+        ? await this.#world.observeManipulationReachability()
+        : this.#world.observe();
+      this.#observationRevisionByAgent.set(
+        invocation.agentId,
+        observation.worldRevision
+      );
+      if (invocation.agentId === "humanoid-motion-reference") {
+        const requirement = manipulationBasePlacementRequirement(observation);
+        if (requirement) {
+          this.#manipulationBasePlacementRequirementByAgent.set(
+            invocation.agentId,
+            requirement
+          );
+        } else {
+          this.#manipulationBasePlacementRequirementByAgent.delete(
+            invocation.agentId
+          );
+        }
+      }
       return {
         accepted: true,
         code: "humanoid_observed",
         channels: [],
-        detail: modelObservation(this.#world.observe())
+        detail: modelObservation(observation)
       };
     }
     if (name === "plan_whole_body_motion") {
       const plan = HumanoidActionInputs.plan_whole_body_motion.parse(rawInput);
-      const result = await this.#world.planWholeBodyMotion(plan);
+      const transitClearance = this.#navigationTransitClearanceRequirementByAgent.get(
+        invocation.agentId
+      );
+      const clearanceRejection = transitClearance
+        ? navigationTransitClearanceMotionRejection([plan], transitClearance)
+        : null;
+      if (clearanceRejection) return clearanceRejection;
+      const placementRequirement = this.#manipulationBasePlacementRequirementByAgent.get(
+        invocation.agentId
+      );
+      const placementRejection = placementRequirement
+        ? manipulationBasePlacementMotionRejection([plan], placementRequirement)
+        : null;
+      if (placementRejection) return placementRejection;
+      const result = await this.#world.planWholeBodyMotion(plan, {
+        retainTerminalJointTracking: transitClearance !== undefined
+      });
       if (result.accepted) this.#planChannels.set(result.planId, result.channels);
       return {
         accepted: result.accepted,
@@ -381,7 +697,29 @@ export class HumanoidActionRuntime {
       const batch = normalizeHumanoidMotionCandidateBatchInput(
         HumanoidActionInputs.plan_whole_body_motion_candidates.parse(rawInput)
       );
-      const result = await this.#world.planWholeBodyMotionCandidates(batch);
+      const transitClearance = this.#navigationTransitClearanceRequirementByAgent.get(
+        invocation.agentId
+      );
+      const clearanceRejection = transitClearance
+        ? navigationTransitClearanceMotionRejection(
+            batch.candidates,
+            transitClearance
+          )
+        : null;
+      if (clearanceRejection) return clearanceRejection;
+      const placementRequirement = this.#manipulationBasePlacementRequirementByAgent.get(
+        invocation.agentId
+      );
+      const placementRejection = placementRequirement
+        ? manipulationBasePlacementMotionRejection(
+            batch.candidates,
+            placementRequirement
+          )
+        : null;
+      if (placementRejection) return placementRejection;
+      const result = await this.#world.planWholeBodyMotionCandidates(batch, {
+        retainTerminalJointTracking: transitClearance !== undefined
+      });
       if (result.accepted) this.#planChannels.set(result.planId, result.channels);
       return {
         accepted: result.accepted,
@@ -488,7 +826,31 @@ export class HumanoidActionRuntime {
     }
     if (name === "plan_humanoid_navigation") {
       const input = HumanoidActionInputs.plan_humanoid_navigation.parse(rawInput);
-      const result = await this.#world.planNavigation(input.target);
+      const transitClearance = this.#navigationTransitClearanceRequirementByAgent.get(
+        invocation.agentId
+      );
+      if (transitClearance) {
+        return {
+          accepted: false,
+          code: "navigation_transit_clearance_required",
+          channels: [],
+          detail: {
+            ...navigationTransitClearanceContext(transitClearance) as Record<string, JsonValue>,
+            recovery: "Plan, execute, and observe a model-selected collision-side arm-clearance posture before requesting another navigation preview."
+          }
+        };
+      }
+      const placementRequirement = this.#manipulationBasePlacementRequirementByAgent.get(
+        invocation.agentId
+      );
+      const placementRejection = placementRequirement
+        ? manipulationBasePlacementNavigationRejection(input, placementRequirement)
+        : null;
+      if (placementRejection) return placementRejection;
+      const result = await this.#world.planNavigation(
+        input.target,
+        input.arrival_heading
+      );
       if (result.accepted) this.#planChannels.set(result.planId, ["locomotion"]);
       return {
         accepted: result.accepted,
@@ -501,10 +863,22 @@ export class HumanoidActionRuntime {
           intent_sha256: result.intentSha256,
           target: result.target,
           chunk_target: result.chunkTarget,
+          requested_arrival_heading: result.requestedArrivalHeading,
+          arrival_heading: result.arrivalHeading,
           waypoints: result.waypoints,
           distance: result.distance,
           remaining_distance: result.remainingDistance,
+          partial_endpoint: result.partialEndpoint ?? null,
+          preview_frames: result.previewFrames ?? null,
+          preview_travelled_m: result.previewTravelledDistance ?? null,
           carry: result.carry,
+          ...(!result.accepted && placementRequirement
+            ? {
+                reachable_base_placements: reachableBasePlacementContext(
+                  placementRequirement.objects
+                )
+              }
+            : {}),
           ...(result.reason ? { reason: result.reason } : {})
         }
       };
@@ -702,6 +1076,8 @@ function planIdFromReceipt(receipt: HumanoidActionReceipt): string | undefined {
 
 function modelObservation(snapshot: HumanoidWorldObservation): unknown {
   const robot = snapshot.robot;
+  const rootYaw = yawFromQuaternion(robot.rootRotation);
+  const exposeHandGeometry = requiresHandSurfaceGeometry(snapshot);
   const embodiedObjectIds = new Set([
     ...snapshot.objectTokens.flatMap((token) => (
       token.status === "visible" && token.observable
@@ -714,10 +1090,74 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
         : [assessment.object_id]
     ))
   ]);
+  const contactReferenceObjects = snapshot.objectTokens.filter((token) => (
+    token.portable
+      && token.observable
+      && embodiedObjectIds.has(token.id)
+      && token.position !== null
+  ));
+  const manipulationGeometry = exposeHandGeometry
+    ? {
+        objects: contactReferenceObjects.map((object) => ({
+          object_id: object.id,
+          object_center_world: object.position,
+          object_size: object.size,
+          reachable_base_placements: snapshot.manipulationBasePlacements
+            .filter((entry) => entry.objectId === object.id)
+            .map((entry) => ({
+              hand_surface: entry.handSurface,
+              root_world_target: entry.rootWorldTarget,
+              root_translation_world: entry.rootTranslationWorld,
+              root_yaw_radians: entry.rootYawRadians,
+              wrist_world_if_surface_at_object_center: entry.wristWorldTarget,
+              ik_residual_m: entry.ikResidualMeters,
+              navigation_validation_required: true
+            })),
+          hands: Object.fromEntries((["left", "right"] as const).map((hand) => {
+            const wrist = robot.links[
+              hand === "left" ? "left_wrist_yaw_link" : "right_wrist_yaw_link"
+            ];
+            return [hand, {
+              current_wrist_world: wrist.position,
+              surface_center_alignments: snapshot.handSurfaces
+                .filter((surface) => surface.hand === hand)
+                .map((surface) => {
+                  const reachability = snapshot.manipulationReachability.find((entry) => (
+                    entry.objectId === object.id
+                      && entry.handSurface === surface.handSurface
+                  ));
+                  const wristTarget = {
+                    x: object.position!.x - surface.surfaceFromWristWorld.x,
+                    y: object.position!.y - surface.surfaceFromWristWorld.y,
+                    z: object.position!.z - surface.surfaceFromWristWorld.z
+                  };
+                  const delta = {
+                    x: wristTarget.x - wrist.position.x,
+                    y: wristTarget.y - wrist.position.y,
+                    z: wristTarget.z - wrist.position.z
+                  };
+                  return {
+                    hand_surface: surface.handSurface,
+                    wrist_world_if_surface_at_object_center: wristTarget,
+                    delta_from_current_wrist_world: delta,
+                    distance_from_current_wrist_m: Math.hypot(
+                      delta.x,
+                      delta.y,
+                      delta.z
+                    ),
+                    ik_reference_reachable:
+                      reachability?.ikReferenceReachable ?? false,
+                    ik_residual_m: reachability?.ikResidualMeters ?? null
+                  };
+                })
+            }];
+          }))
+        }))
+      }
+    : null;
   return {
     frame: snapshot.frame,
     world_revision: snapshot.worldRevision,
-    controller: robot.controller,
     sensor: {
       id: "head_sensor",
       position: snapshot.sensor.position,
@@ -728,12 +1168,24 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
     },
     root: {
       position: robot.rootPosition,
-      rotation: robot.rootRotation
+      rotation: robot.rootRotation,
+      heading: {
+        yaw_radians: rootYaw,
+        forward_world: {
+          x: Math.sin(rootYaw),
+          y: 0,
+          z: Math.cos(rootYaw)
+        },
+        left_world: {
+          x: Math.cos(rootYaw),
+          y: 0,
+          z: -Math.sin(rootYaw)
+        }
+      }
     },
     fallen: robot.fallen,
     balance: robot.balance,
     feet: robot.feet,
-    joints: robot.joints,
     key_links: Object.fromEntries([
       "pelvis",
       "head_link",
@@ -752,6 +1204,27 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
         pelvis_relative_position: humanoidEndEffectorPosition(robot, endEffector, "pelvis")
       }
     ])),
+    manipulation_geometry: manipulationGeometry,
+    hand_coordination: snapshot.handCoordination,
+    hand_surfaces: exposeHandGeometry
+      ? Object.fromEntries((["left", "right"] as const).map((hand) => {
+          const wrist = robot.links[
+            hand === "left" ? "left_wrist_yaw_link" : "right_wrist_yaw_link"
+          ];
+          return [hand, {
+            wrist_world_position: wrist.position,
+            wrist_world_rotation: wrist.rotation,
+            contact_surfaces: snapshot.handSurfaces
+              .filter((surface) => surface.hand === hand)
+              .map((surface) => ({
+                hand_surface: surface.handSurface,
+                world_position: surface.worldPosition,
+                world_rotation: surface.worldRotation,
+                surface_from_wrist_world: surface.surfaceFromWristWorld
+              }))
+          }];
+        }))
+      : null,
     object_tokens: snapshot.objectTokens.map((token) => ({
       id: token.id,
       role: token.role,
@@ -810,9 +1283,304 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
       ))
     },
     interaction: snapshot.interaction,
-    contacts: robot.contacts,
+    contacts: modelRelevantContacts(robot),
+    non_foot_environment_contacts: robot.nonFootEnvironmentContacts,
     navigation: snapshot.navigation
   };
+}
+
+function modelRelevantContacts(
+  robot: HumanoidWorldObservation["robot"]
+): HumanoidWorldObservation["robot"]["contacts"] {
+  const unsafeBodies = new Set(robot.nonFootEnvironmentContacts);
+  return robot.contacts.filter((contact) => (
+    contact.firstHandLink !== null
+      || contact.secondHandLink !== null
+      || contact.firstBody !== null && (
+        unsafeBodies.has(contact.firstBody)
+          || contact.firstObject !== null
+          || contact.secondObject !== null
+          || contact.firstSolid != null
+          || contact.secondSolid != null
+      )
+      || contact.secondBody !== null && (
+        unsafeBodies.has(contact.secondBody)
+          || contact.firstObject !== null
+          || contact.secondObject !== null
+          || contact.firstSolid != null
+          || contact.secondSolid != null
+      )
+  ));
+}
+
+function requiresHandSurfaceGeometry(
+  snapshot: HumanoidWorldObservation
+): boolean {
+  if ((snapshot.interaction.manipulable_objects?.length ?? 0) > 0
+    || (snapshot.interaction.carrying?.bindings.length ?? 0) > 0
+    || snapshot.grasp.assessments.some((assessment) => (
+      assessment.evidence.contact.status !== "missing"
+    ))) {
+    return true;
+  }
+  return snapshot.solidTokens.some((solid) => (
+    solid.kind === "block"
+      && Math.hypot(
+        solid.center.x - snapshot.robot.rootPosition.x,
+        solid.center.z - snapshot.robot.rootPosition.z
+      ) <= 1.25
+  ));
+}
+
+function manipulationBasePlacementRequirement(
+  observation: HumanoidWorldObservation
+): ManipulationBasePlacementRequirement | null {
+  const objects = observation.objectTokens.flatMap((object) => {
+    if (!object.portable
+      || object.status !== "visible"
+      || !object.observable
+      || object.position === null) return [];
+    const reachability = observation.manipulationReachability.filter((entry) => (
+      entry.objectId === object.id
+    ));
+    if (reachability.length === 0
+      || reachability.some((entry) => entry.ikReferenceReachable)) return [];
+    const placements = observation.manipulationBasePlacements.filter((entry) => (
+      entry.objectId === object.id
+    ));
+    return placements.length === 0
+      ? []
+      : [{
+          objectId: object.id,
+          objectCenterWorld: { ...object.position },
+          placements: structuredClone(placements)
+        }];
+  });
+  return objects.length === 0
+    ? null
+    : {
+        observedWorldRevision: observation.worldRevision,
+        objects
+      };
+}
+
+function manipulationBasePlacementNavigationRejection(
+  input: ReturnType<typeof HumanoidActionInputs.plan_humanoid_navigation.parse>,
+  requirement: ManipulationBasePlacementRequirement
+): {
+  accepted: false;
+  code: string;
+  channels: HumanoidBodyChannel[];
+  detail: JsonValue;
+} | null {
+  const approached = requirement.objects.filter((object) => planarDistance(
+    input.target,
+    object.objectCenterWorld
+  ) <= MANIPULATION_APPROACH_RADIUS_METERS);
+  if (approached.length === 0) return null;
+  const matchingPlacement = approached.flatMap((object) => object.placements)
+    .find((placement) => (
+      planarDistance(input.target, placement.rootWorldTarget)
+        <= MANIPULATION_BASE_TARGET_TOLERANCE_METERS
+        && input.arrival_heading?.type === "yaw"
+        && Math.abs(normalizeAngle(
+          input.arrival_heading.yaw_radians - placement.rootYawRadians
+        )) <= input.arrival_heading.tolerance_radians
+    ));
+  if (matchingPlacement) return null;
+  return {
+    accepted: false,
+    code: "manipulation_base_placement_required",
+    channels: ["locomotion"],
+    detail: jsonValue({
+      automatic_actuation: false,
+      observed_world_revision: requirement.observedWorldRevision,
+      requested_target: input.target,
+      requested_arrival_heading: input.arrival_heading,
+      reachable_base_placements: reachableBasePlacementContext(approached),
+      reason: "The current manipulation observation has no directly reachable hand surface. A near-object route must preserve one model-visible IK base-placement sample and its yaw before endpoint planning."
+    })
+  };
+}
+
+function manipulationBasePlacementMotionRejection(
+  plans: Array<ReturnType<typeof HumanoidActionInputs.plan_whole_body_motion.parse>>,
+  requirement: ManipulationBasePlacementRequirement
+): {
+  accepted: false;
+  code: string;
+  channels: HumanoidBodyChannel[];
+  detail: JsonValue;
+} | null {
+  const blockedPlans = plans.flatMap((plan) => {
+    const contactedObjects = requirement.objects.filter((object) => (
+      (plan.contact_constraints ?? []).some((constraint) => (
+        "object_id" in constraint
+          && constraint.object_id === object.objectId
+      ))
+    ));
+    const blockedObjects = contactedObjects.filter((object) => (
+      !isContactGuidedMobileManipulation(plan, object)
+    ));
+    return blockedObjects.length === 0
+      ? []
+      : [{ plan, objects: blockedObjects }];
+  });
+  const approached = requirement.objects.filter((object) => (
+    blockedPlans.some((blocked) => blocked.objects.includes(object))
+  ));
+  if (approached.length === 0) return null;
+  return {
+    accepted: false,
+    code: "manipulation_base_placement_required",
+    channels: [],
+    detail: manipulationBasePlacementDetail(
+      requirement.observedWorldRevision,
+      approached,
+      {
+        reason: "The requested endpoint contact has no directly reachable hand surface at the observed root pose. Use a validated base placement, or submit a contact-guided mobile manipulation candidate with non-zero root translation and an exact required hand-surface contact for the same object.",
+        requested_plan_ids: blockedPlans.map(({ plan }) => plan.id)
+      }
+    )
+  };
+}
+
+function isContactGuidedMobileManipulation(
+  plan: ReturnType<typeof HumanoidActionInputs.plan_whole_body_motion.parse>,
+  object: ManipulationBasePlacementRequirement["objects"][number]
+): boolean {
+  const hasRootTranslation = plan.keyframes.some((keyframe) => {
+    const velocity = keyframe.root_velocity;
+    return velocity != null
+      && Math.hypot(velocity.forward_mps, velocity.lateral_mps) > 1e-6;
+  });
+  if (!hasRootTranslation) return false;
+  const reachableSurfaces = new Set(object.placements.map((placement) => (
+    placement.handSurface
+  )));
+  return (plan.contact_constraints ?? []).some((constraint) => (
+    "hand_surface" in constraint
+      && "object_id" in constraint
+      && constraint.object_id === object.objectId
+      && constraint.required
+      && reachableSurfaces.has(constraint.hand_surface)
+  ));
+}
+
+function manipulationBasePlacementDetail(
+  observedWorldRevision: number,
+  objects: ManipulationBasePlacementRequirement["objects"],
+  extra: Record<string, unknown>
+): JsonValue {
+  return jsonValue({
+    automatic_actuation: false,
+    observed_world_revision: observedWorldRevision,
+    reachable_base_placements: reachableBasePlacementContext(objects),
+    ...extra
+  });
+}
+
+function reachableBasePlacementContext(
+  objects: ManipulationBasePlacementRequirement["objects"]
+): Array<Record<string, unknown>> {
+  return objects.flatMap((object) => object.placements.map((placement) => ({
+    object_id: object.objectId,
+    hand_surface: placement.handSurface,
+    root_world_target: placement.rootWorldTarget,
+    root_yaw_radians: placement.rootYawRadians,
+    wrist_world_target: placement.wristWorldTarget,
+    ik_residual_m: placement.ikResidualMeters,
+    navigation_validation_required: true
+  })));
+}
+
+function planarDistance(left: Vec3, right: Vec3): number {
+  return Math.hypot(left.x - right.x, left.z - right.z);
+}
+
+function normalizeAngle(value: number): number {
+  return Math.atan2(Math.sin(value), Math.cos(value));
+}
+
+function planningFailureKey(agentId: string, fingerprint: string): string {
+  return `${agentId}\0${fingerprint}`;
+}
+
+function planningFailureFingerprint(
+  action: HumanoidPlanningActionName,
+  agentId: string,
+  rawInput: unknown,
+  fallback: string
+): string {
+  try {
+    if (action === "plan_humanoid_navigation") {
+      const navigation = HumanoidActionInputs.plan_humanoid_navigation.parse(rawInput);
+      return humanoidActionFingerprint(action, agentId, {
+        target: {
+          x: planningFailureScalar(navigation.target.x, 0.01),
+          z: planningFailureScalar(navigation.target.z, 0.01)
+        },
+        arrival_heading: navigation.arrival_heading === null
+          ? null
+          : navigation.arrival_heading.type === "yaw"
+            ? {
+                type: "yaw",
+                yaw_radians: planningFailureScalar(
+                  normalizeAngle(navigation.arrival_heading.yaw_radians),
+                  0.01
+                ),
+                tolerance_radians: planningFailureScalar(
+                  navigation.arrival_heading.tolerance_radians,
+                  0.01
+                )
+              }
+            : {
+                type: "face_point",
+                target: {
+                  x: planningFailureScalar(
+                    navigation.arrival_heading.target.x,
+                    0.01
+                  ),
+                  z: planningFailureScalar(
+                    navigation.arrival_heading.target.z,
+                    0.01
+                  )
+                },
+                tolerance_radians: planningFailureScalar(
+                  navigation.arrival_heading.tolerance_radians,
+                  0.01
+                )
+              }
+      });
+    }
+    if (action === "plan_whole_body_motion") {
+      const { id: _id, intent: _intent, ...physical } =
+        HumanoidActionInputs.plan_whole_body_motion.parse(rawInput);
+      return humanoidActionFingerprint(action, agentId, physical);
+    }
+    const batch = normalizeHumanoidMotionCandidateBatchInput(
+      HumanoidActionInputs.plan_whole_body_motion_candidates.parse(rawInput)
+    );
+    const {
+      objective: _objective,
+      termination,
+      candidates
+    } = batch;
+    const { option_id: _optionId, ...physicalTermination } = termination;
+    return humanoidActionFingerprint(action, agentId, {
+      termination: physicalTermination,
+      candidates: candidates.map(({ id: _id, intent: _intent, ...physical }) => (
+        physical
+      ))
+    });
+  } catch {
+    return fallback;
+  }
+}
+
+function planningFailureScalar(value: number, resolution: number): number {
+  const rounded = Math.round(value / resolution) * resolution;
+  return Object.is(rounded, -0) ? 0 : rounded;
 }
 
 function conciseRobot(robot: HumanoidWorldSnapshot["robot"]): unknown {

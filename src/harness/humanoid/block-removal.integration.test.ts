@@ -39,6 +39,7 @@ const BLOCK_ID = "frontier-block";
 const PLAN_TRANSACTION_ID = "contact-plan";
 const EXECUTION_TRANSACTION_ID = "contact-execution";
 const REMOVAL_TRANSACTION_ID = "remove-frontier-block";
+const OBSERVATION_TRANSACTION_ID = "observe-after-frontier-block-removal";
 const CONTACT_STABLE_FRAMES = 8;
 const CONTACT_FORCE_N = 9;
 
@@ -196,6 +197,26 @@ describe("block-removal autonomous transaction", () => {
           })
         })
       ]));
+
+      const observationAuthority = await authorizeAction(
+        runtime,
+        "observe_humanoid",
+        {},
+        OBSERVATION_TRANSACTION_ID,
+        HUMANOID_AGENT_IDS.sentry
+      );
+      const observation = await runtime.invoke(
+        "observe_humanoid",
+        {},
+        OBSERVATION_TRANSACTION_ID,
+        HUMANOID_AGENT_IDS.sentry,
+        observationAuthority
+      );
+      expect(observation).toMatchObject({
+        accepted: true,
+        code: "humanoid_observed",
+        worldBeforeRevision: removal.worldAfterRevision
+      });
 
       expect(runtime.validateCycleEvidence([
         EXECUTION_TRANSACTION_ID,

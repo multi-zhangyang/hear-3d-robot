@@ -4,7 +4,10 @@ import type {
   HumanoidWorldSnapshot
 } from "./world-contract.js";
 
-type ContinuousWorld = Pick<HumanoidWorld, "advanceStationary" | "snapshot">;
+type ContinuousWorld = Pick<
+  HumanoidWorld,
+  "advanceStationary" | "flushFramePublications" | "snapshot"
+>;
 
 export class HumanoidStationarySafetyError extends Error {
   readonly snapshot: HumanoidWorldSnapshot;
@@ -51,9 +54,7 @@ export class HumanoidPhysicsClock {
 
   start(): void {
     if (this.#running) return;
-    if (this.#failure !== undefined) {
-      throw new Error("A failed humanoid physics clock cannot be restarted");
-    }
+    this.throwIfFailed();
     this.#running = true;
     this.#schedule(this.#intervalMilliseconds);
   }
@@ -65,6 +66,7 @@ export class HumanoidPhysicsClock {
       this.#timer = undefined;
     }
     await this.#inFlight;
+    await this.#world.flushFramePublications();
   }
 
   throwIfFailed(): void {

@@ -10,7 +10,10 @@ import type { LongRunContextRuntime } from "./context-runtime.js";
 import { compactorInputTokenLimit } from "../runtime/context-budget.js";
 import { agentInvocationMarker } from "./agent-scope.js";
 import { LongRunContextManager } from "./context-compaction.js";
-import type { ContextSummaryRequest } from "./context-summary-agent.js";
+import {
+  ContextCompactionCapacityError,
+  type ContextSummaryRequest
+} from "./context-summary-agent.js";
 
 describe("LongRunContextManager hierarchy identity", () => {
   it("binds worker memory and budgets from trusted Agent instructions", async () => {
@@ -74,7 +77,7 @@ describe("LongRunContextManager hierarchy identity", () => {
     expect(filtered.instructions).toContain(agentInvocationMarker("humanoid-sentry"));
   });
 
-  it("surfaces revision-bound Goal identifiers ahead of the full authority payload", async () => {
+  it("surfaces revision-bound Goal identifiers in the final authority envelope", async () => {
     let memory = structuredClone(EmptyContextMemoryState);
     const node = taskNode("humanoid-goal-manager", "目标管理");
     const evidenceRef = `goal-world:41:41:${"a".repeat(64)}`;
@@ -128,20 +131,130 @@ describe("LongRunContextManager hierarchy identity", () => {
       agent: { name: node.name, tools: [] }
     } as never);
 
-    expect(filtered.instructions).toContain(
+    const authorityItem = filtered.input.at(-1);
+    expect(authorityItem).toMatchObject({
+      type: "message",
+      role: "user"
+    });
+    const authorityText = authorityItem && "content" in authorityItem
+      && typeof authorityItem.content === "string"
+      ? authorityItem.content
+      : "";
+    expect(authorityText).toContain(
       "CURRENT EXACT IDENTIFIERS (copy values character-for-character; never invent aliases)"
     );
-    expect(filtered.instructions).toContain(`goal_evidence_ref=${JSON.stringify(evidenceRef)}`);
-    expect(filtered.instructions).toContain(
+    expect(authorityText).toContain(`goal_evidence_ref=${JSON.stringify(evidenceRef)}`);
+    expect(authorityText).toContain(
       `existing_goal_candidate_ids=${JSON.stringify([candidateId])}`
     );
-    expect(filtered.instructions).toContain("current_world_revision=41");
-    expect(filtered.instructions).toContain(
+    expect(authorityText).toContain("current_world_revision=41");
+    expect(authorityText).toContain(
       'pending_planning_transaction_id="planning-call-41"'
     );
-    expect(filtered.instructions).toContain(
+    expect(authorityText).toContain(
       'required_executor_action="execute_humanoid_navigation"'
     );
+    expect(filtered.instructions).not.toContain("current_world_revision=41");
+  });
+
+  it("keeps the semantic prefix stable with only the current authority suffix", async () => {
+    let memory = structuredClone(EmptyContextMemoryState);
+    let worldRevision = 1;
+    const node = taskNode("humanoid-coordinator", "协调");
+    const runtime = {
+      rootAgentId: node.id,
+      signal: undefined,
+      store: {
+        readJournalTail: async () => ({ total: 0 })
+      },
+      activeNode: () => node,
+      contextAnchor: () => ({
+        world_frame: worldRevision,
+        world_revision: worldRevision,
+        coordinator_phase: "plan"
+      }),
+      contextMemory: () => structuredClone(memory),
+      contextWorldIdentity: () => ({ worldRevision }),
+      contextReceipts: () => ({}),
+      assertContextSummaryEvidence: () => undefined,
+      async updateContextMemory(state: ContextMemoryState) {
+        memory = structuredClone(state);
+      },
+      async recordCompactionModelCall() {},
+      async reconcileCompactionModelCalls() {},
+      async recordProvider() {}
+    } as unknown as LongRunContextRuntime;
+    const manager = new LongRunContextManager({
+      runtime,
+      provider: providerConfig(),
+      createGenerator: () => ({
+        async generate() {
+          throw new Error("Compaction was not expected in this test");
+        }
+      })
+    });
+    const modelData: ModelInputData = {
+      instructions: `${agentInvocationMarker(node.id)}\nCoordinate.`,
+      input: [{ role: "user", content: "Continue." }] as AgentInputItem[]
+    };
+
+    const first = await manager.filter({
+      modelData,
+      agent: { name: node.name, tools: [] }
+    } as never);
+    worldRevision = 2;
+    const second = await manager.filter({
+      modelData: {
+        ...modelData,
+        input: [
+          ...modelData.input,
+          { role: "assistant", content: "Previous decision." }
+        ] as AgentInputItem[]
+      },
+      agent: { name: node.name, tools: [] }
+    } as never);
+
+    expect(second.instructions).toBe(first.instructions);
+    expect(second.instructions).not.toContain("world_revision");
+    expect(second.input.slice(0, -1)).toEqual([
+      ...modelData.input,
+      { role: "assistant", content: "Previous decision." }
+    ]);
+    expect(second.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
+    const current = second.input.at(-1);
+    expect(current && "content" in current ? current.content : "")
+      .toContain("current_world_revision=2");
+    expect(JSON.stringify(second.input)).not.toContain("current_world_revision=1");
+    expect(manager.snapshot.scopes[node.id]).toMatchObject({
+      raw_item_count: 2,
+      retained_item_count: 2
+    });
+
+    worldRevision = 3;
+    const terminal = { role: "assistant" as const, content: "Terminal decision." };
+    const nextDelegation = { role: "user" as const, content: "Delegate again." };
+    const third = await manager.filter({
+      modelData: {
+        ...modelData,
+        input: [
+          ...first.input,
+          { role: "assistant", content: "Previous decision." },
+          terminal,
+          nextDelegation
+        ] as AgentInputItem[]
+      },
+      agent: { name: node.name, tools: [] }
+    } as never);
+
+    expect(third.input.slice(0, -1)).toEqual([
+      ...modelData.input,
+      { role: "assistant", content: "Previous decision." },
+      terminal,
+      nextDelegation
+    ]);
+    expect(third.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
+    expect(JSON.stringify(third.input)).not.toContain("current_world_revision=1");
+    expect(JSON.stringify(third.input.at(-1))).toContain("current_world_revision=3");
   });
 
   it("calibrates the provider-neutral estimate from reported input usage", async () => {
@@ -204,6 +317,19 @@ describe("LongRunContextManager hierarchy identity", () => {
     await manager.filter(request);
     expect(manager.snapshot.scopes[node.id]!.active_estimated_tokens)
       .toBe(baseline * 2);
+
+    await manager.recordModelInputUsage(node.id, baseline);
+    expect(manager.snapshot.scopes[node.id]).toMatchObject({
+      token_estimator_correction_milli: 1_000,
+      active_estimated_tokens: baseline
+    });
+    expect(journal).toContainEqual(expect.objectContaining({
+      type: "context_token_estimator_calibrated",
+      estimated_input_tokens: baseline,
+      reported_input_tokens: baseline,
+      previous_correction_milli: 2_000,
+      correction_milli: 1_000
+    }));
   });
 
   it("rewrites a completed SDK Session from the logical hot tail", async () => {
@@ -271,7 +397,11 @@ describe("LongRunContextManager hierarchy identity", () => {
       role: "assistant",
       content: "完成当前决策。"
     } as AgentInputItem;
-    let persisted = [...structuredClone(physical), completion];
+    let persisted = [
+      ...structuredClone(physical),
+      structuredClone(filtered.input.at(-1)!),
+      completion
+    ];
     let replacements = 0;
     const session = {
       getItems: async () => structuredClone(persisted),
@@ -289,15 +419,114 @@ describe("LongRunContextManager hierarchy identity", () => {
     await manager.compactSessionHistories(() => session as never);
 
     expect(replacements).toBe(1);
-    expect(persisted).toEqual([...filtered.input, completion]);
-    await manager.filter({
+    expect(isHarnessAuthorityItem(filtered.input.at(-1))).toBe(true);
+    expect(persisted).toEqual([
+      ...filtered.input.filter((item) => !isHarnessAuthorityItem(item)),
+      completion
+    ]);
+    const next = await manager.filter({
       ...request,
       modelData: { ...request.modelData, input: persisted }
     });
+    expect(next.instructions).toBe(filtered.instructions);
+    expect(next.input.slice(0, persisted.length)).toEqual(persisted);
+    expect(next.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
     expect(manager.snapshot.scopes[node.id]).toMatchObject({
       compaction_count: 1,
-      summary_origin: "model"
+      summary_origin: "model",
+      summary_world_revision: 0
     });
+  });
+
+  it("shrinks a compaction batch from a real response usage ceiling", async () => {
+    let memory = structuredClone(EmptyContextMemoryState);
+    const requests: ContextSummaryRequest[] = [];
+    const providerEvents: unknown[] = [];
+    const node = taskNode("humanoid-coordinator", "协调");
+    const sourceProvider = providerConfig({
+      contextWindowTokens: 16_384,
+      compactTriggerTokens: 4_000,
+      compactRecentModelTurns: 1,
+      compactMaxOutputTokens: 256
+    });
+    const runtime = {
+      rootAgentId: node.id,
+      signal: undefined,
+      store: {},
+      activeNode: () => node,
+      contextAnchor: () => ({ world_revision: 0 }),
+      contextMemory: () => structuredClone(memory),
+      contextWorldIdentity: () => ({ worldRevision: 0 }),
+      contextReceipts: () => ({}),
+      assertContextSummaryEvidence: () => undefined,
+      async updateContextMemory(state: ContextMemoryState) {
+        memory = structuredClone(state);
+      },
+      async recordCompactionModelCall() {},
+      async reconcileCompactionModelCalls() {},
+      async recordProvider(event: unknown) {
+        providerEvents.push(event);
+      }
+    } as unknown as LongRunContextRuntime;
+    const manager = new LongRunContextManager({
+      runtime,
+      provider: sourceProvider,
+      compactorProvider: sourceProvider,
+      createGenerator: () => ({
+        async generate(request) {
+          requests.push(request);
+          if (requests.length === 1) {
+            throw new ContextCompactionCapacityError(
+              8_192,
+              "tool JSON was truncated at the observed context ceiling",
+              {
+                usage: {
+                  requests: 1,
+                  inputTokens: 7_800,
+                  outputTokens: 392,
+                  totalTokens: 8_192
+                }
+              }
+            );
+          }
+          return {
+            summary: {
+              mission_state: "继续当前任务。",
+              constraints: [],
+              decisions: [],
+              completed: [],
+              pending: ["保留未完成目标。"],
+              blockers: [],
+              next_actions: ["读取当前权威状态。"]
+            },
+            origin: "model",
+            usage: { requests: 1, inputTokens: 2_000, outputTokens: 80, totalTokens: 2_080 }
+          };
+        }
+      })
+    });
+    const input = Array.from({ length: 12 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" as const : "assistant" as const,
+      content: `${index}:${"x".repeat(2_000)}`
+    })) as AgentInputItem[];
+
+    await manager.filter({
+      modelData: {
+        instructions: `${agentInvocationMarker(node.id)}\nCoordinate.`,
+        input
+      },
+      agent: { name: node.name, tools: [] }
+    } as never);
+
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+    expect(requests[1]!.maxInputTokens).toBe(compactorInputTokenLimit(8_192, 128));
+    expect(requests[1]!.sourceItems.length).toBeLessThan(requests[0]!.sourceItems.length);
+    expect(providerEvents).toContainEqual(expect.objectContaining({
+      status: "context_compaction_capacity_calibrated",
+      configured_context_window_tokens: 16_384,
+      observed_context_window_tokens: 8_192,
+      calibrated_input_limit_tokens: compactorInputTokenLimit(8_192, 128)
+    }));
   });
 
   it("persists distinct scope budgets and applies one effective compactor envelope", async () => {
@@ -438,6 +667,16 @@ function providerConfig(
     compactMaxOutputTokens: 256,
     ...overrides
   };
+}
+
+function isHarnessAuthorityItem(item: AgentInputItem | undefined): boolean {
+  return item !== undefined
+    && item.type === "message"
+    && "role" in item
+    && item.role === "user"
+    && "content" in item
+    && typeof item.content === "string"
+    && item.content.startsWith("CURRENT HARNESS AUTHORITY\n");
 }
 
 function taskNode(id: string, name: string): TaskNode {

@@ -2,6 +2,47 @@ import { describe, expect, it } from "vitest";
 import { HumanoidAuthorityFramePublisher } from "./authority-frame-publisher.js";
 
 describe("HumanoidAuthorityFramePublisher", () => {
+  it("flushes queued frames without closing the publisher", async () => {
+    const entered = deferred();
+    const release = deferred();
+    const published: number[] = [];
+    const publisher = new HumanoidAuthorityFramePublisher<number>();
+    publisher.enqueue({
+      source: "stationary",
+      commandId: null,
+      sink: async (frame) => {
+        published.push(frame);
+        if (frame === 1) {
+          entered.resolve();
+          await release.promise;
+        }
+      },
+      snapshot: 1
+    });
+    await entered.promise;
+    let flushed = false;
+    const firstFlush = publisher.flush().then(() => {
+      flushed = true;
+    });
+    await Promise.resolve();
+    expect(flushed).toBe(false);
+    release.resolve();
+    await firstFlush;
+
+    publisher.enqueue({
+      source: "stationary",
+      commandId: null,
+      sink: (frame) => {
+        published.push(frame);
+      },
+      snapshot: 2
+    });
+    await publisher.flush();
+
+    expect(published).toEqual([1, 2]);
+    await publisher.dispose();
+  });
+
   it("coalesces stationary backlog while a sink is slow", async () => {
     const entered = deferred();
     const release = deferred();

@@ -244,6 +244,11 @@ export class HumanoidAuthorityLoop<Snapshot> {
     await this.#publisher.dispose();
   }
 
+  async flushPublications(): Promise<void> {
+    await this.#publisher.flush();
+    if (this.#publicationFailure !== undefined) throw this.#publicationFailure;
+  }
+
   #promoteQueuedCommand(): void {
     while (!this.#active && this.#queued.length > 0) {
       const pending = this.#queued.shift()!;

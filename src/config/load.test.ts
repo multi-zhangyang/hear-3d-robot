@@ -33,11 +33,13 @@ describe("provider context budget", () => {
 
     expect(config.contextWindowTokens).toBe(262_144);
     expect(config.requestTimeoutMs).toBe(300_000);
+    expect(config.streamEventIdleTimeoutMs).toBe(300_000);
     expect(config.compactTriggerTokens).toBe(Math.floor(262_144 * 0.85));
     expect(config.maxOutputTokens).toBeUndefined();
     expect(config.compactMaxOutputTokens).toBeUndefined();
     expect(config.agentModels?.executor.maxOutputTokens).toBeUndefined();
     expect(config.agentModels?.executor.requestTimeoutMs).toBe(300_000);
+    expect(config.agentModels?.executor.streamEventIdleTimeoutMs).toBe(300_000);
     expect(config.agentModels?.compactor.compactMaxOutputTokens).toBeUndefined();
   });
 

@@ -26,9 +26,13 @@ import type {
   HumanoidCarriedObjectUnauthorizedContact
 } from "./carried-object-binding.js";
 import type {
+  HumanoidHandSurfaceObservation,
   HumanoidObjectSensorSnapshot,
   HumanoidSimulationSnapshot
 } from "./simulation.js";
+import type { G1HandContactSurfaceName } from "./morphology.js";
+import type { G1HandCoordination } from "./hand-coordination.js";
+import type { HumanoidNavigationArrivalHeading } from "./navigation-arrival.js";
 
 export interface HumanoidWorldSnapshot {
   frame: number;
@@ -55,11 +59,33 @@ export interface HumanoidWorldObservation {
   motionGenerator: HumanoidMotionGeneratorDescriptor;
   sensor: HumanoidObjectSensorSnapshot["sensor"];
   robot: Omit<HumanoidSimulationSnapshot, "objects">;
+  handCoordination: G1HandCoordination;
+  handSurfaces: HumanoidHandSurfaceObservation[];
+  manipulationReachability: HumanoidManipulationReachabilityObservation[];
+  manipulationBasePlacements: HumanoidManipulationBasePlacementObservation[];
   objectTokens: HumanoidObjectToken[];
   solidTokens: HumanoidSolidToken[];
   grasp: HumanoidWorldGraspState;
   interaction: HumanoidInteractionObservation;
   navigation: HumanoidWorldSnapshot["navigation"];
+}
+
+export interface HumanoidManipulationReachabilityObservation {
+  objectId: string;
+  handSurface: G1HandContactSurfaceName;
+  wristWorldTarget: Vec3;
+  ikReferenceReachable: boolean;
+  ikResidualMeters: number | null;
+}
+
+export interface HumanoidManipulationBasePlacementObservation {
+  objectId: string;
+  handSurface: G1HandContactSurfaceName;
+  rootWorldTarget: Vec3;
+  rootTranslationWorld: Vec3;
+  rootYawRadians: number;
+  wristWorldTarget: Vec3;
+  ikResidualMeters: number;
 }
 
 export interface WholeBodyPlanReceipt {
@@ -163,9 +189,14 @@ export interface NavigationPlanReceipt {
   intentSha256: string;
   target: Vec3;
   chunkTarget: Vec3;
+  requestedArrivalHeading: HumanoidNavigationArrivalHeading | null;
+  arrivalHeading: HumanoidNavigationArrivalHeading | null;
   waypoints: Vec3[];
   distance: number;
   remainingDistance: number;
+  partialEndpoint?: Vec3;
+  previewFrames?: number;
+  previewTravelledDistance?: number;
   carry: {
     binding_set_sha256: string;
     bindings: Array<{

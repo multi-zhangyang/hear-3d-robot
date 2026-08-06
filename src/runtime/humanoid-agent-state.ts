@@ -63,7 +63,7 @@ export async function captureHumanoidSessionBaseline(
 export async function restoreHumanoidSessionBaseline(
   sessions: ReadonlyMap<string, FileSession>,
   baseline: HumanoidSessionBaseline
-): Promise<void> {
+): Promise<string[]> {
   if (sessions.size !== baseline.size) {
     throw new Error("Humanoid Agent Session set changed during one model call");
   }
@@ -72,11 +72,23 @@ export async function restoreHumanoidSessionBaseline(
     if (!session) {
       throw new Error(`Humanoid Agent Session disappeared during recovery: ${agentId}`);
     }
-    return { session, items };
+    return { agentId, session, items };
   });
-  await Promise.all(entries.map(async ({ session, items }) => {
+  const candidates = await Promise.all(entries.map(async (entry) => ({
+    ...entry,
+    current: await entry.session.getItems()
+  })));
+  const changed = candidates.filter(({ current, items }) => (
+    agentInputItemsSha256(current) !== agentInputItemsSha256(items)
+  ));
+  // Publish the baseline even when this FileSession's cache already matches it:
+  // another process may have replaced the durable file after the snapshot.
+  // Only the returned ids describe an in-process SDK rollback that the context
+  // manager must rebase around.
+  await Promise.all(candidates.map(async ({ session, items }) => {
     await session.replaceItems([...items]);
   }));
+  return changed.map(({ agentId }) => agentId);
 }
 
 export function humanoidSessionBaselineIdentity(

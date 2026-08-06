@@ -27,6 +27,9 @@ const AgentToolContractSchema = z.object({
   input_builder_contract: z.enum([
     "objective_text_v1",
     "goal_manager_authority_envelope_v1",
+    "goal_manager_authority_envelope_v2",
+    "live_authority_delegation_v1",
+    "motion_authority_envelope_v1",
     "validated_execution_task_json_v1"
   ]),
   input_builder_sha256: Sha256Schema,

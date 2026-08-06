@@ -100,11 +100,24 @@ export type NavigationPlanningFailureCode =
  */
 export class NavigationPlanningError extends Error {
   readonly code: NavigationPlanningFailureCode;
+  readonly projectedTarget: Vec3 | undefined;
+  readonly projectionDistance: number | undefined;
 
-  constructor(code: NavigationPlanningFailureCode, message: string) {
+  constructor(
+    code: NavigationPlanningFailureCode,
+    message: string,
+    evidence: {
+      projectedTarget?: Vec3;
+      projectionDistance?: number;
+    } = {}
+  ) {
     super(message);
     this.name = "NavigationPlanningError";
     this.code = code;
+    this.projectedTarget = evidence.projectedTarget
+      ? { ...evidence.projectedTarget }
+      : undefined;
+    this.projectionDistance = evidence.projectionDistance;
   }
 }
 
@@ -278,7 +291,15 @@ export class NavigationMesh {
         "target_projection_exceeded",
         `Navigation target projection exceeds ${this.#profile.maximumTargetProjection.toFixed(2)}m: `
         + `requested=${formatPoint(target)}, projected=${formatPoint(targetResult.point)}, `
-        + `distance=${projectionDistance.toFixed(3)}m`
+        + `distance=${projectionDistance.toFixed(3)}m`,
+        {
+          projectedTarget: {
+            x: targetResult.point.x,
+            y: start.y,
+            z: targetResult.point.z
+          },
+          projectionDistance
+        }
       );
     }
     const resolvedTarget = {
@@ -303,6 +324,17 @@ export class NavigationMesh {
       throw new NavigationPlanningError(
         "path_not_found",
         `No navigation path: ${result.error?.name ?? "empty path"}`
+      );
+    }
+    const intersectedObstacle = pathIntersectedObstacle(
+      result.path,
+      [...this.#obstacles.values()].map((entry) => entry.descriptor),
+      this.#profile.radius
+    );
+    if (intersectedObstacle) {
+      throw new NavigationPlanningError(
+        "path_not_found",
+        `No complete navigation path: computed path intersects obstacle ${intersectedObstacle}`
       );
     }
     const computedEndpoint = result.path.at(-1)!;
@@ -695,6 +727,65 @@ function expandedObstacleHalfExtents(halfExtents: Vec3, agentRadius: number): Ve
     y: halfExtents.y,
     z: halfExtents.z + planarExpansion
   };
+}
+
+function pathIntersectedObstacle(
+  path: readonly Vec3[],
+  obstacles: readonly NavigationObstacle[],
+  agentRadius: number
+): string | null {
+  for (const obstacle of obstacles) {
+    const halfExtents = expandedObstacleHalfExtents(
+      obstacle.halfExtents,
+      agentRadius
+    );
+    for (let index = 1; index < path.length; index += 1) {
+      if (segmentIntersectsOrientedBox(
+        path[index - 1]!,
+        path[index]!,
+        obstacle.center,
+        halfExtents,
+        obstacle.yaw
+      )) return obstacle.id;
+    }
+  }
+  return null;
+}
+
+function segmentIntersectsOrientedBox(
+  start: Vec3,
+  end: Vec3,
+  center: Vec3,
+  halfExtents: Vec3,
+  yaw: number
+): boolean {
+  const cosine = Math.cos(yaw);
+  const sine = Math.sin(yaw);
+  const local = (point: Vec3): readonly [number, number] => {
+    const dx = point.x - center.x;
+    const dz = point.z - center.z;
+    return [cosine * dx + sine * dz, -sine * dx + cosine * dz];
+  };
+  const [startX, startZ] = local(start);
+  const [endX, endZ] = local(end);
+  let minimumTime = 0;
+  let maximumTime = 1;
+  for (const [from, to, extent] of [
+    [startX, endX, halfExtents.x],
+    [startZ, endZ, halfExtents.z]
+  ] as const) {
+    const delta = to - from;
+    if (Math.abs(delta) <= 1e-12) {
+      if (Math.abs(from) > extent) return false;
+      continue;
+    }
+    const first = (-extent - from) / delta;
+    const second = (extent - from) / delta;
+    minimumTime = Math.max(minimumTime, Math.min(first, second));
+    maximumTime = Math.min(maximumTime, Math.max(first, second));
+    if (minimumTime > maximumTime) return false;
+  }
+  return maximumTime >= 0 && minimumTime <= 1;
 }
 
 function validatedProfile(profile: NavigationAgentProfile): NavigationAgentProfile {

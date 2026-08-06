@@ -106,8 +106,8 @@ const HumanoidKeyframeSchema = z.object({
   root_velocity: HumanoidRootVelocitySchema.nullable().optional(),
   root_yaw_velocity: z.number().finite().describe("根节点偏航角速度，单位弧度每秒").nullable().optional(),
   root_height: z.number().finite().nullable().optional().refine(
-    (value) => value == null || value > 0,
-    "root_height must be null when unused or a positive pelvis height in meters"
+    (value) => value == null || (value >= 0.45 && value <= 1.2),
+    "root_height must be null when unused or a world-Y pelvis height from 0.45m to 1.2m"
   ),
   root_roll: z.number().finite().nullable().optional(),
   root_pitch: z.number().finite().nullable().optional(),
@@ -180,7 +180,7 @@ export const HumanoidMotionPlanSchema = z.object({
 
 export type HumanoidMotionPlan = z.infer<typeof HumanoidMotionPlanSchema>;
 
-export function duplicateHumanoidMotionCandidateIndexes(
+function duplicateHumanoidMotionCandidateIndexes(
   candidates: readonly HumanoidMotionPlan[]
 ): Array<{ candidateIndex: number; originalIndex: number }> {
   const firstIndexByContent = new Map<string, number>();
@@ -202,8 +202,8 @@ export const HumanoidMotionCandidateBatchSchema = z.object({
     .describe("所有候选共同服务的当前自主目标"),
   termination: HumanoidMotionOptionContractSchema
     .describe("所有候选必须共同达成的可观测物理结果；时长只是最多八秒的执行上界"),
-  candidates: z.array(HumanoidMotionPlanSchema).min(2).max(3)
-    .describe("按模型偏好排序的不同连续全身动作候选；每个候选都会从同一物理状态完整预演")
+  candidates: z.array(HumanoidMotionPlanSchema).min(1).max(3)
+    .describe("按模型偏好排序的 1 至 3 个连续全身动作候选；每个候选都会从同一物理状态完整预演")
 }).strict().superRefine((batch, context) => {
   const ids = batch.candidates.map((candidate) => candidate.id);
   if (new Set(ids).size !== ids.length) {
@@ -224,6 +224,7 @@ export const HumanoidMotionCandidateBatchSchema = z.object({
   }
   const contactPredicates = batch.termination.predicates.filter((predicate) => (
     predicate.type === "body_contact_object"
+      || predicate.type === "hand_contact_object"
       || predicate.type === "body_contact_solid"
       || predicate.type === "hand_contact_solid"
   ));
@@ -246,7 +247,7 @@ export const HumanoidMotionCandidateBatchSchema = z.object({
         context.addIssue({
           code: "custom",
           path: ["candidates", candidateIndex, "contact_constraints"],
-          message: "A contact termination predicate requires the same required physical contact constraint"
+          message: missingContactAuthorizationMessage(predicate)
         });
       }
     }
@@ -260,12 +261,28 @@ export const HumanoidMotionCandidateBatchSchema = z.object({
         context.addIssue({
           code: "custom",
           path: ["candidates", candidateIndex, "contact_constraints"],
-          message: "A grasp termination predicate requires at least two distinct exact hand-surface authorizations for the same hand and object"
+          message: `The shared grasp_verified predicate binds every candidate to hand=${predicate.hand} and object_id=${predicate.object_id}; authorize at least two distinct required hand_object surfaces for that same hand and object (found: ${[...surfaces].sort().join(", ") || "none"})`
         });
       }
     }
   });
 });
+
+function missingContactAuthorizationMessage(
+  predicate: Extract<HumanoidMotionCandidateBatch["termination"]["predicates"][number], {
+    type: "body_contact_object" | "hand_contact_object"
+      | "body_contact_solid" | "hand_contact_solid";
+  }>
+): string {
+  const contact = predicate.type === "body_contact_object"
+    ? `type=body_object body=${predicate.body} object_id=${predicate.object_id}`
+    : predicate.type === "hand_contact_object"
+      ? `type=hand_object hand_surface=${predicate.hand_surface} object_id=${predicate.object_id}`
+      : predicate.type === "body_contact_solid"
+        ? `type=body_solid body=${predicate.body} solid_id=${predicate.solid_id}`
+        : `type=hand_solid hand_surface=${predicate.hand_surface} solid_id=${predicate.solid_id}`;
+  return `Every candidate shares the termination predicates and must include the exact required contact: ${contact} required=true`;
+}
 
 export interface HumanoidGraspContactAuthorizationFailure {
   candidateIndex: number;
@@ -403,7 +420,8 @@ function contactKey(constraint: HumanoidContactConstraint): string {
 
 function contactPredicateAuthorized(
   predicate: Extract<HumanoidMotionCandidateBatch["termination"]["predicates"][number], {
-    type: "body_contact_object" | "body_contact_solid" | "hand_contact_solid";
+    type: "body_contact_object" | "hand_contact_object"
+      | "body_contact_solid" | "hand_contact_solid";
   }>,
   constraint: HumanoidContactConstraint
 ): boolean {
@@ -412,6 +430,12 @@ function contactPredicateAuthorized(
     return "body" in constraint
       && "object_id" in constraint
       && constraint.body === predicate.body
+      && constraint.object_id === predicate.object_id;
+  }
+  if (predicate.type === "hand_contact_object") {
+    return "hand_surface" in constraint
+      && "object_id" in constraint
+      && constraint.hand_surface === predicate.hand_surface
       && constraint.object_id === predicate.object_id;
   }
   if (predicate.type === "body_contact_solid") {

@@ -162,6 +162,7 @@ function storedMotion(
     expiresRevision: 10,
     intentSha256: humanoidMotionIntentSha256(plan),
     revalidationCount: 0,
+    retainTerminalJointTracking: false,
     terminal: null,
     option: null,
     progress: {

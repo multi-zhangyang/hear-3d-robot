@@ -89,7 +89,7 @@ describe("agent manifest", () => {
       "@openai/agents": "test-sdk",
       "@openai/agents-extensions": "test-bridge"
     });
-    expect(manifest.harness_contract_version).toBe(3);
+    expect(manifest.harness_contract_version).toBe(4);
     expect(manifest.agents.goal_manager.tool_use_behavior).toEqual({
       kind: "harness_callback",
       contract_id: "verified_harness_terminal_status_v1",
@@ -105,13 +105,13 @@ describe("agent manifest", () => {
         tool_name: "delegate_goal_manager",
         target_role: "goal_manager",
         target_agent_id: "humanoid-goal-manager",
-        input_builder_contract: "goal_manager_authority_envelope_v1"
+        input_builder_contract: "goal_manager_authority_envelope_v2"
       }),
       expect.objectContaining({
         tool_name: "delegate_humanoid_sentry",
         target_role: "sentry",
         target_agent_id: "humanoid-sentry",
-        input_builder_contract: "objective_text_v1",
+        input_builder_contract: "live_authority_delegation_v1",
         input_builder_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
         run_options: {
           session_agent_id: "humanoid-sentry",
@@ -123,7 +123,7 @@ describe("agent manifest", () => {
       expect.objectContaining({
         tool_name: "delegate_motion_reference",
         target_role: "motion",
-        input_builder_contract: "objective_text_v1"
+        input_builder_contract: "motion_authority_envelope_v1"
       }),
       expect.objectContaining({
         tool_name: "delegate_physics_executor",
@@ -369,8 +369,9 @@ describe("agent manifest", () => {
   it("uses stable declared Agent-as-tool contracts across runtime compilation", () => {
     const base = createManifest(provider, "11111111-1111-4111-8111-111111111111");
     const sentryContract = HUMANOID_AGENT_TOOL_CONTRACTS.sentry as unknown as {
-      inputBuilder: ({ params }: { params: { objective: string } }) => string;
-      inputBuilderContract: "objective_text_v1" | "validated_execution_task_json_v1";
+      inputBuilder: () => string;
+      inputBuilderContract: "live_authority_delegation_v1"
+        | "validated_execution_task_json_v1";
       resumeContextStrategy: "merge" | "replace" | "preferSerialized";
       runOptions: {
         sessionAgentId: string;
@@ -381,7 +382,7 @@ describe("agent manifest", () => {
     const originalResumeStrategy = sentryContract.resumeContextStrategy;
     const originalSessionAgentId = sentryContract.runOptions.sessionAgentId;
     try {
-      sentryContract.inputBuilder = ({ params }) => JSON.stringify(params);
+      sentryContract.inputBuilder = () => "changed input builder implementation";
       const recompiledBuilder = createManifest(
         provider,
         "22222222-2222-4222-8222-222222222222"
@@ -473,7 +474,7 @@ describe("agent manifest", () => {
     });
     expect(first.identity_sha256).toBe(second.identity_sha256);
     expect(first.identity_sha256).toBe(
-      "4044754d00d834932c847bee83af0c743df6ef4d1cb101fef2822b3973125e5f"
+      "a6199bc7c8ea35cec0e97cb992ece6e90aa2207c22f1d1a6157e2a80ab474e0e"
     );
   });
 

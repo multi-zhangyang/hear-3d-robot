@@ -51,7 +51,7 @@ export function resolveHumanoidCycleCompletionReadiness(
   if (!execution) {
     return notReady("The active cycle has no accepted physical execution");
   }
-  const mutationIds = receipts.slice(executionIndex + 1).flatMap((receipt) => {
+  const mutations = receipts.slice(executionIndex + 1).flatMap((receipt, offset) => {
     if (!receipt.accepted
       || receipt.action !== "remove_world_block"
       || receipt.code !== "world_block_removal_authorized"
@@ -60,19 +60,23 @@ export function resolveHumanoidCycleCompletionReadiness(
       object(receipt.detail).removal_transaction
     );
     return transaction.execution_transaction_id === execution.transactionId
-      ? [receipt.transactionId]
+      ? [{ receipt, index: executionIndex + offset + 1 }]
       : [];
   });
-  const evidenceTransactionIds = [execution.transactionId, ...mutationIds];
+  const evidenceTransactionIds = [
+    execution.transactionId,
+    ...mutations.map(({ receipt }) => receipt.transactionId)
+  ];
   try {
-    validateHumanoidCycleCausalEvidence({
+    validateHumanoidCycleCausalEvidenceCore({
       ...input,
       evidenceTransactionIds
-    });
+    }, false);
   } catch (error) {
     return notReady(error instanceof Error ? error.message : String(error));
   }
-  const observedAfterExecution = receipts.slice(executionIndex + 1).some((receipt) => (
+  const observationBarrierIndex = mutations.at(-1)?.index ?? executionIndex;
+  const observedAfterExecution = receipts.slice(observationBarrierIndex + 1).some((receipt) => (
     receipt.accepted
       && receipt.action === "observe_humanoid"
       && sameAutonomousCycle(receipt.cycle, activeCycle)
@@ -88,6 +92,13 @@ export function resolveHumanoidCycleCompletionReadiness(
 
 export function validateHumanoidCycleCausalEvidence(
   input: HumanoidCycleCausalEvidenceInput
+): HumanoidCycleCausalEvidence {
+  return validateHumanoidCycleCausalEvidenceCore(input, true);
+}
+
+function validateHumanoidCycleCausalEvidenceCore(
+  input: HumanoidCycleCausalEvidenceInput,
+  requirePostExecutionObservation: boolean
 ): HumanoidCycleCausalEvidence {
   const evidence = input.evidenceTransactionIds.map((transactionId) => {
     const receipt = input.committedActions[transactionId];
@@ -181,6 +192,23 @@ export function validateHumanoidCycleCausalEvidence(
     throw new Error(
       `Autonomous cycle references invalid world mutation evidence: ${invalidMutation.transactionId}`
     );
+  }
+
+  if (requirePostExecutionObservation) {
+    const mutationIndexes = worldMutations.map((mutation) => receipts.findIndex((receipt) => (
+      receipt.transactionId === mutation.transactionId
+    )));
+    const observationBarrierIndex = Math.max(executionIndex, ...mutationIndexes);
+    const observation = receipts.slice(observationBarrierIndex + 1).find((receipt) => (
+      receipt.accepted
+        && receipt.action === "observe_humanoid"
+        && sameAutonomousCycle(receipt.cycle, activeCycle)
+    ));
+    if (!observation) {
+      throw new Error(
+        "Autonomous cycle completion requires an accepted Sentry observation after the latest physical execution and world mutation"
+      );
+    }
   }
 
   return {

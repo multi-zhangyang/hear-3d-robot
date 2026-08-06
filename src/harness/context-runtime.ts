@@ -43,7 +43,8 @@ export interface ModelTelemetryRuntime {
     }>;
   }): Promise<void>;
   recordModelCallFailed?(modelCallId: string, agentId: string): Promise<void>;
-  modelProgressSnapshot?(): ModelProgressSnapshot;
+  modelProgressSnapshot?(agentId: string): ModelProgressSnapshot;
+  modelProgressRecoveryEpoch?(): number;
 }
 
 export interface ModelProgressReceipt {
@@ -61,5 +62,6 @@ export interface ModelProgressSnapshot {
   worldRevision: number;
   cycleIndex: number;
   checkerSuccess: boolean;
+  goalStateSha256: string;
   receipts: ModelProgressReceipt[];
 }

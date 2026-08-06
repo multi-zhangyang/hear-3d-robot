@@ -203,6 +203,14 @@ describe("HumanoidWorld recovery and generator contracts", () => {
         ageRevisions: 0
       });
 
+      await world.advanceStationary();
+      const afterPassivePhysics = await world.planWholeBodyMotion(
+        contactPlan("after-passive-physics")
+      );
+      expect(afterPassivePhysics.validation.failures.some((failure) => (
+        failure.code === "contact_object_not_currently_visible"
+      ))).toBe(false);
+
       const grounded = await world.planWholeBodyMotion(contactPlan("after-observation"));
       expect(grounded.accepted).toBe(false);
       expect(grounded.validation.failures).toContainEqual(expect.objectContaining({

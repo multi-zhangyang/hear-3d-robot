@@ -1,4 +1,4 @@
-import { MemorySession } from "@openai/agents";
+import { MemorySession, UserError, type RunStreamEvent } from "@openai/agents";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,7 +30,12 @@ import { FileSession } from "../persistence/file-session.js";
 import { RunStore } from "../persistence/run-store.js";
 import { HumanoidWorld } from "../world/humanoid/world.js";
 import { captureHumanoidSessionStateIdentity } from "./humanoid-agent-state.js";
-import { resumeHumanoidMission } from "./humanoid-mission-runner.js";
+import {
+  humanoidModelProgressSnapshot,
+  recoverableDynamicToolRunStateError,
+  resumeHumanoidMission,
+  shouldPersistHumanoidAgentState
+} from "./humanoid-mission-runner.js";
 import { RunPauseRequestedError } from "./run-pause.js";
 
 const runnerControl = vi.hoisted(() => ({
@@ -102,6 +107,38 @@ afterEach(async () => {
 });
 
 describe("humanoid mission initialization recovery", () => {
+  it("scopes no-progress receipts to the Agent that produced them", () => {
+    const runtime = {
+      rootAgentId: HUMANOID_AGENT_IDS.coordinator,
+      checkpoint: {
+        world: { worldRevision: 42 },
+        cycle_index: 3,
+        checker: { success: false },
+        goal_dag: { state_sha256: "goal-state" },
+        committed_actions: {
+          motion: progressReceipt("motion", HUMANOID_AGENT_IDS.motion),
+          sentry: progressReceipt("sentry", HUMANOID_AGENT_IDS.sentry)
+        }
+      }
+    } as unknown as Parameters<typeof humanoidModelProgressSnapshot>[0];
+
+    expect(humanoidModelProgressSnapshot(
+      runtime,
+      HUMANOID_AGENT_IDS.motion
+    ).receipts.map((receipt) => receipt.transactionId)).toEqual(["motion"]);
+    expect(humanoidModelProgressSnapshot(
+      runtime,
+      HUMANOID_AGENT_IDS.goalManager
+    ).receipts).toEqual([]);
+    expect(humanoidModelProgressSnapshot(
+      runtime,
+      HUMANOID_AGENT_IDS.coordinator
+    ).receipts.map((receipt) => receipt.transactionId)).toEqual([
+      "motion",
+      "sentry"
+    ]);
+  });
+
   it("persists an intentional operator pause separately from a crash interruption", async () => {
     const store = await createCheckpointedRun();
     const controller = new AbortController();
@@ -259,6 +296,59 @@ describe("humanoid mission initialization recovery", () => {
     expect(await lifecycleTypes(store)).toEqual(["run_resumed", "run_interrupted"]);
   }, 30_000);
 
+  it("rebases only the failing SDK branch after repeated identical server errors", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    await Promise.all(Object.values(HUMANOID_AGENT_IDS).map(async (agentId) => {
+      await missionSession(store, manifest.epoch_id, agentId).addItems([{
+        role: "user",
+        content: `baseline:${agentId}`
+      }]);
+    }));
+    const serverError = Object.assign(new Error("provider failed request"), {
+      name: "ModelTransportError",
+      code: 500
+    });
+    const inspected = new Error("rebased branch inspected");
+    runnerControl.run.mockImplementation(async () => {
+      const attempt = runnerControl.run.mock.calls.length;
+      if (attempt <= 3) throw serverError;
+      expect(await missionSession(
+        store,
+        manifest.epoch_id,
+        HUMANOID_AGENT_IDS.coordinator
+      ).getItems()).toEqual([{
+        role: "user",
+        content: `baseline:${HUMANOID_AGENT_IDS.coordinator}`
+      }]);
+      for (const agentId of Object.values(HUMANOID_AGENT_IDS)) {
+        if (agentId === HUMANOID_AGENT_IDS.coordinator) continue;
+        expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual([{
+          role: "user",
+          content: `baseline:${agentId}`
+        }]);
+      }
+      throw inspected;
+    });
+
+    await expect(resume(store, config)).rejects.toBe(inspected);
+
+    expect(runnerControl.run).toHaveBeenCalledTimes(4);
+    const recoveries = (await store.readJournal("provider")).filter((entry) => (
+      isRecord(entry) && entry.status === "transport_interrupted"
+    ));
+    expect(recoveries).toHaveLength(3);
+    expect(recoveries.at(-1)).toMatchObject({
+      recovery_attempt: 3,
+      sdk_branch_rebased: true,
+      raw_history_preserved: true,
+      session_history_preserved: true,
+      prompt_cache_prefix_preserved: true
+    });
+  });
+
   it("keeps Session histories intact when the checkpoint rejects a RunState", async () => {
     const store = await createCheckpointedRun();
     const config = provider();
@@ -301,7 +391,7 @@ describe("humanoid mission initialization recovery", () => {
     }
   });
 
-  it("removes failed decision branches before resetting one stalled Agent", async () => {
+  it("removes the stalled cycle attempt while preserving its durable Session prefix", async () => {
     const store = await createCheckpointedRun();
     const config = provider();
     const manifest = createManifest(config);
@@ -312,34 +402,86 @@ describe("humanoid mission initialization recovery", () => {
     await Promise.all([...sessions.entries()].map(async ([agentId, session]) => {
       await session.addItems([{ role: "user", content: `baseline:${agentId}` }]);
     }));
-    runnerControl.run.mockImplementation(async () => {
-      await Promise.all([...sessions.entries()].map(async ([agentId, session]) => {
-        await session.addItems([{
-          role: "assistant",
-          content: `failed-decision:${runnerControl.run.mock.calls.length}:${agentId}`
-        }]);
-      }));
-      throw new ModelDecisionStallError(
-        HUMANOID_AGENT_IDS.motion,
-        "motion decision stalled"
-      );
+    runnerControl.run.mockImplementation(async (
+      _agent,
+      _runInput,
+      options: { session: FileSession }
+    ) => {
+      const attempt = runnerControl.run.mock.calls.length;
+      await options.session.addItems([{
+        role: "assistant",
+        content: `durable-prefix:${attempt}:${HUMANOID_AGENT_IDS.coordinator}`
+      }]);
+      return {
+        state: { toString: () => `decision-recovery-state:${attempt}` },
+        completed: Promise.resolve(),
+        finalOutput: undefined,
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "raw_model_stream_event",
+            data: { type: "response_started" }
+          };
+          await options.session.addItems([{
+            role: "assistant",
+            content: `failed-decision:${attempt}:${HUMANOID_AGENT_IDS.coordinator}`
+          }]);
+          throw new ModelDecisionStallError(
+            HUMANOID_AGENT_IDS.motion,
+            "motion decision stalled"
+          );
+        }
+      };
     });
 
     await expect(resume(store, config)).rejects.toThrow("motion decision stalled");
 
     expect(runnerControl.run).toHaveBeenCalledTimes(4);
+    expect((await store.readHumanoidCheckpoint()).status).toBe("interrupted");
     for (const agentId of sessions.keys()) {
-      expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual(
-        agentId === HUMANOID_AGENT_IDS.motion
-          ? []
-          : [{ role: "user", content: `baseline:${agentId}` }]
-      );
+      expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual([
+        { role: "user", content: `baseline:${agentId}` }
+      ]);
     }
     const recoveries = (await store.readJournal("provider")).filter((entry) => (
       isRecord(entry) && entry.status === "model_decision_recovery"
     ));
     expect(recoveries).toHaveLength(3);
-  });
+    expect(recoveries).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        session_history_preserved: true,
+        prompt_cache_prefix_preserved: true,
+        recovery_baseline: "cycle_attempt_prefix"
+      })
+    ]));
+  }, 30_000);
+
+  it("retries a completed coordinator response that contains no formal decision", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    await store.writeAgentManifest(createManifest(config));
+    runnerControl.run.mockImplementation(async () => ({
+      state: { toString: () => "completed-response-without-decision" },
+      completed: Promise.resolve(),
+      finalOutput: "model text without a verified tool result",
+      async *[Symbol.asyncIterator]() {}
+    }));
+
+    await expect(resume(store, config)).rejects.toThrow(
+      "did not return the cycle completion tool result"
+    );
+
+    expect(runnerControl.run).toHaveBeenCalledTimes(4);
+    const recoveries = (await store.readJournal("provider")).filter((entry) => (
+      isRecord(entry) && entry.status === "model_decision_recovery"
+    ));
+    expect(recoveries).toEqual([1, 2, 3].map((recoveryAttempt) => (
+      expect.objectContaining({
+        agent_id: HUMANOID_AGENT_IDS.coordinator,
+        recovery_attempt: recoveryAttempt,
+        automatic_actuation: false
+      })
+    )));
+  }, 30_000);
 
   it("restores Sessions to the last persisted RunState before retrying", async () => {
     const store = await createCheckpointedRun();
@@ -371,7 +513,11 @@ describe("humanoid mission initialization recovery", () => {
         async *[Symbol.asyncIterator]() {
           yield {
             type: "raw_model_stream_event",
-            data: { type: "response.output_text.delta", delta: "partial" }
+            data: { type: "response_started" }
+          };
+          yield {
+            type: "raw_model_stream_event",
+            data: { type: "output_text_delta", delta: "partial" }
           };
           await options.session.addItems([{
             role: "user",
@@ -403,6 +549,60 @@ describe("humanoid mission initialization recovery", () => {
     });
   }, 30_000);
 });
+
+describe("humanoid Agent state persistence boundaries", () => {
+  it("rebases only a disabled tool that remains in the configured Agent", () => {
+    expect(recoverableDynamicToolRunStateError(
+      new UserError("Tool delegate_motion_reference not found"),
+      ["delegate_humanoid_sentry", "delegate_motion_reference"]
+    )).toBe("delegate_motion_reference");
+    expect(recoverableDynamicToolRunStateError(
+      new UserError("Tool removed_tool not found"),
+      ["delegate_motion_reference"]
+    )).toBeUndefined();
+    expect(recoverableDynamicToolRunStateError(
+      new Error("Tool delegate_motion_reference not found"),
+      ["delegate_motion_reference"]
+    )).toBeUndefined();
+  });
+
+  it("does not serialize the complete SDK state for token deltas", () => {
+    expect(shouldPersistHumanoidAgentState({
+      type: "raw_model_stream_event",
+      data: { type: "output_text_delta", delta: "一" }
+    } as RunStreamEvent)).toBe(false);
+  });
+
+  it.each(["response_started", "response_done"] as const)(
+    "persists the SDK state at the %s response boundary",
+    (type) => {
+      expect(shouldPersistHumanoidAgentState({
+        type: "raw_model_stream_event",
+        data: { type }
+      } as RunStreamEvent)).toBe(true);
+    }
+  );
+
+  it.each(["run_item_stream_event", "agent_updated_stream_event"] as const)(
+    "persists the SDK state for %s",
+    (type) => {
+      expect(shouldPersistHumanoidAgentState({ type } as RunStreamEvent)).toBe(true);
+    }
+  );
+});
+
+function progressReceipt(transactionId: string, agentId: string) {
+  return {
+    transactionId,
+    agentId,
+    action: "observe_humanoid" as const,
+    accepted: true,
+    code: "humanoid_observed",
+    worldBeforeRevision: 42,
+    worldAfterRevision: 42,
+    frameCount: 0
+  };
+}
 
 function runtimeStateCases(): Array<[
   string,

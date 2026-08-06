@@ -124,6 +124,7 @@ function restoreMotions(input: {
     }
     const restored: StoredHumanoidMotionPlan = {
       ...structuredClone(entry),
+      retainTerminalJointTracking: entry.retainTerminalJointTracking ?? false,
       validatedRevision,
       validatedStateSha256: entry.validatedStateSha256
         ?? input.restoredStateSha256,
@@ -233,7 +234,10 @@ function restoreRoutes(input: {
         ?? input.restoredStateSha256,
       expiresRevision,
       intentSha256: entry.intentSha256
-        ?? humanoidNavigationIntentSha256(entry.requestedTarget),
+        ?? humanoidNavigationIntentSha256(
+          entry.requestedTarget,
+          entry.requestedArrivalHeading
+        ),
       revalidationCount: entry.revalidationCount ?? 0,
       carriedObjectBindings,
       carriedObjectTaskSpaceTargets,

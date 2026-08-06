@@ -41,6 +41,63 @@ export function rotateVector(rotation: Quaternion, value: Vec3): Vec3 {
   return { x: rotated.x, y: rotated.y, z: rotated.z };
 }
 
+export function yawFromQuaternion(rotation: Quaternion): number {
+  const normalized = normalizeQuaternion(rotation);
+  return Math.atan2(
+    2 * (normalized.w * normalized.y + normalized.x * normalized.z),
+    1 - 2 * (normalized.y * normalized.y + normalized.z * normalized.z)
+  );
+}
+
+export function quaternionFromRotationMatrix(
+  matrix: readonly number[]
+): Quaternion {
+  if (matrix.length !== 9 || matrix.some((value) => !Number.isFinite(value))) {
+    throw new Error("Rotation matrix must contain nine finite values");
+  }
+  const [m00, m01, m02, m10, m11, m12, m20, m21, m22] = matrix as [
+    number, number, number,
+    number, number, number,
+    number, number, number
+  ];
+  const trace = m00 + m11 + m22;
+  let rotation: Quaternion;
+  if (trace > 0) {
+    const scale = 2 * Math.sqrt(trace + 1);
+    rotation = {
+      x: (m21 - m12) / scale,
+      y: (m02 - m20) / scale,
+      z: (m10 - m01) / scale,
+      w: scale / 4
+    };
+  } else if (m00 > m11 && m00 > m22) {
+    const scale = 2 * Math.sqrt(1 + m00 - m11 - m22);
+    rotation = {
+      x: scale / 4,
+      y: (m01 + m10) / scale,
+      z: (m02 + m20) / scale,
+      w: (m21 - m12) / scale
+    };
+  } else if (m11 > m22) {
+    const scale = 2 * Math.sqrt(1 + m11 - m00 - m22);
+    rotation = {
+      x: (m01 + m10) / scale,
+      y: scale / 4,
+      z: (m12 + m21) / scale,
+      w: (m02 - m20) / scale
+    };
+  } else {
+    const scale = 2 * Math.sqrt(1 + m22 - m00 - m11);
+    rotation = {
+      x: (m02 + m20) / scale,
+      y: (m12 + m21) / scale,
+      z: scale / 4,
+      w: (m10 - m01) / scale
+    };
+  }
+  return normalizeQuaternion(rotation);
+}
+
 export function orientedBoxWorldHalfExtents(
   size: Vec3,
   rotation: Quaternion

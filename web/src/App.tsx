@@ -144,7 +144,7 @@ export function App(): React.JSX.Element {
       setFramework(nextDetails.framework);
       const runIsActive = nextDetails.checkpoint.status === "starting"
         || nextDetails.checkpoint.status === "running";
-      setModelActivity(modelActivityFromJournal(true, nextDetails.provider, runIsActive));
+      setModelActivity(modelActivityFromJournal(false, nextDetails.provider, runIsActive));
       setRuns((current) => updateRunListStatus(
         current,
         runId,
@@ -465,7 +465,7 @@ export function App(): React.JSX.Element {
   const activeRun = runs.find((run) => run.status === "starting" || run.status === "running");
   const selectedIsActive = details?.checkpoint.status === "starting" || details?.checkpoint.status === "running";
   const missionControlsBusy = submitting || resuming || stoppingRunId !== null;
-  const visibleModelActivity = bootstrap.provider.configured
+  const visibleModelActivity = details !== null || bootstrap.provider.configured
     ? modelActivity
     : createModelActivity(false);
   return (

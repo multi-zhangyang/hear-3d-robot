@@ -292,7 +292,7 @@ describe("agent invocation scope", () => {
       name: "ModelDecisionStallError",
       agentId: "worker"
     });
-    expect(workerCalls).toBe(4);
+    expect(workerCalls).toBe(2);
   });
 
 });

@@ -167,7 +167,7 @@ describe("humanoid whole-body motion", () => {
     expect(rejected.success).toBe(false);
     if (rejected.success) throw new Error("Under-authorized grasp was accepted");
     expect(rejected.error.issues.filter((issue) => (
-      issue.message.includes("two distinct exact hand-surface")
+      issue.message.includes("at least two distinct required hand_object surfaces")
     ))).toHaveLength(2);
 
     const authorized = HumanoidMotionCandidateBatchSchema.parse({
@@ -554,7 +554,11 @@ describe("humanoid whole-body motion", () => {
       }, neutral);
       expect(unreachable.artifact).toBeNull();
       expect(unreachable.validation.failures).toContainEqual(
-        expect.objectContaining({ code: "invalid_reference" })
+        expect.objectContaining({
+          code: "invalid_reference",
+          atSeconds: 0.4,
+          message: expect.stringContaining("keyframe at 0.4s")
+        })
       );
     } finally {
       await simulation.dispose();
@@ -958,6 +962,7 @@ describe("humanoid whole-body motion", () => {
         plan,
         artifact: prepared.artifact,
         rollout: null,
+        retainTerminalJointTracking: false,
         createdRevision: 0,
         validatedRevision: 0,
         validatedStateSha256: "a".repeat(64),

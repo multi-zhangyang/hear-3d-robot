@@ -63,6 +63,13 @@ const BodyContactObjectPredicateSchema = z.object({
   minimum_normal_force: z.number().finite().positive()
 }).strict();
 
+const HandContactObjectPredicateSchema = z.object({
+  type: z.literal("hand_contact_object"),
+  hand_surface: z.enum(G1_HAND_CONTACT_SURFACE_NAMES),
+  object_id: z.string().trim().min(1),
+  minimum_normal_force: z.number().finite().positive()
+}).strict();
+
 const BodyContactSolidPredicateSchema = z.object({
   type: z.literal("body_contact_solid"),
   body: z.enum(HUMANOID_BODY_NAMES),
@@ -115,6 +122,7 @@ const HumanoidMotionOptionPredicateSchema = z.discriminatedUnion("type", [
   BodyNearPointPredicateSchema,
   EndEffectorNearPointPredicateSchema,
   BodyContactObjectPredicateSchema,
+  HandContactObjectPredicateSchema,
   BodyContactSolidPredicateSchema,
   HandContactSolidPredicateSchema,
   ObjectNearPointPredicateSchema,

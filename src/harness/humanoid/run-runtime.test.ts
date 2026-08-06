@@ -184,6 +184,21 @@ describe("HumanoidRunRuntime", () => {
       expect(plan.accepted, JSON.stringify(plan)).toBe(true);
       expect(runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator)).toMatchObject({
         coordinator_phase: "execute_plan",
+        robot: {
+          root_heading: {
+            yaw_radians: expect.any(Number),
+            forward_world: {
+              x: expect.any(Number),
+              y: 0,
+              z: expect.any(Number)
+            },
+            left_world: {
+              x: expect.any(Number),
+              y: 0,
+              z: expect.any(Number)
+            }
+          }
+        },
         execution_authority: {
           task: "execute_plan",
           planning_action: "plan_whole_body_motion",
@@ -231,53 +246,58 @@ describe("HumanoidRunRuntime", () => {
         {
           objective: "比较下一次连续全身动作候选",
           termination: {
+            mode: "all",
             option_id: "persisted-forward-option",
             predicates: [{
               type: "root_near_point",
-              body: null,
-              end_effector: null,
-              frame: null,
-              object_id: null,
-              solid_id: null,
-              hand_surface: null,
-              hand: null,
-              grasp_contract_sha256: null,
-              zone_id: null,
               target: pendingTarget,
-              tolerance_m: 0.03,
-              target_orientation: null,
-              orientation_tolerance_rad: null,
-              minimum_normal_force: null,
-              expected: null
+              tolerance_m: 0.03
             }],
-            stable_steps: 2,
-            phases: null
+            stable_steps: 2
           },
           candidates: [
             {
               id: "unconsumed-reverse-motion",
               intent: "没有实现前进目标",
               duration_seconds: 0.8,
+              contacts: [],
               keyframes: [{
                 at_seconds: 0,
-                root_velocity: { forward_mps: -0.2, lateral_mps: 0 }
+                channels: [{
+                  type: "root_velocity",
+                  forward_mps: -0.2,
+                  lateral_mps: 0
+                }]
               }, {
                 at_seconds: 0.8,
-                root_velocity: { forward_mps: -0.2, lateral_mps: 0 }
+                channels: [{
+                  type: "root_velocity",
+                  forward_mps: -0.2,
+                  lateral_mps: 0
+                }]
               }]
             },
             {
               id: "unconsumed-balanced-motion",
               intent: "保持双足支撑并连续前进",
               duration_seconds: 0.8,
+              contacts: [],
               keyframes: [
                 {
                   at_seconds: 0,
-                  root_velocity: { forward_mps: 0.2, lateral_mps: 0 }
+                  channels: [{
+                    type: "root_velocity",
+                    forward_mps: 0.2,
+                    lateral_mps: 0
+                  }]
                 },
                 {
                   at_seconds: 0.8,
-                  root_velocity: { forward_mps: 0.2, lateral_mps: 0 }
+                  channels: [{
+                    type: "root_velocity",
+                    forward_mps: 0.2,
+                    lateral_mps: 0
+                  }]
                 }
               ]
             }
@@ -295,6 +315,15 @@ describe("HumanoidRunRuntime", () => {
         HUMANOID_AGENT_IDS.executor
       );
       expect(pendingExecution.accepted).toBe(true);
+      expect(() => runtime.validateCycleEvidence([
+        pendingExecution.transactionId
+      ])).toThrow("requires an accepted Sentry observation");
+      await invokeModelAction(runtime,
+        "observe_humanoid",
+        {},
+        "observe-after-unconsumed-execution",
+        HUMANOID_AGENT_IDS.sentry
+      );
       expect(runtime.validateCycleEvidence([pendingExecution.transactionId])).toMatchObject({
         transactionId: pendingExecution.transactionId,
         code: "motion_option_succeeded"
@@ -363,7 +392,37 @@ describe("HumanoidRunRuntime", () => {
       expect(() => lifecycleRuntime.validateCycleEvidence([
         pendingExecution.transactionId
       ])).toThrow("omits world mutation evidence");
-      expect(lifecycleRuntime.validateCycleEvidence([
+      expect(() => lifecycleRuntime.validateCycleEvidence([
+        pendingExecution.transactionId,
+        removalTransaction.transaction_id
+      ])).toThrow("requires an accepted Sentry observation");
+      lifecycleCheckpoint.committed_actions["observe-after-lifecycle-removal"] = {
+        transactionId: "observe-after-lifecycle-removal",
+        agentId: HUMANOID_AGENT_IDS.sentry,
+        cycle: pendingExecution.cycle,
+        action: "observe_humanoid",
+        input: {},
+        fingerprint: humanoidActionFingerprint(
+          "observe_humanoid",
+          HUMANOID_AGENT_IDS.sentry,
+          {}
+        ),
+        accepted: true,
+        code: "humanoid_observed",
+        worldBeforeRevision: world.snapshot().worldRevision,
+        worldAfterRevision: world.snapshot().worldRevision,
+        frameCount: 0,
+        channels: [],
+        detail: {},
+        committedAt: new Date().toISOString()
+      };
+      const observedLifecycleRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: lifecycleCheckpoint
+      });
+      expect(observedLifecycleRuntime.validateCycleEvidence([
         pendingExecution.transactionId,
         removalTransaction.transaction_id
       ])).toMatchObject({ transactionId: pendingExecution.transactionId });
@@ -411,7 +470,7 @@ describe("HumanoidRunRuntime", () => {
         frameCount: 0
       });
       const beforeRecall = runtime.snapshot();
-      expect(await runtime.recallEmbodiedHistory({
+      const explicitHistory = await runtime.recallEmbodiedHistory({
         source_refs: [
           "episode:1",
           `action:${pendingExecution.transactionId}`,
@@ -419,7 +478,8 @@ describe("HumanoidRunRuntime", () => {
         ],
         before_sequence: 2,
         limit: 3
-      })).toMatchObject({
+      });
+      expect(explicitHistory).toMatchObject({
         historical_only: true,
         episodes: [{
           source_ref: "episode:1",
@@ -451,6 +511,8 @@ describe("HumanoidRunRuntime", () => {
         ]),
         missing_source_refs: []
       });
+      expect(JSON.stringify(explicitHistory)).not.toContain("physical_trajectory");
+      expect(JSON.stringify(explicitHistory).length).toBeLessThan(12_000);
       expect(await runtime.recallEmbodiedHistory({ limit: 3 })).toMatchObject({
         historical_only: true,
         ordered_source_refs: expect.arrayContaining([
@@ -1511,6 +1573,179 @@ describe("HumanoidRunRuntime", () => {
     }
   }, 45_000);
 
+  it("completes a cycle only after queued stationary frames reach Goal progress", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-humanoid-cycle-frame-cut-"));
+    temporaryDirectories.push(root);
+    const target = { x: 2, y: 0, z: 2.55 };
+    const goal = GoalSchema.parse({
+      summary: "自主行走到前方目标点",
+      predicates: [{ type: "robot_at", target, tolerance: 0.3 }]
+    });
+    const store = await RunStore.create(root, {
+      mission: "行走后在持续物理世界中完成自主周期",
+      scenarioId: "humanoid-cycle-frame-cut-test",
+      scenario,
+      goal,
+      runtime: "humanoid_g1",
+      runMode: "continuous"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    const publicationEntered = deferredSignal();
+    const releasePublication = deferredSignal();
+    const episodeAppendEntered = deferredSignal();
+    const releaseEpisodeAppend = deferredSignal();
+    let blockNextStationaryPublication = false;
+    let publicationBlocked = false;
+    let runtime: HumanoidRunRuntime | undefined;
+    try {
+      const initial = createHumanoidRunCheckpoint({ store, goal, world });
+      await store.writeCheckpoint(initial);
+      runtime = new HumanoidRunRuntime({
+        store,
+        goal,
+        world,
+        checkpoint: initial,
+        eventSink: async (event) => {
+          if (!blockNextStationaryPublication
+            || publicationBlocked
+            || event.type !== "humanoid_world_frame"
+            || journalField(event.data, "frame_source") !== "stationary") return;
+          publicationBlocked = true;
+          publicationEntered.resolve();
+          await releasePublication.promise;
+        }
+      });
+      await activateGoal(runtime, goal);
+      await runtime.start(false);
+
+      const planned = await invokeModelAction(runtime,
+        "plan_humanoid_navigation",
+        { target, arrival_heading: null },
+        "cycle-frame-cut-plan",
+        HUMANOID_AGENT_IDS.motion
+      );
+      expect(planned.accepted, JSON.stringify(planned)).toBe(true);
+      const executed = await invokeModelAction(runtime,
+        "execute_humanoid_navigation",
+        { planning_transaction_id: planned.transactionId },
+        "cycle-frame-cut-execute",
+        HUMANOID_AGENT_IDS.executor
+      );
+      expect(executed).toMatchObject({ accepted: true, code: "navigation_completed" });
+      await invokeModelAction(runtime,
+        "observe_humanoid",
+        {},
+        "cycle-frame-cut-observe-after-execution",
+        HUMANOID_AGENT_IDS.sentry
+      );
+
+      blockNextStationaryPublication = true;
+      await publicationEntered.promise;
+      let queuedFrameObserved = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const progress = runtime.checkpoint.goal_progress;
+        if (progress && runtime.snapshot().frame > progress.last_world_frame) {
+          queuedFrameObserved = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(queuedFrameObserved).toBe(true);
+
+      const append = store.append.bind(store);
+      vi.spyOn(store, "append").mockImplementation(async (name, value) => {
+        if (name === "episodes") {
+          episodeAppendEntered.resolve();
+          await releaseEpisodeAppend.promise;
+        }
+        await append(name, value);
+      });
+      const completion = runtime.completeCycle(JSON.stringify({
+        summary: "完成真实导航并核验连续物理终态",
+        evidence_transaction_ids: [executed.transactionId]
+      }));
+      const earlyResult = await Promise.race([
+        completion.then(() => "resolved" as const, () => "rejected" as const),
+        new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 100))
+      ]);
+      expect(earlyResult).toBe("pending");
+      releasePublication.resolve();
+      await episodeAppendEntered.promise;
+
+      await expect(runtime.setActiveAgent(HUMANOID_AGENT_IDS.sentry)).resolves.toBeUndefined();
+      releaseEpisodeAppend.resolve();
+
+      await expect(completion).resolves.toBe(true);
+      const checkpoint = runtime.checkpoint;
+      expect(checkpoint.goal_progress).toBeNull();
+      expect(checkpoint.checker).toBeNull();
+      expect(checkpoint.world.frame).toBe(checkpoint.world_checkpoint.frame);
+      expect(checkpoint.world.worldRevision).toBe(
+        checkpoint.world_checkpoint.worldRevision
+      );
+    } finally {
+      releasePublication.resolve();
+      releaseEpisodeAppend.resolve();
+      await runtime?.stopContinuousPhysics();
+      await world.dispose();
+    }
+  }, 60_000);
+
+  it("persists a safe pause after the process signal reaches a stationary frame", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-humanoid-signal-pause-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "在持续物理帧期间安全暂停",
+      scenarioId: "humanoid-signal-pause-test",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    const controller = new AbortController();
+    let runtime: HumanoidRunRuntime | undefined;
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial,
+        signal: controller.signal
+      });
+      await activateGoal(runtime, scenario.default_goal);
+      await runtime.start(false);
+
+      const frameBeforeSignal = runtime.snapshot().frame;
+      controller.abort(new Error("simulated process signal"));
+      await waitForWorldFrame(runtime, frameBeforeSignal);
+
+      await expect(runtime.pause("simulated process signal")).resolves.toBeUndefined();
+      const persisted = await store.readHumanoidCheckpoint();
+      expect(persisted).toMatchObject({
+        status: "paused",
+        error: null,
+        active_agent_id: null,
+        active_agent_ids: []
+      });
+      expect(persisted.world.frame).toBe(persisted.world_checkpoint.frame);
+      expect(persisted.world.worldRevision).toBe(
+        persisted.world_checkpoint.worldRevision
+      );
+      expect((await store.readJournal("events")).filter((event) => (
+        journalField(event, "type") === "run_paused"
+      ))).toHaveLength(1);
+    } finally {
+      await runtime?.stopContinuousPhysics();
+      await world.dispose();
+    }
+  }, 45_000);
+
   it("retires only through a recorded Goal Manager response and rejects missing recovery evidence", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-humanoid-goal-retirement-"));
     temporaryDirectories.push(root);
@@ -1747,6 +1982,16 @@ async function invokeModelAction(
   transactionId: string,
   agentId: string
 ) {
+  if (agentId === HUMANOID_AGENT_IDS.motion
+    && !runtime.isActionAvailable(action, agentId)) {
+    await invokeModelAction(
+      runtime,
+      "observe_humanoid",
+      {},
+      `${transactionId}-motion-observation`,
+      agentId
+    );
+  }
   const authority = await authorizeModelAction(
     runtime,
     action,

@@ -56,7 +56,9 @@ describe("HumanoidSimulation", () => {
         implementation: "yahmp_onnx",
         actuation: "joint_position_pd",
         controlStepSeconds: 0.02,
-        physicsStepSeconds: 0.005
+        physicsStepSeconds: 0.005,
+        commandResponseHorizonSeconds: 0.2,
+        minimumEffectivePlanarSpeedMetersPerSecond: 0.15
       });
       expect(simulation.captureState().controller).toMatchObject({
         version: 1,

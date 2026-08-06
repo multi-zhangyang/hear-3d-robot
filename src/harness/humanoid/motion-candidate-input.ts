@@ -4,101 +4,125 @@ import {
   QuaternionSchema,
   Vec3Schema
 } from "../../domain/schema.js";
+import { G1HandCoordinationSchema } from "../../world/humanoid/hand-coordination.js";
 import { HUMANOID_BODY_NAMES } from "../../world/humanoid/model.js";
 import { G1_HAND_CONTACT_SURFACE_NAMES } from "../../world/humanoid/morphology.js";
 import {
-  duplicateHumanoidMotionCandidateIndexes,
   HumanoidMotionCandidateBatchSchema,
-  HumanoidMotionPlanSchema,
   type HumanoidMotionCandidateBatch
 } from "../../world/humanoid/motion-plan.js";
 
-const PredicateTypeSchema = z.enum([
-  "root_near_point",
-  "body_near_point",
-  "end_effector_near_point",
-  "body_contact_object",
-  "body_contact_solid",
-  "hand_contact_solid",
-  "object_near_point",
-  "object_in_zone",
-  "grasp_verified",
-  "object_settled_on_support"
-]);
+const PositionToleranceSchema = z.number().finite().positive().max(5);
+const TrackingToleranceSchema = z.number().finite().min(0.01).max(0.12);
 
-const ModelMotionPredicateSchema = z.object({
-  type: PredicateTypeSchema,
-  body: z.enum(HUMANOID_BODY_NAMES).nullable()
-    .describe("仅身体谓词使用，否则填 null"),
-  end_effector: HumanoidEndEffectorSchema.nullable()
-    .describe("仅末端谓词使用，否则填 null"),
-  frame: z.enum(["world", "pelvis"]).nullable()
-    .describe("仅末端谓词使用，否则填 null"),
-  object_id: z.string().trim().min(1).nullable()
-    .describe("仅物体谓词使用，否则填 null"),
-  solid_id: z.string().trim().min(1).nullable()
-    .describe("仅静态实体接触谓词使用，否则填 null"),
-  hand_surface: z.enum(G1_HAND_CONTACT_SURFACE_NAMES).nullable()
-    .describe("仅精确手部接触谓词使用，否则填 null"),
-  hand: z.enum(["left", "right"]).nullable()
-    .describe("仅 grasp_verified 使用，否则填 null"),
-  grasp_contract_sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable()
-    .describe("仅 grasp_verified 使用，逐字复制当前观察中的权威契约哈希，否则填 null"),
-  zone_id: z.string().trim().min(1).nullable()
-    .describe("仅区域谓词使用，否则填 null"),
-  target: Vec3Schema.nullable()
-    .describe("仅位置谓词使用，否则填 null"),
-  tolerance_m: z.number().finite().nonnegative().max(5).nullable()
-    .describe("仅位置或区域谓词使用，否则填 null"),
-  target_orientation: QuaternionSchema.nullable()
-    .describe("末端姿态目标可选使用，否则填 null"),
-  orientation_tolerance_rad: z.number().finite().positive().max(Math.PI).nullable()
-    .describe("末端姿态容差可选使用，否则填 null"),
-  minimum_normal_force: z.number().finite().positive().nullable()
-    .describe("仅接触谓词使用，否则填 null"),
-  expected: z.boolean().nullable()
-    .describe("仅 object_in_zone 使用，否则填 null")
-}).strict().superRefine((predicate, context) => {
-  const required = requiredPredicateFields(predicate.type);
-  for (const field of PREDICATE_VALUE_FIELDS) {
-    if (field === "target_orientation" || field === "orientation_tolerance_rad") {
-      continue;
-    }
-    const value = predicate[field];
-    if (required.has(field) ? value === null : value !== null) {
-      context.addIssue({
-        code: "custom",
-        path: [field],
-        message: required.has(field)
-          ? `${field} is required for ${predicate.type}`
-          : `${field} must be null for ${predicate.type}`
-      });
-    }
-  }
-  const hasOrientation = predicate.target_orientation !== null;
-  const hasOrientationTolerance = predicate.orientation_tolerance_rad !== null;
-  if (predicate.type !== "end_effector_near_point"
-    && (hasOrientation || hasOrientationTolerance)) {
-    context.addIssue({
-      code: "custom",
-      path: ["target_orientation"],
-      message: "Orientation fields are only valid for end_effector_near_point"
-    });
-  } else if (hasOrientation !== hasOrientationTolerance) {
-    context.addIssue({
-      code: "custom",
-      path: [hasOrientation ? "orientation_tolerance_rad" : "target_orientation"],
-      message: "End-effector orientation and tolerance must be provided together"
-    });
-  }
-  if (predicate.tolerance_m === 0 && predicate.type !== "object_in_zone") {
-    context.addIssue({
-      code: "custom",
-      path: ["tolerance_m"],
-      message: `${predicate.type} requires a positive tolerance`
-    });
-  }
-});
+const RootNearPointPredicateSchema = z.object({
+  type: z.literal("root_near_point"),
+  target: Vec3Schema,
+  tolerance_m: PositionToleranceSchema
+}).strict();
+
+const BodyNearPointPredicateSchema = z.object({
+  type: z.literal("body_near_point"),
+  body: z.enum(HUMANOID_BODY_NAMES),
+  target: Vec3Schema,
+  tolerance_m: PositionToleranceSchema
+}).strict();
+
+const EndEffectorNearPointPredicateSchema = z.object({
+  type: z.literal("end_effector_near_point"),
+  end_effector: HumanoidEndEffectorSchema,
+  frame: z.enum(["world", "pelvis"]),
+  target: Vec3Schema,
+  tolerance_m: PositionToleranceSchema
+}).strict();
+
+const EndEffectorNearPosePredicateSchema = z.object({
+  type: z.literal("end_effector_near_pose"),
+  end_effector: HumanoidEndEffectorSchema,
+  frame: z.enum(["world", "pelvis"]),
+  target: Vec3Schema,
+  tolerance_m: PositionToleranceSchema,
+  target_orientation: QuaternionSchema,
+  orientation_tolerance_rad: z.number().finite().positive().max(Math.PI)
+}).strict();
+
+const BodyContactObjectPredicateSchema = z.object({
+  type: z.literal("body_contact_object"),
+  body: z.enum(HUMANOID_BODY_NAMES),
+  object_id: z.string().trim().min(1),
+  minimum_normal_force: z.number().finite().positive()
+}).strict();
+
+const HandContactObjectPredicateSchema = z.object({
+  type: z.literal("hand_contact_object"),
+  hand_surface: z.enum(G1_HAND_CONTACT_SURFACE_NAMES),
+  object_id: z.string().trim().min(1),
+  minimum_normal_force: z.number().finite().positive()
+    .describe("该真实掌指碰撞面与物体必须持续达到的最小法向力，单位 N")
+}).strict();
+
+const BodyContactSolidPredicateSchema = z.object({
+  type: z.literal("body_contact_solid"),
+  body: z.enum(HUMANOID_BODY_NAMES),
+  solid_id: z.string().trim().min(1),
+  minimum_normal_force: z.number().finite().positive()
+}).strict();
+
+const HandContactSolidPredicateSchema = z.object({
+  type: z.literal("hand_contact_solid"),
+  hand_surface: z.enum(G1_HAND_CONTACT_SURFACE_NAMES),
+  solid_id: z.string().trim().min(1),
+  minimum_normal_force: z.number().finite().positive()
+}).strict();
+
+const ObjectNearPointPredicateSchema = z.object({
+  type: z.literal("object_near_point"),
+  object_id: z.string().trim().min(1),
+  target: Vec3Schema,
+  tolerance_m: PositionToleranceSchema
+}).strict();
+
+const ObjectInZonePredicateSchema = z.object({
+  type: z.literal("object_in_zone"),
+  object_id: z.string().trim().min(1),
+  zone_id: z.string().trim().min(1),
+  expected: z.boolean(),
+  tolerance_m: z.number().finite().nonnegative().max(5)
+}).strict();
+
+const GraspVerifiedPredicateSchema = z.object({
+  type: z.literal("grasp_verified"),
+  object_id: z.string().trim().min(1),
+  hand: z.enum(["left", "right"]),
+  grasp_contract_sha256: z.string().regex(/^[a-f0-9]{64}$/)
+}).strict();
+
+const ObjectReleasedPredicateSchema = z.object({
+  type: z.literal("object_released"),
+  object_id: z.string().trim().min(1),
+  hand: z.enum(["left", "right"])
+}).strict();
+
+const ObjectSettledOnSupportPredicateSchema = z.object({
+  type: z.literal("object_settled_on_support"),
+  object_id: z.string().trim().min(1)
+}).strict();
+
+const ModelMotionPredicateSchema = z.discriminatedUnion("type", [
+  RootNearPointPredicateSchema,
+  BodyNearPointPredicateSchema,
+  EndEffectorNearPointPredicateSchema,
+  EndEffectorNearPosePredicateSchema,
+  BodyContactObjectPredicateSchema,
+  HandContactObjectPredicateSchema,
+  BodyContactSolidPredicateSchema,
+  HandContactSolidPredicateSchema,
+  ObjectNearPointPredicateSchema,
+  ObjectInZonePredicateSchema,
+  GraspVerifiedPredicateSchema,
+  ObjectReleasedPredicateSchema,
+  ObjectSettledOnSupportPredicateSchema
+]);
 
 const ModelMotionConditionSchema = z.object({
   op: z.enum(["all", "any"]),
@@ -125,189 +149,263 @@ const ModelMotionConditionSchema = z.object({
   }
 });
 
-const ModelMotionOptionPhasesSchema = z.object({
-  precondition: z.object({
+const ModelMotionOptionPreconditionSchema = z.object({
     condition: ModelMotionConditionSchema,
     stable_steps: z.number().int().min(1).max(500).nullable()
-  }).strict().nullable(),
-  during: z.object({
+  }).strict();
+
+const ModelMotionOptionDuringSchema = z.object({
     condition: ModelMotionConditionSchema
-  }).strict().nullable(),
-  terminal: z.object({
+  }).strict();
+
+const ModelMotionOptionTerminalSchema = z.object({
     condition: ModelMotionConditionSchema
+  }).strict();
+
+const ModelMotionOptionSchema = z.discriminatedUnion("mode", [
+  z.object({
+    mode: z.literal("all"),
+    option_id: z.string().trim().min(1),
+    predicates: z.array(ModelMotionPredicateSchema).min(1).max(16),
+    stable_steps: z.number().int().min(1).max(500)
+  }).strict(),
+  z.object({
+    mode: z.literal("phased"),
+    option_id: z.string().trim().min(1),
+    predicates: z.array(ModelMotionPredicateSchema).min(1).max(16),
+    stable_steps: z.number().int().min(1).max(500),
+    precondition: ModelMotionOptionPreconditionSchema.nullable(),
+    during: ModelMotionOptionDuringSchema.nullable(),
+    terminal: ModelMotionOptionTerminalSchema
   }).strict()
+]);
+
+const ModelBodyObjectContactSchema = z.object({
+  body: z.enum(HUMANOID_BODY_NAMES),
+  object_id: z.string().trim().min(1),
+  required: z.boolean()
 }).strict();
 
-const ModelMotionOptionSchema = z.object({
-  option_id: z.string().trim().min(1),
-  predicates: z.array(ModelMotionPredicateSchema).min(1).max(16),
-  stable_steps: z.number().int().min(1).max(500),
-  phases: ModelMotionOptionPhasesSchema.nullable()
+const ModelBodySolidContactSchema = z.object({
+  body: z.enum(HUMANOID_BODY_NAMES),
+  solid_id: z.string().trim().min(1),
+  required: z.boolean()
 }).strict();
 
-export const HumanoidMotionCandidateBatchInputSchema = z.object({
-  objective: z.string().trim().min(1)
-    .describe("所有候选共同服务的当前自主目标"),
-  termination: ModelMotionOptionSchema
-    .describe("可观测物理结果；条件通过谓词索引组合，不直接编写关节角"),
-  candidates: z.array(HumanoidMotionPlanSchema).min(2).max(3)
-    .describe("按模型偏好排序的不同连续全身动作候选")
-}).strict().superRefine((batch, context) => {
-  for (const duplicate of duplicateHumanoidMotionCandidateIndexes(
-    batch.candidates
-  )) {
+const ModelHandObjectContactSchema = z.object({
+  hand_surface: z.enum(G1_HAND_CONTACT_SURFACE_NAMES),
+  object_id: z.string().trim().min(1),
+  required: z.boolean()
+}).strict();
+
+const ModelHandSolidContactSchema = z.object({
+  hand_surface: z.enum(G1_HAND_CONTACT_SURFACE_NAMES),
+  solid_id: z.string().trim().min(1),
+  required: z.boolean()
+}).strict();
+
+const ModelContactConstraintSchema = z.discriminatedUnion("type", [
+  ModelBodyObjectContactSchema.extend({
+    type: z.literal("body_object"),
+  }).strict(),
+  ModelBodySolidContactSchema.extend({
+    type: z.literal("body_solid"),
+  }).strict(),
+  ModelHandObjectContactSchema.extend({
+    type: z.literal("hand_object"),
+  }).strict(),
+  ModelHandSolidContactSchema.extend({
+    type: z.literal("hand_solid"),
+  }).strict()
+]);
+
+const ModelGroupedContactConstraintsSchema = z.object({
+  hand_object: z.array(ModelHandObjectContactSchema).max(16)
+}).strict();
+
+const ModelContactConstraintsSchema = z.union([
+  z.array(ModelContactConstraintSchema).max(16),
+  ModelGroupedContactConstraintsSchema
+]);
+
+const ModelMotionChannelSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("root_velocity"),
+    forward_mps: z.number().finite(),
+    lateral_mps: z.number().finite()
+  }).strict(),
+  z.object({
+    type: z.literal("root_yaw_velocity"),
+    radians_per_second: z.number().finite()
+  }).strict(),
+  z.object({
+    type: z.literal("root_height"),
+    meters: z.number().finite().min(0.45).max(1.2)
+      .describe("骨盆沿世界竖直 Y 轴的绝对高度，单位米；不是世界 X/Z 平面位置")
+  }).strict(),
+  z.object({
+    type: z.literal("root_roll"),
+    radians: z.number().finite()
+  }).strict(),
+  z.object({
+    type: z.literal("root_pitch"),
+    radians: z.number().finite()
+  }).strict(),
+  z.object({
+    type: z.literal("torso_yaw"),
+    radians: z.number().finite().min(-1.2).max(1.2)
+  }).strict(),
+  z.object({
+    type: z.literal("hand_coordination"),
+    coordination: G1HandCoordinationSchema
+  }).strict(),
+  z.object({
+    type: z.literal("end_effector_position"),
+    end_effector: HumanoidEndEffectorSchema,
+    frame: z.enum(["world", "pelvis"]),
+    position: Vec3Schema.describe(
+      "真实腕或踝 Link 目标，不是物体或掌指接触点；手部接触必须用观察的 surface_from_wrist_world 换算腕目标"
+    ),
+    tolerance_m: TrackingToleranceSchema
+  }).strict(),
+  z.object({
+    type: z.literal("end_effector_pose"),
+    end_effector: HumanoidEndEffectorSchema,
+    frame: z.enum(["world", "pelvis"]),
+    position: Vec3Schema.describe(
+      "真实腕或踝 Link 目标，不是物体或掌指接触点"
+    ),
+    tolerance_m: TrackingToleranceSchema,
+    orientation: QuaternionSchema,
+    orientation_tolerance_rad: z.number().finite().positive().max(Math.PI)
+  }).strict()
+]);
+
+const ModelMotionKeyframeSchema = z.object({
+  at_seconds: z.number().finite().nonnegative(),
+  channels: z.array(ModelMotionChannelSchema).max(10)
+}).strict().superRefine((keyframe, context) => {
+  const keys = keyframe.channels.map(channelIdentity);
+  if (new Set(keys).size !== keys.length) {
     context.addIssue({
       code: "custom",
-      path: ["candidates", duplicate.candidateIndex],
-      message: `Candidate motion content duplicates candidate ${duplicate.originalIndex + 1}; id and intent labels do not make a distinct candidate`
+      path: ["channels"],
+      message: "A keyframe cannot command the same physical channel twice"
     });
   }
 });
 
+const ModelMotionCandidateSchema = z.object({
+  id: z.string().trim().min(1),
+  intent: z.string().trim().min(1),
+  duration_seconds: z.number().finite().positive().max(8),
+  contacts: ModelContactConstraintsSchema.describe(
+    "接触约束可写成带 type 的数组；仅含手-物体约束时也可写成 {hand_object:[...]}，两种形式物理语义相同"
+  ),
+  keyframes: z.array(ModelMotionKeyframeSchema).min(2).max(32)
+}).strict();
+
+const HumanoidMotionCandidateBatchInputShapeSchema = z.object({
+  objective: z.string().trim().min(1),
+  termination: ModelMotionOptionSchema,
+  candidates: z.array(ModelMotionCandidateSchema).min(1).max(3)
+}).strict();
+
+export const HumanoidMotionCandidateBatchInputSchema =
+  HumanoidMotionCandidateBatchInputShapeSchema.superRefine((input, context) => {
+    const result = HumanoidMotionCandidateBatchSchema.safeParse(normalizedBatch(input));
+    if (result.success) return;
+    for (const issue of result.error.issues.slice(0, 24)) {
+      context.addIssue({
+        code: "custom",
+        path: issue.path,
+        message: issue.message
+      });
+    }
+  });
+
+type ModelMotionBatch = z.infer<typeof HumanoidMotionCandidateBatchInputShapeSchema>;
 type ModelMotionPredicate = z.infer<typeof ModelMotionPredicateSchema>;
 type ModelMotionCondition = z.infer<typeof ModelMotionConditionSchema>;
-type ModelMotionOption = z.infer<typeof ModelMotionOptionSchema>;
-
-const PREDICATE_VALUE_FIELDS = [
-  "body",
-  "end_effector",
-  "frame",
-  "object_id",
-  "solid_id",
-  "hand_surface",
-  "hand",
-  "grasp_contract_sha256",
-  "zone_id",
-  "target",
-  "tolerance_m",
-  "target_orientation",
-  "orientation_tolerance_rad",
-  "minimum_normal_force",
-  "expected"
-] as const satisfies readonly (keyof ModelMotionPredicate)[];
+type ModelMotionChannel = z.infer<typeof ModelMotionChannelSchema>;
+type ModelContactConstraint = z.infer<typeof ModelContactConstraintSchema>;
 
 export function normalizeHumanoidMotionCandidateBatchInput(
   input: z.infer<typeof HumanoidMotionCandidateBatchInputSchema>
 ): HumanoidMotionCandidateBatch {
-  return HumanoidMotionCandidateBatchSchema.parse({
-    objective: input.objective,
-    termination: normalizeOption(input.termination),
-    candidates: input.candidates
-  });
+  return HumanoidMotionCandidateBatchSchema.parse(normalizedBatch(input));
 }
 
-function normalizeOption(option: ModelMotionOption): unknown {
+function normalizedBatch(input: ModelMotionBatch): unknown {
   return {
-    option_id: option.option_id,
-    predicates: option.predicates.map(normalizePredicate),
-    stable_steps: option.stable_steps,
-    phases: option.phases === null
-      ? null
-      : {
-          precondition: option.phases.precondition === null
-            ? null
-            : {
-                condition: normalizeCondition(
-                  option.phases.precondition.condition
-                ),
-                stable_steps: option.phases.precondition.stable_steps
-              },
-          during: option.phases.during === null
-            ? null
-            : {
-                condition: normalizeCondition(option.phases.during.condition)
-              },
-          terminal: {
-            condition: normalizeCondition(option.phases.terminal.condition)
+    objective: input.objective,
+    termination: {
+      option_id: input.termination.option_id,
+      predicates: input.termination.predicates.map(normalizePredicate),
+      stable_steps: input.termination.stable_steps,
+      phases: input.termination.mode === "all"
+        ? null
+        : {
+            precondition: input.termination.precondition === null
+              ? null
+              : {
+                  condition: normalizeCondition(
+                    input.termination.precondition.condition
+                  ),
+                  stable_steps: input.termination.precondition.stable_steps
+                },
+            during: input.termination.during === null
+              ? null
+              : {
+                  condition: normalizeCondition(
+                    input.termination.during.condition
+                  )
+                },
+            terminal: {
+              condition: normalizeCondition(
+                input.termination.terminal.condition
+              )
+            }
           }
+    },
+    candidates: input.candidates.map((candidate) => ({
+      id: candidate.id,
+      intent: candidate.intent,
+      duration_seconds: candidate.duration_seconds,
+      contact_constraints: contactList(candidate.contacts).map(normalizeContact),
+      keyframes: candidate.keyframes.map((keyframe) => {
+        const normalized: Record<string, unknown> = {
+          at_seconds: keyframe.at_seconds
+        };
+        for (const channel of keyframe.channels) {
+          Object.assign(normalized, normalizeChannel(channel));
         }
+        return normalized;
+      })
+    }))
   };
 }
 
+function contactList(
+  contacts: ModelMotionBatch["candidates"][number]["contacts"]
+): ModelContactConstraint[] {
+  if (Array.isArray(contacts)) return contacts;
+  return contacts.hand_object.map((contact) => ({
+      type: "hand_object" as const,
+      ...contact
+    }));
+}
+
 function normalizePredicate(predicate: ModelMotionPredicate): unknown {
-  if (predicate.type === "root_near_point") {
-    return {
-      type: predicate.type,
-      target: predicate.target,
-      tolerance_m: predicate.tolerance_m
-    };
-  }
-  if (predicate.type === "body_near_point") {
-    return {
-      type: predicate.type,
-      body: predicate.body,
-      target: predicate.target,
-      tolerance_m: predicate.tolerance_m
-    };
-  }
-  if (predicate.type === "end_effector_near_point") {
-    return {
-      type: predicate.type,
-      end_effector: predicate.end_effector,
-      frame: predicate.frame,
-      target: predicate.target,
-      tolerance_m: predicate.tolerance_m,
-      ...(predicate.target_orientation !== null
-        && predicate.orientation_tolerance_rad !== null
-        ? {
-            target_orientation: predicate.target_orientation,
-            orientation_tolerance_rad: predicate.orientation_tolerance_rad
-          }
-        : {})
-    };
-  }
-  if (predicate.type === "body_contact_object") {
-    return {
-      type: predicate.type,
-      body: predicate.body,
-      object_id: predicate.object_id,
-      minimum_normal_force: predicate.minimum_normal_force
-    };
-  }
-  if (predicate.type === "body_contact_solid") {
-    return {
-      type: predicate.type,
-      body: predicate.body,
-      solid_id: predicate.solid_id,
-      minimum_normal_force: predicate.minimum_normal_force
-    };
-  }
-  if (predicate.type === "hand_contact_solid") {
-    return {
-      type: predicate.type,
-      hand_surface: predicate.hand_surface,
-      solid_id: predicate.solid_id,
-      minimum_normal_force: predicate.minimum_normal_force
-    };
-  }
-  if (predicate.type === "object_near_point") {
-    return {
-      type: predicate.type,
-      object_id: predicate.object_id,
-      target: predicate.target,
-      tolerance_m: predicate.tolerance_m
-    };
-  }
-  if (predicate.type === "grasp_verified") {
-    return {
-      type: predicate.type,
-      object_id: predicate.object_id,
-      hand: predicate.hand,
-      grasp_contract_sha256: predicate.grasp_contract_sha256
-    };
-  }
-  if (predicate.type === "object_settled_on_support") {
-    return {
-      type: predicate.type,
-      object_id: predicate.object_id
-    };
-  }
+  if (predicate.type !== "end_effector_near_pose") return predicate;
   return {
-    type: predicate.type,
-    object_id: predicate.object_id,
-    zone_id: predicate.zone_id,
-    expected: predicate.expected,
-    tolerance_m: predicate.tolerance_m
+    type: "end_effector_near_point",
+    end_effector: predicate.end_effector,
+    frame: predicate.frame,
+    target: predicate.target,
+    tolerance_m: predicate.tolerance_m,
+    target_orientation: predicate.target_orientation,
+    orientation_tolerance_rad: predicate.orientation_tolerance_rad
   };
 }
 
@@ -329,38 +427,74 @@ function normalizeCondition(condition: ModelMotionCondition): unknown {
     : { op: condition.op, conditions };
 }
 
-function requiredPredicateFields(
-  type: ModelMotionPredicate["type"]
-): ReadonlySet<(typeof PREDICATE_VALUE_FIELDS)[number]> {
-  if (type === "root_near_point") return new Set(["target", "tolerance_m"]);
-  if (type === "body_near_point") {
-    return new Set(["body", "target", "tolerance_m"]);
+function normalizeContact(contact: ModelContactConstraint): unknown {
+  if (contact.type === "body_object") {
+    return {
+      body: contact.body,
+      object_id: contact.object_id,
+      required: contact.required
+    };
   }
-  if (type === "end_effector_near_point") {
-    return new Set([
-      "end_effector",
-      "frame",
-      "target",
-      "tolerance_m"
-    ]);
+  if (contact.type === "body_solid") {
+    return {
+      body: contact.body,
+      solid_id: contact.solid_id,
+      required: contact.required
+    };
   }
-  if (type === "body_contact_object") {
-    return new Set(["body", "object_id", "minimum_normal_force"]);
+  if (contact.type === "hand_object") {
+    return {
+      hand_surface: contact.hand_surface,
+      object_id: contact.object_id,
+      required: contact.required
+    };
   }
-  if (type === "body_contact_solid") {
-    return new Set(["body", "solid_id", "minimum_normal_force"]);
+  return {
+    hand_surface: contact.hand_surface,
+    solid_id: contact.solid_id,
+    required: contact.required
+  };
+}
+
+function normalizeChannel(channel: ModelMotionChannel): Record<string, unknown> {
+  if (channel.type === "root_velocity") {
+    return {
+      root_velocity: {
+        forward_mps: channel.forward_mps,
+        lateral_mps: channel.lateral_mps
+      }
+    };
   }
-  if (type === "hand_contact_solid") {
-    return new Set(["hand_surface", "solid_id", "minimum_normal_force"]);
+  if (channel.type === "root_yaw_velocity") {
+    return { root_yaw_velocity: channel.radians_per_second };
   }
-  if (type === "grasp_verified") {
-    return new Set(["object_id", "hand", "grasp_contract_sha256"]);
+  if (channel.type === "root_height") return { root_height: channel.meters };
+  if (channel.type === "root_roll") return { root_roll: channel.radians };
+  if (channel.type === "root_pitch") return { root_pitch: channel.radians };
+  if (channel.type === "torso_yaw") return { torso_yaw: channel.radians };
+  if (channel.type === "hand_coordination") {
+    return { hand_coordination: channel.coordination };
   }
-  if (type === "object_settled_on_support") {
-    return new Set(["object_id"]);
-  }
-  if (type === "object_near_point") {
-    return new Set(["object_id", "target", "tolerance_m"]);
-  }
-  return new Set(["object_id", "zone_id", "expected", "tolerance_m"]);
+  const target = {
+    position: channel.position,
+    frame: channel.frame,
+    tolerance_m: channel.tolerance_m,
+    ...(channel.type === "end_effector_pose"
+      ? {
+          orientation: channel.orientation,
+          orientation_tolerance_rad: channel.orientation_tolerance_rad
+        }
+      : {})
+  };
+  if (channel.end_effector === "left_wrist") return { left_hand: target };
+  if (channel.end_effector === "right_wrist") return { right_hand: target };
+  if (channel.end_effector === "left_ankle") return { left_foot: target };
+  return { right_foot: target };
+}
+
+function channelIdentity(channel: ModelMotionChannel): string {
+  return channel.type === "end_effector_position"
+    || channel.type === "end_effector_pose"
+    ? `end_effector:${channel.end_effector}`
+    : channel.type;
 }

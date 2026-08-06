@@ -59,7 +59,7 @@ describe("humanoid joint tracking references", () => {
     );
   });
 
-  it("releases motion-scoped tracking without changing the terminal pose", () => {
+  it("returns motion-scoped joints to the learned policy reference", () => {
     const tracked = targetReference(neutralHumanoidReference(), {
       joints: { right_elbow_joint: 0.25 },
       rootVelocity: [0.1, -0.05]
@@ -67,8 +67,12 @@ describe("humanoid joint tracking references", () => {
 
     const released = releaseReferenceTracking(tracked);
 
-    expect([...released.jointPositions]).toEqual([...tracked.jointPositions]);
-    expect([...released.jointVelocities]).toEqual([...tracked.jointVelocities]);
+    expect([...released.jointPositions]).toEqual([
+      ...neutralHumanoidReference().jointPositions
+    ]);
+    expect([...released.jointVelocities]).toEqual(
+      Array.from({ length: HUMANOID_JOINT_NAMES.length }, () => 0)
+    );
     expect(released.rootVelocity).toEqual(tracked.rootVelocity);
     expect([...released.jointTrackingWeights]).toEqual(
       Array.from({ length: HUMANOID_JOINT_NAMES.length }, () => 0)
@@ -77,7 +81,7 @@ describe("humanoid joint tracking references", () => {
     expect(released.jointTrackingWeights).not.toBe(tracked.jointTrackingWeights);
   });
 
-  it("stops commanded root motion while preserving autonomous balance authority", () => {
+  it("stops root motion while retaining only the last commanded arm posture", () => {
     const moving = targetReference(neutralHumanoidReference(), {
       joints: { left_elbow_joint: 0.2 },
       rootVelocity: [0.32, -0.08],
@@ -91,8 +95,22 @@ describe("humanoid joint tracking references", () => {
     expect(stationary.rootYawVelocity).toBe(0);
     expect(stationary.rootHeight).toBe(0.81);
     expect([...stationary.jointPositions]).toEqual([...moving.jointPositions]);
-    expect([...stationary.jointTrackingWeights]).toEqual(
-      Array.from({ length: HUMANOID_JOINT_NAMES.length }, () => 0)
-    );
+    expect(stationary.jointTrackingWeights[
+      HUMANOID_JOINT_INDEX.get("left_elbow_joint")!
+    ]).toBe(1);
+    expect(stationary.jointTrackingWeights[
+      HUMANOID_JOINT_INDEX.get("left_knee_joint")!
+    ]).toBe(0);
+  });
+
+  it("does not turn uncommanded measured joints into persistent actuation", () => {
+    const stationary = stationaryHumanoidReference(neutralHumanoidReference());
+
+    const shoulder = HUMANOID_JOINT_INDEX.get("right_shoulder_pitch_joint")!;
+    const elbow = HUMANOID_JOINT_INDEX.get("right_elbow_joint")!;
+    const knee = HUMANOID_JOINT_INDEX.get("right_knee_joint")!;
+    expect(stationary.jointTrackingWeights[shoulder]).toBe(0);
+    expect(stationary.jointTrackingWeights[elbow]).toBe(0);
+    expect(stationary.jointTrackingWeights[knee]).toBe(0);
   });
 });

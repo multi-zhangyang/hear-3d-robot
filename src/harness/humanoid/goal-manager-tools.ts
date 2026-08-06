@@ -1,7 +1,10 @@
 import { tool, type FunctionTool } from "@openai/agents";
 import { z } from "zod";
 import { goalSha256 } from "../../domain/goal-identity.js";
-import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
+import {
+  modelPayloadSha256,
+  modelToolArgumentsSha256
+} from "../../domain/model-call-authority.js";
 import { GoalSchema, type JsonValue } from "../../domain/schema.js";
 import { GOAL_RETIREMENT_STATUSES } from "../../domain/goal-epoch-retirement.js";
 import { invalidToolInputResult } from "../tool-input-recovery.js";
@@ -46,6 +49,15 @@ const SubmitGoalCandidatesSchema = z.object({
       message: "A Goal candidate batch must contain distinct Goal contents"
     });
   }
+  input.candidates.forEach((candidate, candidateIndex) => {
+    const predicateHashes = candidate.goal.predicates.map(modelPayloadSha256);
+    if (new Set(predicateHashes).size === predicateHashes.length) return;
+    context.addIssue({
+      code: "custom",
+      path: ["candidates", candidateIndex, "goal", "predicates"],
+      message: "A Goal candidate cannot repeat an identical predicate"
+    });
+  });
 });
 
 const SelectGoalCandidateSchema = z.object({
@@ -136,6 +148,7 @@ export interface GoalToolCallAuthority {
   tool_call_id: string;
   tool_name: string;
   arguments_sha256: string;
+  normalized_arguments_sha256?: string;
 }
 
 export function createGoalManagerTools(
@@ -214,13 +227,22 @@ function goalTool(
     timeoutBehavior: "raise_exception",
     errorFunction: (_context, error) => invalidToolInputResult(error, name),
     execute: async (input, _context, details) => {
-      const toolCallId = details?.toolCall?.callId;
+      const toolCall = details?.toolCall;
+      const toolCallId = toolCall?.callId;
       if (!toolCallId) throw new Error(`SDK did not provide a call ID for ${name}`);
+      if (toolCall.name !== name) {
+        throw new Error(`SDK tool identity mismatch for ${name}`);
+      }
+      const argumentsSha256 = modelToolArgumentsSha256(toolCall.arguments);
+      const normalizedArgumentsSha256 = modelPayloadSha256(input);
       try {
         return JSON.stringify(await invoke(input, {
           tool_call_id: toolCallId,
           tool_name: name,
-          arguments_sha256: modelPayloadSha256(input)
+          arguments_sha256: argumentsSha256,
+          ...(normalizedArgumentsSha256 === argumentsSha256
+            ? {}
+            : { normalized_arguments_sha256: normalizedArgumentsSha256 })
         }));
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") throw error;

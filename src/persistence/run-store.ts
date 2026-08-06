@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import {
   access,
+  cp,
   mkdir,
   readFile,
   readdir,
+  rename,
+  rm,
   unlink
 } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
@@ -482,6 +485,96 @@ export class RunStore {
       }
       throw error;
     }
+  }
+
+  async readArchivedAgentManifests(): Promise<AgentManifest[]> {
+    return this.#runMutation(async () => {
+      const directory = resolve(this.runDir, "agent-epochs");
+      let entries;
+      try {
+        entries = await readdir(directory, { withFileTypes: true });
+      } catch (error) {
+        if (isMissing(error)) return [];
+        throw error;
+      }
+      const manifests: AgentManifest[] = [];
+      for (const entry of entries
+        .filter((candidate) => candidate.isDirectory())
+        .sort((left, right) => left.name.localeCompare(right.name))) {
+        const manifest = AgentManifestSchema.parse(JSON.parse(await readFile(
+          resolve(directory, entry.name, "agent-manifest.json"),
+          "utf8"
+        )));
+        if (manifest.epoch_id !== entry.name) {
+          throw new Error(`Archived Agent manifest epoch mismatch: ${entry.name}`);
+        }
+        manifests.push(manifest);
+      }
+      return manifests;
+    });
+  }
+
+  async archiveCurrentAgentEpoch(): Promise<string> {
+    return this.#runMutation(async () => {
+      const manifest = await this.readAgentManifest();
+      const archiveRoot = resolve(this.runDir, "agent-epochs");
+      const destination = resolve(archiveRoot, manifest.epoch_id);
+      const staging = resolve(
+        archiveRoot,
+        `.${manifest.epoch_id}.${randomUUID()}.tmp`
+      );
+      await mkdir(archiveRoot, { recursive: true });
+      let destinationExists = false;
+      try {
+        await access(destination);
+        destinationExists = true;
+      } catch {
+        destinationExists = false;
+      }
+      if (destinationExists) {
+        const archived = AgentManifestSchema.parse(JSON.parse(await readFile(
+          resolve(destination, "agent-manifest.json"),
+          "utf8"
+        )));
+        if (archived.identity_sha256 !== manifest.identity_sha256) {
+          throw new Error(`Archived Agent epoch identity mismatch: ${manifest.epoch_id}`);
+        }
+      } else {
+        await mkdir(staging, { recursive: false });
+        try {
+          for (const name of [
+            "agent-manifest.json",
+            "agent-state.json",
+            "session.json",
+            "sessions"
+          ] as const) {
+            const source = resolve(this.runDir, name);
+            try {
+              await access(source);
+            } catch {
+              continue;
+            }
+            await cp(source, resolve(staging, name), {
+              recursive: name === "sessions",
+              errorOnExist: true
+            });
+          }
+          await rename(staging, destination);
+        } catch (error) {
+          await rm(staging, { recursive: true, force: true });
+          throw error;
+        }
+      }
+      for (const name of [
+        "agent-manifest.json",
+        "agent-state.json",
+        "session.json",
+        "sessions"
+      ] as const) {
+        await rm(resolve(this.runDir, name), { recursive: true, force: true });
+      }
+      return manifest.epoch_id;
+    });
   }
 
   sessionPath(): string {

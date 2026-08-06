@@ -14,6 +14,8 @@ export interface HumanoidControllerDescriptor {
   actuation: "joint_position_pd";
   controlStepSeconds: number;
   physicsStepSeconds: number;
+  commandResponseHorizonSeconds?: number | undefined;
+  minimumEffectivePlanarSpeedMetersPerSecond?: number | undefined;
 }
 
 export interface HumanoidJointPositionCommand {
@@ -30,14 +32,27 @@ export interface HumanoidControllerState {
   payload: JsonValue;
 }
 
+export interface HumanoidControllerInferenceOptions {
+  trackedJointPolicyCommand?: "measured" | "neutral";
+}
+
 export interface HumanoidWholeBodyController {
   readonly descriptor: HumanoidControllerDescriptor;
-  reset(state: HumanoidPolicyState, reference: HumanoidReference): void;
+  reset(
+    state: HumanoidPolicyState,
+    reference: HumanoidReference,
+    options?: HumanoidControllerInferenceOptions
+  ): void;
   infer(
     state: HumanoidPolicyState,
-    reference: HumanoidReference
+    reference: HumanoidReference,
+    options?: HumanoidControllerInferenceOptions
   ): Promise<HumanoidJointPositionCommand>;
-  advanceHistory(state: HumanoidPolicyState, reference: HumanoidReference): void;
+  advanceHistory(
+    state: HumanoidPolicyState,
+    reference: HumanoidReference,
+    options?: HumanoidControllerInferenceOptions
+  ): void;
   captureState(): HumanoidControllerState;
   restoreState(state: HumanoidControllerState): void;
   dispose(): Promise<void>;

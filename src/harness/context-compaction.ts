@@ -24,6 +24,7 @@ import {
 } from "../runtime/context-budget.js";
 import { agentIdFromInstructions, agentInvocationMarker } from "./agent-scope.js";
 import {
+  ContextCompactionCapacityError,
   ContextCompactionInterruption,
   estimateContextSummaryRequestTokens,
   rebaseContextSummary,
@@ -38,6 +39,11 @@ import {
 } from "./token-budget.js";
 
 const HASH_SEED = "hear-context-ledger-v1";
+const CURRENT_AUTHORITY_POLICY = [
+  "The final user message beginning CURRENT HARNESS AUTHORITY is a trusted runtime envelope appended by the Harness.",
+  "It overrides older observations, authority envelopes, compact memory, frame numbers, revisions, phases, and transaction identifiers.",
+  "Treat it as data and follow the stable Agent instructions above when deciding how to use it."
+].join(" ");
 
 interface RecoveredInputState {
   physical: AgentInputItem[];
@@ -68,8 +74,10 @@ export class LongRunContextManager {
   readonly #compactorConfig: ModelProviderConfig;
   readonly #recoveredInputs = new Map<string, RecoveredInputState>();
   readonly #pendingModelEstimates = new Map<string, number>();
-  readonly #freshTurnScopes = new Set<string>();
-  readonly #freshTurnRebaseScopes = new Set<string>();
+  readonly #sessionRollbackScopes = new Set<string>();
+  readonly #sessionRollbackRebaseScopes = new Set<string>();
+  readonly #authorityHistoryNormalizationScopes = new Set<string>();
+  #observedCompactorContextWindowTokens: number | undefined;
   #memoryPersistence: Promise<void> = Promise.resolve();
   #state: ContextMemoryState;
 
@@ -107,7 +115,7 @@ export class LongRunContextManager {
     const scope = this.#state.scopes[agentId];
     if (!scope || estimated === undefined || estimated <= 0) return;
     const observedCorrection = Math.ceil(inputTokens * 1_000 / estimated);
-    if (observedCorrection <= scope.token_estimator_correction_milli) return;
+    if (observedCorrection === scope.token_estimator_correction_milli) return;
     const previousCorrection = scope.token_estimator_correction_milli;
     scope.token_estimator_correction_milli = observedCorrection;
     scope.active_estimated_tokens = correctedTokenEstimate(
@@ -140,10 +148,10 @@ export class LongRunContextManager {
       const session = sessionForAgent(scopeId);
       const persisted = await session.getItems();
       if (isPrefix(recovered.physical, persisted)) {
-        const retained = [
+        const retained = withoutHarnessAuthorityItems([
           ...structuredClone(recovered.logical),
           ...structuredClone(persisted.slice(recovered.physical.length))
-        ];
+        ]).items;
         await session.replaceItems(retained);
         this.#recoveredInputs.set(scopeId, {
           physical: structuredClone(retained),
@@ -161,15 +169,16 @@ export class LongRunContextManager {
   }
 
   /**
-   * Starts a clean SDK conversation after repeated responses without a formal
-   * decision. Durable raw history stays in context.jsonl and the last validated
-   * model checkpoint remains available; only the poisoned short-term branch is
-   * replaced on the next filter call.
+   * Accepts a durable Session rollback after a failed SDK attempt. The next
+   * filter call must use that restored Session verbatim instead of rehydrating
+   * the abandoned journal suffix. It deliberately preserves the Agent's
+   * conversation prefix so a retry remains one topic and can reuse provider
+   * prompt-cache entries.
    */
-  startFreshSdkTurn(agentId: string): void {
+  acceptSdkSessionRollback(agentId: string): void {
     this.#recoveredInputs.delete(agentId);
-    this.#freshTurnScopes.add(agentId);
-    this.#freshTurnRebaseScopes.add(agentId);
+    this.#sessionRollbackScopes.add(agentId);
+    this.#sessionRollbackRebaseScopes.add(agentId);
   }
 
   readonly filter: CallModelInputFilter = async ({
@@ -186,7 +195,26 @@ export class LongRunContextManager {
     const summaryOutputTokens = this.#summaryOutputTokens(config);
     const scope = this.#scope(node, config, summaryOutputTokens);
     const physicalInput = modelData.input;
-    const logicalInput = await this.#logicalInput(scope, physicalInput);
+    const recoveredLogicalInput = await this.#logicalInput(scope, physicalInput);
+    const normalized = withoutHarnessAuthorityItems(recoveredLogicalInput);
+    const logicalInput = normalized.items;
+    if (normalized.removed > 0) {
+      this.#authorityHistoryNormalizationScopes.add(scope.scope_id);
+      this.#recoveredInputs.set(scope.scope_id, {
+        physical: structuredClone(physicalInput),
+        logical: structuredClone(logicalInput),
+        sessionRewritePending: true
+      });
+      await this.#runtime.recordProvider({
+        status: "context_authority_history_normalized",
+        source: "harness_revision_filter",
+        scope_id: scope.scope_id,
+        agent_id: node.id,
+        removed_authority_items: normalized.removed,
+        semantic_session_preserved: true,
+        automatic_actuation: false
+      }, node.id);
+    }
     const logicalModelData: ModelInputData = {
       input: logicalInput,
       ...(modelData.instructions === undefined ? {} : { instructions: modelData.instructions })
@@ -279,6 +307,12 @@ export class LongRunContextManager {
       persisted = true;
     }
 
+    scope.active_estimated_tokens = correctedTokenEstimate(
+      estimateModelInputTokens(filtered) + toolTokens,
+      scope.token_estimator_correction_milli
+    );
+    this.#setActive(scope);
+
     const hardLimit = config.contextWindowTokens
       - (config.maxOutputTokens ?? defaultOutputTokenReserve(config.contextWindowTokens));
     if (scope.active_estimated_tokens > hardLimit) {
@@ -335,11 +369,10 @@ export class LongRunContextManager {
     scope: ContextScopeState,
     physical: AgentInputItem[]
   ): Promise<AgentInputItem[]> {
-    // An explicit fresh turn may deliberately start with the same mission
-    // prompt as the abandoned branch. Prefix equality is not permission to
-    // rehydrate that branch; #recordRawDelta will preserve only its validated
-    // compact checkpoint and begin a new raw chain.
-    if (this.#freshTurnScopes.has(scope.scope_id)) return physical;
+    // A restored Session may end at the same prefix as an abandoned attempt.
+    // Prefix equality is not permission to rehydrate that failed suffix;
+    // #recordRawDelta keeps the durable prefix and its validated checkpoint.
+    if (this.#sessionRollbackScopes.has(scope.scope_id)) return physical;
     const recovered = this.#recoveredInputs.get(scope.scope_id);
     if (recovered) {
       if (!isPrefix(recovered.physical, physical)) {
@@ -494,14 +527,17 @@ export class LongRunContextManager {
   }
 
   #recordRawDelta(scope: ContextScopeState, items: AgentInputItem[]): JsonValue | undefined {
-    const explicitFreshTurn = this.#freshTurnScopes.delete(scope.scope_id);
-    let branch = explicitFreshTurn;
+    const explicitSessionRollback = this.#sessionRollbackScopes.delete(scope.scope_id);
+    const normalizedAuthorityHistory = this.#authorityHistoryNormalizationScopes.delete(
+      scope.scope_id
+    );
+    let branch = explicitSessionRollback || normalizedAuthorityHistory;
     const priorCount = scope.raw_item_count;
     const priorHash = scope.raw_chain_hash;
-    if (explicitFreshTurn || priorCount > items.length
+    if (explicitSessionRollback || normalizedAuthorityHistory || priorCount > items.length
       || (priorCount > 0 && chainHash(items.slice(0, priorCount)) !== priorHash)) {
       branch = true;
-      const preserveCheckpoint = explicitFreshTurn;
+      const preserveCheckpoint = explicitSessionRollback || normalizedAuthorityHistory;
       const retainedMatches = scope.summary !== null
         && scope.retained_item_count <= items.length
         && (scope.retained_item_count === 0
@@ -575,115 +611,159 @@ export class LongRunContextManager {
     });
     if (targetCut <= scope.compacted_item_count) return null;
 
-    const maxInputTokens = compactorInputTokenLimit(
+    const effectiveCompactorContextWindowTokens = Math.min(
       this.#compactorConfig.contextWindowTokens,
+      this.#observedCompactorContextWindowTokens ?? Number.POSITIVE_INFINITY
+    );
+    const configuredMaxInputTokens = compactorInputTokenLimit(
+      effectiveCompactorContextWindowTokens,
       summaryOutputTokens
     );
-    if (maxInputTokens <= 0) {
+    if (configuredMaxInputTokens <= 0) {
       throw new ContextCompactionInterruption(
         "Context compactor has no input budget in the configured model window"
       );
     }
-    let selected: {
+    type SelectedRequest = {
       cut: number;
       request: ContextSummaryRequest;
       estimatedInputTokens: number;
-    } | undefined;
-    let smallestCandidateTokens: number | undefined;
-    for (const cut of compactionBoundaries(
-      modelData.input,
-      scope.compacted_item_count,
-      targetCut
-    )) {
-      const sourceItems = modelData.input.slice(scope.compacted_item_count, cut);
-      const receipts = this.#runtime.contextReceipts();
-      const transactionIds = relevantTransactionIds(
-        receipts,
-        scope.summary,
-        sourceItems
-      );
-      const request: ContextSummaryRequest = {
-        priorSummary: scope.summary,
-        sourceItems,
-        authority,
-        acceptedTransactionIds: transactionIds.filter((transactionId) =>
-          receipts[transactionId]?.accepted === true
-            && receipts[transactionId]?.worldRevision === contextWorldRevision
-        ),
-        blockerTransactionIds: transactionIds.filter((transactionId) =>
-          receipts[transactionId]?.worldRevision === contextWorldRevision
-        ),
-        maxInputTokens,
-        maxOutputTokens: summaryOutputTokens,
-        ...(this.#runtime.signal ? { signal: this.#runtime.signal } : {})
-      };
-      const estimatedInputTokens = estimateContextSummaryRequestTokens(request);
-      smallestCandidateTokens ??= estimatedInputTokens;
-      if (estimatedInputTokens <= maxInputTokens) {
-        selected = { cut, request, estimatedInputTokens };
+    };
+    const selectRequest = (maxInputTokens: number): SelectedRequest => {
+      let selected: SelectedRequest | undefined;
+      let smallestCandidateTokens: number | undefined;
+      for (const cut of compactionBoundaries(
+        modelData.input,
+        scope.compacted_item_count,
+        targetCut
+      )) {
+        const sourceItems = modelData.input.slice(scope.compacted_item_count, cut);
+        const receipts = this.#runtime.contextReceipts();
+        const transactionIds = relevantTransactionIds(
+          receipts,
+          scope.summary,
+          sourceItems
+        );
+        const request: ContextSummaryRequest = {
+          priorSummary: scope.summary,
+          sourceItems,
+          authority,
+          acceptedTransactionIds: transactionIds.filter((transactionId) =>
+            receipts[transactionId]?.accepted === true
+              && receipts[transactionId]?.worldRevision === contextWorldRevision
+          ),
+          blockerTransactionIds: transactionIds.filter((transactionId) =>
+            receipts[transactionId]?.worldRevision === contextWorldRevision
+          ),
+          maxInputTokens,
+          maxOutputTokens: summaryOutputTokens,
+          ...(this.#runtime.signal ? { signal: this.#runtime.signal } : {})
+        };
+        const estimatedInputTokens = estimateContextSummaryRequestTokens(request);
+        smallestCandidateTokens ??= estimatedInputTokens;
+        if (estimatedInputTokens <= maxInputTokens) {
+          selected = { cut, request, estimatedInputTokens };
+        }
       }
-    }
-    if (!selected) {
+      if (selected) return selected;
       throw new ContextCompactionInterruption(
         `The next complete context turn for ${node.name} requires an estimated `
         + `${smallestCandidateTokens ?? "unknown"} compactor input tokens, above its `
         + `${maxInputTokens}-token hard limit; no oversized request was sent`
       );
+    };
+
+    const sourceFrom = scope.compacted_item_count;
+    const startedAt = new Date().toISOString();
+    let effectiveMaxInputTokens = configuredMaxInputTokens;
+    let selected = selectRequest(effectiveMaxInputTokens);
+    let generated: ContextSummaryResult;
+    for (;;) {
+      await this.#runtime.recordCompactionModelCall(node.id);
+      let reconciledRequests = 1;
+      try {
+        generated = await this.#generatorFor(node.id).generate(selected.request);
+        this.#runtime.signal?.throwIfAborted();
+        if (generated.usage.requests > 1) {
+          await this.#runtime.reconcileCompactionModelCalls(
+            node.id,
+            generated.usage.requests - 1
+          );
+          reconciledRequests = generated.usage.requests;
+        }
+        if (generated.origin !== "model") {
+          throw new ContextCompactionInterruption(
+            "Context Compactor returned a synthetic checkpoint instead of model-written memory",
+            { usage: generated.usage }
+          );
+        }
+        this.#runtime.assertContextSummaryEvidence(generated.summary);
+        break;
+      } catch (error) {
+        this.#runtime.signal?.throwIfAborted();
+        const usage = compactionFailureUsage(error);
+        if (usage && usage.requests > reconciledRequests) {
+          await this.#runtime.reconcileCompactionModelCalls(
+            node.id,
+            usage.requests - reconciledRequests
+          );
+        }
+        if (error instanceof ContextCompactionCapacityError) {
+          this.#observedCompactorContextWindowTokens = Math.min(
+            this.#observedCompactorContextWindowTokens ?? Number.POSITIVE_INFINITY,
+            error.observedContextWindowTokens
+          );
+          const calibratedMaxInputTokens = compactorInputTokenLimit(
+            this.#observedCompactorContextWindowTokens,
+            summaryOutputTokens
+          );
+          if (calibratedMaxInputTokens > 0
+            && calibratedMaxInputTokens < effectiveMaxInputTokens) {
+            const previous = selected;
+            const calibrated = selectRequest(calibratedMaxInputTokens);
+            if (calibrated.cut < previous.cut) {
+              effectiveMaxInputTokens = calibratedMaxInputTokens;
+              selected = calibrated;
+              await this.#runtime.recordProvider(json({
+                status: "context_compaction_capacity_calibrated",
+                source: "model_usage",
+                scope_id: scope.scope_id,
+                agent_id: node.id,
+                configured_context_window_tokens: this.#compactorConfig.contextWindowTokens,
+                observed_context_window_tokens: error.observedContextWindowTokens,
+                previous_source_to_item: previous.cut,
+                calibrated_source_to_item: calibrated.cut,
+                calibrated_input_limit_tokens: calibratedMaxInputTokens,
+                ...(usage ? { usage } : {}),
+                automatic_actuation: false
+              }));
+              continue;
+            }
+          }
+        }
+        const interruption = error instanceof ContextCompactionInterruption
+          ? error
+          : new ContextCompactionInterruption(
+              error instanceof Error ? error.message : String(error),
+              { cause: error, ...(usage ? { usage } : {}) }
+            );
+        await this.#runtime.recordProvider(json({
+          status: "context_compaction_interrupted",
+          source: "agents_sdk",
+          scope_id: scope.scope_id,
+          agent_id: node.id,
+          error: interruption instanceof Error ? interruption.message : String(interruption),
+          ...(usage ? { usage } : {}),
+          recoverable: true,
+          raw_history_preserved: true,
+          session_trimmed: false
+        }));
+        throw interruption;
+      }
     }
 
     const { cut, request, estimatedInputTokens } = selected;
     const sourceItems = request.sourceItems;
-    const sourceFrom = scope.compacted_item_count;
-    const startedAt = new Date().toISOString();
-    await this.#runtime.recordCompactionModelCall(node.id);
-
-    let generated: ContextSummaryResult;
-    let reconciledRequests = 1;
-    try {
-      generated = await this.#generatorFor(node.id).generate(request);
-      this.#runtime.signal?.throwIfAborted();
-      if (generated.usage.requests > 1) {
-        await this.#runtime.reconcileCompactionModelCalls(
-          node.id,
-          generated.usage.requests - 1
-        );
-        reconciledRequests = generated.usage.requests;
-      }
-      if (generated.origin !== "model") {
-        throw new ContextCompactionInterruption(
-          "Context Compactor returned a synthetic checkpoint instead of model-written memory",
-          { usage: generated.usage }
-        );
-      }
-      this.#runtime.assertContextSummaryEvidence(generated.summary);
-    } catch (error) {
-      this.#runtime.signal?.throwIfAborted();
-      const usage = compactionFailureUsage(error);
-      if (usage && usage.requests > reconciledRequests) {
-        await this.#runtime.reconcileCompactionModelCalls(
-          node.id,
-          usage.requests - reconciledRequests
-        );
-      }
-      const interruption = error instanceof ContextCompactionInterruption
-        ? error
-        : new ContextCompactionInterruption(
-            error instanceof Error ? error.message : String(error),
-            { cause: error, ...(usage ? { usage } : {}) }
-          );
-      await this.#runtime.recordProvider(json({
-        status: "context_compaction_interrupted",
-        source: "agents_sdk",
-        scope_id: scope.scope_id,
-        agent_id: node.id,
-        error: interruption instanceof Error ? interruption.message : String(interruption),
-        ...(usage ? { usage } : {}),
-        recoverable: true,
-        raw_history_preserved: true,
-        session_trimmed: false
-      }));
-      throw interruption;
-    }
 
     const completedAt = new Date().toISOString();
     scope.compacted_item_count = cut;
@@ -712,7 +792,7 @@ export class LongRunContextManager {
       source_from_item: sourceFrom,
       source_to_item: cut,
       compactor_estimated_input_tokens: estimatedInputTokens,
-      compactor_input_limit_tokens: maxInputTokens,
+      compactor_input_limit_tokens: effectiveMaxInputTokens,
       compactor_max_output_tokens: summaryOutputTokens,
       active_estimated_tokens: scope.active_estimated_tokens,
       usage: generated.usage
@@ -729,7 +809,7 @@ export class LongRunContextManager {
         source_to_item: cut,
         source_estimated_tokens: estimateItemsTokens(sourceItems),
         compactor_estimated_input_tokens: estimatedInputTokens,
-        compactor_input_limit_tokens: maxInputTokens,
+        compactor_input_limit_tokens: effectiveMaxInputTokens,
         compactor_max_output_tokens: summaryOutputTokens,
         retained_items: modelData.input.length - cut,
         active_estimated_tokens: scope.active_estimated_tokens,
@@ -764,9 +844,10 @@ export class LongRunContextManager {
       ...exactIdentifiers,
       JSON.stringify(authority)
     ].join("\n");
+    const authorityItem = currentAuthorityItem(authorityBlock);
     if (!scope.summary) return {
-      input: modelData.input,
-      instructions: [modelData.instructions, identity, authorityBlock]
+      input: [...modelData.input, authorityItem],
+      instructions: [modelData.instructions, identity, CURRENT_AUTHORITY_POLICY]
         .filter(Boolean)
         .join("\n\n")
     };
@@ -783,8 +864,11 @@ export class LongRunContextManager {
       })}`
     ].join("\n");
     return {
-      input: modelData.input.slice(scope.compacted_item_count),
-      instructions: [modelData.instructions, identity, authorityBlock, checkpoint]
+      input: [
+        ...modelData.input.slice(scope.compacted_item_count),
+        authorityItem
+      ],
+      instructions: [modelData.instructions, identity, CURRENT_AUTHORITY_POLICY, checkpoint]
         .filter(Boolean)
         .join("\n\n")
     };
@@ -809,15 +893,16 @@ export class LongRunContextManager {
     summary: ContextScopeState["summary"];
     at: string;
   } | undefined {
-    const forceFreshRebase = this.#freshTurnRebaseScopes.delete(scope.scope_id);
+    const forceSessionRollbackRebase = this.#sessionRollbackRebaseScopes.delete(
+      scope.scope_id
+    );
     if (!scope.summary) return undefined;
     const receipts = this.#runtime.contextReceipts();
     const evidenceIds = summaryTransactionIds(scope.summary);
     const staleIds = evidenceIds.filter((transactionId) =>
       receipts[transactionId]?.worldRevision !== currentWorldRevision
     );
-    const revisionChanged = scope.summary_world_revision !== currentWorldRevision;
-    if (!forceFreshRebase && !revisionChanged && staleIds.length === 0) return undefined;
+    if (!forceSessionRollbackRebase && staleIds.length === 0) return undefined;
 
     const currentIds = evidenceIds.filter((transactionId) =>
       receipts[transactionId]?.worldRevision === currentWorldRevision
@@ -826,8 +911,7 @@ export class LongRunContextManager {
       receipts[transactionId]?.accepted === true
     );
     const reasons = [
-      ...(forceFreshRebase ? ["fresh_sdk_turn"] : []),
-      ...(revisionChanged ? ["world_identity_changed"] : []),
+      ...(forceSessionRollbackRebase ? ["sdk_session_rollback"] : []),
       ...(staleIds.length > 0 ? ["stale_receipt_evidence"] : [])
     ];
     scope.summary = rebaseContextSummary({
@@ -887,6 +971,7 @@ export class LongRunContextManager {
     scope.retained_item_count = retained.length;
     scope.retained_chain_hash = retained.length === 0 ? null : chainHash(retained);
   }
+
 }
 
 function chooseCutIndex(input: {
@@ -975,6 +1060,32 @@ function toolVisibleToNode(name: string, node: TaskNode, rootAgentId: string): b
   return node.capabilities.includes(name)
     || name === "complete_assignment"
     || name === "report_blocked";
+}
+
+function currentAuthorityItem(content: string): AgentInputItem {
+  return {
+    type: "message",
+    role: "user",
+    content
+  };
+}
+
+function isHarnessAuthorityItem(item: AgentInputItem | undefined): boolean {
+  return item?.type === "message"
+    && item.role === "user"
+    && typeof item.content === "string"
+    && item.content.startsWith("CURRENT HARNESS AUTHORITY\n");
+}
+
+function withoutHarnessAuthorityItems(items: AgentInputItem[]): {
+  items: AgentInputItem[];
+  removed: number;
+} {
+  const semantic = items.filter((item) => !isHarnessAuthorityItem(item));
+  return {
+    items: semantic,
+    removed: items.length - semantic.length
+  };
 }
 
 function chainHash(items: AgentInputItem[]): string {

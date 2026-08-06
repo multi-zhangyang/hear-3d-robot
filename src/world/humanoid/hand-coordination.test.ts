@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   G1HandArtifactCommandSchema,
   createG1HandArtifactCommand,
+  g1HandCoordinationFromJointTargets,
   interpolateG1HandCoordination,
   resolveG1HandCoordination,
   type G1HandCoordination
@@ -78,5 +79,36 @@ describe("G1 hand coordination", () => {
 
     expect(() => G1HandArtifactCommandSchema.parse(tampered))
       .toThrow(/does not match coordination input/);
+  });
+
+  it("recovers the compact coordination state from physical joint targets", () => {
+    const coordination: G1HandCoordination = {
+      left: {
+        thumb_opposition: 0.72,
+        thumb_curl: 0.36,
+        index_curl: 0.81,
+        middle_curl: 0.43
+      },
+      right: {
+        thumb_opposition: 0.18,
+        thumb_curl: 0.67,
+        index_curl: 0.29,
+        middle_curl: 0.94
+      }
+    };
+
+    const recovered = g1HandCoordinationFromJointTargets(
+      resolveG1HandCoordination(coordination)
+    );
+    for (const hand of ["left", "right"] as const) {
+      for (const channel of [
+        "thumb_opposition",
+        "thumb_curl",
+        "index_curl",
+        "middle_curl"
+      ] as const) {
+        expect(recovered[hand][channel]).toBeCloseTo(coordination[hand][channel], 12);
+      }
+    }
   });
 });

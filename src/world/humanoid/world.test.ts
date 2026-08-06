@@ -58,6 +58,10 @@ describe("HumanoidWorld", () => {
       const plannedAfter = await world.planNavigation(target);
       expect(plannedAfter.accepted).toBe(false);
       expect(plannedAfter.reason).toMatch(/projection|path|mesh/i);
+      if (/projection/i.test(plannedAfter.reason ?? "")) {
+        expect(plannedAfter.chunkTarget).not.toEqual(after.robot.rootPosition);
+        expect(plannedAfter.chunkTarget).not.toEqual(target);
+      }
     } finally {
       await world.dispose();
     }

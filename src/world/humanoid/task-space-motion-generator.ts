@@ -60,6 +60,17 @@ export interface HumanoidMotionGenerator {
   dispose(): Promise<void>;
 }
 
+export class HumanoidMotionGenerationError extends Error {
+  readonly atSeconds: number;
+
+  constructor(atSeconds: number, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Humanoid motion keyframe at ${atSeconds}s is invalid: ${detail}`, { cause });
+    this.name = "HumanoidMotionGenerationError";
+    this.atSeconds = atSeconds;
+  }
+}
+
 export class TaskSpaceHumanoidMotionGenerator implements HumanoidMotionGenerator {
   readonly descriptor: HumanoidMotionGeneratorDescriptor =
     TASK_SPACE_MOTION_GENERATOR_DESCRIPTOR;
@@ -109,7 +120,11 @@ async function generateTaskSpaceMotion(
   const targets: HumanoidReference[] = [];
   let previous = input.baseline;
   for (const keyframe of plan.keyframes) {
-    previous = taskSpaceReference(input.simulation, previous, keyframe);
+    try {
+      previous = taskSpaceReference(input.simulation, previous, keyframe);
+    } catch (error) {
+      throw new HumanoidMotionGenerationError(keyframe.at_seconds, error);
+    }
     targets.push(previous);
   }
 

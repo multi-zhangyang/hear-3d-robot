@@ -8,16 +8,26 @@ const scenario = ScenarioSchema.parse({
   seed: 43,
   bounds: { width: 8, depth: 8 },
   visibility_radius: 5,
-  robot: { x: 0, z: 0, yaw: 0 },
+  robot: { x: 0, z: 0.36, yaw: 0 },
   obstacles: [],
-  objects: [{
-    id: "crate",
-    kind: "crate",
-    color: "#8b6b45",
-    position: { x: 0, y: 0.15, z: 1.5 },
-    size: { x: 0.3, y: 0.3, z: 0.3 },
-    portable: true
-  }],
+  objects: [
+    {
+      id: "stand",
+      kind: "stand",
+      color: "#76877c",
+      position: { x: 0.2, y: 0.555, z: 0.8 },
+      size: { x: 0.12, y: 0.01, z: 0.12 },
+      portable: false
+    },
+    {
+      id: "crate",
+      kind: "workpiece",
+      color: "#8b6b45",
+      position: { x: 0.2, y: 0.67, z: 0.8 },
+      size: { x: 0.03, y: 0.22, z: 0.03 },
+      portable: true
+    }
+  ],
   zones: [],
   default_goal: {
     summary: "Observe the crate",
@@ -34,11 +44,12 @@ describe("humanoid role object observation", () => {
     const world = await HumanoidWorld.create(scenario);
     const runtime = new HumanoidActionRuntime(world);
     try {
+      const before = world.snapshot();
       const receipt = await runtime.invoke(
         "observe_humanoid",
         {},
         "observe-role-object",
-        "perception-agent"
+        "humanoid-motion-reference"
       );
       expect(receipt.accepted).toBe(true);
       const detail = record(receipt.detail);
@@ -75,6 +86,74 @@ describe("humanoid role object observation", () => {
           })
         ]
       });
+      const handSurfaces = record(detail.hand_surfaces);
+      const leftHand = record(handSurfaces.left);
+      expect(leftHand.contact_surfaces).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          hand_surface: "left_hand_palm_link",
+          world_position: expect.any(Object),
+          surface_from_wrist_world: expect.any(Object)
+        })
+      ]));
+      expect(record(detail.manipulation_geometry).objects).toEqual([
+        expect.objectContaining({
+          object_id: "crate",
+          hands: expect.objectContaining({
+            left: expect.objectContaining({
+              current_wrist_world: expect.any(Object),
+              surface_center_alignments: expect.arrayContaining([
+                expect.objectContaining({
+                  hand_surface: "left_hand_palm_link",
+                  wrist_world_if_surface_at_object_center: expect.any(Object),
+                  delta_from_current_wrist_world: expect.any(Object),
+                  distance_from_current_wrist_m: expect.any(Number),
+                  ik_reference_reachable: expect.any(Boolean)
+                })
+              ])
+            })
+          })
+        })
+      ]);
+      const geometries = record(detail.manipulation_geometry).objects;
+      if (!Array.isArray(geometries)) {
+        throw new Error("Expected manipulation geometry objects");
+      }
+      const hands = record(geometries[0]).hands;
+      const leftAlignments = record(record(hands).left)
+        .surface_center_alignments;
+      if (!Array.isArray(leftAlignments)) {
+        throw new Error("Expected left-hand reachability alignments");
+      }
+      expect(leftAlignments).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          hand_surface: "left_hand_middle_1_link",
+          ik_reference_reachable: true,
+          ik_residual_m: expect.any(Number)
+        }),
+        expect.objectContaining({
+          hand_surface: "left_hand_palm_link",
+          ik_reference_reachable: false,
+          ik_residual_m: expect.any(Number)
+        })
+      ]));
+      expect(record(detail.manipulation_geometry).objects).toEqual([
+        expect.objectContaining({
+          reachable_base_placements: expect.arrayContaining([
+            expect.objectContaining({
+              hand_surface: expect.any(String),
+              root_world_target: expect.any(Object),
+              root_translation_world: expect.any(Object),
+              root_yaw_radians: expect.any(Number),
+              navigation_validation_required: true
+            })
+          ])
+        })
+      ]);
+      const after = world.snapshot();
+      expect(after.frame).toBe(before.frame);
+      expect(after.worldRevision).toBe(before.worldRevision);
+      expect(after.robot.rootPosition).toEqual(before.robot.rootPosition);
+      expect(after.robot.contacts).toEqual(before.robot.contacts);
     } finally {
       await world.dispose();
     }

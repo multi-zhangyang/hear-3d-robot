@@ -116,9 +116,9 @@ describe("humanoid multi-scale embodied memory", () => {
     input.execution.code = "motion_option_succeeded";
     input.execution.detail = {
       planning_action: "plan_whole_body_motion_candidates",
-      candidate_count: 3,
-      selected_rank: 2,
-      selected_candidate_id: "balanced-candidate",
+      candidate_count: 1,
+      selected_rank: 1,
+      selected_candidate_id: "precise-candidate",
       result: {
         option: {
           option_id: "reach-target",
@@ -135,9 +135,9 @@ describe("humanoid multi-scale embodied memory", () => {
 
     expect(appendEmbodiedEpisode(input).episode).toMatchObject({
       planning_action: "plan_whole_body_motion_candidates",
-      candidate_count: 3,
-      selected_rank: 2,
-      selected_candidate_id: "balanced-candidate",
+      candidate_count: 1,
+      selected_rank: 1,
+      selected_candidate_id: "precise-candidate",
       motion_option: {
         option_id: "reach-target",
         status: "succeeded",
@@ -156,7 +156,9 @@ describe("humanoid multi-scale embodied memory", () => {
 
     expect(retained.removed).toBe(40 - MAX_CHECKPOINT_ACTION_RECEIPTS);
     expect(Object.keys(retained.receipts)).toHaveLength(MAX_CHECKPOINT_ACTION_RECEIPTS);
-    expect(Object.keys(retained.receipts)[0]).toBe("receipt-9");
+    expect(Object.keys(retained.receipts)[0]).toBe(
+      `receipt-${40 - MAX_CHECKPOINT_ACTION_RECEIPTS + 1}`
+    );
     expect(Object.keys(receipts)).toHaveLength(40);
   });
 

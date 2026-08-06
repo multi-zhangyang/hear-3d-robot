@@ -50,6 +50,8 @@ describe("humanoid Cycle causal evidence", () => {
   it("publishes the exact completion evidence and detects post-execution observation", () => {
     const input = validInput();
     const { evidenceTransactionIds: _evidenceTransactionIds, ...state } = input;
+    const { "observe-after": _observation, ...unobserved } = state.committedActions;
+    state.committedActions = unobserved;
     expect(resolveHumanoidCycleCompletionReadiness(state)).toMatchObject({
       status: "ready",
       evidence_transaction_ids: ["execute-a", "remove-a"],
@@ -137,6 +139,34 @@ describe("humanoid Cycle causal evidence", () => {
     );
   });
 
+  it("requires a Sentry observation after execution and every causal mutation", () => {
+    const missing = validInput();
+    const { "observe-after": _observation, ...unobserved } = missing.committedActions;
+    missing.committedActions = unobserved;
+    expect(() => validateHumanoidCycleCausalEvidence(missing)).toThrow(
+      "requires an accepted Sentry observation"
+    );
+
+    const stale = validInput();
+    stale.committedActions = {
+      "execute-a": stale.committedActions["execute-a"]!,
+      "observe-after": stale.committedActions["observe-after"]!,
+      "remove-a": stale.committedActions["remove-a"]!
+    };
+    expect(() => validateHumanoidCycleCausalEvidence(stale)).toThrow(
+      "requires an accepted Sentry observation"
+    );
+    expect(resolveHumanoidCycleCompletionReadiness({
+      committedActions: stale.committedActions,
+      previousCycle: stale.previousCycle,
+      activeCycle: stale.activeCycle,
+      currentWorld: stale.currentWorld
+    })).toMatchObject({
+      status: "ready",
+      observed_after_execution: false
+    });
+  });
+
   it("does not complete a Cycle from consumed evidence or a fallen world", () => {
     const consumed = validInput();
     consumed.previousCycle = { evidence_transaction_ids: ["execute-a"] };
@@ -188,11 +218,21 @@ function validInput(): HumanoidCycleCausalEvidenceInput {
     worldAfterRevision: 6,
     detail: { removal_transaction: transaction }
   });
+  const observation = receipt({
+    transactionId: "observe-after",
+    action: "observe_humanoid",
+    accepted: true,
+    code: "humanoid_observed",
+    frameCount: 0,
+    worldBeforeRevision: 6,
+    worldAfterRevision: 6
+  });
   return {
     evidenceTransactionIds: [execution.transactionId, removal.transactionId],
     committedActions: {
       [execution.transactionId]: execution,
-      [removal.transactionId]: removal
+      [removal.transactionId]: removal,
+      [observation.transactionId]: observation
     },
     previousCycle: null,
     activeCycle,
@@ -212,7 +252,11 @@ function receipt(input: {
 }): HumanoidActionReceipt {
   return {
     transactionId: input.transactionId,
-    agentId: input.action.startsWith("plan_") ? "humanoid-motion-reference" : "humanoid-executor",
+    agentId: input.action === "observe_humanoid"
+      ? "humanoid-sentry"
+      : input.action.startsWith("plan_")
+        ? "humanoid-motion-reference"
+        : "humanoid-executor",
     cycle: activeCycle,
     action: input.action,
     input: {},

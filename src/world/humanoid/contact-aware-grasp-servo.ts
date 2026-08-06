@@ -28,6 +28,8 @@ export interface G1ContactAwareGraspTarget {
   objectId: string;
   hand: "left" | "right";
   minimumNormalForceN: number;
+  maximumRelativeTranslationDriftM?: number;
+  maximumRelativeRotationDriftRad?: number;
   referenceRelativePose?: {
     translation: Vec3;
     rotation: Quaternion;
@@ -50,17 +52,54 @@ export interface G1ContactAwareGraspServoResult {
   evidence: G1ContactAwareGraspServoEvidence;
 }
 
+export function g1CarriedGraspRequiresNoslip(input: {
+  snapshot: HumanoidSimulationSnapshot;
+  targets: readonly G1ContactAwareGraspTarget[];
+}): boolean {
+  return validateTargets(input.targets).some((target) => {
+    if (!target.referenceRelativePose
+      || target.maximumRelativeTranslationDriftM === undefined
+      || target.maximumRelativeRotationDriftRad === undefined) return false;
+    const object = input.snapshot.objects[target.objectId];
+    if (!object) {
+      throw new Error(`Carried grasp object is missing: ${target.objectId}`);
+    }
+    const wrist = input.snapshot.links[
+      target.hand === "left" ? "left_wrist_yaw_link" : "right_wrist_yaw_link"
+    ];
+    const inverseWrist = inverseQuaternion(wrist.rotation);
+    const currentRelativeTranslation = rotateVector(
+      inverseWrist,
+      subtract(object.position, wrist.position)
+    );
+    const translationRatio = vectorLength(subtract(
+      target.referenceRelativePose.translation,
+      currentRelativeTranslation
+    )) / target.maximumRelativeTranslationDriftM;
+    const currentRelativeRotation = normalizeQuaternion(multiplyQuaternion(
+      inverseWrist,
+      object.rotation
+    ));
+    const rotationRatio = vectorLength(quaternionRotationVector(
+      target.referenceRelativePose.rotation,
+      currentRelativeRotation
+    )) / target.maximumRelativeRotationDriftRad;
+    return translationRatio >= 0.8 && translationRatio > rotationRatio;
+  });
+}
+
 const MAXIMUM_FREE_CLOSURE_STEP_RAD = 0.025;
 const CONTACT_APPROACH_STEP_RAD = 0.006;
 const QUALIFIED_CONTACT_PRELOAD_RAD = 0.0005;
 const CARRY_CONTACT_RECOVERY_STEP_RAD = 0.001;
 const CARRY_FREE_RECOVERY_STEP_RAD = 0.003;
-const MAXIMUM_DIFFERENTIAL_CLOSURE_STEP_RAD = 0.001;
+const CARRY_WORKING_FORCE_MULTIPLIER = 2;
+const MAXIMUM_DIFFERENTIAL_CLOSURE_STEP_RAD = 0.002;
 const ROTATION_REGULATION_FULL_AUTHORITY_RADIANS = 0.08;
 const TRANSLATION_REGULATION_FULL_AUTHORITY_METERS = 0.012;
+const MAXIMUM_TRANSLATION_PRELOAD_STEP_RAD = 0.002;
 const RELATIVE_ANGULAR_VELOCITY_DAMPING_SECONDS = 0.04;
 const RELATIVE_LINEAR_VELOCITY_DAMPING_SECONDS = 0.02;
-const TRANSLATION_REGULATION_WEIGHT = 0.5;
 
 export function contactAwareG1GraspTargets(input: {
   command: G1HandArtifactCommand;
@@ -144,6 +183,18 @@ export function contactAwareG1GraspJointTargets(input: {
                 ? CONTACT_APPROACH_STEP_RAD
                 : MAXIMUM_FREE_CLOSURE_STEP_RAD)
           );
+    const translationPreload = poseRegulation.preloadByDigit.get(
+      `${hand}:${jointDigit(joint)}`
+    ) ?? 0;
+    if (translationPreload > 0
+      && !joint.includes("_thumb_0_joint")
+      && !(jointState.saturated
+        && jointState.appliedNewtonMeters * direction > 0)) {
+      closure = Math.min(
+        requestedClosure,
+        Math.max(closure, appliedClosure + translationPreload)
+      );
+    }
     let differential = poseRegulation.correctionByDigit.get(
       `${hand}:${digit}`
     ) ?? 0;
@@ -155,7 +206,8 @@ export function contactAwareG1GraspJointTargets(input: {
       differential = 0;
     }
     if (differential < 0
-      && force < graspTarget.minimumNormalForceN * 2) {
+      && force < graspTarget.minimumNormalForceN
+        * CARRY_WORKING_FORCE_MULTIPLIER) {
       differential = 0;
     }
     if (differential > 0) {
@@ -195,11 +247,13 @@ function carriedPoseRegulation(
   targets: readonly G1ContactAwareGraspTarget[]
 ): {
   correctionByDigit: ReadonlyMap<string, number>;
+  preloadByDigit: ReadonlyMap<string, number>;
   poseRegulatedHands: Array<"left" | "right">;
   maximumRotationErrorRadians: number;
   maximumTranslationErrorMeters: number;
 } {
   const correctionByDigit = new Map<string, number>();
+  const preloadByDigit = new Map<string, number>();
   const poseRegulatedHands: Array<"left" | "right"> = [];
   let maximumRotationErrorRadians = 0;
   let maximumTranslationErrorMeters = 0;
@@ -263,11 +317,15 @@ function carriedPoseRegulation(
       )
     );
     const desiredForceMagnitude = vectorLength(desiredForce);
+    const translationAuthority = Math.min(
+      1,
+      desiredForceMagnitude / TRANSLATION_REGULATION_FULL_AUTHORITY_METERS
+    );
     if (desiredMagnitude <= 1e-9 && desiredForceMagnitude <= 1e-9) continue;
     const moments = new Map<string, {
       momentSum: Vec3;
       normalSum: Vec3;
-      normalForceSum: number;
+      weightSum: number;
     }>();
     for (const contact of g1HandObjectContacts(
       snapshot.contacts,
@@ -287,7 +345,7 @@ function carriedPoseRegulation(
       const previous = moments.get(digit) ?? {
         momentSum: { x: 0, y: 0, z: 0 },
         normalSum: { x: 0, y: 0, z: 0 },
-        normalForceSum: 0
+        weightSum: 0
       };
       const weight = Math.sqrt(contact.normalForce);
       previous.momentSum = {
@@ -300,45 +358,47 @@ function carriedPoseRegulation(
         y: previous.normalSum.y + contact.normalFromHand.y * weight,
         z: previous.normalSum.z + contact.normalFromHand.z * weight
       };
-      previous.normalForceSum += weight;
+      previous.weightSum += weight;
       moments.set(digit, previous);
     }
     if (moments.size < 2) continue;
     poseRegulatedHands.push(target.hand);
+    if (translationAuthority > 0) {
+      for (const [digit, moment] of moments) {
+        const averageNormal = scale(
+          moment.normalSum,
+          1 / moment.weightSum
+        );
+        const normalMagnitude = vectorLength(averageNormal);
+        const translationAlignment = normalMagnitude <= 1e-9
+          ? 0
+          : dot(averageNormal, desiredForce)
+            / (normalMagnitude * desiredForceMagnitude);
+        if (translationAlignment <= 1e-9) continue;
+        preloadByDigit.set(
+          digit,
+          translationAlignment
+            * translationAuthority
+            * MAXIMUM_TRANSLATION_PRELOAD_STEP_RAD
+        );
+      }
+    }
     const rotationAuthority = Math.min(
       1,
       rotationErrorRadians / ROTATION_REGULATION_FULL_AUTHORITY_RADIANS
     );
-    const translationAuthority = Math.min(
-      1,
-      translationErrorMeters / TRANSLATION_REGULATION_FULL_AUTHORITY_METERS
-    );
-    const authority = Math.max(rotationAuthority, translationAuthority);
+    if (rotationAuthority <= 1e-9 || desiredMagnitude <= 1e-9) continue;
     const alignments = [...moments].flatMap(([digit, moment]) => {
       const averageMoment = scale(
         moment.momentSum,
-        1 / moment.normalForceSum
+        1 / moment.weightSum
       );
       const momentMagnitude = vectorLength(averageMoment);
-      const averageNormal = scale(
-        moment.normalSum,
-        1 / moment.normalForceSum
-      );
-      const normalMagnitude = vectorLength(averageNormal);
-      const rotationAlignment = desiredMagnitude > 1e-9
-        && momentMagnitude > 1e-9
+      const rotationAlignment = momentMagnitude > 1e-9
         ? dot(averageMoment, desiredMoment)
           / (momentMagnitude * desiredMagnitude)
         : 0;
-      const translationAlignment = desiredForceMagnitude > 1e-9
-        && normalMagnitude > 1e-9
-        ? dot(averageNormal, desiredForce)
-          / (normalMagnitude * desiredForceMagnitude)
-        : 0;
-      const alignment = rotationAuthority * rotationAlignment
-        + TRANSLATION_REGULATION_WEIGHT
-          * translationAuthority
-          * translationAlignment;
+      const alignment = rotationAuthority * rotationAlignment;
       return Math.abs(alignment) <= 1e-9
         ? []
         : [{
@@ -364,12 +424,13 @@ function carriedPoseRegulation(
           (alignment - meanAlignment) / maximumCenteredAlignment,
           -1,
           1
-        ) * authority * MAXIMUM_DIFFERENTIAL_CLOSURE_STEP_RAD
+        ) * rotationAuthority * MAXIMUM_DIFFERENTIAL_CLOSURE_STEP_RAD
       );
     }
   }
   return {
     correctionByDigit,
+    preloadByDigit,
     poseRegulatedHands: [...new Set(poseRegulatedHands)].sort(),
     maximumRotationErrorRadians,
     maximumTranslationErrorMeters
@@ -395,6 +456,10 @@ export function contactAwareG1GraspTargetsForBindings(input: {
       hand: binding.hand,
       minimumNormalForceN:
         input.graspRegistry.contract.minimum_contact_normal_force_n,
+      maximumRelativeTranslationDriftM:
+        input.graspRegistry.contract.maximum_relative_translation_drift_m,
+      maximumRelativeRotationDriftRad:
+        input.graspRegistry.contract.maximum_relative_rotation_drift_rad,
       referenceRelativePose: structuredClone(
         track.attempt.reference_relative_pose
       )
@@ -461,6 +526,14 @@ function validateTargets(
     if (!Number.isFinite(target.minimumNormalForceN)
       || target.minimumNormalForceN <= 0) {
       throw new Error("Contact-aware grasp force threshold must be positive");
+    }
+    if ((target.maximumRelativeTranslationDriftM !== undefined
+      && (!Number.isFinite(target.maximumRelativeTranslationDriftM)
+        || target.maximumRelativeTranslationDriftM <= 0))
+      || (target.maximumRelativeRotationDriftRad !== undefined
+        && (!Number.isFinite(target.maximumRelativeRotationDriftRad)
+          || target.maximumRelativeRotationDriftRad <= 0))) {
+      throw new Error("Contact-aware grasp drift threshold must be positive");
     }
     if (seenHands.has(target.hand)) {
       throw new Error(`Contact-aware grasp servo received two ${target.hand} targets`);

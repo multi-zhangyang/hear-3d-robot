@@ -12,6 +12,7 @@ import type { JsonValue } from "../../domain/schema.js";
 import type { RunStore } from "../../persistence/run-store.js";
 import type { HumanoidActionReceipt } from "./runtime.js";
 import { embodiedActionJournalReceipt, json } from "./run-runtime-persistence.js";
+import { modelReceiptDetail } from "./receipt-context.js";
 
 const RECALL_PAGE_SIZE = 64;
 
@@ -44,9 +45,24 @@ export interface HumanoidEmbodiedRecallRequest {
   limit: number;
 }
 
-type HistoricalHumanoidAction = HumanoidActionReceipt & {
+type HistoricalHumanoidAction = Pick<HumanoidActionReceipt,
+  | "transactionId"
+  | "agentId"
+  | "decision"
+  | "cycle"
+  | "action"
+  | "accepted"
+  | "code"
+  | "worldBeforeRevision"
+  | "worldAfterRevision"
+  | "frameCount"
+  | "channels"
+  | "committedAt"
+> & {
+  detail: JsonValue;
   source_ref: string;
   historical_only: true;
+  full_receipt_persisted: true;
 };
 
 export async function recallHumanoidEmbodiedHistory(input: {
@@ -324,9 +340,22 @@ function semanticQuery(request: HumanoidEmbodiedRecallRequest) {
 
 function historicalAction(receipt: HumanoidActionReceipt): HistoricalHumanoidAction {
   return {
-    ...receipt,
+    transactionId: receipt.transactionId,
+    agentId: receipt.agentId,
+    ...(receipt.decision ? { decision: structuredClone(receipt.decision) } : {}),
+    ...(receipt.cycle ? { cycle: structuredClone(receipt.cycle) } : {}),
+    action: receipt.action,
+    accepted: receipt.accepted,
+    code: receipt.code,
+    worldBeforeRevision: receipt.worldBeforeRevision,
+    worldAfterRevision: receipt.worldAfterRevision,
+    frameCount: receipt.frameCount,
+    channels: [...receipt.channels],
+    detail: json(modelReceiptDetail(receipt.detail)),
+    committedAt: receipt.committedAt,
     source_ref: `action:${receipt.transactionId}`,
-    historical_only: true
+    historical_only: true,
+    full_receipt_persisted: true
   };
 }
 

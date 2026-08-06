@@ -160,6 +160,44 @@ export function resolveG1HandCoordination(
   });
 }
 
+export function g1HandCoordinationFromJointTargets(
+  input: Readonly<Record<G1HandJointName, number>>
+): G1HandCoordination {
+  const targets = G1HandJointTargetsSchema.parse(input);
+  return G1HandCoordinationSchema.parse({
+    left: {
+      thumb_opposition: endpointAmount("left_hand_thumb_0_joint", "minimum", targets),
+      thumb_curl: meanEndpointAmount([
+        ["left_hand_thumb_1_joint", "maximum"],
+        ["left_hand_thumb_2_joint", "maximum"]
+      ], targets),
+      index_curl: meanEndpointAmount([
+        ["left_hand_index_0_joint", "minimum"],
+        ["left_hand_index_1_joint", "minimum"]
+      ], targets),
+      middle_curl: meanEndpointAmount([
+        ["left_hand_middle_0_joint", "minimum"],
+        ["left_hand_middle_1_joint", "minimum"]
+      ], targets)
+    },
+    right: {
+      thumb_opposition: endpointAmount("right_hand_thumb_0_joint", "minimum", targets),
+      thumb_curl: meanEndpointAmount([
+        ["right_hand_thumb_1_joint", "minimum"],
+        ["right_hand_thumb_2_joint", "minimum"]
+      ], targets),
+      index_curl: meanEndpointAmount([
+        ["right_hand_index_0_joint", "maximum"],
+        ["right_hand_index_1_joint", "maximum"]
+      ], targets),
+      middle_curl: meanEndpointAmount([
+        ["right_hand_middle_0_joint", "maximum"],
+        ["right_hand_middle_1_joint", "maximum"]
+      ], targets)
+    }
+  });
+}
+
 function endpoint(
   joint: G1HandJointName,
   side: "minimum" | "maximum",
@@ -168,6 +206,25 @@ function endpoint(
   const range = G1_HAND_JOINT_LIMITS[joint];
   const target = side === "minimum" ? range[0] : range[1];
   return target * amount;
+}
+
+function meanEndpointAmount(
+  endpoints: readonly (readonly [G1HandJointName, "minimum" | "maximum"])[],
+  targets: Readonly<Record<G1HandJointName, number>>
+): number {
+  return endpoints.reduce((sum, [joint, side]) => (
+    sum + endpointAmount(joint, side, targets)
+  ), 0) / endpoints.length;
+}
+
+function endpointAmount(
+  joint: G1HandJointName,
+  side: "minimum" | "maximum",
+  targets: Readonly<Record<G1HandJointName, number>>
+): number {
+  const range = G1_HAND_JOINT_LIMITS[joint];
+  const target = side === "minimum" ? range[0] : range[1];
+  return Math.max(0, Math.min(1, targets[joint] / target));
 }
 
 function interpolateSide(

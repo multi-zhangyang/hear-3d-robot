@@ -54,6 +54,40 @@ describe("YAHMP joint tracking authority", () => {
     expect(session.run).not.toHaveBeenCalled();
     await controller.dispose();
   });
+
+  it("separates a tracked joint from the locomotion policy command on request", async () => {
+    const session = fakeSession(new Float32Array(HUMANOID_JOINT_NAMES.length));
+    const controller = createController(session);
+    const reference = neutralHumanoidReference();
+    const trackedIndex = 15;
+    reference.jointTrackingWeights[trackedIndex] = 1;
+    const jointPositions = reference.jointPositions.slice();
+    jointPositions[trackedIndex] = reference.jointPositions[trackedIndex]! + 0.4;
+    const jointVelocities = new Float64Array(HUMANOID_JOINT_NAMES.length);
+    jointVelocities[trackedIndex] = 0.3;
+    const state = { ...policyState(jointPositions), jointVelocities };
+
+    await controller.infer(state, reference, {
+      trackedJointPolicyCommand: "measured"
+    });
+    await controller.infer(state, reference, {
+      trackedJointPolicyCommand: "neutral"
+    });
+
+    expect(session.observations[0]![trackedIndex]).toBeCloseTo(
+      state.jointPositions[trackedIndex]!,
+      6
+    );
+    expect(session.observations[0]![HUMANOID_JOINT_NAMES.length + trackedIndex])
+      .toBeCloseTo(state.jointVelocities[trackedIndex]!, 6);
+    expect(session.observations[1]![trackedIndex]).toBeCloseTo(
+      YAHMP_POLICY.defaultJointPositions[trackedIndex]!,
+      6
+    );
+    expect(session.observations[1]![HUMANOID_JOINT_NAMES.length + trackedIndex])
+      .toBe(0);
+    await controller.dispose();
+  });
 });
 
 function policyState(jointPositions: Float64Array): HumanoidPolicyState {
@@ -67,10 +101,15 @@ function policyState(jointPositions: Float64Array): HumanoidPolicyState {
 
 function fakeSession(action: Float32Array) {
   const output = { data: action, dispose: vi.fn() };
+  const observations: Float32Array[] = [];
   return {
-    run: vi.fn(async () => ({ actions: output })),
+    run: vi.fn(async (feeds: { obs: { data: ArrayLike<number> } }) => {
+      observations.push(Float32Array.from(feeds.obs.data));
+      return { actions: output };
+    }),
     release: vi.fn(async () => undefined),
-    output
+    output,
+    observations
   };
 }
 

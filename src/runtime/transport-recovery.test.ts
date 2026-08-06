@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   ConsecutiveTransportRecovery,
+  PerAgentTransportRecovery,
   isTransportInterruption,
+  transportStatusCode,
   transportRetryPlan
 } from "./transport-recovery.js";
 
@@ -37,6 +39,18 @@ describe("isTransportInterruption", () => {
       name: "ModelTransportError",
       code: 504
     }))).toBe(true);
+  });
+
+  it("extracts a nested compatible transport status without mistaking socket codes", () => {
+    expect(transportStatusCode({
+      cause: {
+        name: "ModelTransportError",
+        code: 500
+      }
+    })).toBe(500);
+    expect(transportStatusCode(Object.assign(new Error("reset"), {
+      code: "ECONNRESET"
+    }))).toBeUndefined();
   });
 
   it("does not reinterpret an arbitrary numeric business code as HTTP status", () => {
@@ -181,5 +195,17 @@ describe("ConsecutiveTransportRecovery", () => {
     expect(() => new ConsecutiveTransportRecovery(0)).toThrow("positive safe integer");
     expect(() => new ConsecutiveTransportRecovery(Number.POSITIVE_INFINITY))
       .toThrow("positive safe integer");
+  });
+
+  it("keeps consecutive transport windows isolated per Agent", () => {
+    const recovery = new PerAgentTransportRecovery(2);
+
+    expect(recovery.nextAttempt("executor")).toBe(1);
+    expect(recovery.nextAttempt("coordinator")).toBe(1);
+    expect(recovery.responseCompleted("coordinator")).toBe(1);
+    expect(recovery.nextAttempt("executor")).toBe(2);
+    expect(recovery.nextAttempt("executor")).toBeNull();
+    expect(recovery.nextAttempt("coordinator")).toBe(1);
+    expect(() => recovery.nextAttempt(" ")).toThrow("must not be empty");
   });
 });

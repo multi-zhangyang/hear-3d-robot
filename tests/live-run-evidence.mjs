@@ -81,6 +81,12 @@ export async function inspectLiveRunEvidence(input) {
   assert.ok(startedCalls.length > 0, "Live run journal contains no model request");
   assert.ok(startedCalls.some((record) => completedCallIds.has(record.model_call_id)),
     "Live run contains no completed model request");
+  for (const record of completedCalls) {
+    assert.equal(typeof record.response_id, "string",
+      `Completed model call has no response identity: ${record.model_call_id}`);
+    assert.notEqual(record.response_id, "FAKE_ID",
+      `Completed model call retained the SDK placeholder identity: ${record.model_call_id}`);
+  }
 
   const planningActions = new Map(actions
     .filter((receipt) => isRecord(receipt) && isPlanningAction(receipt.action))

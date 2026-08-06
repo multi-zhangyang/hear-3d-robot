@@ -20,7 +20,7 @@ export const MAX_RECENT_EMBODIED_EPISODES = 64;
 export const MAX_RECENT_EMBODIED_EXPERIENCES = 128;
 const CONTEXT_EMBODIED_EPISODES = 12;
 const CONTEXT_EMBODIED_EXPERIENCES = 16;
-export const MAX_CHECKPOINT_ACTION_RECEIPTS = 32;
+export const MAX_CHECKPOINT_ACTION_RECEIPTS = 12;
 
 export function appendEmbodiedEpisode(input: {
   state: HumanoidEmbodiedMemoryState;

@@ -33,6 +33,22 @@ describe("humanoid plan intent lifecycle", () => {
       .toBe(humanoidNavigationIntentSha256({ x: 0, y: 0, z: 2 }));
   });
 
+  it("binds a model-selected arrival heading into navigation intent identity", () => {
+    const target = { x: 1, y: 0, z: 2 };
+    const facing = {
+      type: "face_point" as const,
+      target: { x: 2, y: 0.7, z: 2 },
+      tolerance_radians: 0.1
+    };
+
+    expect(humanoidNavigationIntentSha256(target, facing)).not.toBe(
+      humanoidNavigationIntentSha256(target)
+    );
+    expect(humanoidNavigationIntentSha256(target, structuredClone(facing))).toBe(
+      humanoidNavigationIntentSha256(target, facing)
+    );
+  });
+
   it("derives an inclusive revision lease from the controller cadence", () => {
     const expiresRevision = humanoidPlanExpiryRevision({
       createdRevision: 40,

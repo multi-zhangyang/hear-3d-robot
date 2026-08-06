@@ -99,6 +99,7 @@ async function main(argv: string[]): Promise<void> {
         runDir: resolveRunDirectory(server.runsDir, runId),
         catalog,
         provider,
+        freshAgentEpoch: options["fresh-agent-epoch"] === "true",
         signal,
         mutationFence
       }));
@@ -224,7 +225,7 @@ function printHelp(): void {
     "",
     "  hear scenarios",
     "  hear run --scenario ID --mission TEXT --goal JSON [--mode mission|continuous] [--seed N] --confirm",
-    "  hear resume --run RUN_ID --confirm",
+    "  hear resume --run RUN_ID [--fresh-agent-epoch] --confirm",
     "  hear operator [--host HOST] [--port PORT] [--dev]",
     ""
   ].join("\n"));

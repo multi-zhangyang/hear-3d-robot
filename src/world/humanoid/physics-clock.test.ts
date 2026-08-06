@@ -87,6 +87,7 @@ describe("HumanoidPhysicsClock", () => {
     expect(clock.running).toBe(false);
     expect(clock.failure).toBeInstanceOf(HumanoidStationarySafetyError);
     expect(() => clock.throwIfFailed()).toThrow(HumanoidStationarySafetyError);
+    expect(() => clock.start()).toThrow(HumanoidStationarySafetyError);
     expect(onError).toHaveBeenCalledTimes(1);
     await clock.stop();
   });
@@ -96,10 +97,14 @@ function fakeWorld(
   advance: (
     sink?: (snapshot: HumanoidWorldSnapshot) => void | Promise<void>
   ) => Promise<HumanoidWorldSnapshot | null>
-): Pick<import("./world.js").HumanoidWorld, "advanceStationary" | "snapshot"> {
+): Pick<
+  import("./world.js").HumanoidWorld,
+  "advanceStationary" | "flushFramePublications" | "snapshot"
+> {
   const initial = fakeSnapshot(0);
   return {
     advanceStationary: advance,
+    flushFramePublications: async () => undefined,
     snapshot: () => initial
   };
 }

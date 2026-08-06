@@ -11,7 +11,7 @@ const MINIMUM_PORTABLE_OBJECT_MASS_KG = 0.25;
 const MAXIMUM_PORTABLE_OBJECT_MASS_KG = 2;
 
 export const HUMANOID_NAVIGATION_PROFILE: NavigationAgentProfile = {
-  radius: 0.34,
+  radius: 0.18,
   height: 1.45,
   maximumClimb: 0,
   maximumSlopeDegrees: 20,

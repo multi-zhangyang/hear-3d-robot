@@ -105,9 +105,13 @@ export class HumanoidAuthorityFramePublisher<Snapshot> {
     this.#settleCommand(commandId, state);
   }
 
+  async flush(): Promise<void> {
+    while (this.#draining) await this.#draining;
+  }
+
   async dispose(): Promise<void> {
     this.#disposed = true;
-    await this.#draining;
+    await this.flush();
     for (const [commandId, state] of this.#commands) {
       state.closed = true;
       this.#settleCommand(commandId, state);

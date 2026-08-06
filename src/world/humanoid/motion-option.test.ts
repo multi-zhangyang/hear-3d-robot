@@ -749,6 +749,61 @@ describe("humanoid motion option detector", () => {
     });
   });
 
+  it("measures an exact hand surface contacting an observable dynamic object", () => {
+    const handObjectContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "touch-observed-object",
+      stable_steps: 2,
+      predicates: [{
+        type: "hand_contact_object",
+        hand_surface: "left_hand_palm_link",
+        object_id: "crate",
+        minimum_normal_force: 5
+      }]
+    });
+    const handObjectRobot: HumanoidMotionOptionRobotSnapshot = {
+      ...robot,
+      contacts: [{
+        normalForce: 12,
+        firstBody: null,
+        secondBody: null,
+        firstObject: null,
+        secondObject: "crate",
+        firstHandLink: "left_hand_palm_link",
+        secondHandLink: null
+      }]
+    };
+
+    expect(detectHumanoidMotionOption(handObjectContract, {
+      snapshot: handObjectRobot,
+      observableObjects: [observableCrate],
+      zones: []
+    })).toMatchObject({
+      status: "satisfied",
+      evidence: [{
+        type: "hand_contact_object",
+        handSurface: "left_hand_palm_link",
+        objectId: "crate",
+        objectObservable: true,
+        maximumNormalForce: 12,
+        minimumNormalForce: 5
+      }]
+    });
+    expect(detectHumanoidMotionOption(handObjectContract, {
+      snapshot: handObjectRobot,
+      observableObjects: [],
+      zones: []
+    })).toMatchObject({
+      status: "uncertain",
+      hasUncertain: true,
+      evidence: [{
+        type: "hand_contact_object",
+        objectObservable: false,
+        maximumNormalForce: null,
+        reason: "object_not_observable"
+      }]
+    });
+  });
+
   it("never uses hidden snapshot objects or contacts as observable success", () => {
     const snapshotWithHiddenObject = {
       ...robot,

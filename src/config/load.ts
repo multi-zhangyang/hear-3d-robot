@@ -21,6 +21,7 @@ import { materializeScenario } from "../world/world-generator.js";
 const bundledConfigDirectory = fileURLToPath(new URL("../../config/", import.meta.url));
 
 export const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 300_000;
+export const DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS = 300_000;
 
 export const AGENT_MODEL_ROLES = [
   "goal_manager",
@@ -43,6 +44,7 @@ const ProviderConfigShape = {
   model: z.string().min(1),
   apiKey: z.string().min(1),
   requestTimeoutMs: z.number().int().min(5_000).max(10 * 60_000).optional(),
+  streamEventIdleTimeoutMs: z.number().int().min(5_000).max(10 * 60_000).optional(),
   temperature: z.number().min(0).max(2),
   maxOutputTokens: z.number().int().positive().optional(),
   contextWindowTokens: z.number().int().positive(),
@@ -133,6 +135,10 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
     requestTimeoutMs: numberFromEnv(
       env.AI_REQUEST_TIMEOUT_MS,
       DEFAULT_MODEL_REQUEST_TIMEOUT_MS
+    ),
+    streamEventIdleTimeoutMs: numberFromEnv(
+      env.AI_STREAM_EVENT_IDLE_TIMEOUT_MS,
+      DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS
     ),
     temperature: numberFromEnv(env.AI_TEMPERATURE, 0.2),
     maxOutputTokens,
@@ -250,6 +256,10 @@ function loadAgentModelConfig(
     requestTimeoutMs: numberFromEnv(
       env[`${prefix}REQUEST_TIMEOUT_MS`],
       inherited.requestTimeoutMs ?? DEFAULT_MODEL_REQUEST_TIMEOUT_MS
+    ),
+    streamEventIdleTimeoutMs: numberFromEnv(
+      env[`${prefix}STREAM_EVENT_IDLE_TIMEOUT_MS`],
+      inherited.streamEventIdleTimeoutMs ?? DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS
     ),
     temperature: numberFromEnv(env[`${prefix}TEMPERATURE`], inherited.temperature),
     maxOutputTokens,

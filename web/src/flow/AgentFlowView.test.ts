@@ -101,8 +101,8 @@ describe("agent flow context meter", () => {
       },
       model_usage: {
         version: 1,
-        total: usageTotals(600),
-        by_agent: { worker: usageTotals(600) },
+        total: usageTotals(600, 120),
+        by_agent: { worker: usageTotals(600, 120) },
         updated_at: "2026-08-03T00:00:02.000Z"
       }
     } as unknown as HumanoidRunCheckpoint;
@@ -120,6 +120,7 @@ describe("agent flow context meter", () => {
     expect(html).toContain("/ 3.3万");
     expect(html).toContain("压缩线 8000");
     expect(html).toContain("600 模型令牌");
+    expect(html).toContain("缓存读取 25%");
   });
 
   it("shows the Goal Manager and the live candidate-selection phase", () => {
@@ -201,14 +202,14 @@ function treeNode(
   };
 }
 
-function usageTotals(totalTokens: number) {
+function usageTotals(totalTokens: number, cachedInputTokens = 0) {
   return {
     requests: 1,
     reported_requests: 1,
     input_tokens: Math.max(0, totalTokens - 120),
     output_tokens: Math.min(120, totalTokens),
     total_tokens: totalTokens,
-    cached_input_tokens: 0,
+    cached_input_tokens: cachedInputTokens,
     reasoning_tokens: 0
   };
 }

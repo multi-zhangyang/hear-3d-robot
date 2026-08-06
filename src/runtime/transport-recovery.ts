@@ -2,13 +2,11 @@
 /**
  * A mission is a long conversation over one HTTP connection, and connections
  * break for reasons that have nothing to do with the mission: a socket closes
- * mid-body, a gateway times out, a rate limiter sheds load. The harness already
- * persists the agent state after every stream event, so none of that has to end
- * a run — but only if the failure can be told apart from a real one. Retrying a
- * malformed request or a rejected key forever would be worse than failing.
- *
- * These are standard HTTP and Node socket failure shapes, not any one vendor's:
- * classifying by transport error code is what keeps the runtime provider-neutral.
+ * mid-body, a gateway times out, a rate limiter sheds load. The harness persists
+ * resumable SDK boundaries, so none of that has to end a run when the failure
+ * can be distinguished from a malformed request or rejected credential. Using
+ * standard HTTP and Node socket shapes keeps recovery provider-neutral without
+ * rewriting a model decision.
  */
 
 /** Node/undici socket and DNS failures — the connection never carried a reply. */
@@ -69,6 +67,45 @@ export class ConsecutiveTransportRecovery {
   }
 }
 
+export class PerAgentTransportRecovery {
+  readonly maximumAttempts: number;
+  readonly #recoveries = new Map<string, ConsecutiveTransportRecovery>();
+
+  constructor(maximumAttempts: number) {
+    if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1) {
+      throw new Error("Maximum transport recovery attempts must be a positive safe integer");
+    }
+    this.maximumAttempts = maximumAttempts;
+  }
+
+  nextAttempt(agentId: string): number | null {
+    return this.#recovery(agentId).nextAttempt();
+  }
+
+  responseCompleted(agentId: string): number {
+    assertRecoveryAgentId(agentId);
+    const recovery = this.#recoveries.get(agentId);
+    if (!recovery) return 0;
+    this.#recoveries.delete(agentId);
+    return recovery.responseCompleted();
+  }
+
+  #recovery(agentId: string): ConsecutiveTransportRecovery {
+    assertRecoveryAgentId(agentId);
+    const existing = this.#recoveries.get(agentId);
+    if (existing) return existing;
+    const recovery = new ConsecutiveTransportRecovery(this.maximumAttempts);
+    this.#recoveries.set(agentId, recovery);
+    return recovery;
+  }
+}
+
+function assertRecoveryAgentId(agentId: string): void {
+  if (agentId.trim().length === 0) {
+    throw new Error("Transport recovery Agent identity must not be empty");
+  }
+}
+
 /**
  * True when the failure is the connection rather than the conversation, so
  * resuming the mission from its persisted state is a real continuation and not
@@ -76,9 +113,7 @@ export class ConsecutiveTransportRecovery {
  */
 export function isTransportInterruption(error: unknown): boolean {
   for (const link of errorChain(error)) {
-    const status = numberField(link, "statusCode")
-      ?? numberField(link, "status")
-      ?? normalizedTransportCode(link);
+    const status = transportStatusFromLink(link);
     if (status !== undefined) {
       if (isRetryableStatus(status)) return true;
       if (status >= 400 && status <= 499) return false;
@@ -95,6 +130,20 @@ export function isTransportInterruption(error: unknown): boolean {
     }
   }
   return false;
+}
+
+export function transportStatusCode(error: unknown): number | undefined {
+  for (const link of errorChain(error)) {
+    const status = transportStatusFromLink(link);
+    if (status !== undefined) return status;
+  }
+  return undefined;
+}
+
+function transportStatusFromLink(value: unknown): number | undefined {
+  return numberField(value, "statusCode")
+    ?? numberField(value, "status")
+    ?? normalizedTransportCode(value);
 }
 
 function normalizedTransportCode(value: unknown): number | undefined {

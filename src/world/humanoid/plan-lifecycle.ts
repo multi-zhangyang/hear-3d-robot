@@ -4,6 +4,10 @@ import {
   HumanoidMotionPlanSchema,
   type HumanoidMotionPlan
 } from "./motion-plan.js";
+import {
+  HumanoidNavigationArrivalHeadingSchema,
+  type HumanoidNavigationArrivalHeading
+} from "./navigation-arrival.js";
 
 export const DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS = 900;
 
@@ -14,11 +18,19 @@ export function humanoidMotionIntentSha256(
   return sha256(JSON.stringify(plan));
 }
 
-export function humanoidNavigationIntentSha256(target: Vec3): string {
-  return sha256(JSON.stringify({
+export function humanoidNavigationIntentSha256(
+  target: Vec3,
+  arrivalHeading: HumanoidNavigationArrivalHeading | null = null
+): string {
+  const normalizedTarget = {
     x: finiteCoordinate(target.x, "x"),
     y: finiteCoordinate(target.y, "y"),
     z: finiteCoordinate(target.z, "z")
+  };
+  if (arrivalHeading === null) return sha256(JSON.stringify(normalizedTarget));
+  return sha256(JSON.stringify({
+    target: normalizedTarget,
+    arrival_heading: HumanoidNavigationArrivalHeadingSchema.parse(arrivalHeading)
   }));
 }
 

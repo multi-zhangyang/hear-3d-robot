@@ -4,8 +4,10 @@ import {
   normalizeQuaternion,
   orientedBoxWorldHalfExtents,
   quaternionAngularDistance,
+  quaternionFromRotationMatrix,
   quaternionRotationVector,
-  rotateVector
+  rotateVector,
+  yawFromQuaternion
 } from "./geometry.js";
 
 describe("quaternion geometry", () => {
@@ -41,6 +43,38 @@ describe("quaternion geometry", () => {
     expect(direct.z).toBeCloseTo(sequential.z, 12);
     expect(() => normalizeQuaternion({ x: 0, y: 0, z: 0, w: 0 })).toThrow(
       "finite non-zero magnitude"
+    );
+  });
+
+  it("projects normalized root yaw for locomotion", () => {
+    expect(yawFromQuaternion({
+      x: 0,
+      y: Math.sin(Math.PI / 4),
+      z: 0,
+      w: Math.cos(Math.PI / 4)
+    })).toBeCloseTo(Math.PI / 2, 12);
+    expect(yawFromQuaternion({ x: 0, y: 2, z: 0, w: 2 })).toBeCloseTo(
+      Math.PI / 2,
+      12
+    );
+  });
+
+  it("converts a row-major world rotation matrix without losing orientation", () => {
+    const expected = normalizeQuaternion({
+      x: Math.sin(Math.PI / 4),
+      y: 0,
+      z: 0,
+      w: Math.cos(Math.PI / 4)
+    });
+    const converted = quaternionFromRotationMatrix([
+      1, 0, 0,
+      0, 0, -1,
+      0, 1, 0
+    ]);
+
+    expect(quaternionAngularDistance(converted, expected)).toBeCloseTo(0, 12);
+    expect(() => quaternionFromRotationMatrix([1, 0, 0])).toThrow(
+      "nine finite values"
     );
   });
 

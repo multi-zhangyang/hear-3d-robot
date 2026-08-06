@@ -26,11 +26,13 @@ import type {
   HumanoidCarriedObjectUnauthorizedContact
 } from "./carried-object-binding.js";
 import type { HumanoidCarryTaskSpaceTarget } from "./carry-task-space-servo.js";
+import type { HumanoidNavigationArrivalHeading } from "./navigation-arrival.js";
 
 export interface StoredHumanoidMotionPlan {
   plan: HumanoidMotionPlan;
   artifact: HumanoidMotionArtifact;
   rollout: HumanoidMotionRollout | null;
+  retainTerminalJointTracking: boolean;
   createdRevision: number;
   validatedRevision: number;
   validatedStateSha256: string;
@@ -50,6 +52,9 @@ export interface StoredHumanoidNavigationPlan {
   id: string;
   plan: NavigationPlan;
   requestedTarget: Vec3;
+  requestedArrivalHeading: HumanoidNavigationArrivalHeading | null;
+  arrivalHeading: HumanoidNavigationArrivalHeading | null;
+  releaseJointTracking: boolean;
   createdRevision: number;
   validatedRevision: number;
   validatedStateSha256: string;

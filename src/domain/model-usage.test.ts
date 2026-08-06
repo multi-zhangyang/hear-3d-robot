@@ -58,4 +58,29 @@ describe("model usage", () => {
     expect(modelUsageDeltaFromProviderEvent({ usage: { requests: 0 } }, "agent"))
       .toBeUndefined();
   });
+
+  it("aggregates Agents SDK run-level token detail arrays", () => {
+    const delta = modelUsageDeltaFromProviderEvent({
+      usage: {
+        requests: 2,
+        inputTokens: 240,
+        outputTokens: 50,
+        totalTokens: 290,
+        inputTokensDetails: [
+          { cached_tokens: 80 },
+          { cachedTokens: 120 }
+        ],
+        outputTokensDetails: [
+          { reasoning_tokens: 9 },
+          { reasoningTokens: 11 }
+        ]
+      }
+    }, "agent")!;
+
+    expect(delta.usage).toMatchObject({
+      requests: 2,
+      cached_input_tokens: 200,
+      reasoning_tokens: 20
+    });
+  });
 });

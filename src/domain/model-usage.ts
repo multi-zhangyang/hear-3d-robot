@@ -66,8 +66,12 @@ export function modelUsageDeltaFromProviderEvent(
   const inputTokens = integer(usage.inputTokens) ?? integer(usage.input_tokens);
   const outputTokens = integer(usage.outputTokens) ?? integer(usage.output_tokens);
   const totalTokens = integer(usage.totalTokens) ?? integer(usage.total_tokens);
-  const inputDetails = record(usage.inputTokensDetails ?? usage.input_tokens_details);
-  const outputDetails = record(usage.outputTokensDetails ?? usage.output_tokens_details);
+  const inputDetails = detailRecords(
+    usage.inputTokensDetails ?? usage.input_tokens_details
+  );
+  const outputDetails = detailRecords(
+    usage.outputTokensDetails ?? usage.output_tokens_details
+  );
   const reported = inputTokens !== undefined
     || outputTokens !== undefined
     || totalTokens !== undefined;
@@ -79,14 +83,16 @@ export function modelUsageDeltaFromProviderEvent(
       input_tokens: inputTokens ?? 0,
       output_tokens: outputTokens ?? 0,
       total_tokens: totalTokens ?? ((inputTokens ?? 0) + (outputTokens ?? 0)),
-      cached_input_tokens: integer(inputDetails?.cachedTokens)
-        ?? integer(inputDetails?.cached_tokens)
-        ?? integer(inputDetails?.cacheReadTokens)
-        ?? integer(inputDetails?.cache_read_tokens)
-        ?? 0,
-      reasoning_tokens: integer(outputDetails?.reasoningTokens)
-        ?? integer(outputDetails?.reasoning_tokens)
-        ?? 0
+      cached_input_tokens: detailTotal(inputDetails, [
+        "cachedTokens",
+        "cached_tokens",
+        "cacheReadTokens",
+        "cache_read_tokens"
+      ]),
+      reasoning_tokens: detailTotal(outputDetails, [
+        "reasoningTokens",
+        "reasoning_tokens"
+      ])
     })
   };
 }
@@ -121,6 +127,30 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function detailRecords(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => {
+      const parsed = record(item);
+      return parsed ? [parsed] : [];
+    });
+  }
+  const parsed = record(value);
+  return parsed ? [parsed] : [];
+}
+
+function detailTotal(
+  details: Record<string, unknown>[],
+  aliases: string[]
+): number {
+  return details.reduce((total, detail) => {
+    for (const alias of aliases) {
+      const value = integer(detail[alias]);
+      if (value !== undefined) return total + value;
+    }
+    return total;
+  }, 0);
 }
 
 function integer(value: unknown): number | undefined {

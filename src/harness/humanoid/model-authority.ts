@@ -29,6 +29,7 @@ interface ToolCallAuthority {
   tool_call_id: string;
   tool_name: string;
   arguments_sha256: string;
+  normalized_arguments_sha256?: string;
 }
 
 interface ManifestAuthority {
@@ -52,6 +53,7 @@ type FailedModelCall = Extract<
 
 export class HumanoidModelAuthority {
   readonly #goalManager: ManifestAuthority;
+  readonly #authorizedGoalManagers: readonly ManifestAuthority[];
   readonly #actionAgents: ReadonlyMap<string, ManifestAuthority>;
   readonly #appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
   readonly #started = new Map<string, StartedModelCall>();
@@ -60,11 +62,13 @@ export class HumanoidModelAuthority {
 
   private constructor(input: {
     goalManager: ManifestAuthority;
+    authorizedGoalManagers: readonly ManifestAuthority[];
     actionAgents: ReadonlyMap<string, ManifestAuthority>;
     records: readonly ModelCallLifecycleRecord[];
     appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
   }) {
     this.#goalManager = input.goalManager;
+    this.#authorizedGoalManagers = input.authorizedGoalManagers;
     this.#actionAgents = input.actionAgents;
     this.#appendRecord = input.appendRecord;
     this.#authorities = rebuildModelCallAuthorities(input.records);
@@ -80,6 +84,7 @@ export class HumanoidModelAuthority {
 
   static restore(input: {
     manifest: AgentManifest;
+    archivedManifests?: readonly AgentManifest[];
     nodes: Readonly<Record<string, TaskNode>>;
     records: readonly JsonValue[];
     appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
@@ -87,6 +92,22 @@ export class HumanoidModelAuthority {
     const goalManager = input.manifest.agents.goal_manager;
     assertManifestNode(input.nodes, goalManager.agent_id, "Goal Manager");
     const goalAuthority = manifestAuthority(input.manifest, goalManager.agent_id);
+    const authorizedGoalManagers = [
+      goalAuthority,
+      ...(input.archivedManifests ?? []).map((archived) => {
+        const archivedGoalManager = archived.agents.goal_manager;
+        assertManifestNode(input.nodes, archivedGoalManager.agent_id, "Archived Goal Manager");
+        return manifestAuthority(archived, archivedGoalManager.agent_id);
+      })
+    ];
+    const goalAuthorityKeys = new Set<string>();
+    for (const authority of authorizedGoalManagers) {
+      const key = `${authority.epochId}:${authority.identitySha256}:${authority.agentId}`;
+      if (goalAuthorityKeys.has(key)) {
+        throw new Error(`Duplicate Goal Manager manifest authority: ${authority.epochId}`);
+      }
+      goalAuthorityKeys.add(key);
+    }
     const actionAgents = new Map<string, ManifestAuthority>();
     for (const role of ["sentry", "motion", "executor"] as const) {
       const agent = input.manifest.agents[role];
@@ -104,6 +125,7 @@ export class HumanoidModelAuthority {
     ));
     return new HumanoidModelAuthority({
       goalManager: goalAuthority,
+      authorizedGoalManagers,
       actionAgents,
       records,
       appendRecord: input.appendRecord
@@ -210,13 +232,12 @@ export class HumanoidModelAuthority {
     evidence: ReadonlyMap<string, GoalEvidenceArtifact>;
     scenario: Scenario;
   }): GoalHarnessValidation {
-    const manifest = this.#goalManager;
     return {
-      authorized_model_sources: [{
-        agent_id: manifest.agentId,
-        agent_manifest_sha256: manifest.identitySha256,
-        agent_manifest_epoch_id: manifest.epochId
-      }],
+      authorized_model_sources: this.#authorizedGoalManagers.map((authority) => ({
+        agent_id: authority.agentId,
+        agent_manifest_sha256: authority.identitySha256,
+        agent_manifest_epoch_id: authority.epochId
+      })),
       is_model_call_authoritative: (source, expectedToolName) => {
         const authority = this.#authorities.get(source.model_call_id);
         if (!authority
@@ -249,7 +270,8 @@ export class HumanoidModelAuthority {
 
   goalModelSource(
     toolAuthority: ToolCallAuthority,
-    expectedToolName: string
+    expectedToolName: string,
+    normalizedInput: unknown
   ): GoalModelSource {
     const manifest = this.#goalManager;
     if (toolAuthority.tool_name !== expectedToolName) {
@@ -273,6 +295,13 @@ export class HumanoidModelAuthority {
         `Goal tool call has no completed model response authority: ${toolAuthority.tool_call_id}`
       );
     }
+    const normalizedArgumentsSha256 = modelPayloadSha256(normalizedInput);
+    if ((toolAuthority.normalized_arguments_sha256
+      ?? toolAuthority.arguments_sha256) !== normalizedArgumentsSha256) {
+      throw new Error(
+        `Goal tool arguments have no model authority: ${toolAuthority.tool_call_id}`
+      );
+    }
     return {
       agent_id: manifest.agentId,
       agent_manifest_sha256: manifest.identitySha256,
@@ -281,7 +310,10 @@ export class HumanoidModelAuthority {
       response_id: authority.response_id,
       response_output_sha256: authority.response_output_sha256,
       tool_call_id: toolCall.tool_call_id,
-      tool_arguments_sha256: toolCall.arguments_sha256
+      tool_arguments_sha256: toolCall.arguments_sha256,
+      ...(normalizedArgumentsSha256 === toolCall.arguments_sha256
+        ? {}
+        : { normalized_tool_arguments_sha256: normalizedArgumentsSha256 })
     };
   }
 
@@ -298,8 +330,9 @@ export class HumanoidModelAuthority {
       || input.toolAuthority.tool_call_id !== transactionId) {
       throw new Error(`Humanoid action tool authority mismatch: ${transactionId}`);
     }
-    const argumentsSha256 = modelPayloadSha256(input.actionInput);
-    if (input.toolAuthority.arguments_sha256 !== argumentsSha256) {
+    const normalizedArgumentsSha256 = modelPayloadSha256(input.actionInput);
+    if ((input.toolAuthority.normalized_arguments_sha256
+      ?? input.toolAuthority.arguments_sha256) !== normalizedArgumentsSha256) {
       throw new Error(`Humanoid action tool arguments have no model authority: ${transactionId}`);
     }
     const manifest = this.#actionAgents.get(agentId);
@@ -317,7 +350,7 @@ export class HumanoidModelAuthority {
         && entry.tool_name === input.expectedToolName
     ));
     if (!authority || !authority.cycle || !toolCall
-      || toolCall.arguments_sha256 !== argumentsSha256) {
+      || toolCall.arguments_sha256 !== input.toolAuthority.arguments_sha256) {
       throw new Error(
         `Humanoid action tool call has no completed model response authority: ${transactionId}`
       );
@@ -330,7 +363,10 @@ export class HumanoidModelAuthority {
       response_id: authority.response_id,
       response_output_sha256: authority.response_output_sha256,
       tool_call_id: toolCall.tool_call_id,
-      tool_arguments_sha256: toolCall.arguments_sha256
+      tool_arguments_sha256: toolCall.arguments_sha256,
+      ...(normalizedArgumentsSha256 === toolCall.arguments_sha256
+        ? {}
+        : { normalized_tool_arguments_sha256: normalizedArgumentsSha256 })
     });
   }
 
@@ -360,8 +396,9 @@ export class HumanoidModelAuthority {
     const toolCalls = authority?.tool_calls.filter((entry) => (
       entry.tool_call_id === input.transactionId
         && entry.tool_name === input.expectedToolName
-        && entry.arguments_sha256 === modelPayloadSha256(input.actionInput)
+        && entry.arguments_sha256 === decision.tool_arguments_sha256
     ));
+    const normalizedArgumentsSha256 = modelPayloadSha256(input.actionInput);
     if (!manifest
       || decision.agent_id !== input.agentId
       || decision.agent_manifest_sha256 !== manifest.identitySha256
@@ -373,7 +410,8 @@ export class HumanoidModelAuthority {
       || authority.response_output_sha256 !== decision.response_output_sha256
       || !sameAutonomousCycle(authority.cycle, input.cycle)
       || toolCalls?.length !== 1
-      || toolCalls[0]!.arguments_sha256 !== decision.tool_arguments_sha256) {
+      || (decision.normalized_tool_arguments_sha256
+        ?? decision.tool_arguments_sha256) !== normalizedArgumentsSha256) {
       throw new Error(`Humanoid action decision is not authoritative: ${input.transactionId}`);
     }
   }

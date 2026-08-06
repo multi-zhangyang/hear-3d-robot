@@ -1,5 +1,9 @@
+import { randomUUID } from "node:crypto";
 import type { Model, ModelResponse } from "@openai/agents";
-import { modelPayloadSha256 } from "../domain/model-call-authority.js";
+import {
+  modelPayloadSha256,
+  modelToolArgumentsSha256
+} from "../domain/model-call-authority.js";
 import { errorMessage } from "../runtime/error-message.js";
 import { isTransportInterruption } from "../runtime/transport-recovery.js";
 import {
@@ -16,11 +20,13 @@ import type {
 } from "./context-runtime.js";
 import { modelResponseDisposition } from "./sdk-events.js";
 
-const MAX_CONSECUTIVE_NO_DECISION_RESPONSES = 4;
+const MAX_CONSECUTIVE_NO_DECISION_RESPONSES = 2;
 const MAX_ROOT_CONSECUTIVE_NO_DECISION_RESPONSES = 3;
 const MAX_DECISIONS_WITHOUT_AUTHORITY_CHANGE = 6;
 const MAX_REPEATED_NO_PROGRESS_RECEIPTS = 4;
 const MAX_DECISIONS_WITHOUT_PHYSICAL_PROGRESS = 18;
+const SDK_ABSENT_RESPONSE_ID = "FAKE_ID";
+const transportInterruptionAgentIds = new WeakMap<object, string>();
 
 /**
  * Binds one model facade to exactly one hierarchy node while recording every
@@ -35,7 +41,9 @@ export function withModelTelemetry(
   onModelResponseCompleted?: (
     agentId: string,
     usage: { inputTokens: number }
-  ) => void | Promise<void>
+  ) => void | Promise<void>,
+  streamEventIdleTimeoutMs?: number,
+  requestTimeoutMs?: number
 ): Model {
   const decisionGuard = new ModelDecisionGuard(
     boundAgentId === runtime.rootAgentId
@@ -43,7 +51,18 @@ export function withModelTelemetry(
       : MAX_CONSECUTIVE_NO_DECISION_RESPONSES
   );
   const progressGuard = runtime.modelProgressSnapshot
-    ? new AuthoritativeModelProgressGuard(runtime.modelProgressSnapshot())
+    ? new AuthoritativeModelProgressGuard(runtime.modelProgressSnapshot(boundAgentId))
+    : undefined;
+  let progressRecoveryEpoch = runtime.modelProgressRecoveryEpoch?.() ?? 0;
+  const observeProgress = progressGuard
+    ? (agentId: string, snapshot: ModelProgressSnapshot) => {
+        const nextEpoch = runtime.modelProgressRecoveryEpoch?.() ?? progressRecoveryEpoch;
+        if (nextEpoch !== progressRecoveryEpoch) {
+          progressGuard.resetAfterTransportInterruption(snapshot);
+          progressRecoveryEpoch = nextEpoch;
+        }
+        progressGuard.observe(agentId, snapshot);
+      }
     : undefined;
   return {
     getResponse: async (request) => {
@@ -53,10 +72,17 @@ export function withModelTelemetry(
       const modelCallId = await runtime.recordModelCallStarted(agentId);
       let response: ModelResponse;
       try {
-        response = await model.getResponse(request);
+        response = normalizeModelResponseIdentity(
+          await modelResponseWithIdleTimeout(
+            model,
+            request,
+            streamEventIdleTimeoutMs
+          ),
+          modelCallId ?? randomUUID()
+        );
       } catch (error) {
         if (modelCallId) await runtime.recordModelCallFailed?.(modelCallId, agentId);
-        throw preserveModelInterruption(error);
+        throw preserveModelInterruption(error, agentId);
       }
       clearAgentInvocationTransportInterruption();
       if (modelCallId && response.responseId) {
@@ -68,9 +94,9 @@ export function withModelTelemetry(
       }
       await onModelResponseCompleted?.(agentId, response.usage);
       const hasDecision = decisionGuard.observe(agentId, response.output);
-      const progressSnapshot = runtime.modelProgressSnapshot?.();
-      if (hasDecision && progressGuard && progressSnapshot) {
-        progressGuard.observe(agentId, progressSnapshot);
+      const progressSnapshot = runtime.modelProgressSnapshot?.(agentId);
+      if (hasDecision && observeProgress && progressSnapshot) {
+        observeProgress(agentId, progressSnapshot);
       }
       return response;
     },
@@ -78,10 +104,12 @@ export function withModelTelemetry(
       model,
       runtime,
       decisionGuard,
-      progressGuard,
+      observeProgress,
       boundAgentId,
       request,
-      onModelResponseCompleted
+      onModelResponseCompleted,
+      streamEventIdleTimeoutMs,
+      requestTimeoutMs
     ),
     ...(model.getRetryAdvice
       ? { getRetryAdvice: (request) => model.getRetryAdvice!(request) }
@@ -89,42 +117,103 @@ export function withModelTelemetry(
   };
 }
 
+async function modelResponseWithIdleTimeout(
+  model: Model,
+  request: Parameters<Model["getResponse"]>[0],
+  timeoutMs: number | undefined
+): Promise<ModelResponse> {
+  if (timeoutMs === undefined) return model.getResponse(request);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Model response event idle timeout must be finite and positive");
+  }
+  const controller = new AbortController();
+  const timedRequest = {
+    ...request,
+    signal: request.signal
+      ? AbortSignal.any([request.signal, controller.signal])
+      : controller.signal
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = modelResponseEventTimeoutError(timeoutMs);
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([model.getResponse(timedRequest), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function* claimAndStream(
   model: Model,
   runtime: ModelTelemetryRuntime,
   decisionGuard: ModelDecisionGuard,
-  progressGuard: AuthoritativeModelProgressGuard | undefined,
+  observeProgress: ((agentId: string, snapshot: ModelProgressSnapshot) => void) | undefined,
   boundAgentId: string,
   request: Parameters<Model["getStreamedResponse"]>[0],
   onModelResponseCompleted?: (
     agentId: string,
     usage: { inputTokens: number }
-  ) => void | Promise<void>
+  ) => void | Promise<void>,
+  streamEventIdleTimeoutMs?: number,
+  requestTimeoutMs?: number
 ) {
   const agentId = requestAgentId(request.systemInstructions, runtime.rootAgentId);
   assertModelBinding(boundAgentId, agentId);
   runtime.activeNode(agentId);
   const modelCallId = await runtime.recordModelCallStarted(agentId);
+  const localResponseIdentity = modelCallId ?? randomUUID();
   let terminalRecorded = false;
+  const streamAbort = new AbortController();
+  const streamRequest = {
+    ...request,
+    signal: request.signal
+      ? AbortSignal.any([request.signal, streamAbort.signal])
+      : streamAbort.signal
+  };
+  const iterator = model.getStreamedResponse(streamRequest)[Symbol.asyncIterator]();
+  const responseDeadline = modelResponseDeadline(requestTimeoutMs);
+  let streamDone = false;
   try {
-    for await (const event of model.getStreamedResponse(request)) {
+    for (;;) {
+      const next = await nextModelStreamEvent(
+        iterator,
+        streamEventIdleTimeoutMs,
+        streamAbort,
+        responseDeadline
+      );
+      if (next.done) {
+        streamDone = true;
+        break;
+      }
+      const event = next.value;
       if (event.type === "response_done") {
+        const response = normalizeStreamResponseIdentity(
+          event.response,
+          localResponseIdentity
+        );
         if (modelCallId) {
           await runtime.recordModelCallCompleted?.(completedModelCall(
             modelCallId,
             agentId,
-            event.response.id,
-            event.response.output
+            response.id,
+            response.output
           ));
           terminalRecorded = true;
         }
         clearAgentInvocationTransportInterruption();
-        await onModelResponseCompleted?.(agentId, event.response.usage);
-        const hasDecision = decisionGuard.observe(agentId, event.response.output);
-        const progressSnapshot = runtime.modelProgressSnapshot?.();
-        if (hasDecision && progressGuard && progressSnapshot) {
-          progressGuard.observe(agentId, progressSnapshot);
+        await onModelResponseCompleted?.(agentId, response.usage);
+        const hasDecision = decisionGuard.observe(agentId, response.output);
+        const progressSnapshot = runtime.modelProgressSnapshot?.(agentId);
+        if (hasDecision && observeProgress && progressSnapshot) {
+          observeProgress(agentId, progressSnapshot);
         }
+        yield response === event.response ? event : { ...event, response };
+        return;
       }
       yield event;
     }
@@ -132,8 +221,133 @@ async function* claimAndStream(
     if (modelCallId && !terminalRecorded) {
       await runtime.recordModelCallFailed?.(modelCallId, agentId);
     }
-    throw preserveModelInterruption(error);
+    throw preserveModelInterruption(error, agentId);
+  } finally {
+    if (!streamDone) {
+      streamAbort.abort(new Error("Model stream consumer completed"));
+      void iterator.return?.();
+    }
   }
+}
+
+async function nextModelStreamEvent<T>(
+  iterator: AsyncIterator<T>,
+  timeoutMs: number | undefined,
+  controller: AbortController,
+  responseDeadline?: { at: number; timeoutMs: number }
+): Promise<IteratorResult<T>> {
+  if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+    throw new Error("Model stream event idle timeout must be finite and positive");
+  }
+  const remainingResponseMs = responseDeadline
+    ? Math.max(0, responseDeadline.at - Date.now())
+    : undefined;
+  if (timeoutMs === undefined && remainingResponseMs === undefined) {
+    return iterator.next();
+  }
+  const effectiveTimeoutMs = Math.min(
+    timeoutMs ?? Number.POSITIVE_INFINITY,
+    remainingResponseMs ?? Number.POSITIVE_INFINITY
+  );
+  const responseDeadlineWins = remainingResponseMs !== undefined
+    && remainingResponseMs <= (timeoutMs ?? Number.POSITIVE_INFINITY);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = responseDeadlineWins && responseDeadline
+        ? modelResponseDeadlineError(responseDeadline.timeoutMs)
+        : modelStreamEventTimeoutError(timeoutMs!);
+      controller.abort(error);
+      reject(error);
+    }, effectiveTimeoutMs);
+  });
+  try {
+    return await Promise.race([iterator.next(), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function modelResponseDeadline(
+  timeoutMs: number | undefined
+): { at: number; timeoutMs: number } | undefined {
+  if (timeoutMs === undefined) return undefined;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Model request timeout must be finite and positive");
+  }
+  return { at: Date.now() + timeoutMs, timeoutMs };
+}
+
+function modelStreamEventTimeoutError(timeoutMs: number): TypeError {
+  const cause = Object.assign(new Error(
+    `Model stream produced no SDK event for ${timeoutMs}ms`
+  ), {
+    code: "ETIMEDOUT"
+  });
+  return new TypeError("Model stream stalled", { cause });
+}
+
+function modelResponseEventTimeoutError(timeoutMs: number): TypeError {
+  const cause = Object.assign(new Error(
+    `Model response produced no SDK event for ${timeoutMs}ms`
+  ), {
+    code: "ETIMEDOUT"
+  });
+  return new TypeError("Model response stalled", { cause });
+}
+
+function modelResponseDeadlineError(timeoutMs: number): TypeError {
+  const cause = Object.assign(new Error(
+    `Model response did not complete within ${timeoutMs}ms`
+  ), {
+    code: "ETIMEDOUT"
+  });
+  return new TypeError("Model response exceeded its request deadline", { cause });
+}
+
+function normalizeModelResponseIdentity(
+  response: ModelResponse,
+  localIdentity: string
+): ModelResponse {
+  if (usableResponseId(response.responseId)) return response;
+  const responseId = `local-response:${localIdentity}`;
+  return {
+    ...response,
+    responseId,
+    output: outputWithResponseIdentity(response.output, responseId)
+  };
+}
+
+function normalizeStreamResponseIdentity<T extends {
+  id: string;
+  output: ModelResponse["output"];
+}>(response: T, localIdentity: string): T {
+  if (usableResponseId(response.id)) return response;
+  const responseId = `local-response:${localIdentity}`;
+  return {
+    ...response,
+    id: responseId,
+    output: outputWithResponseIdentity(response.output, responseId)
+  };
+}
+
+function outputWithResponseIdentity(
+  output: ModelResponse["output"],
+  responseId: string
+): ModelResponse["output"] {
+  return output.map((item) => ({
+    ...item,
+    providerData: {
+      ...(item.providerData ?? {}),
+      responseId
+    }
+  })) as ModelResponse["output"];
+}
+
+function usableResponseId(responseId: string | undefined): responseId is string {
+  return responseId !== undefined
+    && responseId.trim().length > 0
+    && responseId !== SDK_ABSENT_RESPONSE_ID;
 }
 
 function completedModelCall(
@@ -149,29 +363,48 @@ function completedModelCall(
     responseOutputSha256: modelPayloadSha256(output),
     toolCalls: output.flatMap((item) => {
       if (item.type !== "function_call") return [];
-      let parsedArguments: unknown;
-      try {
-        parsedArguments = JSON.parse(item.arguments);
-      } catch {
-        parsedArguments = item.arguments;
-      }
       return [{
         toolCallId: item.callId,
         toolName: item.name,
-        argumentsSha256: modelPayloadSha256(parsedArguments)
+        argumentsSha256: modelToolArgumentsSha256(item.arguments)
       }];
     })
   };
 }
 
-function preserveModelInterruption(error: unknown): Error {
+function preserveModelInterruption(error: unknown, agentId: string): Error {
   const normalized = asError(error);
   if (isTransportInterruption(normalized)) {
+    transportInterruptionAgentIds.set(normalized, agentId);
     recordAgentInvocationTransportInterruption(normalized);
   } else if (normalized instanceof ModelDecisionStallError) {
     recordAgentInvocationDecisionInterruption(normalized);
   }
   return normalized;
+}
+
+export function modelTransportInterruptionAgentIdFrom(
+  error: unknown
+): string | undefined {
+  const pending: unknown[] = [error];
+  const visited = new Set<object>();
+  while (pending.length > 0 && visited.size < 16) {
+    const candidate = pending.shift();
+    if (candidate === null || typeof candidate !== "object"
+      || visited.has(candidate)) continue;
+    visited.add(candidate);
+    const agentId = transportInterruptionAgentIds.get(candidate);
+    if (agentId) return agentId;
+    const wrapper = candidate as {
+      error?: unknown;
+      cause?: unknown;
+      originalError?: unknown;
+      errors?: unknown;
+    };
+    pending.push(wrapper.error, wrapper.cause, wrapper.originalError);
+    if (Array.isArray(wrapper.errors)) pending.push(...wrapper.errors);
+  }
+  return undefined;
 }
 
 function requestAgentId(systemInstructions: unknown, rootAgentId: string): string {
@@ -254,6 +487,7 @@ export class AuthoritativeModelProgressGuard {
   readonly #receiptPatterns = new Map<string, number>();
   #cycleIndex: number;
   #checkerSuccess: boolean;
+  #goalStateSha256: string;
   #previousReceiptIds: Set<string>;
   #decisionsSincePhysicalProgress = 0;
   #decisionsWithoutNewReceipt = 0;
@@ -277,8 +511,8 @@ export class AuthoritativeModelProgressGuard {
     }
     this.#cycleIndex = snapshot.cycleIndex;
     this.#checkerSuccess = snapshot.checkerSuccess;
+    this.#goalStateSha256 = snapshot.goalStateSha256;
     this.#previousReceiptIds = new Set(snapshot.receipts.map((receipt) => receipt.transactionId));
-    this.#seedFromDurableReceipts(snapshot.receipts);
   }
 
   observe(agentId: string, snapshot: ModelProgressSnapshot): void {
@@ -288,12 +522,14 @@ export class AuthoritativeModelProgressGuard {
     this.#previousReceiptIds = new Set(
       snapshot.receipts.map((receipt) => receipt.transactionId)
     );
-    const physicalProgress = snapshot.cycleIndex !== this.#cycleIndex
+    const authoritativeProgress = snapshot.cycleIndex !== this.#cycleIndex
       || (!this.#checkerSuccess && snapshot.checkerSuccess)
+      || snapshot.goalStateSha256 !== this.#goalStateSha256
       || newReceipts.some(receiptHasPhysicalProgress);
     this.#cycleIndex = snapshot.cycleIndex;
     this.#checkerSuccess = snapshot.checkerSuccess;
-    if (physicalProgress) {
+    this.#goalStateSha256 = snapshot.goalStateSha256;
+    if (authoritativeProgress) {
       this.#resetProgressWindow();
       return;
     }
@@ -347,14 +583,14 @@ export class AuthoritativeModelProgressGuard {
     );
   }
 
-  #seedFromDurableReceipts(receipts: readonly ModelProgressReceipt[]): void {
-    const lastPhysical = receipts.findLastIndex(receiptHasPhysicalProgress);
-    const suffix = receipts.slice(lastPhysical + 1);
-    this.#decisionsSincePhysicalProgress = suffix.length;
-    for (const receipt of suffix) {
-      const pattern = receiptPattern(receipt);
-      this.#receiptPatterns.set(pattern, (this.#receiptPatterns.get(pattern) ?? 0) + 1);
-    }
+  resetAfterTransportInterruption(snapshot: ModelProgressSnapshot): void {
+    this.#cycleIndex = snapshot.cycleIndex;
+    this.#checkerSuccess = snapshot.checkerSuccess;
+    this.#goalStateSha256 = snapshot.goalStateSha256;
+    this.#previousReceiptIds = new Set(
+      snapshot.receipts.map((receipt) => receipt.transactionId)
+    );
+    this.#resetProgressWindow();
   }
 
   #resetProgressWindow(): void {

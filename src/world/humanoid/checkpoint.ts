@@ -52,6 +52,8 @@ import {
 } from "./carried-object-binding.js";
 import { humanoidMotionContactEvidenceSha256 } from "./motion-contact-evidence.js";
 import { HumanoidCarriedObjectLifecycleCheckpointSchema } from "./carried-object-lifecycle.js";
+import { HumanoidStationKeepingAnchorSchema } from "./station-keeping.js";
+import { HumanoidNavigationArrivalHeadingSchema } from "./navigation-arrival.js";
 
 const FiniteArraySchema = z.array(z.number().finite());
 
@@ -175,6 +177,7 @@ const StoredMotionSchema = z.object({
   plan: HumanoidMotionPlanSchema,
   artifact: HumanoidMotionArtifactSchema,
   rollout: HumanoidMotionRolloutSchema.nullable().default(null),
+  retainTerminalJointTracking: z.boolean().default(false),
   createdRevision: z.number().int().nonnegative(),
   validatedRevision: z.number().int().nonnegative().optional(),
   validatedStateSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
@@ -559,11 +562,19 @@ const HumanoidWorldCheckpointBaseSchema = z.object({
   planRegistryEpoch: z.number().int().nonnegative().default(0),
   simulation: HumanoidSimulationStateCheckpointSchema,
   reference: HumanoidReferenceStateSchema,
+  stationKeeping: HumanoidStationKeepingAnchorSchema.nullable().default(null),
   motions: z.array(StoredMotionSchema),
   routes: z.array(z.object({
     id: z.string().min(1),
     plan: NavigationPlanSchema,
     requestedTarget: Vec3Schema,
+    requestedArrivalHeading: HumanoidNavigationArrivalHeadingSchema
+      .nullable()
+      .default(null),
+    arrivalHeading: HumanoidNavigationArrivalHeadingSchema
+      .nullable()
+      .default(null),
+    releaseJointTracking: z.boolean().default(false),
     createdRevision: z.number().int().nonnegative(),
     validatedRevision: z.number().int().nonnegative().optional(),
     validatedStateSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
@@ -584,7 +595,10 @@ const HumanoidWorldCheckpointBaseSchema = z.object({
     terminal: HumanoidPlanTerminalSchema.nullable().default(null)
   }).strict().superRefine((route, context) => {
     if (route.intentSha256 !== undefined
-      && route.intentSha256 !== humanoidNavigationIntentSha256(route.requestedTarget)) {
+      && route.intentSha256 !== humanoidNavigationIntentSha256(
+        route.requestedTarget,
+        route.requestedArrivalHeading
+      )) {
       context.addIssue({
         code: "custom",
         path: ["intentSha256"],
@@ -735,6 +749,15 @@ function validateHumanoidWorldCheckpointAlignment(
     | Omit<HumanoidWorldCheckpointBase, "graspRegistry">,
   context: z.RefinementCtx
 ): void {
+  if (checkpoint.stationKeeping
+    && (checkpoint.stationKeeping.sourceFrame > checkpoint.frame
+      || checkpoint.stationKeeping.sourceWorldRevision > checkpoint.worldRevision)) {
+    context.addIssue({
+      code: "custom",
+      path: ["stationKeeping"],
+      message: "Humanoid station-keeping anchor is newer than its world checkpoint"
+    });
+  }
   if ("graspRegistry" in checkpoint
     && checkpoint.graspRegistry.last_frame !== checkpoint.frame) {
     context.addIssue({

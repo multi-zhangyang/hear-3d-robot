@@ -10,7 +10,8 @@ import type { HumanoidActionReceipt } from "./runtime.js";
 import {
   HUMANOID_AGENT_TOOL_CONTRACTS,
   createHumanoidAgentHierarchy,
-  goalManagerInvocationInput
+  goalManagerInvocationInput,
+  motionInvocationInput
 } from "./agents.js";
 
 const provider: ProviderConfig = {
@@ -49,7 +50,7 @@ describe("humanoid agent hierarchy", () => {
     const evidenceRef = `goal-world:19:19:${"a".repeat(64)}`;
     const candidateId = `goal-candidate:${"b".repeat(64)}`;
 
-    const rendered = goalManagerInvocationInput("推进长期任务。", {
+    const rendered = goalManagerInvocationInput({
       run_mode: "mission",
       mission_goal: {
         summary: "进入庭院信标区",
@@ -65,7 +66,17 @@ describe("humanoid agent hierarchy", () => {
           [candidateId]: {
             status: "proposed",
             proposal_id: "mission-navigation",
-            candidate_sequence: 7
+            candidate_sequence: 7,
+            goal: {
+              summary: "进入庭院信标区",
+              predicates: [{
+                type: "robot_in_zone",
+                zone_id: "courtyard_beacon",
+                tolerance: 0.2
+              }]
+            },
+            mission_link: "直接推进长期任务",
+            dependency_candidate_ids: []
           }
         },
         current_epoch_id: null
@@ -91,7 +102,21 @@ describe("humanoid agent hierarchy", () => {
           bindings: [{ object_id: "courtyard_crate", hand: "left" }],
           continuation_verified: true
         }
-      }
+      },
+      recent_receipts: [{
+        transaction_id: "planning-call-42",
+        action: "plan_whole_body_motion_candidates",
+        accepted: false,
+        code: "whole_body_candidates_rejected",
+        world_after_revision: 21,
+        frame_count: 0,
+        detail: {
+          reachable_base_placements: [{
+            object_id: "courtyard_crate",
+            root_world_target: { x: 2.1, y: 0.75, z: 2.4 }
+          }]
+        }
+      }]
     });
 
     expect(rendered).toContain(`"current_goal_evidence_ref":"${evidenceRef}"`);
@@ -102,13 +127,58 @@ describe("humanoid agent hierarchy", () => {
       `"candidate_sequence":7,"proposal_id":"mission-navigation","candidate_id":"${candidateId}"`
     );
     expect(rendered).toContain(
+      '"status":"proposed","goal":{"summary":"进入庭院信标区"'
+    );
+    expect(rendered).toContain(
+      '"mission_link":"直接推进长期任务","dependency_candidate_ids":[]'
+    );
+    expect(rendered).toContain(
       '"visible_object_ids":["courtyard_crate"],"portable_object_ids":["courtyard_crate"],"removable_block_ids":["stone_column"]'
     );
     expect(rendered).toContain('"predicate_types":["robot_at","robot_in_zone"');
     expect(rendered).toContain(
       '"carrying":{"phase":"carrying","object_ids":["courtyard_crate"],"continuation_verified":true}'
     );
+    expect(rendered).toContain(
+      '"recent_action_evidence":[{"evidence_ref":"action:planning-call-42","transaction_id":"planning-call-42"'
+    );
+    expect(rendered).toContain('"world_after_revision":21,"frame_count":0');
+    expect(rendered).toContain(
+      '"detail":{"reachable_base_placements":[{"object_id":"courtyard_crate"'
+    );
     expect(rendered).toContain("候选提交和选择会由 Harness 绑定本次证据");
+  });
+
+  it("gives Motion only active Goal authority instead of Coordinator parameters", () => {
+    const rendered = motionInvocationInput({
+      run_mode: "mission",
+      coordinator_phase: "plan",
+      active_cycle: { cycle_id: "cycle-7" },
+      active_goal: {
+        summary: "抓取可见工件",
+        predicates: [{ type: "object_grasped", object_id: "workpiece", hand: "left" }]
+      },
+      goal_dag: { current_epoch_id: "goal-epoch-7" },
+      planning_tool_state: {
+        planning_actions: [{
+          action: "plan_humanoid_navigation",
+          available: false
+        }],
+        cooldown: {
+          action: "plan_humanoid_navigation",
+          code: "repeated_planning_failure"
+        }
+      },
+      robot: { root_position: { x: 9, y: 8, z: 7 } }
+    });
+
+    expect(rendered).toContain("CURRENT MOTION DELEGATION");
+    expect(rendered).toContain('"current_goal_epoch_id":"goal-epoch-7"');
+    expect(rendered).toContain('"active_goal":{"summary":"抓取可见工件"');
+    expect(rendered).toContain(
+      '"planning_tool_state":{"planning_actions":[{"action":"plan_humanoid_navigation","available":false}]'
+    );
+    expect(rendered).not.toContain('"root_position"');
   });
 
   it("owns one Model facade and one Session per concrete hierarchy node", async () => {
@@ -133,6 +203,8 @@ describe("humanoid agent hierarchy", () => {
       | "post_execution"
       | "complete_cycle";
     let executorDelegationAvailable = false;
+    let goalRetirementDelegationAvailable = true;
+    let sentryDelegationAvailable = true;
     const execution = receipt({
       transactionId: "execute-accepted",
       action: "execute_whole_body_motion",
@@ -165,7 +237,9 @@ describe("humanoid agent hierarchy", () => {
       },
       cycleCompletionReadiness: () => structuredClone(cycleCompletion),
       coordinatorPhase: () => coordinatorPhase,
-      executorDelegationAvailable: () => executorDelegationAvailable
+      executorDelegationAvailable: () => executorDelegationAvailable,
+      goalRetirementDelegationAvailable: () => goalRetirementDelegationAvailable,
+      sentryDelegationAvailable: () => sentryDelegationAvailable
     } as never;
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
@@ -256,11 +330,104 @@ describe("humanoid agent hierarchy", () => {
       }
       return selected;
     };
-    const enabled = (name: string) => coordinatorTool(name).isEnabled(
-      new RunContext({ runId: `enabled-${name}` }),
-      hierarchy.coordinator
+    const visibleCoordinatorTools = async () => (
+      await hierarchy.coordinator.getAllTools(
+        new RunContext({ runId: "stable-coordinator-tools" })
+      )
+    ).map((entry) => entry.name);
+    expect(await visibleCoordinatorTools()).toEqual([
+      "recall_embodied_history",
+      "delegate_humanoid_sentry",
+      "delegate_motion_reference"
+    ]);
+    coordinatorPhase = "plan";
+    sentryDelegationAvailable = false;
+    expect(await visibleCoordinatorTools()).toEqual([
+      "recall_embodied_history",
+      "delegate_motion_reference"
+    ]);
+    coordinatorPhase = "observe_or_plan";
+    sentryDelegationAvailable = true;
+    const smuggledMotionParameters = await coordinatorTool(
+      "delegate_motion_reference"
+    ).invoke(
+      new RunContext({ runId: "smuggled-motion-parameters" }),
+      JSON.stringify({ objective: "Move to x=4.2 and close the left palm." }),
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "smuggled-motion-parameters",
+          name: "delegate_motion_reference",
+          arguments: JSON.stringify({
+            objective: "Move to x=4.2 and close the left palm."
+          }),
+          status: "completed"
+        }
+      }
     );
-    expect(await enabled("delegate_motion_reference")).toBe(true);
+    expect(JSON.parse(String(smuggledMotionParameters))).toMatchObject({
+      accepted: false,
+      code: "invalid_tool_input",
+      tool: "delegate_motion_reference",
+      automatic_actuation: false
+    });
+    const unavailableExecutorDelegation = await coordinatorTool(
+      "delegate_physics_executor"
+    ).invoke(
+      new RunContext({ runId: "unavailable-executor-delegation" }),
+      JSON.stringify({
+        task: "execute_plan",
+        objective: "尝试消费尚不存在的规划",
+        planning_action: "plan_humanoid_navigation",
+        planning_transaction_id: "missing-plan",
+        solid_id: null,
+        execution_transaction_id: null
+      }),
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "unavailable-executor-delegation",
+          name: "delegate_physics_executor",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    );
+    expect(JSON.parse(String(unavailableExecutorDelegation))).toMatchObject({
+      accepted: false,
+      code: "coordinator_phase_rejected",
+      tool: "delegate_physics_executor",
+      automatic_actuation: false
+    });
+    coordinatorPhase = "replan_or_retire";
+    goalRetirementDelegationAvailable = false;
+    expect(await visibleCoordinatorTools()).not.toContain("delegate_goal_manager");
+    const recoverableGoalRetirement = await coordinatorTool(
+      "delegate_goal_manager"
+    ).invoke(
+      new RunContext({ runId: "recoverable-goal-retirement" }),
+      "{}",
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "recoverable-goal-retirement",
+          name: "delegate_goal_manager",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    );
+    expect(JSON.parse(String(recoverableGoalRetirement))).toMatchObject({
+      accepted: false,
+      code: "coordinator_phase_rejected",
+      tool: "delegate_goal_manager",
+      coordinator_phase: "replan_or_retire",
+      automatic_actuation: false
+    });
+    goalRetirementDelegationAvailable = true;
+    expect(await visibleCoordinatorTools()).toContain("delegate_goal_manager");
+    coordinatorPhase = "observe_or_plan";
+    executorDelegationAvailable = true;
     const invalidExecutorDelegation = await coordinatorTool(
       "delegate_physics_executor"
     ).invoke(
@@ -291,7 +458,6 @@ describe("humanoid agent hierarchy", () => {
         path: "planning_transaction_id"
       })]
     });
-    expect(await enabled("complete_autonomous_cycle")).toBe(false);
     cycleCompletion = {
       status: "ready",
       evidence_transaction_ids: [execution.transactionId],
@@ -300,17 +466,68 @@ describe("humanoid agent hierarchy", () => {
       reason: null
     };
     coordinatorPhase = "post_execution";
-    expect(await enabled("delegate_motion_reference")).toBe(false);
-    expect(await enabled("delegate_humanoid_sentry")).toBe(true);
-    expect(await enabled("complete_autonomous_cycle")).toBe(true);
+    expect(await visibleCoordinatorTools()).toEqual([
+      "delegate_humanoid_sentry",
+      "delegate_physics_executor"
+    ]);
+    const prematureCompletionInput = JSON.stringify({
+      summary: "不能跳过执行后感知",
+      evidence_transaction_ids: [execution.transactionId]
+    });
+    expect(JSON.parse(String(await coordinatorTool(
+      "complete_autonomous_cycle"
+    ).invoke(
+      new RunContext({ runId: "premature-cycle-completion" }),
+      prematureCompletionInput
+    )))).toMatchObject({
+      accepted: false,
+      code: "coordinator_phase_rejected",
+      tool: "complete_autonomous_cycle",
+      coordinator_phase: "post_execution",
+      automatic_actuation: false
+    });
     cycleCompletion.observed_after_execution = true;
+    expect(JSON.parse(String(await coordinatorTool(
+      "complete_autonomous_cycle"
+    ).invoke(
+      new RunContext({ runId: "inconsistent-cycle-completion-phase" }),
+      prematureCompletionInput
+    )))).toMatchObject({
+      accepted: false,
+      code: "coordinator_phase_rejected",
+      coordinator_phase: "post_execution"
+    });
     coordinatorPhase = "complete_cycle";
-    expect(await enabled("delegate_humanoid_sentry")).toBe(false);
-    expect(await enabled("delegate_physics_executor")).toBe(false);
-    executorDelegationAvailable = true;
-    expect(await enabled("delegate_physics_executor")).toBe(true);
+    executorDelegationAvailable = false;
+    expect(await visibleCoordinatorTools()).toEqual([
+      "complete_autonomous_cycle"
+    ]);
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
       "object_in_zone、object_released 与 object_settled_on_support"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "at_seconds=0 的关键帧代表当前物理瞬间"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "coordination:{left:{thumb_opposition,thumb_curl,index_curl,middle_curl},right:{thumb_opposition,thumb_curl,index_curl,middle_curl}}"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "字段 grasp_contract_sha256"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "优先使用 end_effector_position"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "已到导航可行边界"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "manipulation_geometry"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "ik_reference_reachable"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "其他 Agent 的观测不会注入你的独立 Session"
     ));
     expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
       "不得改 tolerance、删减谓词或拼接额外条件"
@@ -351,6 +568,7 @@ describe("humanoid agent hierarchy", () => {
       finalOutput: JSON.stringify({ status: "goal_transition_completed" })
     });
 
+    coordinatorPhase = "observe_or_plan";
     const recall = hierarchy.coordinator.tools.find(
       (entry) => entry.name === "recall_embodied_history"
     );
@@ -393,6 +611,7 @@ describe("humanoid agent hierarchy", () => {
     if (!complete || complete.type !== "function") {
       throw new Error("Cycle completion tool is missing");
     }
+    coordinatorPhase = "complete_cycle";
     const output = await complete.invoke(
       new RunContext({ runId: "humanoid-hierarchy-test" }),
       JSON.stringify({
@@ -423,7 +642,7 @@ describe("humanoid agent hierarchy", () => {
     })).toThrow("cannot share one Model facade");
   });
 
-  it("applies the long-run input filter inside every Agent-as-tool Runner", async () => {
+  it("keeps Sentry available during replanning and applies the nested input filter", async () => {
     const filteredAgents: string[] = [];
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
@@ -447,7 +666,7 @@ describe("humanoid agent hierarchy", () => {
           observed_after_execution: false,
           reason: "no execution"
         }),
-        coordinatorPhase: () => "observe_or_plan"
+        coordinatorPhase: () => "replan_or_retire"
       } as never,
       createModel: (agentId) => agentId === "humanoid-sentry"
         ? functionCallModel("observe_humanoid")
@@ -467,13 +686,13 @@ describe("humanoid agent hierarchy", () => {
 
     const output = await delegate.invoke(
       new RunContext({ runId: "nested-filter" }),
-      JSON.stringify({ objective: "读取当前物理状态" }),
+      JSON.stringify({}),
       {
         toolCall: {
           type: "function_call",
           callId: "delegate-sentry-filter",
           name: "delegate_humanoid_sentry",
-          arguments: JSON.stringify({ objective: "读取当前物理状态" }),
+          arguments: JSON.stringify({}),
           status: "completed"
         }
       }

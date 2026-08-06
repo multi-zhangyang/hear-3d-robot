@@ -93,7 +93,10 @@ const HumanoidSimulationSnapshotSchema = z.object({
     implementation: z.string().trim().min(1),
     actuation: z.literal("joint_position_pd"),
     controlStepSeconds: z.number().finite().positive(),
-    physicsStepSeconds: z.number().finite().positive()
+    physicsStepSeconds: z.number().finite().positive(),
+    commandResponseHorizonSeconds: z.number().finite().positive().optional(),
+    minimumEffectivePlanarSpeedMetersPerSecond:
+      z.number().finite().positive().optional()
   }).strict(),
   rootPosition: Vec3Schema,
   rootRotation: QuaternionSchema,

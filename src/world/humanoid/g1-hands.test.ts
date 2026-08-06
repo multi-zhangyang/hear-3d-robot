@@ -3,10 +3,16 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
   G1_HAND_JOINT_NAMES,
+  G1_HAND_CONTACT_SURFACE_NAMES,
   G1_HAND_LINK_NAMES,
   G1_MORPHOLOGY
 } from "./morphology.js";
 import { HUMANOID_JOINT_NAMES, YAHMP_POLICY } from "./model.js";
+import {
+  inverseQuaternion,
+  multiplyQuaternion,
+  quaternionAngularDistance
+} from "../geometry.js";
 import { neutralHumanoidReference, type HumanoidReference } from "./reference.js";
 import { HumanoidSimulation } from "./simulation.js";
 import { g1HandObjectContacts } from "./hand-contact-evidence.js";
@@ -68,6 +74,52 @@ describe("Unitree G1 43DoF hands", () => {
       expect(Object.keys(initial.joints)).toEqual(HUMANOID_JOINT_NAMES);
       expect(Object.keys(initial.hands.joints)).toEqual(G1_HAND_JOINT_NAMES);
       expect(Object.keys(initial.hands.links)).toEqual(G1_HAND_LINK_NAMES);
+      const handSurfaces = simulation.handSurfaceObservations(initial);
+      expect(handSurfaces.map((surface) => surface.handSurface)).toEqual(
+        G1_HAND_CONTACT_SURFACE_NAMES
+      );
+      const leftPalm = handSurfaces.find((surface) => (
+        surface.handSurface === "left_hand_palm_link"
+      ));
+      expect(leftPalm).toMatchObject({
+        hand: "left",
+        wristWorldPosition: initial.links.left_wrist_yaw_link.position
+      });
+      expect(Math.hypot(
+        leftPalm!.surfaceFromWristWorld.x,
+        leftPalm!.surfaceFromWristWorld.y,
+        leftPalm!.surfaceFromWristWorld.z
+      )).toBeGreaterThan(0.04);
+      const runtime = await loadHumanoidMujoco();
+      const model = runtime.MjModel.from_xml_path(humanoidModelPath());
+      try {
+        const geometryId = runtime.mj_name2id(
+          model,
+          runtime.mjtObj.mjOBJ_GEOM.value,
+          g1HandContactGeomName("left_hand_palm_link")
+        );
+        const offset = geometryId * 4;
+        const expectedLocalRotation = {
+          x: model.geom_quat[offset + 2]!,
+          y: model.geom_quat[offset + 3]!,
+          z: model.geom_quat[offset + 1]!,
+          w: model.geom_quat[offset]!
+        };
+        const observedLocalRotation = multiplyQuaternion(
+          inverseQuaternion(initial.links.left_wrist_yaw_link.rotation),
+          leftPalm!.worldRotation
+        );
+        expect(quaternionAngularDistance(
+          observedLocalRotation,
+          expectedLocalRotation
+        )).toBeCloseTo(0, 8);
+        expect(quaternionAngularDistance(
+          leftPalm!.worldRotation,
+          initial.links.left_wrist_yaw_link.rotation
+        )).toBeGreaterThan(1);
+      } finally {
+        model.delete();
+      }
       expect(initial.hands.controller).toEqual({
         protocol: "g1-hand-controller-v1",
         implementation: "mujoco_continuous_position_pd",

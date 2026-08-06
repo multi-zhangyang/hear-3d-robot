@@ -5,6 +5,7 @@ import {
   multiplyQuaternion,
   normalizeQuaternion,
   quaternionAngularDistance,
+  quaternionFromRotationMatrix,
   quaternionRotationVector,
   rotateVector,
   scale,
@@ -74,6 +75,7 @@ import {
   type HumanoidTaskSpaceServoTarget
 } from "./task-space-servo.js";
 import type {
+  HumanoidControllerInferenceOptions,
   HumanoidControllerDescriptor,
   HumanoidControllerState,
   HumanoidJointPositionCommand,
@@ -141,6 +143,15 @@ export interface HumanoidObjectSensorSnapshot {
 export interface HumanoidSolidSensorSnapshot {
   sensor: HumanoidObjectSensorSnapshot["sensor"];
   solids: Record<string, HumanoidSceneSolid>;
+}
+
+export interface HumanoidHandSurfaceObservation {
+  handSurface: G1HandContactSurfaceName;
+  hand: "left" | "right";
+  worldPosition: Vec3;
+  worldRotation: Quaternion;
+  wristWorldPosition: Vec3;
+  surfaceFromWristWorld: Vec3;
 }
 
 interface HumanoidBalanceSnapshot {
@@ -214,6 +225,21 @@ export interface HumanoidTaskSpaceSolution {
   }>;
 }
 
+export class HumanoidTaskSpaceIkError extends Error {
+  readonly residuals: HumanoidTaskSpaceSolution["residuals"];
+
+  constructor(residuals: HumanoidTaskSpaceSolution["residuals"]) {
+    super(`Task-space IK did not converge: ${residuals.map((entry) => (
+      `${entry.body}=${entry.error.toFixed(3)}m`
+        + (entry.orientationError === undefined
+          ? ""
+          : `/${entry.orientationError.toFixed(3)}rad`)
+    )).join(", ")}`);
+    this.name = "HumanoidTaskSpaceIkError";
+    this.residuals = structuredClone(residuals);
+  }
+}
+
 export class HumanoidSimulation {
   readonly #runtime: MujocoModule;
   readonly #model: MujocoModel;
@@ -232,6 +258,7 @@ export class HumanoidSimulation {
   readonly #handBodyIds: number[];
   readonly #handBodyNamesById = new Map<number, G1HandLinkName>();
   readonly #handSurfaceNamesByGeomId = new Map<number, G1HandContactSurfaceName>();
+  readonly #handSurfaceGeometryIds = new Map<G1HandContactSurfaceName, number>();
   readonly #handActuator: G1HandActuator;
   readonly #objectJointBindings: readonly MujocoJointBinding[];
   readonly #objectNamesByBodyId = new Map<number, string>();
@@ -317,14 +344,17 @@ export class HumanoidSimulation {
       this.#handBodyNamesById.set(this.#handBodyIds[index]!, name);
     });
     for (const surface of G1_HAND_CONTACT_SURFACE_NAMES) {
-      const geometryId = runtime.mj_name2id(
+      const namedGeometryId = runtime.mj_name2id(
         model,
         runtime.mjtObj.mjOBJ_GEOM.value,
         g1HandContactGeomName(surface)
       );
-      if (geometryId < 0) continue;
+      const geometryId = namedGeometryId >= 0
+        ? namedGeometryId
+        : this.#soleHandSurfaceGeometry(surface);
       this.#assertHandSurfaceGeometry(surface, geometryId);
       this.#handSurfaceNamesByGeomId.set(geometryId, surface);
+      this.#handSurfaceGeometryIds.set(surface, geometryId);
     }
     (options.objects ?? []).forEach((object, index) => {
       this.#objectNamesByBodyId.set(this.#id("body", `world-object-${index}`), object.id);
@@ -365,18 +395,55 @@ export class HumanoidSimulation {
     assertSpawn(this.#spawn);
   }
 
-  async step(reference: HumanoidReference): Promise<HumanoidSimulationSnapshot> {
+  async step(
+    reference: HumanoidReference,
+    options: {
+      noslipIterations?: number;
+      trackedJointPolicyCommand?: HumanoidControllerInferenceOptions[
+        "trackedJointPolicyCommand"
+      ];
+    } = {}
+  ): Promise<HumanoidSimulationSnapshot> {
     this.#validateReference(reference);
-    const command = await this.#controller.infer(this.#policyState(), reference);
+    const noslipIterations = options.noslipIterations ?? 0;
+    if (!Number.isSafeInteger(noslipIterations)
+      || noslipIterations < 0
+      || noslipIterations > 3) {
+      throw new Error("MuJoCo NoSlip iterations must be an integer from 0 to 3");
+    }
+    if (options.trackedJointPolicyCommand !== undefined
+      && options.trackedJointPolicyCommand !== "measured"
+      && options.trackedJointPolicyCommand !== "neutral") {
+      throw new Error("Tracked-joint policy command must be measured or neutral");
+    }
+    const controllerOptions: HumanoidControllerInferenceOptions =
+      options.trackedJointPolicyCommand === undefined
+        ? {}
+        : { trackedJointPolicyCommand: options.trackedJointPolicyCommand };
+    const command = await this.#controller.infer(
+      this.#policyState(),
+      reference,
+      controllerOptions
+    );
     const substeps = Math.round(
       this.#controller.descriptor.controlStepSeconds
       / this.#controller.descriptor.physicsStepSeconds
     );
-    for (let step = 0; step < substeps; step += 1) {
-      this.#applyCommand(command);
-      this.#runtime.mj_step(this.#model, this.#data);
+    const previousNoslipIterations = this.#model.opt.noslip_iterations;
+    this.#model.opt.noslip_iterations = noslipIterations;
+    try {
+      for (let step = 0; step < substeps; step += 1) {
+        this.#applyCommand(command);
+        this.#runtime.mj_step(this.#model, this.#data);
+      }
+    } finally {
+      this.#model.opt.noslip_iterations = previousNoslipIterations;
     }
-    this.#controller.advanceHistory(this.#policyState(), reference);
+    this.#controller.advanceHistory(
+      this.#policyState(),
+      reference,
+      controllerOptions
+    );
     return this.snapshot();
   }
 
@@ -415,6 +482,30 @@ export class HumanoidSimulation {
     return Object.fromEntries(G1_HAND_JOINT_NAMES.map((name, index) => (
       [name, this.#handCommandTargets[index]!]
     ))) as Record<G1HandJointName, number>;
+  }
+
+  handSurfaceObservations(
+    snapshot: HumanoidSimulationSnapshot
+  ): HumanoidHandSurfaceObservation[] {
+    return G1_HAND_CONTACT_SURFACE_NAMES.map((handSurface) => {
+      const geometryId = this.#handSurfaceGeometryIds.get(handSurface);
+      if (geometryId === undefined) {
+        throw new Error(`G1 hand contact surface geometry is missing: ${handSurface}`);
+      }
+      const hand = handSurface.startsWith("left_") ? "left" as const : "right" as const;
+      const wrist = snapshot.links[
+        hand === "left" ? "left_wrist_yaw_link" : "right_wrist_yaw_link"
+      ];
+      const worldPosition = worldVector(this.#data.geom_xpos, geometryId * 3);
+      return {
+        handSurface,
+        hand,
+        worldPosition,
+        worldRotation: worldRotationMatrix(this.#data.geom_xmat, geometryId * 9),
+        wristWorldPosition: { ...wrist.position },
+        surfaceFromWristWorld: subtract(worldPosition, wrist.position)
+      };
+    });
   }
 
   snapshot(): HumanoidSimulationSnapshot {
@@ -862,12 +953,7 @@ export class HumanoidSimulation {
             }
           : {})
       }));
-      throw new Error(`Task-space IK did not converge: ${residuals.map((entry) => (
-        `${entry.body}=${entry.error.toFixed(3)}m`
-          + (entry.orientationError === undefined
-            ? ""
-            : `/${entry.orientationError.toFixed(3)}rad`)
-      )).join(", ")}`);
+      throw new HumanoidTaskSpaceIkError(residuals);
     } finally {
       this.restoreState(saved);
     }
@@ -1199,13 +1285,23 @@ export class HumanoidSimulation {
       ?? null;
   }
 
+  #soleHandSurfaceGeometry(surface: G1HandContactSurfaceName): number {
+    const bodyId = this.#id("body", g1HandSurfaceBodyName(surface));
+    const geometryIds = Array.from({ length: this.#model.ngeom }, (_, index) => index)
+      .filter((geometryId) => this.#model.geom_bodyid[geometryId] === bodyId);
+    if (geometryIds.length !== 1) {
+      throw new Error(
+        `MuJoCo hand contact surface ${surface} has ${geometryIds.length} collision geoms`
+      );
+    }
+    return geometryIds[0]!;
+  }
+
   #assertHandSurfaceGeometry(
     surface: G1HandContactSurfaceName,
     geometryId: number
   ): void {
-    const expectedBody = surface.endsWith("_hand_palm_link")
-      ? surface.replace("_hand_palm_link", "_wrist_yaw_link")
-      : surface;
+    const expectedBody = g1HandSurfaceBodyName(surface);
     const expectedBodyId = this.#runtime.mj_name2id(
       this.#model,
       this.#runtime.mjtObj.mjOBJ_BODY.value,
@@ -1236,6 +1332,12 @@ export class HumanoidSimulation {
   }
 }
 
+function g1HandSurfaceBodyName(surface: G1HandContactSurfaceName): string {
+  return surface.endsWith("_hand_palm_link")
+    ? surface.replace("_hand_palm_link", "_wrist_yaw_link")
+    : surface;
+}
+
 function worldVector(values: ArrayLike<number>, offset: number): Vec3 {
   return {
     x: requiredValue(values, offset + 1),
@@ -1255,6 +1357,20 @@ function worldQuaternion(values: ArrayLike<number>, offset: number): Quaternion 
     z: requiredValue(values, offset + 1),
     w: requiredValue(values, offset)
   };
+}
+
+function worldRotationMatrix(values: ArrayLike<number>, offset: number): Quaternion {
+  return quaternionFromRotationMatrix([
+    requiredValue(values, offset + 4),
+    requiredValue(values, offset + 5),
+    requiredValue(values, offset + 3),
+    requiredValue(values, offset + 7),
+    requiredValue(values, offset + 8),
+    requiredValue(values, offset + 6),
+    requiredValue(values, offset + 1),
+    requiredValue(values, offset + 2),
+    requiredValue(values, offset)
+  ]);
 }
 
 function requiredValue(values: ArrayLike<number>, index: number): number {
@@ -1319,6 +1435,12 @@ function assertControllerTiming(controller: HumanoidWholeBodyController): void {
     || descriptor.implementation.trim().length === 0
     || !Number.isFinite(descriptor.controlStepSeconds)
     || !Number.isFinite(descriptor.physicsStepSeconds)
+    || (descriptor.commandResponseHorizonSeconds !== undefined
+      && (!Number.isFinite(descriptor.commandResponseHorizonSeconds)
+        || descriptor.commandResponseHorizonSeconds <= 0))
+    || (descriptor.minimumEffectivePlanarSpeedMetersPerSecond !== undefined
+      && (!Number.isFinite(descriptor.minimumEffectivePlanarSpeedMetersPerSecond)
+        || descriptor.minimumEffectivePlanarSpeedMetersPerSecond <= 0))
     || descriptor.controlStepSeconds <= 0
     || descriptor.physicsStepSeconds <= 0
     || ratio < 1

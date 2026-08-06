@@ -15,7 +15,8 @@ export const ModelDecisionRefSchema = z.object({
   response_id: z.string().trim().min(1),
   response_output_sha256: Sha256Schema,
   tool_call_id: z.string().trim().min(1),
-  tool_arguments_sha256: Sha256Schema
+  tool_arguments_sha256: Sha256Schema,
+  normalized_tool_arguments_sha256: Sha256Schema.optional()
 }).strict();
 
 export type ModelDecisionRef = z.infer<typeof ModelDecisionRefSchema>;
@@ -132,6 +133,16 @@ export function modelPayloadSha256(value: unknown): string {
   return createHash("sha256")
     .update(JSON.stringify(canonicalValue(value)))
     .digest("hex");
+}
+
+export function modelToolArgumentsSha256(rawArguments: string): string {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(rawArguments);
+  } catch {
+    payload = rawArguments;
+  }
+  return modelPayloadSha256(payload);
 }
 
 function canonicalValue(value: unknown): unknown {

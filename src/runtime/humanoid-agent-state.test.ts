@@ -112,7 +112,10 @@ describe("humanoid Agent state recovery identity", () => {
     await Promise.all([...sessions.values()].map((session) => session.addItems([
       { role: "user", content: "failed transport branch" }
     ])));
-    await restoreHumanoidSessionBaseline(sessions, baseline);
+    expect(await restoreHumanoidSessionBaseline(sessions, baseline)).toEqual([
+      "coordinator",
+      "worker"
+    ]);
 
     expect(await sessions.get("coordinator")!.getItems()).toEqual([
       { role: "user", content: "coordinator baseline" }
@@ -120,6 +123,28 @@ describe("humanoid Agent state recovery identity", () => {
     expect(await sessions.get("worker")!.getItems()).toEqual([
       { role: "user", content: "worker baseline" }
     ]);
+  });
+
+  it("reports only Sessions whose durable history was actually rolled back", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hear-agent-session-changed-"));
+    temporaryDirectories.push(directory);
+    const sessions = new Map([
+      ["coordinator", new FileSession(join(directory, "coordinator.json"), "coordinator")],
+      ["worker", new FileSession(join(directory, "worker.json"), "worker")]
+    ]);
+    await sessions.get("coordinator")!.addItems([
+      { role: "user", content: "coordinator baseline" }
+    ]);
+    await sessions.get("worker")!.addItems([
+      { role: "user", content: "worker baseline" }
+    ]);
+    const baseline = await captureHumanoidSessionBaseline(sessions);
+    await sessions.get("worker")!.addItems([
+      { role: "user", content: "abandoned suffix" }
+    ]);
+
+    expect(await restoreHumanoidSessionBaseline(sessions, baseline)).toEqual(["worker"]);
+    expect(await restoreHumanoidSessionBaseline(sessions, baseline)).toEqual([]);
   });
 
   it("rejects a changed Session set before restoring any call baseline", async () => {

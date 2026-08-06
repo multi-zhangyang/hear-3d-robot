@@ -25,6 +25,16 @@ export interface HumanoidReferenceTarget {
   rootPitch?: number;
 }
 
+const STATIONARY_POSTURE_HOLD_JOINT_INDEXES = HUMANOID_JOINT_NAMES.flatMap(
+  (name, index) => (
+    name.includes("_shoulder_")
+      || name.includes("_elbow_")
+      || name.includes("_wrist_")
+      ? [index]
+      : []
+  )
+);
+
 export function neutralHumanoidReference(): HumanoidReference {
   return {
     jointPositions: Float64Array.from(YAHMP_POLICY.defaultJointPositions),
@@ -118,8 +128,8 @@ export function releaseReferenceTracking(
   assertHumanoidReference(reference);
   return {
     ...reference,
-    jointPositions: reference.jointPositions.slice(),
-    jointVelocities: reference.jointVelocities.slice(),
+    jointPositions: Float64Array.from(YAHMP_POLICY.defaultJointPositions),
+    jointVelocities: new Float64Array(HUMANOID_JOINT_NAMES.length),
     jointTrackingWeights: new Float64Array(HUMANOID_JOINT_NAMES.length),
     rootVelocity: [...reference.rootVelocity]
   };
@@ -128,9 +138,19 @@ export function releaseReferenceTracking(
 export function stationaryHumanoidReference(
   reference: HumanoidReference
 ): HumanoidReference {
-  const released = releaseReferenceTracking(reference);
+  assertHumanoidReference(reference);
+  const jointPositions = reference.jointPositions.slice();
+  const jointTrackingWeights = new Float64Array(HUMANOID_JOINT_NAMES.length);
+  for (const index of STATIONARY_POSTURE_HOLD_JOINT_INDEXES) {
+    if (reference.jointTrackingWeights[index]! > 0) {
+      jointTrackingWeights[index] = reference.jointTrackingWeights[index]!;
+    }
+  }
   return {
-    ...released,
+    ...reference,
+    jointPositions,
+    jointVelocities: new Float64Array(HUMANOID_JOINT_NAMES.length),
+    jointTrackingWeights,
     rootVelocity: [0, 0],
     rootYawVelocity: 0
   };

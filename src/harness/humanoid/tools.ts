@@ -10,8 +10,14 @@ import {
   type HumanoidActionName
 } from "./actions.js";
 import type { JsonValue } from "../../domain/schema.js";
-import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
-import { invalidToolInputResult } from "../tool-input-recovery.js";
+import {
+  modelPayloadSha256,
+  modelToolArgumentsSha256
+} from "../../domain/model-call-authority.js";
+import {
+  createToolInputRecovery,
+  invalidToolInputResult,
+} from "../tool-input-recovery.js";
 import type {
   HumanoidActionInvoker,
   HumanoidActionReceipt,
@@ -20,6 +26,7 @@ import {
   HUMANOID_EXPERIENCE_OUTCOMES,
   HUMANOID_GOAL_PREDICATE_TYPES
 } from "./embodied-recall.js";
+import { modelToolReceiptDetail } from "./receipt-context.js";
 
 export type { HumanoidActionInvoker } from "./runtime.js";
 
@@ -94,13 +101,6 @@ const HumanoidEmbodiedRecallInputSchema = z.object({
       message: "Exact source recall and semantic experience filters are separate queries"
     });
   }
-  if (semantic && input.before_sequence != null) {
-    context.addIssue({
-      code: "custom",
-      path: ["before_sequence"],
-      message: "Semantic experience recall uses before_experience_sequence"
-    });
-  }
 });
 
 export interface HumanoidEmbodiedRecallInvoker {
@@ -168,16 +168,24 @@ function humanoidActionTool(
   name: HumanoidActionName
 ): FunctionTool<unknown, z.ZodObject, string> {
   const parameters: z.ZodObject = HumanoidActionInputs[name];
-  return tool<z.ZodObject, unknown, string>({
+  const inputRecovery = createToolInputRecovery();
+  const actionTool = tool<z.ZodObject, unknown, string>({
     name,
     description: HumanoidActionDescriptions[name],
     parameters,
     strict: true,
+    isEnabled: () => runtime.isActionAvailable?.(name, agentId) ?? true,
     timeoutBehavior: "raise_exception",
     errorFunction: (_context, error) => invalidToolInputResult(error, name),
     execute: async (input, _context, details) => {
-      const transactionId = details?.toolCall?.callId;
+      const toolCall = details?.toolCall;
+      const transactionId = toolCall?.callId;
       if (!transactionId) throw new Error(`SDK did not provide a call ID for ${name}`);
+      if (toolCall.name !== name) {
+        throw new Error(`SDK tool identity mismatch for ${name}`);
+      }
+      const argumentsSha256 = modelToolArgumentsSha256(toolCall.arguments);
+      const normalizedArgumentsSha256 = modelPayloadSha256(input);
       const receipt: HumanoidActionReceipt = await runtime.invoke(
         name,
         input,
@@ -186,12 +194,60 @@ function humanoidActionTool(
         {
           tool_call_id: transactionId,
           tool_name: name,
-          arguments_sha256: modelPayloadSha256(input)
+          arguments_sha256: argumentsSha256,
+          ...(normalizedArgumentsSha256 === argumentsSha256
+            ? {}
+            : { normalized_arguments_sha256: normalizedArgumentsSha256 })
         }
       );
-      return JSON.stringify(receipt);
+      return humanoidActionReceiptModelOutput(receipt);
     }
   });
+  if (name === "plan_whole_body_motion_candidates") {
+    actionTool.parameters = referencedJsonSchema(parameters);
+  }
+  const invoke = actionTool.invoke;
+  actionTool.invoke = async (context, input, details) => {
+    const rejection = inputRecovery.preflight(input, parameters, name);
+    if (rejection !== undefined) return rejection;
+    return invoke(context, input, details);
+  };
+  return actionTool;
+}
+
+function humanoidActionReceiptModelOutput(receipt: HumanoidActionReceipt): string {
+  return JSON.stringify({
+    transactionId: receipt.transactionId,
+    agentId: receipt.agentId,
+    action: receipt.action,
+    accepted: receipt.accepted,
+    code: receipt.code,
+    worldBeforeRevision: receipt.worldBeforeRevision,
+    worldAfterRevision: receipt.worldAfterRevision,
+    frameCount: receipt.frameCount,
+    channels: receipt.channels,
+    detail: modelToolReceiptDetail(receipt),
+    committedAt: receipt.committedAt,
+    durable_evidence: {
+      source_ref: `action:${receipt.transactionId}`,
+      receipt_sha256: modelPayloadSha256(receipt),
+      full_receipt_persisted: true
+    }
+  });
+}
+
+function referencedJsonSchema(
+  parameters: z.ZodObject
+): FunctionTool<unknown, z.ZodObject, string>["parameters"] {
+  const schema = z.toJSONSchema(parameters, {
+    cycles: "ref",
+    reused: "ref",
+    unrepresentable: "any"
+  });
+  if (schema.type !== "object" || schema.properties === undefined) {
+    throw new Error("Humanoid action parameters must produce an object JSON schema");
+  }
+  return schema as FunctionTool<unknown, z.ZodObject, string>["parameters"];
 }
 
 function humanoidActionNames(): HumanoidActionName[] {

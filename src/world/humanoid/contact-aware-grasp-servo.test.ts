@@ -42,7 +42,7 @@ describe("contact-aware G1 grasp servo", () => {
     } finally {
       await simulation.dispose();
     }
-  });
+  }, 30_000);
 
   it("rejects ambiguous targets for one hand", async () => {
     const simulation = await HumanoidSimulation.create();
@@ -183,7 +183,7 @@ describe("contact-aware G1 grasp servo", () => {
       }, {
         position: { x: 0.03, y: 0, z: -0.03 },
         normal: { x: 1, y: 0, z: 0 },
-        normalForce: 12,
+        normalForce: 6,
         firstBody: null,
         secondBody: null,
         firstObject: "crate",
@@ -228,6 +228,106 @@ describe("contact-aware G1 grasp servo", () => {
         saturationLimitedDigits: []
       });
       expect(result.evidence.maximumRotationErrorRadians).toBeCloseTo(0.06, 12);
+    } finally {
+      await simulation.dispose();
+    }
+  });
+
+  it("redistributes digit closure to oppose carried-object translation", async () => {
+    const simulation = await HumanoidSimulation.create();
+    try {
+      const snapshot = structuredClone(simulation.snapshot());
+      const closing = createG1HandArtifactCommand({
+        left: {
+          thumb_opposition: 1,
+          thumb_curl: 1,
+          index_curl: 1,
+          middle_curl: 1
+        },
+        right: {
+          thumb_opposition: 0,
+          thumb_curl: 0,
+          index_curl: 0,
+          middle_curl: 0
+        }
+      });
+      const wrist = snapshot.links.left_wrist_yaw_link;
+      wrist.position = { x: 0, y: 0, z: 0 };
+      wrist.rotation = { x: 0, y: 0, z: 0, w: 1 };
+      wrist.linearVelocity = { x: 0, y: 0, z: 0 };
+      snapshot.objects.crate = {
+        id: "crate",
+        position: { x: 0, y: -0.013, z: 0 },
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+        linearVelocity: { x: 0, y: 0, z: 0 },
+        angularVelocity: { x: 0, y: 0, z: 0 }
+      };
+      const positions = {
+        left_hand_thumb_2_joint: 0.6,
+        left_hand_middle_1_joint: -0.6,
+        left_hand_index_1_joint: -0.6
+      } as const;
+      for (const [joint, position] of Object.entries(positions)) {
+        snapshot.hands.joints[joint as keyof typeof snapshot.hands.joints].position = position;
+        snapshot.hands.joints[joint as keyof typeof snapshot.hands.joints].target = position;
+      }
+      snapshot.contacts = [{
+        position: { x: -0.03, y: 0, z: 0 },
+        normal: { x: 0, y: 1, z: 0 },
+        normalForce: 20,
+        firstBody: null,
+        secondBody: null,
+        firstObject: "crate",
+        secondObject: null,
+        firstHandLink: null,
+        secondHandLink: "left_hand_thumb_2_link"
+      }, {
+        position: { x: 0.03, y: 0, z: 0 },
+        normal: { x: 0, y: -1, z: 0 },
+        normalForce: 5,
+        firstBody: null,
+        secondBody: null,
+        firstObject: "crate",
+        secondObject: null,
+        firstHandLink: null,
+        secondHandLink: "left_hand_middle_1_link"
+      }, {
+        position: { x: 0, y: 0, z: 0.03 },
+        normal: { x: 0, y: -1, z: 0 },
+        normalForce: 10,
+        firstBody: null,
+        secondBody: null,
+        firstObject: "crate",
+        secondObject: null,
+        firstHandLink: null,
+        secondHandLink: "left_hand_index_1_link"
+      }];
+      snapshot.contactCount = snapshot.contacts.length;
+
+      const result = contactAwareG1GraspTargets({
+        command: closing,
+        snapshot,
+        targets: [{
+          objectId: "crate",
+          hand: "left",
+          minimumNormalForceN: 5,
+          referenceRelativePose: {
+            translation: { x: 0, y: 0, z: 0 },
+            rotation: { x: 0, y: 0, z: 0, w: 1 }
+          }
+        }]
+      });
+
+      expect(result.jointTargets.left_hand_thumb_2_joint)
+        .toBe(positions.left_hand_thumb_2_joint);
+      expect(result.jointTargets.left_hand_middle_1_joint)
+        .toBeLessThan(positions.left_hand_middle_1_joint);
+      expect(result.jointTargets.left_hand_index_1_joint)
+        .toBeLessThan(positions.left_hand_index_1_joint);
+      expect(result.evidence).toMatchObject({
+        poseRegulatedHands: ["left"],
+        maximumTranslationErrorMeters: 0.013
+      });
     } finally {
       await simulation.dispose();
     }

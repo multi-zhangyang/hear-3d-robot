@@ -576,7 +576,7 @@ describe("humanoid physical grasp transport", () => {
       const navigation = await world.planNavigation({
         x: root.x,
         y: 0,
-        z: root.z + 0.8
+        z: root.z + 0.6
       });
       expect(navigation.accepted, JSON.stringify({
         reason: navigation.reason,

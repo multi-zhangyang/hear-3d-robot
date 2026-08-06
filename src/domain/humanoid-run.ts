@@ -195,7 +195,7 @@ export const HumanoidEmbodiedEpisodeSchema = z.object({
     "plan_whole_body_motion_candidates",
     "plan_humanoid_navigation"
   ]).optional(),
-  candidate_count: z.number().int().min(2).max(3).optional(),
+  candidate_count: z.number().int().min(1).max(3).optional(),
   selected_rank: z.number().int().min(1).max(3).optional(),
   selected_candidate_id: z.string().min(1).optional(),
   motion_option: z.object({

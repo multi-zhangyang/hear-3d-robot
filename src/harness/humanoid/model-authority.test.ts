@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AgentManifest } from "../../domain/agent-manifest.js";
 import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
+import { assertGoalModelSource } from "../../domain/goal-epoch.js";
 import {
   modelPayloadSha256,
   type ModelCallLifecycleRecord
@@ -199,7 +200,7 @@ describe("HumanoidModelAuthority", () => {
       tool_call_id: toolCallId,
       tool_name: "submit_goal_candidates",
       arguments_sha256: argumentsSha256
-    }, "submit_goal_candidates")).toMatchObject({
+    }, "submit_goal_candidates", { candidates: ["a", "b"] })).toMatchObject({
       agent_id: HUMANOID_AGENT_IDS.goalManager,
       model_call_id: MODEL_CALL_ID,
       tool_call_id: toolCallId
@@ -216,16 +217,141 @@ describe("HumanoidModelAuthority", () => {
       agentId: HUMANOID_AGENT_IDS.goalManager
     })).toThrow("tool authority mismatch");
   });
+
+  it("keeps a durably verified Goal source authorized across an archived Agent epoch", async () => {
+    const records: ModelCallLifecycleRecord[] = [];
+    const archived = {
+      ...manifest(),
+      epoch_id: "44444444-4444-4444-8444-444444444444",
+      identity_sha256: "d".repeat(64)
+    } as AgentManifest;
+    const authority = createAuthority(
+      records,
+      async (record) => { records.push(structuredClone(record)); },
+      [archived]
+    );
+    const toolCallId = "archived-goal-proposal";
+    const argumentsSha256 = modelPayloadSha256({ candidates: ["archived"] });
+    await authority.recordStarted(
+      HUMANOID_AGENT_IDS.goalManager,
+      undefined,
+      MODEL_CALL_ID,
+      STARTED_AT
+    );
+    await authority.recordCompleted({
+      modelCallId: MODEL_CALL_ID,
+      agentId: HUMANOID_AGENT_IDS.goalManager,
+      responseId: "archived-goal-response",
+      responseOutputSha256: RESPONSE_SHA256,
+      toolCalls: [{
+        toolCallId,
+        toolName: "submit_goal_candidates",
+        argumentsSha256
+      }],
+      at: COMPLETED_AT
+    });
+    const source = {
+      agent_id: HUMANOID_AGENT_IDS.goalManager,
+      agent_manifest_sha256: archived.identity_sha256,
+      agent_manifest_epoch_id: archived.epoch_id,
+      model_call_id: MODEL_CALL_ID,
+      response_id: "archived-goal-response",
+      response_output_sha256: RESPONSE_SHA256,
+      tool_call_id: toolCallId,
+      tool_arguments_sha256: argumentsSha256
+    };
+    const harness = authority.goalHarness({
+      evidence: new Map(),
+      scenario: {} as never
+    });
+
+    expect(() => assertGoalModelSource(
+      source,
+      harness,
+      "submit_goal_candidates"
+    )).not.toThrow();
+    expect(() => assertGoalModelSource(
+      { ...source, agent_manifest_sha256: "e".repeat(64) },
+      harness,
+      "submit_goal_candidates"
+    )).toThrowError(expect.objectContaining({ code: "unauthorized_model_source" }));
+  });
+
+  it("binds raw model arguments and normalized SDK input without weakening authority", async () => {
+    const records: ModelCallLifecycleRecord[] = [];
+    const authority = createAuthority(records);
+    const transactionId = "normalized-model-tool";
+    const rawInput = {
+      target: { x: 2, y: 0, z: 3 },
+      optional_sdk_field: null
+    };
+    const normalizedInput = { target: { x: 2, y: 0, z: 3 } };
+    const rawArgumentsSha256 = modelPayloadSha256(rawInput);
+    const normalizedArgumentsSha256 = modelPayloadSha256(normalizedInput);
+    await authority.recordStarted(
+      HUMANOID_AGENT_IDS.motion,
+      cycle,
+      MODEL_CALL_ID,
+      STARTED_AT
+    );
+    await authority.recordCompleted({
+      modelCallId: MODEL_CALL_ID,
+      agentId: HUMANOID_AGENT_IDS.motion,
+      responseId: "response-normalized",
+      responseOutputSha256: RESPONSE_SHA256,
+      toolCalls: [{
+        toolCallId: transactionId,
+        toolName: "plan_humanoid_navigation",
+        argumentsSha256: rawArgumentsSha256
+      }],
+      at: COMPLETED_AT
+    });
+
+    const decision = authority.actionModelSource({
+      toolAuthority: {
+        tool_call_id: transactionId,
+        tool_name: "plan_humanoid_navigation",
+        arguments_sha256: rawArgumentsSha256,
+        normalized_arguments_sha256: normalizedArgumentsSha256
+      },
+      expectedToolName: "plan_humanoid_navigation",
+      actionInput: normalizedInput,
+      transactionId,
+      agentId: HUMANOID_AGENT_IDS.motion
+    });
+    expect(decision).toMatchObject({
+      tool_arguments_sha256: rawArgumentsSha256,
+      normalized_tool_arguments_sha256: normalizedArgumentsSha256
+    });
+    expect(() => authority.assertActionDecision({
+      rawDecision: decision,
+      expectedToolName: "plan_humanoid_navigation",
+      actionInput: normalizedInput,
+      transactionId,
+      agentId: HUMANOID_AGENT_IDS.motion,
+      cycle
+    })).not.toThrow();
+    expect(() => authority.assertActionDecision({
+      rawDecision: decision,
+      expectedToolName: "plan_humanoid_navigation",
+      actionInput: { target: { x: 9, y: 0, z: 9 } },
+      transactionId,
+      agentId: HUMANOID_AGENT_IDS.motion,
+      cycle
+    })).toThrow("decision is not authoritative");
+  });
 });
 
 function createAuthority(
   records: ModelCallLifecycleRecord[],
   appendRecord: (record: ModelCallLifecycleRecord) => Promise<void> = async (record) => {
     records.push(structuredClone(record));
-  }
+  },
+  archivedManifests: readonly AgentManifest[] = []
 ): HumanoidModelAuthority {
   return HumanoidModelAuthority.restore({
     manifest: manifest(),
+    archivedManifests,
     nodes: hierarchyNodes(),
     records,
     appendRecord

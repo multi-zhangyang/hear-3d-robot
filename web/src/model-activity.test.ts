@@ -38,7 +38,11 @@ describe("model activity lifecycle", () => {
   });
 
   it("folds completed journal calls without treating a live run as an active request", () => {
-    const activity = modelActivityFromJournal(true, [{
+    const activity = modelActivityFromJournal(false, [{
+      status: "configured",
+      agent_id: "sentry",
+      at: "2026-08-02T23:59:59.000Z"
+    }, {
       status: "contacted",
       agent_id: "sentry",
       at: "2026-08-03T00:00:00.000Z"
@@ -48,6 +52,10 @@ describe("model activity lifecycle", () => {
       at: "2026-08-03T00:00:01.000Z"
     }], true);
     expect(activity).toMatchObject({ phase: "verified", agentId: "sentry" });
+  });
+
+  it("does not invent model readiness for a record with no provider evidence", () => {
+    expect(modelActivityFromJournal(false, [], false).phase).toBe("offline");
   });
 
   it("shows recovery distinctly and settles stale terminal activity", () => {

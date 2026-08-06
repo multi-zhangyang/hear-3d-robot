@@ -30,7 +30,7 @@ import {
 
 const COMPACTOR_AGENT_ID = "humanoid-context-compactor";
 const COMPACTOR_AGENT_NAME = "Context Compactor";
-const HUMANOID_HARNESS_CONTRACT_VERSION = 3;
+const HUMANOID_HARNESS_CONTRACT_VERSION = 4;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",

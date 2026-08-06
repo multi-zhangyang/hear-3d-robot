@@ -14,6 +14,7 @@ import {
 } from "./reference.js";
 import type {
   HumanoidControllerDescriptor,
+  HumanoidControllerInferenceOptions,
   HumanoidControllerState,
   HumanoidJointPositionCommand,
   HumanoidPolicyState,
@@ -50,7 +51,9 @@ export class YahmpController implements HumanoidWholeBodyController {
     implementation: "yahmp_onnx",
     actuation: "joint_position_pd",
     controlStepSeconds: YAHMP_POLICY.controlDt,
-    physicsStepSeconds: YAHMP_POLICY.physicsDt
+    physicsStepSeconds: YAHMP_POLICY.physicsDt,
+    commandResponseHorizonSeconds: 0.2,
+    minimumEffectivePlanarSpeedMetersPerSecond: 0.15
   };
   readonly #session: ort.InferenceSession;
   #previousAction = new Float32Array(HUMANOID_JOINT_NAMES.length);
@@ -68,9 +71,13 @@ export class YahmpController implements HumanoidWholeBodyController {
     this.#session = session;
   }
 
-  reset(state: HumanoidPolicyState, reference: HumanoidReference): void {
+  reset(
+    state: HumanoidPolicyState,
+    reference: HumanoidReference,
+    options: HumanoidControllerInferenceOptions = {}
+  ): void {
     this.#previousAction.fill(0);
-    const current = this.#observationBlock(state, reference);
+    const current = this.#observationBlock(state, reference, options);
     this.#history = Array.from(
       { length: YAHMP_POLICY.historyLength },
       () => current.slice()
@@ -79,10 +86,11 @@ export class YahmpController implements HumanoidWholeBodyController {
 
   async infer(
     state: HumanoidPolicyState,
-    reference: HumanoidReference
+    reference: HumanoidReference,
+    options: HumanoidControllerInferenceOptions = {}
   ): Promise<HumanoidJointPositionCommand> {
-    if (this.#history.length === 0) this.reset(state, reference);
-    const current = this.#observationBlock(state, reference);
+    if (this.#history.length === 0) this.reset(state, reference, options);
+    const current = this.#observationBlock(state, reference, options);
     const observation = new Float32Array(YAHMP_POLICY.observationSize);
     observation.set(current, 0);
     let offset = current.length;
@@ -126,13 +134,17 @@ export class YahmpController implements HumanoidWholeBodyController {
     };
   }
 
-  advanceHistory(state: HumanoidPolicyState, reference: HumanoidReference): void {
+  advanceHistory(
+    state: HumanoidPolicyState,
+    reference: HumanoidReference,
+    options: HumanoidControllerInferenceOptions = {}
+  ): void {
     if (this.#history.length === 0) {
-      this.reset(state, reference);
+      this.reset(state, reference, options);
       return;
     }
     this.#history.shift();
-    this.#history.push(this.#observationBlock(state, reference));
+    this.#history.push(this.#observationBlock(state, reference, options));
   }
 
   captureState(): HumanoidControllerState {
@@ -165,7 +177,8 @@ export class YahmpController implements HumanoidWholeBodyController {
 
   #observationBlock(
     state: HumanoidPolicyState,
-    reference: HumanoidReference
+    reference: HumanoidReference,
+    options: HumanoidControllerInferenceOptions
   ): Float32Array {
     assertHumanoidReference(reference);
     if (state.jointPositions.length !== HUMANOID_JOINT_NAMES.length
@@ -173,11 +186,14 @@ export class YahmpController implements HumanoidWholeBodyController {
       throw new Error("Humanoid policy state has an invalid joint count");
     }
     const projectedGravity = inverseRotate(state.rootQuaternion, [0, 0, -1]);
+    const neutralTrackedCommand = options.trackedJointPolicyCommand === "neutral";
     const policyReferencePositions = Array.from(
       reference.jointPositions,
       (value, index) => mix(
         value,
-        state.jointPositions[index]!,
+        neutralTrackedCommand
+          ? YAHMP_POLICY.defaultJointPositions[index]!
+          : state.jointPositions[index]!,
         reference.jointTrackingWeights[index]!
       )
     );
@@ -185,7 +201,7 @@ export class YahmpController implements HumanoidWholeBodyController {
       reference.jointVelocities,
       (value, index) => mix(
         value,
-        state.jointVelocities[index]!,
+        neutralTrackedCommand ? 0 : state.jointVelocities[index]!,
         reference.jointTrackingWeights[index]!
       )
     );

@@ -35,7 +35,7 @@ import type {
 } from "./runtime.js";
 
 const EXECUTION_FRAME_CHECKPOINT_INTERVAL = 10;
-const STATIONARY_FRAME_CHECKPOINT_INTERVAL = 50;
+const STATIONARY_CHECKPOINT_INTERVAL_SECONDS = 5 * 60;
 
 type HumanoidPersistenceCut = Awaited<
   ReturnType<HumanoidWorld["capturePersistenceState"]>
@@ -57,6 +57,7 @@ export class HumanoidPhysicalExecutionRuntime {
   }) => Promise<void>;
   readonly #signal: AbortSignal | undefined;
   readonly #physicalTrajectories = new Map<string, PhysicalTrajectorySummary>();
+  #lastStationaryCheckpointSimulationTime: number;
 
   constructor(input: {
     runId: string;
@@ -83,6 +84,8 @@ export class HumanoidPhysicalExecutionRuntime {
     this.#persist = input.persist;
     this.#emitFrame = input.emitFrame;
     this.#signal = input.signal;
+    this.#lastStationaryCheckpointSimulationTime =
+      input.checkpoint().world.robot.simulatedTime;
   }
 
   assertExecutionOwner(transactionId: string): void {
@@ -216,10 +219,13 @@ export class HumanoidPhysicalExecutionRuntime {
     checkpoint.goal_progress = advanced?.progress ?? null;
     checkpoint.checker = advanced?.checker ?? null;
     if (source === "stationary") {
-      if (frame.frame % STATIONARY_FRAME_CHECKPOINT_INTERVAL === 0) {
+      if (frame.robot.simulatedTime - this.#lastStationaryCheckpointSimulationTime
+        >= STATIONARY_CHECKPOINT_INTERVAL_SECONDS) {
         const cut = await this.#capturePhysicalCut();
         this.#applyPhysicalCut(cut);
         await this.#persist();
+        this.#lastStationaryCheckpointSimulationTime =
+          cut.world.robot.simulatedTime;
       }
     } else {
       const [entry] = activeActionExecutions(checkpoint.action_execution_ledger);
@@ -231,7 +237,7 @@ export class HumanoidPhysicalExecutionRuntime {
       this.#applyPhysicalCut(cut);
       await this.#persistExecutionCut(cut);
     }
-    this.#signal?.throwIfAborted();
+    if (this.#signal?.aborted) return;
     await this.#publishFrame(frame, advanced, source);
   }
 
@@ -249,7 +255,7 @@ export class HumanoidPhysicalExecutionRuntime {
     checkpoint.goal_progress = advanced?.progress ?? null;
     checkpoint.checker = advanced?.checker ?? null;
     await this.#persistExecutionCut(cut);
-    this.#signal?.throwIfAborted();
+    if (this.#signal?.aborted) return;
     await this.#publishFrame(frame, advanced, "execution");
   }
 

@@ -4,10 +4,12 @@ import { resolve } from "node:path";
 import {
   Runner,
   RunState,
+  UserError,
   setTracingDisabled,
   type RunStreamEvent
 } from "@openai/agents";
 import {
+  DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS,
   providerConfigForRole,
   type ProviderConfig,
   type RuntimeCatalog
@@ -40,11 +42,18 @@ import { createHumanoidRunCheckpoint } from "../harness/humanoid/run-checkpoint.
 import { HumanoidRunRuntime } from "../harness/humanoid/run-runtime.js";
 import { assertHumanoidPhysicalWorldDeltaRecovery } from "../harness/humanoid/physical-world-delta.js";
 import {
+  ModelDecisionStallError,
   modelDecisionStallFrom,
+  modelTransportInterruptionAgentIdFrom,
   withModelTelemetry
 } from "../harness/model-telemetry.js";
 import { providerEventJson, sdkEventJson } from "../harness/sdk-events.js";
-import { createConfiguredModel, providerIdentity } from "../model/factory.js";
+import {
+  createConfiguredModel,
+  promptCacheAffinityKey,
+  providerIdentity,
+  type PromptCacheRequestTrace
+} from "../model/factory.js";
 import { FileSession } from "../persistence/file-session.js";
 import type { MutationFence } from "../persistence/mutation-fence.js";
 import { RunStore } from "../persistence/run-store.js";
@@ -59,11 +68,13 @@ import {
   captureHumanoidSessionStateIdentity,
   humanoidAgentStateFingerprint,
   restoreHumanoidSessionBaseline,
-  restoreHumanoidSessionStateBaseline
+  restoreHumanoidSessionStateBaseline,
+  type HumanoidSessionBaseline
 } from "./humanoid-agent-state.js";
 import {
-  ConsecutiveTransportRecovery,
+  PerAgentTransportRecovery,
   isTransportInterruption,
+  transportStatusCode,
   transportRetryPlan
 } from "./transport-recovery.js";
 import { HumanoidWorld } from "../world/humanoid/world.js";
@@ -72,7 +83,9 @@ import { drawSeed } from "../world/world-generator.js";
 setTracingDisabled(true);
 
 const MAX_TRANSPORT_RECOVERIES = 8;
+const SERVER_ERROR_CONTEXT_RECOVERY_ATTEMPT = 3;
 const MAX_MODEL_DECISION_RECOVERIES = 3;
+const HUMANOID_PROMPT_CACHE_NAMESPACE = "hear-humanoid-agent-profile-v1";
 
 export interface HumanoidMissionRunResult {
   runId: string;
@@ -139,6 +152,7 @@ export async function resumeHumanoidMission(input: {
   runDir: string;
   catalog: RuntimeCatalog;
   provider: ProviderConfig;
+  freshAgentEpoch?: boolean;
   eventSink?: RuntimeEventSink;
   signal?: AbortSignal;
   mutationFence?: MutationFence;
@@ -152,6 +166,9 @@ export async function resumeHumanoidMission(input: {
   }
   const checkpoint = await store.readHumanoidCheckpoint();
   if (checkpoint.status === "succeeded") throw new Error("A succeeded run cannot be resumed");
+  if (input.freshAgentEpoch) {
+    await store.archiveCurrentAgentEpoch();
+  }
   const scenarioChunks = await store.readScenarioChunkDeltaState();
   assertHumanoidPhysicalWorldDeltaRecovery({
     scenario: store.definition.scenario,
@@ -189,12 +206,22 @@ async function executeHumanoidMission(input: {
   resumed: boolean;
   signal?: AbortSignal;
 }): Promise<HumanoidMissionRunResult> {
-  const transportRecovery = new ConsecutiveTransportRecovery(MAX_TRANSPORT_RECOVERIES);
+  const transportRecovery = new PerAgentTransportRecovery(MAX_TRANSPORT_RECOVERIES);
+  let modelProgressRecoveryEpoch = 0;
   let initialized = false;
   try {
     const persistedManifest = await persistedManifestForMission(input);
     const manifestEpochId = persistedManifest?.epoch_id ?? randomUUID();
+    const promptCacheKeyFor = (
+      agentId: string,
+      provider: ReturnType<typeof providerConfigForRole>
+    ): string => promptCacheAffinityKey({
+      namespace: HUMANOID_PROMPT_CACHE_NAMESPACE,
+      agentId,
+      provider
+    });
     const sessions = new Map<string, FileSession>();
+    let modelRequestSessionBaseline: HumanoidSessionBaseline | undefined;
     let activeContextManager: LongRunContextManager | undefined;
     const sessionForAgent = (agentId: string): FileSession => {
       const existing = sessions.get(agentId);
@@ -216,7 +243,7 @@ async function executeHumanoidMission(input: {
       if (usage) {
         await activeContextManager?.recordModelInputUsage(agentId, usage.inputTokens);
       }
-      const recovered = transportRecovery.responseCompleted();
+      const recovered = transportRecovery.responseCompleted(agentId);
       if (recovered === 0) return;
       await input.runtime.recordProvider({
         status: "transport_recovered",
@@ -239,15 +266,51 @@ async function executeHumanoidMission(input: {
       ),
       compactorProvider,
       createGenerator: (agentId) => new AgentsSdkContextSummaryGenerator({
-        model: createConfiguredModel(compactorProvider),
+        model: createConfiguredModel(compactorProvider, {
+          promptCacheKey: promptCacheKeyFor(
+            `humanoid-context-compactor:${agentId}`,
+            compactorProvider
+          ),
+          onPromptCacheRequest: (event) => recordPromptCacheRequest(
+            input.runtime,
+            agentId,
+            event
+          ),
+          onPromptCacheStatus: (event) => input.runtime.recordProvider({
+            status: "prompt_cache_unsupported",
+            source: "protocol_capability_negotiation",
+            compatibility_retry: event.compatibilityRetry,
+            automatic_actuation: false
+          }, agentId)
+        }),
         temperature: compactorProvider.temperature,
         ...(compactorOutputLimit === undefined
           ? {}
           : { maxOutputTokens: compactorOutputLimit }),
-        onModelResponseCompleted: () => onModelResponseCompleted(agentId)
+        onModelResponseCompleted: () => onModelResponseCompleted(agentId),
+        onAttemptFailure: (event) => input.runtime.recordProvider({
+          status: "context_compaction_attempt_failed",
+          source: "agents_sdk",
+          attempt: event.attempt,
+          error: event.failure,
+          automatic_actuation: false
+        }, agentId)
       })
     });
     activeContextManager = contextManager;
+    const resumedWithFreshAgentEpoch = input.resumed
+      && !(await hasPersistedAgentRuntimeState(input.runtime.store))
+      && Object.keys(contextManager.snapshot.scopes).length > 0;
+    if (resumedWithFreshAgentEpoch) {
+      for (const agentId of Object.values(HUMANOID_AGENT_IDS)) {
+        contextManager.acceptSdkSessionRollback(agentId);
+      }
+    }
+    const acceptRestoredSessions = (agentIds: readonly string[]): void => {
+      for (const agentId of agentIds) {
+        contextManager.acceptSdkSessionRollback(agentId);
+      }
+    };
     const modelTelemetryRuntime: ModelTelemetryRuntime = {
       rootAgentId: input.runtime.rootAgentId,
       activeNode: (agentId) => input.runtime.activeNode(agentId),
@@ -256,7 +319,11 @@ async function executeHumanoidMission(input: {
       recordModelCallFailed: (modelCallId, agentId) => (
         input.runtime.recordModelCallFailed(modelCallId, agentId)
       ),
-      modelProgressSnapshot: () => humanoidModelProgressSnapshot(input.runtime)
+      modelProgressSnapshot: (agentId) => humanoidModelProgressSnapshot(
+        input.runtime,
+        agentId
+      ),
+      modelProgressRecoveryEpoch: () => modelProgressRecoveryEpoch
     };
 
     const persistAgentEvent = async (
@@ -265,13 +332,32 @@ async function executeHumanoidMission(input: {
     ): Promise<void> => {
       await input.runtime.setActiveAgent(agentId);
       await persistStreamEvent(input.runtime, agentId, event);
+      if (isModelResponseStarted(event)) {
+        modelRequestSessionBaseline = await captureHumanoidSessionBaseline(sessions);
+      }
     };
     const hierarchy = createHumanoidAgentHierarchy({
       createModel: (agentId, provider) => withModelTelemetry(
-        createConfiguredModel(provider),
+        createConfiguredModel(provider, {
+          promptCacheKey: promptCacheKeyFor(agentId, provider),
+          onPromptCacheRequest: (event) => recordPromptCacheRequest(
+            input.runtime,
+            agentId,
+            event
+          ),
+          onPromptCacheStatus: (event) => input.runtime.recordProvider({
+            status: "prompt_cache_unsupported",
+            source: "protocol_capability_negotiation",
+            compatibility_retry: event.compatibilityRetry,
+            automatic_actuation: false
+          }, agentId)
+        }),
         modelTelemetryRuntime,
         agentId,
-        onModelResponseCompleted
+        onModelResponseCompleted,
+        provider.streamEventIdleTimeoutMs
+          ?? DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS,
+        provider.requestTimeoutMs
       ),
       createSession: sessionForAgent,
       callModelInputFilter: contextManager.filter,
@@ -301,6 +387,17 @@ async function executeHumanoidMission(input: {
     } else {
       await input.runtime.store.writeAgentManifest(currentManifest);
     }
+    if (resumedWithFreshAgentEpoch) {
+      await input.runtime.recordProvider({
+        status: "agent_epoch_started",
+        source: "operator_configuration",
+        previous_session_history_attached: false,
+        context_checkpoint_preserved: true,
+        physical_authority_preserved: true,
+        agent_manifest_epoch: currentManifest.epoch_id,
+        automatic_actuation: false
+      }, input.runtime.rootAgentId);
+    }
     await input.runtime.initializeGoalAutonomy(
       persistedManifest ?? currentManifest
     );
@@ -310,6 +407,7 @@ async function executeHumanoidMission(input: {
       status: "configured",
       ...providerIdentity(coordinatorProvider),
       hierarchy: "one_model_facade_and_session_per_agent",
+      prompt_cache_affinity: "stable_per_credential_agent_protocol_native",
       agent_manifest_epoch: currentManifest.epoch_id,
       agent_profiles: Object.fromEntries(Object.entries(currentManifest.agents).map(
         ([role, profile]) => [role, {
@@ -352,10 +450,38 @@ async function executeHumanoidMission(input: {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
       const sessionBaseline = await captureHumanoidSessionBaseline(sessions);
+      modelRequestSessionBaseline = sessionBaseline;
       try {
-        const runInput = serializedState
-          ? await RunState.fromString(hierarchy.coordinator, serializedState)
-          : autonomousCycleInput(input.runtime);
+        let runInput: string | RunState<unknown, typeof hierarchy.coordinator>;
+        if (serializedState) {
+          try {
+            runInput = await RunState.fromString(
+              hierarchy.coordinator,
+              serializedState
+            );
+          } catch (error) {
+            const unavailableTool = recoverableDynamicToolRunStateError(
+              error,
+              hierarchy.coordinator.tools.map((tool) => tool.name)
+            );
+            if (!unavailableTool) throw error;
+            await input.runtime.store.clearAgentState();
+            serializedState = undefined;
+            await input.runtime.recordProvider({
+              status: "sdk_state_rebased",
+              source: "dynamic_tool_capability_refresh",
+              unavailable_tool: unavailableTool,
+              session_history_preserved: true,
+              physical_checkpoint_preserved: true,
+              automatic_actuation: false
+            }, input.runtime.rootAgentId);
+            continue;
+          }
+        } else {
+          runInput = decisionRecoveries > 0
+            ? autonomousDecisionRecoveryInput(input.runtime, decisionRecoveries)
+            : autonomousCycleInput(input.runtime);
+        }
         serializedState = undefined;
         const stream = await runner.run(hierarchy.coordinator, runInput, {
           stream: true,
@@ -367,6 +493,7 @@ async function executeHumanoidMission(input: {
         });
         for await (const event of stream) {
           await persistAgentEvent(HUMANOID_AGENT_IDS.coordinator, event);
+          if (!shouldPersistHumanoidAgentState(event)) continue;
           const persistedSessionBaseline = await captureHumanoidSessionStateIdentity(
             sessions
           );
@@ -377,12 +504,18 @@ async function executeHumanoidMission(input: {
           );
         }
         await stream.completed;
+        const finalSessionBaseline = await captureHumanoidSessionStateIdentity(sessions);
+        await input.runtime.store.writeAgentState(
+          stream.state.toString(),
+          humanoidAgentStateFingerprint(input.runtime.checkpoint),
+          finalSessionBaseline
+        );
         input.signal?.throwIfAborted();
-        await contextManager.compactSessionHistories(sessionForAgent);
         const output = typeof stream.finalOutput === "string"
           ? stream.finalOutput
           : JSON.stringify(stream.finalOutput);
         const completion = assertCycleOutput(output);
+        await contextManager.compactSessionHistories(sessionForAgent);
         if (completion.status === "cycle_completed") {
           const activeGoalCompleted = await input.runtime.completeCycle(output);
           if (input.runtime.checkpoint.status === "succeeded") {
@@ -409,18 +542,19 @@ async function executeHumanoidMission(input: {
         }
         await input.runtime.store.clearAgentState();
         decisionRecoveries = 0;
-        transportRecovery.responseCompleted();
         await input.runtime.setActiveAgent(input.runtime.rootAgentId);
       } catch (error) {
         if (input.signal?.aborted) throw error;
         const decisionStall = modelDecisionStallFrom(error);
         if (decisionStall) {
-          await restoreHumanoidSessionBaseline(sessions, sessionBaseline);
+          const restoredAgentIds = await restoreHumanoidSessionBaseline(
+            sessions,
+            sessionBaseline
+          );
+          acceptRestoredSessions(restoredAgentIds);
         }
         if (decisionStall && decisionRecoveries < MAX_MODEL_DECISION_RECOVERIES) {
           decisionRecoveries += 1;
-          contextManager.startFreshSdkTurn(decisionStall.agentId);
-          await sessionForAgent(decisionStall.agentId).clearSession();
           await input.runtime.store.clearAgentState();
           await input.runtime.recordProvider({
             status: "model_decision_recovery",
@@ -428,6 +562,9 @@ async function executeHumanoidMission(input: {
             recovery_attempt: decisionRecoveries,
             maximum_recoveries: MAX_MODEL_DECISION_RECOVERIES,
             error: decisionStall.message,
+            session_history_preserved: true,
+            prompt_cache_prefix_preserved: true,
+            recovery_baseline: "cycle_attempt_prefix",
             ...(decisionStall.evidence
               ? { stall_evidence: decisionStall.evidence }
               : {}),
@@ -437,14 +574,36 @@ async function executeHumanoidMission(input: {
           continue;
         }
         if (!isTransportInterruption(error)) throw error;
+        modelProgressRecoveryEpoch += 1;
+        const interruptedAgentId = modelTransportInterruptionAgentIdFrom(error)
+          ?? input.runtime.rootAgentId;
         const persisted = await resumableAgentState(input.runtime, sessions);
+        let restoredAgentIds: string[] = [];
         if (persisted === undefined) {
-          await restoreHumanoidSessionBaseline(sessions, sessionBaseline);
+          restoredAgentIds = await restoreHumanoidSessionBaseline(
+            sessions,
+            modelRequestSessionBaseline ?? sessionBaseline
+          );
         }
+        acceptRestoredSessions(restoredAgentIds);
         serializedState = persisted;
-        const recoveryAttempt = transportRecovery.nextAttempt();
+        const recoveryAttempt = transportRecovery.nextAttempt(interruptedAgentId);
         if (recoveryAttempt === null) throw error;
         const retry = transportRetryPlan(error, recoveryAttempt);
+        const statusCode = transportStatusCode(error);
+        const rebaseSdkBranch = recoveryAttempt === SERVER_ERROR_CONTEXT_RECOVERY_ATTEMPT
+          && statusCode !== undefined
+          && statusCode >= 500
+          && statusCode <= 599;
+        if (rebaseSdkBranch) {
+          restoredAgentIds = await restoreHumanoidSessionBaseline(
+            sessions,
+            modelRequestSessionBaseline ?? sessionBaseline
+          );
+          acceptRestoredSessions(restoredAgentIds);
+          await input.runtime.store.clearAgentState();
+          serializedState = undefined;
+        }
         await input.runtime.recordProvider({
           status: "transport_interrupted",
           recovery_attempt: recoveryAttempt,
@@ -460,9 +619,19 @@ async function executeHumanoidMission(input: {
                   : "exponential_backoff"
               }),
           resumed_sdk_state: serializedState !== undefined,
+          ...(rebaseSdkBranch
+            ? {
+                sdk_branch_rebased: true,
+                raw_history_preserved: true,
+                session_history_preserved: true,
+                prompt_cache_prefix_preserved: true,
+                rebase_reason: "repeated_server_error_for_identical_sdk_branch",
+                recovery_baseline: "latest_model_request_prefix"
+              }
+            : {}),
           error: errorMessage(error),
           automatic_actuation: false
-        });
+        }, interruptedAgentId);
         await delay(retry.waitMs, input.signal);
       }
     }
@@ -475,6 +644,7 @@ async function executeHumanoidMission(input: {
       || error instanceof AgentManifestRecoveryInterruption
       || error instanceof AgentManifestIncompatibleError
       || isContextCompactionInterruption(error)
+      || error instanceof ModelDecisionStallError
       || isTransportInterruption(error)) {
       await input.runtime.interrupt(message);
     } else {
@@ -482,6 +652,51 @@ async function executeHumanoidMission(input: {
     }
     throw error;
   }
+}
+
+export function shouldPersistHumanoidAgentState(event: RunStreamEvent): boolean {
+  if (event.type === "agent_updated_stream_event"
+    || event.type === "run_item_stream_event") return true;
+  return event.data.type === "response_started"
+    || event.data.type === "response_done";
+}
+
+export function recoverableDynamicToolRunStateError(
+  error: unknown,
+  configuredToolNames: readonly string[]
+): string | undefined {
+  if (!(error instanceof UserError)) return undefined;
+  const match = /^Tool (.+) not found$/u.exec(error.message);
+  if (!match?.[1] || !configuredToolNames.includes(match[1])) return undefined;
+  return match[1];
+}
+
+async function recordPromptCacheRequest(
+  runtime: HumanoidRunRuntime,
+  agentId: string,
+  event: PromptCacheRequestTrace
+): Promise<void> {
+  await runtime.recordProvider({
+    status: "prompt_cache_request",
+    source: "protocol_request_fingerprint",
+    request_sha256: event.requestSha256,
+    message_count: event.messageCount,
+    previous_message_count: event.previousMessageCount,
+    common_message_prefix_count: event.commonMessagePrefixCount,
+    common_message_prefix_bytes: event.commonMessagePrefixBytes,
+    append_only_message_prefix: event.appendOnlyMessagePrefix,
+    tool_count: event.toolCount,
+    tools_stable: event.toolsStable,
+    settings_stable: event.settingsStable,
+    cache_affinity_present: event.cacheAffinityPresent,
+    content_recorded: false,
+    automatic_actuation: false
+  }, agentId);
+}
+
+function isModelResponseStarted(event: RunStreamEvent): boolean {
+  return event.type === "raw_model_stream_event"
+    && event.data.type === "response_started";
 }
 
 async function persistedManifestForMission(input: {
@@ -560,15 +775,20 @@ class AgentManifestRecoveryInterruption extends Error {
   }
 }
 
-function humanoidModelProgressSnapshot(
-  runtime: HumanoidRunRuntime
+export function humanoidModelProgressSnapshot(
+  runtime: Pick<HumanoidRunRuntime, "checkpoint" | "rootAgentId">,
+  agentId: string
 ): ModelProgressSnapshot {
   const checkpoint = runtime.checkpoint;
+  const receipts = Object.values(checkpoint.committed_actions).filter((receipt) => (
+    agentId === runtime.rootAgentId || receipt.agentId === agentId
+  ));
   return {
     worldRevision: checkpoint.world.worldRevision,
     cycleIndex: checkpoint.cycle_index,
     checkerSuccess: checkpoint.checker?.success ?? false,
-    receipts: Object.values(checkpoint.committed_actions).map((receipt) => ({
+    goalStateSha256: checkpoint.goal_dag.state_sha256,
+    receipts: receipts.map((receipt) => ({
       transactionId: receipt.transactionId,
       agentId: receipt.agentId,
       action: receipt.action,
@@ -632,25 +852,49 @@ function autonomousCycleInput(runtime: HumanoidRunRuntime): string {
       ? [`循环身份：${checkpoint.active_cycle.cycle_id}`]
       : []),
     "当前 frame、revision、阶段和待执行 transactionId 只以每次请求重建的 CURRENT HARNESS AUTHORITY 为准；忽略会话中的旧值。",
-    "完成一次真实物理执行后，用 accepted 执行回执调用 complete_autonomous_cycle。"
+    "完成一次真实物理执行后，必须先委派感知哨兵重新观察；只有 cycle_completion.observed_after_execution=true 且 coordinator_phase=complete_cycle 时，才用 Harness 给出的 accepted 因果证据调用 complete_autonomous_cycle。"
+  ].join("\n");
+}
+
+function autonomousDecisionRecoveryInput(
+  runtime: HumanoidRunRuntime,
+  recoveryAttempt: number
+): string {
+  return [
+    "继续当前人形自主闭环。上一次模型分支没有产生 Harness 可验收的正式工具决策。",
+    `恢复轮次：${recoveryAttempt}`,
+    `当前循环：${runtime.checkpoint.cycle_index + 1}`,
+    "保留此前已完成的各 Agent 会话、工具回执和物理证据；根据末尾 CURRENT HARNESS AUTHORITY 直接选择当前阶段允许的正式工具。",
+    "不得复述任务、输出普通说明或重复已经失败且没有新证据的参数。"
   ].join("\n");
 }
 
 function assertCycleOutput(output: string | undefined): {
   status: "cycle_completed" | "goal_transition_completed";
 } {
-  if (!output?.trim()) throw new Error("Humanoid coordinator returned no cycle output");
+  if (!output?.trim()) {
+    throw new ModelDecisionStallError(
+      HUMANOID_AGENT_IDS.coordinator,
+      "Humanoid coordinator returned no cycle output"
+    );
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(output);
   } catch {
-    throw new Error("Humanoid coordinator did not return the cycle completion tool result");
+    throw new ModelDecisionStallError(
+      HUMANOID_AGENT_IDS.coordinator,
+      "Humanoid coordinator did not return the cycle completion tool result"
+    );
   }
   const status = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>).status
     : undefined;
   if (status !== "cycle_completed" && status !== "goal_transition_completed") {
-    throw new Error("Humanoid coordinator did not complete a verified runtime transition");
+    throw new ModelDecisionStallError(
+      HUMANOID_AGENT_IDS.coordinator,
+      "Humanoid coordinator did not complete a verified runtime transition"
+    );
   }
   return { status };
 }

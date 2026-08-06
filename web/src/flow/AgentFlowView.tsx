@@ -134,6 +134,13 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
                 {selectedUsage && selectedUsage.reported_requests > 0 && (
                   <span>{compactTokens(selectedUsage.total_tokens)} 模型令牌</span>
                 )}
+                {selectedUsage && selectedUsage.input_tokens > 0 && (
+                  <span>
+                    缓存读取 {formatPercent(
+                      selectedUsage.cached_input_tokens / selectedUsage.input_tokens
+                    )}
+                  </span>
+                )}
                 <span>{selected.steps_used} 次工具决策</span>
                 <span>{selected.child_ids.length} 个下级角色</span>
               </div>

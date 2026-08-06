@@ -8,6 +8,7 @@ import type { HumanoidRunMode } from "../../domain/run-mode.js";
 import type { HumanoidRunCheckpoint } from "../../domain/humanoid-run.js";
 import { sameAutonomousCycle } from "../../domain/autonomous-cycle.js";
 import { inspectHumanoidGoal } from "../../runtime/humanoid-checker.js";
+import { yawFromQuaternion } from "../../world/geometry.js";
 import type {
   HumanoidWorldObservation,
   HumanoidWorldSnapshot
@@ -24,6 +25,7 @@ import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.j
 import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
 import { createHumanoidAutonomyContext } from "./autonomy-context.js";
 import { goalDAGContextView } from "./goal-dag-context.js";
+import { recentReceiptContext } from "./receipt-context.js";
 
 export interface HumanoidContextAnchorResult {
   anchor: JsonValue;
@@ -59,17 +61,9 @@ export function createHumanoidContextAnchor(input: {
   });
   const recentReceipts = Object.values(input.checkpoint.committed_actions)
     .slice(-16)
-    .map((receipt) => ({
-      transaction_id: receipt.transactionId,
-      agent_id: receipt.agentId,
-      action: receipt.action,
-      accepted: receipt.accepted,
-      code: receipt.code,
-      world_before_revision: receipt.worldBeforeRevision,
-      world_after_revision: receipt.worldAfterRevision,
-      frame_count: receipt.frameCount
-    }));
+    .map(recentReceiptContext);
   const executionAuthority = pendingExecutionAuthority(input);
+  const rootYaw = yawFromQuaternion(input.world.robot.rootRotation);
   return {
     worldEvidence,
     anchor: json({
@@ -98,6 +92,19 @@ export function createHumanoidContextAnchor(input: {
       robot: {
         root_position: input.world.robot.rootPosition,
         root_rotation: input.world.robot.rootRotation,
+        root_heading: {
+          yaw_radians: rootYaw,
+          forward_world: {
+            x: Math.sin(rootYaw),
+            y: 0,
+            z: Math.cos(rootYaw)
+          },
+          left_world: {
+            x: Math.cos(rootYaw),
+            y: 0,
+            z: -Math.sin(rootYaw)
+          }
+        },
         fallen: input.world.robot.fallen,
         balance: input.world.robot.balance,
         feet: input.world.robot.feet,

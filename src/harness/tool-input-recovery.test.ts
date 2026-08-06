@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  createToolInputRecovery,
   invalidToolInputResult,
   preflightAgentToolInput
 } from "./tool-input-recovery.js";
@@ -26,6 +27,12 @@ describe("invalid tool input recovery", () => {
       code: "invalid_tool_input",
       tool: "delegate_physics_executor",
       automatic_actuation: false,
+      next_response_contract: {
+        mode: "corrected_tool_call_only",
+        tool: "delegate_physics_executor",
+        preserve_valid_fields: true,
+        narration_allowed: false
+      },
       validation_issues: [{
         path: "planning_transaction_id",
         message: "Planning transaction is required"
@@ -74,6 +81,175 @@ describe("invalid tool input recovery", () => {
       accepted: false,
       code: "invalid_tool_input",
       validation_issues: [{ path: "", code: "invalid_json" }]
+    });
+  });
+
+  it("reports each actionable field error once", () => {
+    const output = invalidToolInputResult(
+      Object.assign(new Error("Invalid JSON input for tool"), {
+        name: "InvalidToolInputError",
+        originalError: {
+          issues: [
+            { path: ["candidates", 0, "contacts"], code: "custom", message: "Duplicate contact" },
+            { path: ["candidates", 0, "contacts"], code: "custom", message: "Duplicate contact" },
+            { path: ["candidates", 1, "contacts"], code: "custom", message: "Duplicate contact" }
+          ]
+        }
+      }),
+      "plan_whole_body_motion_candidates"
+    );
+
+    expect(JSON.parse(output).validation_issues).toEqual([
+      {
+        path: "candidates.0.contacts",
+        code: "custom",
+        message: "Duplicate contact"
+      },
+      {
+        path: "candidates.1.contacts",
+        code: "custom",
+        message: "Duplicate contact"
+      }
+    ]);
+  });
+
+  it("identifies a repeated invalid field without repairing the model input", () => {
+    const recovery = createToolInputRecovery();
+    const schema = z.object({
+      termination: z.object({
+        predicates: z.array(z.object({
+          minimum_normal_force: z.number().positive()
+        }))
+      })
+    });
+    const input = JSON.stringify({
+      termination: {
+        predicates: [{ minimum_normal_force: 0 }]
+      }
+    });
+
+    expect(JSON.parse(String(recovery.preflight(
+      input,
+      schema,
+      "plan_whole_body_motion_candidates"
+    )))).toMatchObject({
+      code: "invalid_tool_input"
+    });
+    expect(JSON.parse(String(recovery.preflight(
+      input,
+      schema,
+      "plan_whole_body_motion_candidates"
+    )))).toMatchObject({
+      accepted: false,
+      code: "repeated_invalid_tool_input",
+      tool: "plan_whole_body_motion_candidates",
+      repeated_attempt: {
+        count: 2,
+        invalid_fields: [{
+          path: "termination.predicates.0.minimum_normal_force",
+          value: 0
+        }]
+      },
+      automatic_actuation: false
+    });
+  });
+
+  it("treats reordered JSON as the same invalid model arguments", () => {
+    const recovery = createToolInputRecovery();
+    const schema = z.object({
+      root_height: z.number().positive(),
+      intent: z.string()
+    });
+
+    recovery.preflight(
+      JSON.stringify({ intent: "reach", root_height: 0 }),
+      schema,
+      "plan_whole_body_motion_candidates"
+    );
+    const output = recovery.preflight(
+      JSON.stringify({ root_height: 0, intent: "reach" }),
+      schema,
+      "plan_whole_body_motion_candidates"
+    );
+
+    expect(JSON.parse(String(output))).toMatchObject({
+      code: "repeated_invalid_tool_input",
+      repeated_attempt: { count: 2 }
+    });
+  });
+
+  it("does not let unrelated labels hide a repeated invalid field value", () => {
+    const recovery = createToolInputRecovery();
+    const schema = z.object({
+      id: z.string(),
+      objective: z.string(),
+      minimum_normal_force: z.number().positive()
+    });
+
+    recovery.preflight(
+      JSON.stringify({
+        id: "candidate-v7",
+        objective: "first label",
+        minimum_normal_force: 0
+      }),
+      schema,
+      "plan_whole_body_motion_candidates"
+    );
+    const output = recovery.preflight(
+      JSON.stringify({
+        id: "candidate-v8",
+        objective: "renamed label",
+        minimum_normal_force: 0
+      }),
+      schema,
+      "plan_whole_body_motion_candidates"
+    );
+
+    expect(JSON.parse(String(output))).toMatchObject({
+      code: "repeated_invalid_tool_input",
+      repeated_attempt: {
+        count: 2,
+        invalid_fields: [{ path: "minimum_normal_force", value: 0 }]
+      }
+    });
+  });
+
+  it("reports a repeated null field as the rejected scalar value", () => {
+    const recovery = createToolInputRecovery();
+    const schema = z.object({ planning_transaction_id: z.string().min(1) });
+    const input = JSON.stringify({ planning_transaction_id: null });
+
+    recovery.preflight(input, schema, "delegate_physics_executor");
+    const output = recovery.preflight(
+      input,
+      schema,
+      "delegate_physics_executor"
+    );
+
+    expect(JSON.parse(String(output))).toMatchObject({
+      code: "repeated_invalid_tool_input",
+      repeated_attempt: {
+        count: 2,
+        invalid_fields: [{ path: "planning_transaction_id", value: null }]
+      }
+    });
+  });
+
+  it("resets repeated-input tracking after a valid tool call", () => {
+    const recovery = createToolInputRecovery();
+    const schema = z.object({ force: z.number().positive() });
+    const invalid = JSON.stringify({ force: 0 });
+
+    recovery.preflight(invalid, schema, "contact_tool");
+    expect(recovery.preflight(
+      JSON.stringify({ force: 1 }),
+      schema,
+      "contact_tool"
+    )).toBeUndefined();
+    const output = recovery.preflight(invalid, schema, "contact_tool");
+
+    expect(JSON.parse(String(output))).toMatchObject({
+      code: "invalid_tool_input"
     });
   });
 });

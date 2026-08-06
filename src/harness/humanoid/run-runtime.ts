@@ -72,6 +72,7 @@ import {
 } from "../../persistence/lifecycle-outbox.js";
 import { reconcileActionCommitOutbox } from "../../persistence/action-commit-reconciler.js";
 import type { RuntimeEvent, RuntimeEventSink } from "../../runtime/events.js";
+import { assertGoalSupported } from "../../runtime/goal-validation.js";
 import {
   advanceHumanoidGoal,
   assertHumanoidGoalProgressIntegrity,
@@ -101,6 +102,7 @@ import {
   recallGoalHistory as recallDurableGoalHistory,
   type GoalHistoryRecallRequest
 } from "./goal-history.js";
+import { recoverableBlockedGoalEvidence } from "./goal-retirement-evidence.js";
 import {
   assertPendingActionReceipt,
   cycleSummary,
@@ -152,6 +154,20 @@ export type HumanoidCoordinatorPhase =
   | "execute_plan"
   | "post_execution"
   | "complete_cycle";
+
+function observationHasReachableBasePlacements(
+  receipt: HumanoidActionReceipt
+): boolean {
+  const detail = object(receipt.detail);
+  const rawGeometry = detail?.manipulation_geometry;
+  const geometry = rawGeometry === undefined ? undefined : object(rawGeometry);
+  if (!Array.isArray(geometry?.objects)) return false;
+  return geometry.objects.some((entry) => {
+    const observedObject = object(entry);
+    return Array.isArray(observedObject?.reachable_base_placements)
+      && observedObject.reachable_base_placements.length > 0;
+  });
+}
 
 export class HumanoidRunRuntime implements LongRunContextRuntime {
   readonly #store: RunStore;
@@ -267,11 +283,18 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#store.definition.scenario,
       await this.#store.readScenarioChunkDeltaState()
     );
-    const [rawEvidence, rawModelCalls, rawActionIdentities, providerModelUsage] = await Promise.all([
+    const [
+      rawEvidence,
+      rawModelCalls,
+      rawActionIdentities,
+      providerModelUsage,
+      archivedManifests
+    ] = await Promise.all([
       this.#store.readJournal("goal_evidence"),
       this.#store.readJournal("model_calls"),
       this.#store.readJournal("action_identities"),
-      latestProviderModelUsage(this.#store)
+      latestProviderModelUsage(this.#store),
+      this.#store.readArchivedAgentManifests()
     ]);
     const evidence = new Map<string, GoalEvidenceArtifact>();
     for (const rawArtifact of rawEvidence) {
@@ -290,6 +313,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#persistedGoalEvidenceRefs = new Set(evidence.keys());
     this.#modelAuthority = HumanoidModelAuthority.restore({
       manifest,
+      archivedManifests,
       nodes: this.#checkpoint.nodes,
       records: rawModelCalls,
       appendRecord: (record) => this.#store.append("model_calls", json(record))
@@ -323,7 +347,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       if (this.#checkpoint.goal_dag.status !== "awaiting_model_selection") {
         throw new Error("Goal candidates cannot be submitted while a Goal epoch is active");
       }
-      const source = this.#goalModelSource(authority, "submit_goal_candidates");
+      const source = this.#goalModelSource(
+        authority,
+        "submit_goal_candidates",
+        input
+      );
       const evidence = this.#requiredContextGoalEvidence(source.agent_id);
       await this.#persistGoalEvidence([evidence.ref]);
       let next = this.#checkpoint.goal_dag;
@@ -336,6 +364,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       for (const candidate of input.candidates) {
         const before = new Set(Object.keys(next.candidates));
         try {
+          assertGoalSupported(candidate.goal, this.#scenario);
           next = proposeGoalCandidate(next, {
             proposal_id: candidate.proposal_id,
             source,
@@ -381,7 +410,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   ): Promise<JsonValue> {
     return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
       this.#assertRunAcceptsDecisions();
-      const selectedBy = this.#goalModelSource(authority, "select_goal_candidate");
+      const selectedBy = this.#goalModelSource(
+        authority,
+        "select_goal_candidate",
+        input
+      );
       const candidate = Object.values(this.#checkpoint.goal_dag.candidates)[
         input.candidate_sequence - 1
       ];
@@ -434,12 +467,26 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   ): Promise<JsonValue> {
     return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
       this.#assertRunAcceptsDecisions();
-      const retiredBy = this.#goalModelSource(authority, "retire_goal_epoch");
+      const retiredBy = this.#goalModelSource(
+        authority,
+        "retire_goal_epoch",
+        input
+      );
       await this.#persistGoalEvidence(input.evidence_refs);
       const artifacts = input.evidence_refs.map((ref) => this.#requiredGoalEvidence(ref));
       const revisions = new Set(artifacts.map((artifact) => artifact.evidence.world_revision));
       if (revisions.size !== 1) {
         throw new Error("Goal retirement evidence must belong to one world revision");
+      }
+      const recoverable = input.status === "blocked"
+        ? recoverableBlockedGoalEvidence(artifacts)
+        : null;
+      if (recoverable) {
+        throw new Error(
+          `Goal remains physically recoverable: ${recoverable.code} returned `
+          + `${recoverable.reachableBasePlacementCount} IK-validated base placement(s); `
+          + "continue motion planning instead of marking it blocked"
+        );
       }
       const resolvedWorldRevision = artifacts[0]!.evidence.world_revision;
       const activeEpochId = this.#checkpoint.goal_dag.current_epoch_id;
@@ -516,6 +563,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#checkpoint,
       this.#goalEvidence.values()
     ) !== null;
+  }
+
+  isActionAvailable(
+    action: Parameters<HumanoidActionRuntime["invoke"]>[0],
+    agentId: string
+  ): boolean {
+    return this.#actions.isActionAvailable(action, agentId);
   }
 
   async invoke(
@@ -667,6 +721,51 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     )) ?? false;
   }
 
+  goalRetirementDelegationAvailable(): boolean {
+    if (this.coordinatorPhase() !== "replan_or_retire") return false;
+    const activeCycle = this.#activeCycleRef();
+    if (!activeCycle) return false;
+    const latestRejectedPlan = Object.values(this.#checkpoint.committed_actions)
+      .findLast((receipt) => (
+        sameAutonomousCycle(receipt.cycle, activeCycle)
+          && !receipt.accepted
+          && isHumanoidPlanningReceipt(receipt)
+      ));
+    if (!latestRejectedPlan) return false;
+    const detail = object(latestRejectedPlan.detail);
+    const placements = detail?.reachable_base_placements;
+    if (Array.isArray(placements) && placements.length > 0) return false;
+    const latestMotionObservation = Object.values(
+      this.#checkpoint.committed_actions
+    ).findLast((receipt) => (
+      sameAutonomousCycle(receipt.cycle, activeCycle)
+        && receipt.agentId === "humanoid-motion-reference"
+        && receipt.accepted
+        && receipt.action === "observe_humanoid"
+    ));
+    return latestMotionObservation === undefined
+      || !observationHasReachableBasePlacements(latestMotionObservation);
+  }
+
+  sentryDelegationAvailable(): boolean {
+    const phase = this.coordinatorPhase();
+    if (phase === "observe_or_plan" || phase === "post_execution") return true;
+    if (phase !== "replan_or_retire") return false;
+    const activeCycle = this.#activeCycleRef();
+    if (!activeCycle) return false;
+    const cycleReceipts = Object.values(this.#checkpoint.committed_actions)
+      .filter((receipt) => sameAutonomousCycle(receipt.cycle, activeCycle));
+    const latestRejectedPlanIndex = cycleReceipts.findLastIndex((receipt) => (
+      !receipt.accepted && isHumanoidPlanningReceipt(receipt)
+    ));
+    if (latestRejectedPlanIndex < 0) return false;
+    return !cycleReceipts.slice(latestRejectedPlanIndex + 1).some((receipt) => (
+      receipt.agentId === "humanoid-sentry"
+        && receipt.accepted
+        && receipt.action === "observe_humanoid"
+    ));
+  }
+
   #validateCycleCausalEvidence(
     evidenceTransactionIds: readonly string[]
   ): HumanoidCycleCausalEvidence {
@@ -730,7 +829,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
     this.#rememberGoalEvidence(result.worldEvidence);
     this.#contextGoalEvidenceRefs.set(agentId, result.worldEvidence.evidence.ref);
-    return result.anchor;
+    if (agentId !== "humanoid-motion-reference") return result.anchor;
+    return json({
+      ...(object(result.anchor) ?? {}),
+      planning_tool_state: this.#actions.planningToolState(agentId)
+    });
   }
 
   #checkpointForContext(
@@ -984,9 +1087,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         cycle = output;
       }
       const activeGoal = this.#requiredActiveGoal();
+      const captured = await this.#world.capturePersistenceState();
+      this.#applyWorldPersistenceState(captured);
       const progress = this.#checkpoint.goal_progress;
       if (!progress) throw new Error("Active Goal progress is unavailable");
-      const world = this.#world.snapshot();
+      const world = captured.world;
       const checker = inspectHumanoidGoal(
         activeGoal,
         this.#scenario,
@@ -1012,6 +1117,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         }
       }
       const goalEvidenceRefs = [actionEvidenceRef, ...mutationEvidenceRefs];
+      let completedGoalDAG = this.#checkpoint.goal_dag;
       if (checker.success) {
         const epochId = this.#checkpoint.goal_dag.current_epoch_id;
         if (!epochId) throw new Error("Active Goal epoch identity is unavailable");
@@ -1025,20 +1131,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         this.#rememberGoalEvidence(evaluation);
         await this.#persistGoalEvidence([evaluation.evidence.ref]);
         goalEvidenceRefs.push(evaluation.evidence.ref);
-        this.#checkpoint.goal_dag = completeGoalEpoch(this.#checkpoint.goal_dag, {
+        completedGoalDAG = completeGoalEpoch(this.#checkpoint.goal_dag, {
           resolution_evidence_refs: [evaluation.evidence.ref],
           resolved_world_revision: world.worldRevision
         }, this.#goalHarness());
-        this.#checkpoint.goal_progress = null;
-        this.#checkpoint.checker = null;
       }
 
-      this.#checkpoint.cycle_index = activeCycle.cycle_index;
-      this.#checkpoint.last_cycle = cycle;
-      if (!checker.success) this.#checkpoint.checker = checker;
       const memory = appendEmbodiedEpisode({
         state: this.#checkpoint.embodied_memory,
-        sequence: this.#checkpoint.cycle_index,
+        sequence: activeCycle.cycle_index,
         execution,
         modelSummary: cycleSummary(cycle),
         world,
@@ -1048,11 +1149,23 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         worldMutations: causalEvidence.worldMutations
       });
       await this.#persistEmbodiedEpisode(memory.episode);
-      this.#checkpoint.embodied_memory = memory.state;
-      this.#checkpoint.active_cycle = null;
+
       const actionWindow = retainRecentActionReceipts(
         this.#checkpoint.committed_actions
       );
+      // Publish the causal transition as one synchronous checkpoint cut. Other
+      // authority publishers may persist while the episode journal is being
+      // written; they must observe either the prior active Cycle or the fully
+      // committed successor, never a new cycle_index paired with active_cycle.
+      this.#checkpoint.goal_dag = completedGoalDAG;
+      this.#checkpoint.goal_progress = checker.success
+        ? null
+        : this.#checkpoint.goal_progress;
+      this.#checkpoint.checker = checker.success ? null : checker;
+      this.#checkpoint.cycle_index = activeCycle.cycle_index;
+      this.#checkpoint.last_cycle = cycle;
+      this.#checkpoint.embodied_memory = memory.state;
+      this.#checkpoint.active_cycle = null;
       this.#checkpoint.committed_actions = actionWindow.receipts;
 
       const missionCompleted = checker.success
@@ -1548,15 +1661,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         this.#store.definition.scenario,
         synchronizedChunks
       );
-      const activeGoal = this.#activeGoal();
-      this.#checkpoint.checker = activeGoal && this.#checkpoint.goal_progress
-        ? inspectHumanoidGoal(
-            activeGoal,
-            this.#scenario,
-            this.#world.snapshot(),
-            this.#checkpoint.goal_progress
-          )
-        : null;
+      await this.#refreshWorldPersistenceState();
     }
     const reconciled = await reconcileActionCommitOutbox({
       store: this.#store,
@@ -1606,6 +1711,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       );
     }
     await this.#physicalExecution.acknowledgeTerminals(staged);
+    const actionWindow = retainRecentActionReceipts(
+      this.#checkpoint.committed_actions
+    );
+    if (actionWindow.removed > 0) {
+      this.#checkpoint.committed_actions = actionWindow.receipts;
+      await this.#persist();
+    }
     if (synchronizedChunks && synchronization?.changed) {
       await this.#persist();
       await this.emit("humanoid_scenario_synchronized", json({
@@ -1810,11 +1922,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   #goalModelSource(
     toolAuthority: GoalToolCallAuthority,
-    expectedToolName: string
+    expectedToolName: string,
+    normalizedInput: unknown
   ) {
     return this.#requiredModelAuthority().goalModelSource(
       toolAuthority,
-      expectedToolName
+      expectedToolName,
+      normalizedInput
     );
   }
 

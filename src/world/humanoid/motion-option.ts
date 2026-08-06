@@ -156,6 +156,15 @@ type HumanoidMotionOptionPredicateEvidence =
       reason?: Extract<PredicateUncertainty, "object_not_observable">;
     }
   | PredicateEvidenceBase & {
+      type: "hand_contact_object";
+      handSurface: G1HandContactSurfaceName;
+      objectId: string;
+      objectObservable: boolean;
+      maximumNormalForce: number | null;
+      minimumNormalForce: number;
+      reason?: Extract<PredicateUncertainty, "object_not_observable">;
+    }
+  | PredicateEvidenceBase & {
       type: "body_contact_solid";
       body: HumanoidBodyName;
       solidId: string;
@@ -758,6 +767,25 @@ function detectPredicate(
   }
   const object = objects.get(predicate.object_id);
   if (!object) return unobservableObjectEvidence(predicate, predicateIndex);
+  if (predicate.type === "hand_contact_object") {
+    const maximumNormalForce = maximumHandContactForce(
+      snapshot,
+      predicate.hand_surface,
+      predicate.object_id
+    );
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: maximumNormalForce >= predicate.minimum_normal_force
+        ? "satisfied"
+        : "unsatisfied",
+      handSurface: predicate.hand_surface,
+      objectId: predicate.object_id,
+      objectObservable: true,
+      maximumNormalForce,
+      minimumNormalForce: predicate.minimum_normal_force
+    };
+  }
   if (predicate.type === "body_contact_object") {
     const maximumNormalForce = maximumContactForce(
       snapshot,
@@ -882,7 +910,8 @@ function graspAssessmentIsPhysicallyUncertain(
 
 function unobservableObjectEvidence(
   predicate: Extract<HumanoidMotionOptionPredicate, {
-    type: "body_contact_object" | "object_near_point" | "object_in_zone";
+    type: "body_contact_object" | "hand_contact_object"
+      | "object_near_point" | "object_in_zone";
   }>,
   predicateIndex: number
 ): HumanoidMotionOptionPredicateEvidence {
@@ -892,6 +921,19 @@ function unobservableObjectEvidence(
       type: predicate.type,
       status: "uncertain",
       body: predicate.body,
+      objectId: predicate.object_id,
+      objectObservable: false,
+      maximumNormalForce: null,
+      minimumNormalForce: predicate.minimum_normal_force,
+      reason: "object_not_observable"
+    };
+  }
+  if (predicate.type === "hand_contact_object") {
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: "uncertain",
+      handSurface: predicate.hand_surface,
       objectId: predicate.object_id,
       objectObservable: false,
       maximumNormalForce: null,
@@ -937,6 +979,22 @@ function maximumContactForce(
   for (const contact of snapshot.contacts) {
     const matches = (contact.firstBody === body && contact.secondObject === objectId)
       || (contact.secondBody === body && contact.firstObject === objectId);
+    if (matches) maximum = Math.max(maximum, contact.normalForce);
+  }
+  return maximum;
+}
+
+function maximumHandContactForce(
+  snapshot: HumanoidMotionOptionRobotSnapshot,
+  handSurface: G1HandContactSurfaceName,
+  objectId: string
+): number {
+  let maximum = 0;
+  for (const contact of snapshot.contacts) {
+    const matches = (contact.firstHandLink === handSurface
+      && contact.secondObject === objectId)
+      || (contact.secondHandLink === handSurface
+        && contact.firstObject === objectId);
     if (matches) maximum = Math.max(maximum, contact.normalForce);
   }
   return maximum;

@@ -3,7 +3,8 @@ import {
   Runner,
   tool,
   type AgentInputItem,
-  type Model
+  type Model,
+  type ModelResponse
 } from "@openai/agents";
 import { z } from "zod";
 import {
@@ -72,6 +73,8 @@ export interface ContextSummaryUsage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  inputTokensDetails?: Array<Record<string, number>>;
+  outputTokensDetails?: Array<Record<string, number>>;
 }
 
 export interface ContextSummaryResult {
@@ -82,6 +85,16 @@ export interface ContextSummaryResult {
 
 export interface ContextSummaryGenerator {
   generate(request: ContextSummaryRequest): Promise<ContextSummaryResult>;
+}
+
+interface ContextModelResponse {
+  output: ModelResponse["output"];
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
+  providerData?: unknown;
 }
 
 /**
@@ -97,17 +110,26 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
   readonly #temperature: number;
   readonly #maxOutputTokens: number | undefined;
   readonly #onModelResponseCompleted: (() => void | Promise<void>) | undefined;
+  readonly #onAttemptFailure: ((event: {
+    attempt: number;
+    failure: string;
+  }) => void | Promise<void>) | undefined;
 
   constructor(input: {
     model: Model;
     temperature: number;
     maxOutputTokens?: number;
     onModelResponseCompleted?: () => void | Promise<void>;
+    onAttemptFailure?: (event: {
+      attempt: number;
+      failure: string;
+    }) => void | Promise<void>;
   }) {
     this.#model = input.model;
     this.#temperature = input.temperature;
     this.#maxOutputTokens = input.maxOutputTokens;
     this.#onModelResponseCompleted = input.onModelResponseCompleted;
+    this.#onAttemptFailure = input.onAttemptFailure;
     this.#runner = new Runner({
       tracingDisabled: true,
       traceIncludeSensitiveData: false,
@@ -140,15 +162,36 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
         { usage }
       );
     }
+    let observeModelResponse: ((response: ContextModelResponse) => void) | undefined;
     const countedModel = withUsageCounter(
       this.#model,
       usage,
-      this.#onModelResponseCompleted
+      this.#onModelResponseCompleted,
+      (response) => observeModelResponse?.(response)
     );
     let lastFailure: string | undefined;
 
     for (let attempt = 1; attempt <= CONTEXT_COMPACTOR_MAX_ATTEMPTS; attempt += 1) {
       request.signal?.throwIfAborted();
+      let attemptValidationFailure: string | undefined;
+      let attemptResponseFailure: string | undefined;
+      let observedContextWindowTokens: number | undefined;
+      observeModelResponse = (response) => {
+        const failure = checkpointResponseFailure(response.output);
+        const finishReason = responseFinishReason(response.providerData);
+        attemptResponseFailure = failure && finishReason
+          ? `${failure}; finish_reason=${finishReason}`
+          : failure;
+        if (failure?.includes("checkpoint:invalid_json")
+          && truncatedAtContextLimit(response, finishReason)) {
+          observedContextWindowTokens = response.usage.totalTokens;
+          throw new ContextCompactionCapacityError(
+            observedContextWindowTokens,
+            attemptResponseFailure ?? failure,
+            { usage }
+          );
+        }
+      };
       const agent = compactorAgent({
         model: countedModel,
         temperature: this.#temperature,
@@ -156,7 +199,10 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
           ? {}
           : { maxOutputTokens: this.#maxOutputTokens }),
         accepted,
-        blockers
+        blockers,
+        onInputFailure: (failure) => {
+          attemptValidationFailure = failure;
+        }
       });
       const prompt = compactionPrompt(boundedRequest, attempt, lastFailure);
       const attemptInputTokens = estimateContextSummaryPromptTokens(prompt, accepted, blockers);
@@ -193,7 +239,20 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
         };
       } catch (error) {
         request.signal?.throwIfAborted();
-        lastFailure = errorMessage(error).slice(0, 600);
+        lastFailure = (
+          attemptValidationFailure
+          ?? attemptResponseFailure
+          ?? errorMessage(error)
+        ).slice(0, 600);
+        await this.#onAttemptFailure?.({ attempt, failure: lastFailure });
+        if (error instanceof ContextCompactionCapacityError) throw error;
+        if (observedContextWindowTokens !== undefined) {
+          throw new ContextCompactionCapacityError(
+            observedContextWindowTokens,
+            lastFailure,
+            { usage }
+          );
+        }
       }
     }
 
@@ -217,6 +276,20 @@ export class ContextCompactionInterruption extends Error {
     });
     this.name = "ContextCompactionInterruption";
     this.usage = options.usage ? { ...options.usage } : undefined;
+  }
+}
+
+export class ContextCompactionCapacityError extends ContextCompactionInterruption {
+  readonly observedContextWindowTokens: number;
+
+  constructor(
+    observedContextWindowTokens: number,
+    detail: string,
+    options: { usage?: ContextSummaryUsage } = {}
+  ) {
+    super(detail, options);
+    this.name = "ContextCompactionCapacityError";
+    this.observedContextWindowTokens = observedContextWindowTokens;
   }
 }
 
@@ -246,8 +319,13 @@ function compactorAgent(input: {
   maxOutputTokens?: number;
   accepted: string[];
   blockers: string[];
+  onInputFailure?: (failure: string) => void;
 }): Agent {
-  const commit = contextCheckpointTool(input.accepted, input.blockers);
+  const commit = contextCheckpointTool(
+    input.accepted,
+    input.blockers,
+    input.onInputFailure
+  );
   return new Agent({
     name: "Context Compactor",
     instructions: COMPACTOR_INSTRUCTIONS,
@@ -287,18 +365,36 @@ function compactorAgent(input: {
 function withUsageCounter(
   model: Model,
   usage: ContextSummaryUsage,
-  onModelResponseCompleted?: () => void | Promise<void>
+  onModelResponseCompleted?: () => void | Promise<void>,
+  onModelResponse?: (response: ContextModelResponse) => void
 ): Model {
-  const addUsage = (value: { inputTokens: number; outputTokens: number; totalTokens: number }) => {
+  const addUsage = (value: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    inputTokensDetails?: Record<string, number> | Array<Record<string, number>> | undefined;
+    outputTokensDetails?: Record<string, number> | Array<Record<string, number>> | undefined;
+  }) => {
     usage.inputTokens += value.inputTokens;
     usage.outputTokens += value.outputTokens;
     usage.totalTokens += value.totalTokens;
+    const inputDetails = appendUsageDetails(
+      usage.inputTokensDetails,
+      value.inputTokensDetails
+    );
+    const outputDetails = appendUsageDetails(
+      usage.outputTokensDetails,
+      value.outputTokensDetails
+    );
+    if (inputDetails) usage.inputTokensDetails = inputDetails;
+    if (outputDetails) usage.outputTokensDetails = outputDetails;
   };
   return {
     getResponse: async (request) => {
       usage.requests += 1;
       const response = await model.getResponse(request);
       addUsage(response.usage);
+      onModelResponse?.(response);
       await onModelResponseCompleted?.();
       return response;
     },
@@ -309,6 +405,7 @@ function withUsageCounter(
         for await (const event of stream) {
           if (event.type === "response_done") {
             addUsage(event.response.usage);
+            onModelResponse?.(event.response);
             await onModelResponseCompleted?.();
           }
           yield event;
@@ -319,6 +416,16 @@ function withUsageCounter(
       ? { getRetryAdvice: (request) => model.getRetryAdvice!(request) }
       : {})
   };
+}
+
+function appendUsageDetails(
+  current: Array<Record<string, number>> | undefined,
+  value: Record<string, number> | Array<Record<string, number>> | undefined
+): Array<Record<string, number>> | undefined {
+  if (value === undefined) return current;
+  const additions = Array.isArray(value) ? value : [value];
+  if (additions.length === 0) return current;
+  return [...(current ?? []), ...additions.map((details) => ({ ...details }))];
 }
 
 /** Worst-case bounded attempt input, including retry diagnostics and dynamic schema. */
@@ -441,46 +548,175 @@ function retainedEvidence(
   });
 }
 
-function summarySchema(
-  acceptedTransactionIds: string[],
-  blockerTransactionIds: string[]
-) {
-  const acceptedIds = acceptedTransactionIds.length > 0
-    ? z.array(z.enum(acceptedTransactionIds as [string, ...string[]])).min(1)
-    : z.array(z.string()).length(0);
-  const blockerIds = blockerTransactionIds.length > 0
-    ? z.array(z.enum(blockerTransactionIds as [string, ...string[]])).min(1)
-    : z.array(z.string()).length(0);
-  const completedEvidence = z.object({
-    summary: z.string().trim().min(1),
-    transaction_ids: acceptedIds
-  }).strict();
-  const blockerEvidence = z.object({
-    summary: z.string().trim().min(1),
-    transaction_ids: blockerIds
-  }).strict();
-  return z.object({
-    mission_state: z.string().trim().min(1),
-    constraints: z.array(z.string().trim().min(1)),
-    decisions: z.array(z.string().trim().min(1)),
-    completed: z.array(completedEvidence),
-    pending: z.array(z.string().trim().min(1)),
-    blockers: z.array(blockerEvidence),
-    next_actions: z.array(z.string().trim().min(1))
-  }).strict();
-}
-
 function contextCheckpointTool(
   acceptedTransactionIds: string[],
-  blockerTransactionIds: string[]
+  blockerTransactionIds: string[],
+  onInputFailure?: (failure: string) => void
 ) {
   return tool({
     name: COMMIT_CONTEXT_TOOL,
     description: COMMIT_CONTEXT_DESCRIPTION,
-    parameters: summarySchema(acceptedTransactionIds, blockerTransactionIds),
+    parameters: ContextCompactionSummarySchema,
     strict: true,
-    execute: async (summary) => JSON.stringify(ContextCompactionSummarySchema.parse(summary))
+    errorFunction: (_context, error) => {
+      const failure = checkpointInputFailure(error);
+      onInputFailure?.(failure);
+      return `${failure}. Call ${COMMIT_CONTEXT_TOOL} again with every required field and the documented types.`;
+    },
+    execute: async (summary) => JSON.stringify(rebaseContextSummary({
+      summary: ContextCompactionSummarySchema.parse(summary),
+      acceptedTransactionIds,
+      blockerTransactionIds
+    }))
   });
+}
+
+function checkpointInputFailure(error: unknown): string {
+  const pending: unknown[] = [error];
+  const visited = new Set<object>();
+  while (pending.length > 0 && visited.size < 12) {
+    const candidate = pending.shift();
+    if (candidate instanceof z.ZodError) {
+      const issues = candidate.issues.slice(0, 8).map((issue) => {
+        const path = issue.path.length > 0 ? issue.path.join(".") : "checkpoint";
+        return `${path}:${issue.code}`;
+      });
+      return `Checkpoint tool input failed schema validation (${issues.join(", ")})`;
+    }
+    if (candidate === null || typeof candidate !== "object"
+      || visited.has(candidate)) continue;
+    visited.add(candidate);
+    const record = candidate as {
+      cause?: unknown;
+      error?: unknown;
+      errors?: unknown;
+      originalError?: unknown;
+      toolInvocation?: unknown;
+    };
+    const invocation = recordValue(record.toolInvocation);
+    if (typeof invocation?.input === "string") {
+      try {
+        const parsed = ContextCompactionSummarySchema.safeParse(
+          JSON.parse(invocation.input)
+        );
+        if (!parsed.success) return checkpointZodFailure(parsed.error);
+      } catch (error) {
+        return checkpointJsonFailure(invocation.input, error);
+      }
+    }
+    pending.push(record.cause, record.error, record.originalError);
+    if (Array.isArray(record.errors)) pending.push(...record.errors);
+  }
+  return `Checkpoint tool input failed: ${errorMessage(error)}`;
+}
+
+function checkpointResponseFailure(output: ModelResponse["output"]): string | undefined {
+  const calls = output.filter((item) => item.type === "function_call");
+  const checkpointCall = calls.find((item) => item.name === COMMIT_CONTEXT_TOOL);
+  if (!checkpointCall) {
+    const outputTypes = [...new Set(output.map((item) => item.type))];
+    const functionNames = calls.map((item) => item.name);
+    return functionNames.length > 0
+      ? `Context Compactor called unexpected function names (${functionNames.join(", ")})`
+      : `Context Compactor omitted ${COMMIT_CONTEXT_TOOL} (output types: ${
+          outputTypes.join(", ") || "none"
+        })`;
+  }
+  try {
+    const parsed = ContextCompactionSummarySchema.safeParse(
+      JSON.parse(checkpointCall.arguments)
+    );
+    return parsed.success ? undefined : checkpointZodFailure(parsed.error);
+  } catch (error) {
+    return checkpointJsonFailure(checkpointCall.arguments, error);
+  }
+}
+
+function responseFinishReason(providerData: unknown): string | undefined {
+  const pending: unknown[] = [providerData];
+  const visited = new Set<object>();
+  while (pending.length > 0 && visited.size < 24) {
+    const candidate = pending.shift();
+    if (candidate === null || typeof candidate !== "object"
+      || visited.has(candidate)) continue;
+    visited.add(candidate);
+    for (const [key, value] of Object.entries(candidate as Record<string, unknown>)) {
+      if (key === "finishReason" || key === "finish_reason") {
+        if (typeof value === "string") return value;
+        const reason = recordValue(value);
+        if (typeof reason?.unified === "string") return reason.unified;
+        if (typeof reason?.raw === "string") return reason.raw;
+      }
+      if (value !== null && typeof value === "object") pending.push(value);
+    }
+  }
+  return undefined;
+}
+
+function truncatedAtContextLimit(
+  response: ContextModelResponse,
+  finishReason: string | undefined
+): boolean {
+  const normalizedReason = finishReason?.toLowerCase();
+  if (normalizedReason === "length"
+    || normalizedReason === "max_tokens"
+    || normalizedReason === "max_output_tokens") return true;
+  const total = response.usage.totalTokens;
+  return Number.isSafeInteger(total)
+    && total >= 16_384
+    && Number.isInteger(Math.log2(total))
+    && response.usage.inputTokens > response.usage.outputTokens;
+}
+
+function checkpointJsonFailure(input: string, error: unknown): string {
+  const trimmed = input.trim();
+  return [
+    "Checkpoint tool input failed schema validation (checkpoint:invalid_json)",
+    `parser=${errorMessage(error)}`,
+    `bytes=${Buffer.byteLength(input)}`,
+    `first=${JSON.stringify(trimmed.at(0) ?? "")}`,
+    `last=${JSON.stringify(trimmed.at(-1) ?? "")}`,
+    `markdown_fence=${trimmed.startsWith("```")}`,
+    `balanced_object=${balancedRootObject(trimmed)}`
+  ].join("; ");
+}
+
+function balancedRootObject(value: string): boolean {
+  if (!value.startsWith("{") || !value.endsWith("}")) return false;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === "\"") inString = false;
+      continue;
+    }
+    if (character === "\"") inString = true;
+    else if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth === 0 && index !== value.length - 1) return false;
+      if (depth < 0) return false;
+    }
+  }
+  return depth === 0 && !inString;
+}
+
+function checkpointZodFailure(error: z.ZodError): string {
+  const issues = error.issues.slice(0, 8).map((issue) => {
+    const path = issue.path.length > 0 ? issue.path.join(".") : "checkpoint";
+    return `${path}:${issue.code}`;
+  });
+  return `Checkpoint tool input failed schema validation (${issues.join(", ")})`;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function validCheckpointOutput(value: unknown): boolean {

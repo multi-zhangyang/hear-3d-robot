@@ -6,7 +6,11 @@ import {
   HumanoidContactConstraintSchema,
   type HumanoidContactConstraint
 } from "./motion-plan.js";
-import { targetReference, type HumanoidReference } from "./reference.js";
+import {
+  stationaryHumanoidReference,
+  targetReference,
+  type HumanoidReference
+} from "./reference.js";
 import type {
   HumanoidSimulation,
   HumanoidSimulationSnapshot
@@ -14,6 +18,7 @@ import type {
 import {
   contactAwareG1GraspTargetsForBindings,
   contactAwareG1GraspJointTargets,
+  g1CarriedGraspRequiresNoslip,
   type G1ContactAwareGraspTarget
 } from "./contact-aware-grasp-servo.js";
 import {
@@ -34,21 +39,50 @@ import {
   multiplyQuaternion,
   normalizeQuaternion,
   rotateVector,
-  subtract
+  subtract,
+  yawFromQuaternion
 } from "../geometry.js";
+import {
+  HumanoidNavigationArrivalHeadingSchema,
+  humanoidNavigationArrivalHeadingError,
+  humanoidNavigationArrivalHeadingSatisfied,
+  humanoidNavigationShouldBeginBraking,
+  humanoidNavigationStoppingDistance,
+  type HumanoidNavigationArrivalHeading
+} from "./navigation-arrival.js";
 
 const NAVIGATION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.05;
+const NAVIGATION_PRECISION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.01;
+const NAVIGATION_WAYPOINT_TOLERANCE_METERS = 0.18;
+const NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS = 0.06;
+const CARRY_NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS = 0.12;
+const NAVIGATION_POSITION_DISCRETIZATION_METERS = 0.001;
+const NAVIGATION_EFFECTIVE_COMMAND_MARGIN_METERS_PER_SECOND = 0.01;
+const NAVIGATION_ALREADY_AT_TARGET_TOLERANCE_METERS = 0.02;
+const NAVIGATION_MINIMUM_SHORT_ROUTE_PROGRESS_METERS = 0.02;
+const NAVIGATION_MINIMUM_SHORT_ROUTE_PROGRESS_RATIO = 0.5;
 const NAVIGATION_STARTUP_SECONDS = 10;
+const NAVIGATION_FINAL_CONVERGENCE_BUDGET_SECONDS = 6;
+const NAVIGATION_ARRIVAL_HEADING_BUDGET_SECONDS = 8;
+const NAVIGATION_ARRIVAL_HEADING_RECOVERY_HYSTERESIS_RADIANS = 0.03;
+const NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS = 0.01;
+const NAVIGATION_STOP_SETTLE_BUDGET_SECONDS = 6;
+const NAVIGATION_STOP_SETTLED_STEPS = 4;
+const NAVIGATION_STOP_PLANAR_SPEED_TOLERANCE_METERS_PER_SECOND = 0.08;
+const NAVIGATION_STOP_COMMAND_TOLERANCE_METERS_PER_SECOND = 0.08;
+const NAVIGATION_STOP_YAW_COMMAND_TOLERANCE_RADIANS_PER_SECOND = 0.08;
+const NAVIGATION_STOP_POSITION_HOLD_COMMAND_METERS_PER_SECOND = 0.06;
 const MAXIMUM_NAVIGATION_SECONDS = 90;
 const MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED = 1;
 const MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED = 2;
-const CARRY_MAXIMUM_FORWARD_SPEED_METERS_PER_SECOND = 0.22;
-const CARRY_MAXIMUM_REVERSE_SPEED_METERS_PER_SECOND = 0.16;
+const CARRY_MAXIMUM_FORWARD_SPEED_METERS_PER_SECOND = 0.3;
+const CARRY_MAXIMUM_REVERSE_SPEED_METERS_PER_SECOND = 0.3;
 const CARRY_MAXIMUM_LATERAL_SPEED_METERS_PER_SECOND = 0.12;
 const CARRY_MAXIMUM_YAW_SPEED_RADIANS_PER_SECOND = 0.55;
 const CARRY_MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED = 0.3;
 const CARRY_MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED = 0.7;
 const CARRY_MAXIMUM_WRIST_REFERENCE_CORRECTION_RADIANS = 0.06;
+const CARRY_NOSLIP_SOLVER_ITERATIONS = 2;
 
 export interface HumanoidNavigationExecutionResult {
   completed: boolean;
@@ -76,13 +110,23 @@ export const HumanoidNavigationExecutionProgressSchema = z.object({
   start_root_position: Vec3Schema,
   waypoint_index: z.number().int().nonnegative(),
   committed_frame_count: z.number().int().nonnegative(),
-  stopping_frame_count: z.number().int().nonnegative()
+  stopping_frame_count: z.number().int().nonnegative(),
+  stopping_settled_frame_count: z.number().int().nonnegative().optional(),
+  arrival_position_latched: z.boolean().optional()
 }).strict().superRefine((progress, context) => {
   if (progress.stopping_frame_count > progress.committed_frame_count) {
     context.addIssue({
       code: "custom",
       path: ["stopping_frame_count"],
       message: "Navigation stopping progress cannot exceed committed physical frames"
+    });
+  }
+  if ((progress.stopping_settled_frame_count ?? 0)
+    > progress.stopping_frame_count) {
+    context.addIssue({
+      code: "custom",
+      path: ["stopping_settled_frame_count"],
+      message: "Navigation settled progress cannot exceed stopping progress"
     });
   }
 });
@@ -96,15 +140,26 @@ export class HumanoidNavigationExecution {
   readonly #startRootPosition: Vec3;
   readonly #maximumTravelFrames: number;
   readonly #stoppingFrames: number;
+  readonly #maximumStoppingFrames: number;
   readonly #controlStepSeconds: number;
+  readonly #commandResponseHorizonSeconds: number;
+  readonly #brakingResponseHorizonSeconds: number;
+  readonly #linearAcceleration: number;
+  readonly #yawAcceleration: number;
+  readonly #carrying: boolean;
+  readonly #minimumEffectivePlanarSpeed: number;
+  readonly #precisionArrival: boolean;
   readonly #contactConstraints: readonly HumanoidContactConstraint[];
   readonly #graspTargets: readonly G1ContactAwareGraspTarget[];
   readonly #carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
+  readonly #arrivalHeading: HumanoidNavigationArrivalHeading | null;
   #reference: HumanoidReference;
   #final: HumanoidSimulationSnapshot;
   #waypointIndex: number;
   #frames = 0;
   #stopFrames = 0;
+  #stopSettledFrames = 0;
+  #arrivalPositionLatched = false;
   #result: HumanoidNavigationExecutionResult | undefined;
   #pendingFrame: HumanoidNavigationPreparedFrame | undefined;
 
@@ -116,6 +171,7 @@ export class HumanoidNavigationExecution {
     contactConstraints?: readonly HumanoidContactConstraint[];
     graspTargets?: readonly G1ContactAwareGraspTarget[];
     carryTaskSpaceTargets?: readonly HumanoidCarryTaskSpaceTarget[];
+    arrivalHeading?: HumanoidNavigationArrivalHeading | null;
   }) {
     this.#plan = structuredClone(input.plan);
     this.#reference = input.reference;
@@ -124,20 +180,48 @@ export class HumanoidNavigationExecution {
       : undefined;
     const carrying = (input.graspTargets?.length ?? 0) > 0
       || (input.carryTaskSpaceTargets?.length ?? 0) > 0;
+    this.#carrying = carrying;
     if (!carrying && (!progress || progress.committed_frame_count === 0)) {
       input.simulation.resetController(input.reference);
     }
     this.#final = input.simulation.snapshot();
-    const controlStepSeconds = input.simulation.controllerDescriptor().controlStepSeconds;
+    this.#arrivalHeading = input.arrivalHeading === null
+      || input.arrivalHeading === undefined
+      ? null
+      : HumanoidNavigationArrivalHeadingSchema.parse(input.arrivalHeading);
+    const controller = input.simulation.controllerDescriptor();
+    const controlStepSeconds = controller.controlStepSeconds;
     this.#controlStepSeconds = controlStepSeconds;
-    this.#maximumTravelFrames = Math.ceil(
-      Math.min(
-        MAXIMUM_NAVIGATION_SECONDS,
-        this.#plan.distance / NAVIGATION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND
-          + NAVIGATION_STARTUP_SECONDS
+    this.#commandResponseHorizonSeconds = controller.commandResponseHorizonSeconds
+      ?? controlStepSeconds;
+    this.#brakingResponseHorizonSeconds = this.#commandResponseHorizonSeconds;
+    this.#minimumEffectivePlanarSpeed = controller
+      .minimumEffectivePlanarSpeedMetersPerSecond ?? 0;
+    this.#linearAcceleration = carrying
+      ? CARRY_MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED
+      : MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED;
+    this.#yawAcceleration = carrying
+      ? CARRY_MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED
+      : MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED;
+    const maximumPlanarSpeed = carrying
+      ? Math.hypot(
+          CARRY_MAXIMUM_FORWARD_SPEED_METERS_PER_SECOND,
+          CARRY_MAXIMUM_LATERAL_SPEED_METERS_PER_SECOND
+        )
+      : Math.hypot(0.48, 0.22);
+    const maximumYawSpeed = carrying
+      ? CARRY_MAXIMUM_YAW_SPEED_RADIANS_PER_SECOND
+      : 1;
+    this.#stoppingFrames = Math.ceil(
+      Math.max(
+        maximumPlanarSpeed / this.#linearAcceleration,
+        maximumYawSpeed / this.#yawAcceleration
       ) / controlStepSeconds
+        + this.#commandResponseHorizonSeconds / controlStepSeconds
     );
-    this.#stoppingFrames = Math.ceil(0.6 / controlStepSeconds);
+    this.#maximumStoppingFrames = this.#stoppingFrames + Math.ceil(
+      NAVIGATION_STOP_SETTLE_BUDGET_SECONDS / controlStepSeconds
+    );
     this.#contactConstraints = (input.contactConstraints ?? []).map((constraint) => (
       HumanoidContactConstraintSchema.parse(constraint)
     ));
@@ -148,10 +232,40 @@ export class HumanoidNavigationExecution {
     this.#startRootPosition = progress
       ? { ...progress.start_root_position }
       : { ...this.#final.rootPosition };
+    const finalTarget = this.#plan.waypoints.at(-1)!;
+    const initialFinalDistance = Math.hypot(
+      finalTarget.x - this.#startRootPosition.x,
+      finalTarget.z - this.#startRootPosition.z
+    );
+    this.#precisionArrival = initialFinalDistance <= (
+      NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS
+        + NAVIGATION_POSITION_DISCRETIZATION_METERS
+        + humanoidNavigationStoppingDistance({
+          planarSpeedMetersPerSecond: maximumPlanarSpeed,
+          maximumDecelerationMetersPerSecondSquared: this.#linearAcceleration,
+          commandResponseHorizonSeconds: this.#brakingResponseHorizonSeconds
+        })
+    );
+    const progressBudgetSpeed = this.#precisionArrival
+      ? NAVIGATION_PRECISION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND
+      : NAVIGATION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND;
+    this.#maximumTravelFrames = Math.ceil(
+      Math.min(
+        MAXIMUM_NAVIGATION_SECONDS,
+        this.#plan.distance / progressBudgetSpeed
+          + NAVIGATION_STARTUP_SECONDS
+          + NAVIGATION_FINAL_CONVERGENCE_BUDGET_SECONDS
+          + (this.#arrivalHeading === null
+            ? 0
+            : NAVIGATION_ARRIVAL_HEADING_BUDGET_SECONDS)
+      ) / controlStepSeconds
+    );
     this.#waypointIndex = progress?.waypoint_index
       ?? Math.min(1, this.#plan.waypoints.length - 1);
     this.#frames = progress?.committed_frame_count ?? 0;
     this.#stopFrames = progress?.stopping_frame_count ?? 0;
+    this.#stopSettledFrames = progress?.stopping_settled_frame_count ?? 0;
+    this.#arrivalPositionLatched = progress?.arrival_position_latched ?? false;
     this.#assertProgress();
   }
 
@@ -172,7 +286,9 @@ export class HumanoidNavigationExecution {
       start_root_position: this.#startRootPosition,
       waypoint_index: this.#waypointIndex,
       committed_frame_count: this.#frames,
-      stopping_frame_count: this.#stopFrames
+      stopping_frame_count: this.#stopFrames,
+      stopping_settled_frame_count: this.#stopSettledFrames,
+      arrival_position_latched: this.#arrivalPositionLatched
     });
   }
 
@@ -190,10 +306,21 @@ export class HumanoidNavigationExecution {
     if (this.#pendingFrame) {
       throw new Error("Humanoid navigation already has an uncommitted physical frame");
     }
-    if (this.#waypointIndex === this.#plan.waypoints.length
-      && this.#stopFrames >= this.#stoppingFrames) {
-      this.#finish(true);
-      return null;
+    if (this.#waypointIndex === this.#plan.waypoints.length) {
+      if (this.#arrivalPositionLatched
+        && this.#finalWaypointDistance() > this.#finalAcceptedPositionTolerance()
+          + NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS) {
+        this.#arrivalPositionLatched = false;
+        this.#waypointIndex = this.#plan.waypoints.length - 1;
+        this.#stopFrames = 0;
+        this.#stopSettledFrames = 0;
+      } else {
+        if (this.#resolveSettledStop()) return null;
+        if (this.#stopFrames >= this.#maximumStoppingFrames) {
+          this.#finish(false, this.#failedToSettleReason());
+          return null;
+        }
+      }
     }
     while (this.#waypointIndex < this.#plan.waypoints.length) {
       if (this.#frames >= this.#maximumTravelFrames) {
@@ -201,6 +328,15 @@ export class HumanoidNavigationExecution {
         this.#finish(
           false,
           `navigation_timeout:position=${point(this.#final.rootPosition)},target=${point(waypoint)}`
+            + `;distance=${this.#finalWaypointDistance().toFixed(6)}`
+            + `;accepted_distance=${this.#finalAcceptedPositionTolerance().toFixed(6)}`
+            + `;heading_error=${this.#arrivalHeading === null
+              ? "none"
+              : Math.abs(humanoidNavigationArrivalHeadingError(
+                  this.#arrivalHeading,
+                  this.#final.rootPosition,
+                  yawFromQuaternion(this.#final.rootRotation)
+                )).toFixed(6)}`
             + `;command=${this.#reference.rootVelocity.map((value) => (
               value.toFixed(3)
             )).join(",")},yaw=${this.#reference.rootYawVelocity.toFixed(3)}`
@@ -213,34 +349,116 @@ export class HumanoidNavigationExecution {
       const dx = waypoint.x - this.#final.rootPosition.x;
       const dz = waypoint.z - this.#final.rootPosition.z;
       const distance = Math.hypot(dx, dz);
-      if (distance <= 0.18) {
+      if (distance <= NAVIGATION_WAYPOINT_TOLERANCE_METERS
+        && (this.#waypointIndex < this.#plan.waypoints.length - 1
+          || this.#finalWaypointSatisfied())) {
         this.#waypointIndex += 1;
         continue;
       }
       const yaw = yawFromQuaternion(this.#final.rootRotation);
+      const finalWaypoint = this.#waypointIndex === this.#plan.waypoints.length - 1;
+      const acceptedPositionTolerance = finalWaypoint
+        ? this.#finalAcceptedPositionTolerance()
+        : NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS;
+      if (finalWaypoint
+        && this.#arrivalHeading !== null
+        && this.#arrivalPositionLatched
+        && distance > acceptedPositionTolerance
+          + NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS) {
+        this.#arrivalPositionLatched = false;
+      }
+      if (finalWaypoint
+        && this.#arrivalHeading !== null
+        && distance <= acceptedPositionTolerance) {
+        this.#arrivalPositionLatched = true;
+      }
+      const aligningArrivalHeading = finalWaypoint
+        && this.#arrivalPositionLatched
+        && this.#arrivalHeading !== null;
+      const arrivalHeadingReadyForPositionRecovery = aligningArrivalHeading
+        && Math.abs(humanoidNavigationArrivalHeadingError(
+          this.#arrivalHeading!,
+          this.#final.rootPosition,
+          yaw
+        )) <= this.#arrivalHeading!.tolerance_radians
+          + NAVIGATION_ARRIVAL_HEADING_RECOVERY_HYSTERESIS_RADIANS;
+      if (finalWaypoint
+        && this.#arrivalHeading === null
+        && humanoidNavigationShouldBeginBraking({
+          distanceMeters: distance,
+          acceptedDistanceMeters: acceptedPositionTolerance,
+          planarSpeedMetersPerSecond: this.#planarApproachSpeed(dx, dz, distance),
+          ...((this.#carrying || this.#arrivalPositionLatched)
+            ? {
+                commandedPlanarSpeedMetersPerSecond: Math.hypot(
+                  ...this.#reference.rootVelocity
+                )
+              }
+            : {}),
+          maximumDecelerationMetersPerSecondSquared: this.#linearAcceleration,
+          commandResponseHorizonSeconds: this.#brakingResponseHorizonSeconds
+        })) {
+        this.#waypointIndex = this.#plan.waypoints.length;
+        break;
+      }
       const travelYaw = Math.atan2(dx, dz);
-      const yawError = shortestLocomotionYawError(travelYaw, yaw);
+      const yawError = aligningArrivalHeading
+        ? humanoidNavigationArrivalHeadingError(
+            this.#arrivalHeading!,
+            this.#final.rootPosition,
+            yaw
+          )
+        : shortestLocomotionYawError(travelYaw, yaw);
       const localForward = dx * Math.sin(yaw) + dz * Math.cos(yaw);
       const localLateral = dx * Math.cos(yaw) - dz * Math.sin(yaw);
-      const carrying = this.#graspTargets.length > 0;
-      const desiredForward = clamp(
+      const carrying = this.#carrying;
+      let desiredForward = clamp(
         localForward * 1.4,
         carrying ? -CARRY_MAXIMUM_REVERSE_SPEED_METERS_PER_SECOND : -0.3,
         carrying ? CARRY_MAXIMUM_FORWARD_SPEED_METERS_PER_SECOND : 0.48
       );
-      const desiredLateral = clamp(
+      let desiredLateral = clamp(
         localLateral * 0.8,
         carrying ? -CARRY_MAXIMUM_LATERAL_SPEED_METERS_PER_SECOND : -0.22,
         carrying ? CARRY_MAXIMUM_LATERAL_SPEED_METERS_PER_SECOND : 0.22
       );
-      const linearStep = (carrying
-        ? CARRY_MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED
-        : MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED)
-        * this.#controlStepSeconds;
-      const yawStep = (carrying
-        ? CARRY_MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED
-        : MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED)
-        * this.#controlStepSeconds;
+      const minimumPlanarSpeed = this.#minimumPlanarCommandSpeed();
+      const desiredPlanarSpeed = Math.hypot(desiredForward, desiredLateral);
+      if ((!aligningArrivalHeading || arrivalHeadingReadyForPositionRecovery)
+        && distance > acceptedPositionTolerance
+        && desiredPlanarSpeed > 1e-9
+        && desiredPlanarSpeed < minimumPlanarSpeed) {
+        const scale = minimumPlanarSpeed / desiredPlanarSpeed;
+        desiredForward *= scale;
+        desiredLateral *= scale;
+      }
+      desiredForward = clamp(
+        desiredForward,
+        carrying ? -CARRY_MAXIMUM_REVERSE_SPEED_METERS_PER_SECOND : -0.3,
+        carrying ? CARRY_MAXIMUM_FORWARD_SPEED_METERS_PER_SECOND : 0.48
+      );
+      desiredLateral = clamp(
+        desiredLateral,
+        carrying ? -CARRY_MAXIMUM_LATERAL_SPEED_METERS_PER_SECOND : -0.22,
+        carrying ? CARRY_MAXIMUM_LATERAL_SPEED_METERS_PER_SECOND : 0.22
+      );
+      if (carrying && finalWaypoint) {
+        const safeApproachSpeed = Math.max(
+          minimumPlanarSpeed,
+          this.#maximumSafeApproachSpeed(
+            distance,
+            acceptedPositionTolerance
+          )
+        );
+        const plannedSpeed = Math.hypot(desiredForward, desiredLateral);
+        if (plannedSpeed > safeApproachSpeed && plannedSpeed > 1e-9) {
+          const scale = safeApproachSpeed / plannedSpeed;
+          desiredForward *= scale;
+          desiredLateral *= scale;
+        }
+      }
+      const linearStep = this.#linearAcceleration * this.#controlStepSeconds;
+      const yawStep = this.#yawAcceleration * this.#controlStepSeconds;
       this.#reference = targetReference(this.#reference, {
         rootVelocity: [
           approach(this.#reference.rootVelocity[0], desiredForward, linearStep),
@@ -259,29 +477,87 @@ export class HumanoidNavigationExecution {
       return this.#preparePhysicalFrame(simulation, false);
     }
 
+    const stoppingVelocity = this.#stoppingStationKeepingVelocityTarget();
+    const stoppingLinearStep = this.#linearAcceleration * this.#controlStepSeconds;
     this.#reference = targetReference(this.#reference, {
       rootVelocity: [
         approach(
           this.#reference.rootVelocity[0],
-          0,
-          MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED
-            * this.#controlStepSeconds
+          stoppingVelocity[0],
+          stoppingLinearStep
         ),
         approach(
           this.#reference.rootVelocity[1],
-          0,
-          MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED
-            * this.#controlStepSeconds
+          stoppingVelocity[1],
+          stoppingLinearStep
         )
       ],
       rootYawVelocity: approach(
         this.#reference.rootYawVelocity,
-        0,
-        MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED
-          * this.#controlStepSeconds
+        this.#stoppingYawVelocityTarget(),
+        this.#yawAcceleration * this.#controlStepSeconds
       )
     });
     return this.#preparePhysicalFrame(simulation, true);
+  }
+
+  #stoppingStationKeepingVelocityTarget(): readonly [number, number] {
+    const target = this.#plan.waypoints.at(-1)!;
+    const dx = target.x - this.#final.rootPosition.x;
+    const dz = target.z - this.#final.rootPosition.z;
+    const distance = Math.hypot(dx, dz);
+    const yaw = yawFromQuaternion(this.#final.rootRotation);
+    let forward = (dx * Math.sin(yaw) + dz * Math.cos(yaw)) * 1.4;
+    let lateral = (dx * Math.cos(yaw) - dz * Math.sin(yaw)) * 0.8;
+    if (!this.#carrying && distance > this.#finalAcceptedPositionTolerance()) {
+      const speed = Math.hypot(forward, lateral);
+      const minimumSpeed = this.#minimumPlanarCommandSpeed();
+      if (speed > 1e-9 && speed < minimumSpeed) {
+        const scale = minimumSpeed / speed;
+        forward *= scale;
+        lateral *= scale;
+      }
+      return [
+        clamp(forward, -0.3, 0.48),
+        clamp(lateral, -0.22, 0.22)
+      ];
+    }
+    return [
+      clamp(
+        forward,
+        -NAVIGATION_STOP_POSITION_HOLD_COMMAND_METERS_PER_SECOND,
+        NAVIGATION_STOP_POSITION_HOLD_COMMAND_METERS_PER_SECOND
+      ),
+      clamp(
+        lateral,
+        -NAVIGATION_STOP_POSITION_HOLD_COMMAND_METERS_PER_SECOND,
+        NAVIGATION_STOP_POSITION_HOLD_COMMAND_METERS_PER_SECOND
+      )
+    ];
+  }
+
+  #stoppingYawVelocityTarget(): number {
+    if (!this.#arrivalPositionLatched || this.#arrivalHeading === null) return 0;
+    const error = humanoidNavigationArrivalHeadingError(
+      this.#arrivalHeading,
+      this.#final.rootPosition,
+      yawFromQuaternion(this.#final.rootRotation)
+    );
+    return clamp(error * 1.8, -1, 1);
+  }
+
+  #maximumSafeApproachSpeed(
+    distance: number,
+    acceptedDistance: number
+  ): number {
+    const brakingDistance = Math.max(0, distance - acceptedDistance);
+    const response = this.#brakingResponseHorizonSeconds;
+    const acceleration = this.#linearAcceleration;
+    return acceleration * (
+      Math.sqrt(
+        response * response + 2 * brakingDistance / acceleration
+      ) - response
+    );
   }
 
   commitPreparedFrame(externalFailure?: string): HumanoidNavigationExecutionStep {
@@ -290,19 +566,28 @@ export class HumanoidNavigationExecution {
     this.#pendingFrame = undefined;
     this.#final = pending.snapshot;
     this.#frames += 1;
-    if (pending.stopping) this.#stopFrames += 1;
+    if (pending.stopping) {
+      this.#stopFrames += 1;
+      this.#stopSettledFrames = this.#stoppingFrameIsSettled()
+        ? this.#stopSettledFrames + 1
+        : 0;
+    }
     const failure = this.#final.fallen
       ? pending.stopping ? "fallen_while_stopping" : "fallen"
       : blockedHumanoidContacts(this.#final, this.#contactConstraints).length > 0
         ? pending.stopping
-          ? "contact_while_stopping"
+          ? `contact_while_stopping:${environmentContact(
+              this.#final,
+              this.#contactConstraints
+            )}`
           : environmentContact(this.#final, this.#contactConstraints)
         : externalFailure;
     if (failure) this.#finish(false, failure);
-    if (!this.#result
-      && pending.stopping
-      && this.#stopFrames >= this.#stoppingFrames) {
-      this.#finish(true);
+    if (!this.#result && pending.stopping) {
+      if (!this.#resolveSettledStop()
+        && this.#stopFrames >= this.#maximumStoppingFrames) {
+        this.#finish(false, this.#failedToSettleReason());
+      }
     }
     return {
       snapshot: this.#final,
@@ -331,14 +616,22 @@ export class HumanoidNavigationExecution {
         CARRY_MAXIMUM_WRIST_REFERENCE_CORRECTION_RADIANS
     });
     if (this.#graspTargets.length > 0) {
+      const snapshot = simulation.snapshot();
+      const requestedJointTargets = simulation.handJointCommandTargets();
       const controlled = contactAwareG1GraspJointTargets({
-        requestedJointTargets: simulation.handJointCommandTargets(),
-        snapshot: simulation.snapshot(),
+        requestedJointTargets,
+        snapshot,
         targets: this.#graspTargets
       });
       simulation.applyHandServoJointTargets(controlled.jointTargets);
     }
-    const snapshot = await simulation.step(this.#reference);
+    const snapshot = await simulation.step(this.#reference, {
+      trackedJointPolicyCommand: this.#carrying ? "neutral" : "measured",
+      noslipIterations: g1CarriedGraspRequiresNoslip({
+        snapshot: simulation.snapshot(),
+        targets: this.#graspTargets
+      }) ? CARRY_NOSLIP_SOLVER_ITERATIONS : 0
+    });
     const prepared = {
       snapshot,
       waypointIndex: Math.min(
@@ -365,6 +658,7 @@ export class HumanoidNavigationExecution {
   }
 
   #finish(completed: boolean, reason?: string): void {
+    if (completed) this.#reference = stationaryHumanoidReference(this.#reference);
     this.#result = {
       completed,
       ...(reason ? { reason } : {}),
@@ -378,6 +672,123 @@ export class HumanoidNavigationExecution {
     };
   }
 
+  #finalWaypointDistance(): number {
+    const target = this.#plan.waypoints.at(-1)!;
+    return Math.hypot(
+      target.x - this.#final.rootPosition.x,
+      target.z - this.#final.rootPosition.z
+    );
+  }
+
+  #resolveSettledStop(): boolean {
+    if (this.#stopFrames < this.#stoppingFrames
+      || this.#stopSettledFrames < NAVIGATION_STOP_SETTLED_STEPS) {
+      return false;
+    }
+    if (this.#finalWaypointSatisfied()) {
+      this.#finish(true);
+      return true;
+    }
+    this.#waypointIndex = this.#plan.waypoints.length - 1;
+    this.#stopFrames = 0;
+    this.#stopSettledFrames = 0;
+    return false;
+  }
+
+  #stoppingFrameIsSettled(): boolean {
+    const pelvisVelocity = this.#final.links?.pelvis?.linearVelocity;
+    const planarSpeed = pelvisVelocity
+      ? Math.hypot(pelvisVelocity.x, pelvisVelocity.z)
+      : 0;
+    return planarSpeed
+        <= NAVIGATION_STOP_PLANAR_SPEED_TOLERANCE_METERS_PER_SECOND
+      && Math.hypot(...this.#reference.rootVelocity)
+        <= NAVIGATION_STOP_COMMAND_TOLERANCE_METERS_PER_SECOND
+      && Math.abs(this.#reference.rootYawVelocity)
+        <= NAVIGATION_STOP_YAW_COMMAND_TOLERANCE_RADIANS_PER_SECOND;
+  }
+
+  #failedToSettleReason(): string {
+    const pelvisVelocity = this.#final.links?.pelvis?.linearVelocity;
+    return "navigation_failed_to_settle"
+      + `:position=${point(this.#final.rootPosition)}`
+      + `;distance=${this.#finalWaypointDistance().toFixed(6)}`
+      + `;pelvis_speed=${pelvisVelocity
+        ? Math.hypot(pelvisVelocity.x, pelvisVelocity.z).toFixed(6)
+        : "unavailable"}`
+      + `;command=${this.#reference.rootVelocity.map((value) => (
+        value.toFixed(3)
+      )).join(",")}`;
+  }
+
+  #planarApproachSpeed(dx: number, dz: number, distance: number): number {
+    const commandedSpeed = Math.hypot(...this.#reference.rootVelocity);
+    const pelvisVelocity = this.#final.links?.pelvis?.linearVelocity;
+    if (!pelvisVelocity || distance <= 1e-9) {
+      return commandedSpeed + 1e-9 < this.#minimumPlanarCommandSpeed()
+        ? 0
+        : commandedSpeed;
+    }
+    return Math.max(
+      0,
+      (pelvisVelocity.x * dx + pelvisVelocity.z * dz) / distance
+    );
+  }
+
+  #minimumPlanarCommandSpeed(): number {
+    if (!this.#carrying && !this.#precisionArrival) return 0;
+    return Math.max(
+      this.#carrying ? 0.07 : 0.1,
+      this.#minimumEffectivePlanarSpeed > 0
+        ? this.#minimumEffectivePlanarSpeed
+          + NAVIGATION_EFFECTIVE_COMMAND_MARGIN_METERS_PER_SECOND
+        : 0
+    );
+  }
+
+  #finalWaypointSatisfied(): boolean {
+    const currentDistance = this.#finalWaypointDistance();
+    if (currentDistance > this.#finalAcceptedPositionTolerance()) return false;
+    if (!humanoidNavigationArrivalHeadingSatisfied(
+      this.#arrivalHeading,
+      this.#final.rootPosition,
+      yawFromQuaternion(this.#final.rootRotation)
+    )) return false;
+    return true;
+  }
+
+  #finalPositionTolerance(): number {
+    const target = this.#plan.waypoints.at(-1)!;
+    const initialDistance = Math.hypot(
+      target.x - this.#startRootPosition.x,
+      target.z - this.#startRootPosition.z
+    );
+    if (initialDistance <= NAVIGATION_ALREADY_AT_TARGET_TOLERANCE_METERS) {
+      return this.#baseFinalPositionTolerance();
+    }
+    const requiredProgress = Math.min(
+      initialDistance,
+      Math.max(
+        NAVIGATION_MINIMUM_SHORT_ROUTE_PROGRESS_METERS,
+        initialDistance * NAVIGATION_MINIMUM_SHORT_ROUTE_PROGRESS_RATIO
+      )
+    );
+    return Math.min(
+      this.#baseFinalPositionTolerance(),
+      initialDistance - requiredProgress
+    );
+  }
+
+  #baseFinalPositionTolerance(): number {
+    return this.#carrying
+      ? CARRY_NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS
+      : NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS;
+  }
+
+  #finalAcceptedPositionTolerance(): number {
+    return this.#finalPositionTolerance() + NAVIGATION_POSITION_DISCRETIZATION_METERS;
+  }
+
   #assertProgress(): void {
     if (this.#plan.waypoints.length === 0) {
       throw new Error("Humanoid navigation execution requires at least one waypoint");
@@ -386,11 +797,15 @@ export class HumanoidNavigationExecution {
       throw new Error("Humanoid navigation waypoint progress exceeds its plan");
     }
     const stopping = this.#waypointIndex === this.#plan.waypoints.length;
-    if ((!stopping && this.#stopFrames !== 0)
-      || this.#stopFrames > this.#stoppingFrames) {
+    if ((!stopping && (this.#stopFrames !== 0 || this.#stopSettledFrames !== 0))
+      || this.#stopFrames > this.#maximumStoppingFrames
+      || this.#stopSettledFrames > this.#stopFrames) {
       throw new Error("Humanoid navigation stopping progress is inconsistent with its route");
     }
-    if (this.#frames > this.#maximumTravelFrames + this.#stoppingFrames) {
+    if (this.#arrivalPositionLatched && this.#arrivalHeading === null) {
+      throw new Error("Humanoid navigation position latch requires an arrival heading");
+    }
+    if (this.#frames > this.#maximumTravelFrames + this.#maximumStoppingFrames) {
       throw new Error("Humanoid navigation progress exceeds its physical frame limit");
     }
   }
@@ -404,7 +819,8 @@ export async function previewHumanoidNavigation(
   startFrame: number,
   startWorldRevision: number,
   carriedObjectBindings: HumanoidCarriedObjectBindingSet,
-  carriedObjectTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[]
+  carriedObjectTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[],
+  arrivalHeading: HumanoidNavigationArrivalHeading | null = null
 ): Promise<ReturnType<HumanoidNavigationExecution["result"]>> {
   if (graspRegistry.lastFrame !== startFrame) {
     throw new Error("Humanoid navigation preview grasp registry is not frame-aligned");
@@ -420,7 +836,8 @@ export async function previewHumanoidNavigation(
       bindings: carriedObjectBindings.bindings,
       graspRegistry
     }),
-    carryTaskSpaceTargets: carriedObjectTaskSpaceTargets
+    carryTaskSpaceTargets: carriedObjectTaskSpaceTargets,
+    arrivalHeading
   });
   let frame = startFrame;
   let worldRevision = startWorldRevision;
@@ -526,13 +943,6 @@ function environmentContact(
   return `${base};time=${snapshot.simulatedTime.toFixed(3)};contacts=${
     evidence.join(",") || "none"
   }`;
-}
-
-function yawFromQuaternion(rotation: HumanoidSimulationSnapshot["rootRotation"]): number {
-  return Math.atan2(
-    2 * (rotation.w * rotation.y + rotation.x * rotation.z),
-    1 - 2 * (rotation.y * rotation.y + rotation.z * rotation.z)
-  );
 }
 
 function normalizeAngle(value: number): number {
