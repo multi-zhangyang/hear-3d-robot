@@ -5,6 +5,7 @@ import {
   type Scenario
 } from "../domain/schema.js";
 import { assertScenarioChunkIntegrity } from "../domain/scenario-chunk.js";
+import { humanoidObjectCapability } from "../world/humanoid/object-capability.js";
 
 export class GoalValidationError extends Error {
   readonly statusCode = 400;
@@ -49,6 +50,39 @@ export function assertGoalSupported(goal: Goal, scenario: Scenario): void {
     }
     const object = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
     if (!object) throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
+    if (predicate.type === "object_inside") {
+      if (!object.portable) {
+        throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);
+      }
+      const container = scenario.objects.find((candidate) => (
+        candidate.id === predicate.container_id
+      ));
+      if (!container) throw new GoalValidationError(`Unknown container: ${predicate.container_id}`);
+      if (!humanoidObjectCapability(container).affordances.includes("container")) {
+        throw new GoalValidationError(`Object is not a container: ${predicate.container_id}`);
+      }
+      continue;
+    }
+    if (predicate.type === "object_on") {
+      if (!object.portable) {
+        throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);
+      }
+      const support = scenario.objects.find((candidate) => candidate.id === predicate.support_id);
+      if (!support) throw new GoalValidationError(`Unknown support: ${predicate.support_id}`);
+      if (!humanoidObjectCapability(support).affordances.includes("support_surface")) {
+        throw new GoalValidationError(`Object is not a support surface: ${predicate.support_id}`);
+      }
+      continue;
+    }
+    if (predicate.type === "articulation_state") {
+      const articulation = humanoidObjectCapability(object).articulation;
+      if (!articulation || articulation.joint_id !== predicate.joint_id) {
+        throw new GoalValidationError(
+          `Unknown articulation ${predicate.joint_id} on ${predicate.object_id}`
+        );
+      }
+      continue;
+    }
     if (predicate.type === "object_grasped" || predicate.type === "object_placed") {
       if (!object.portable) {
         throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);

@@ -12,6 +12,7 @@ import type {
   HumanoidSimulationSnapshot
 } from "./simulation.js";
 import { observableHumanoidSolidIds } from "./solid-observation.js";
+import { humanoidObjectCapability } from "./object-capability.js";
 
 interface HumanoidMotionOptionObservation {
   contract: HumanoidMotionOptionContract;
@@ -60,7 +61,8 @@ export function humanoidMotionOptionDetectorInputFromSimulation(
       id: descriptor.id,
       position: { ...object.position },
       rotation: { ...object.rotation },
-      size: { ...descriptor.size }
+      size: { ...descriptor.size },
+      ...observableArticulation(descriptor, object)
     });
   }
   return {
@@ -78,6 +80,35 @@ export function humanoidMotionOptionDetectorInputFromSimulation(
             input.worldFrame
           )
         }
+      : {})
+  };
+}
+
+function observableArticulation(
+  descriptor: Scenario["objects"][number],
+  observed: HumanoidSimulationSnapshot["objects"][string]
+): Pick<
+  HumanoidMotionOptionObservableObject,
+  "articulation" | "container" | "supportSurface"
+> {
+  const capability = humanoidObjectCapability(descriptor);
+  return {
+    ...(capability.articulation && observed.articulation
+      ? {
+          articulation: {
+            jointId: capability.articulation.joint_id,
+            position: observed.articulation.position,
+            velocity: observed.articulation.velocity,
+            closedPosition: capability.articulation.closed_position,
+            openPosition: capability.articulation.open_position
+          }
+        }
+      : {}),
+    ...(capability.container
+      ? { container: structuredClone(capability.container) }
+      : {}),
+    ...(capability.supportSurface
+      ? { supportSurface: structuredClone(capability.supportSurface) }
       : {})
   };
 }

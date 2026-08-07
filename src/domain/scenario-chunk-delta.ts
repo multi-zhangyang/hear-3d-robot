@@ -271,14 +271,20 @@ export function materializeScenarioChunkDeltaState(
       center: structuredClone(block.center),
       size: structuredClone(block.size)
     })),
-    objects: entities.map((entity) => ({
-      id: entity.id,
-      kind: entity.kind,
-      color: entity.color,
-      position: structuredClone(entity.position),
-      size: structuredClone(entity.size),
-      portable: entity.portable
-    })),
+    objects: entities.map((entity) => {
+      const baseline = scenario.objects.find(({ id }) => id === entity.id);
+      return {
+        id: entity.id,
+        kind: entity.kind,
+        color: entity.color,
+        position: structuredClone(entity.position),
+        size: structuredClone(entity.size),
+        portable: entity.portable,
+        ...(baseline?.capability
+          ? { capability: structuredClone(baseline.capability) }
+          : {})
+      };
+    }),
     zones: zones.map((zone) => ({
       id: zone.id,
       color: zone.color,

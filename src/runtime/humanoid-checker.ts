@@ -17,6 +17,11 @@ import {
 import { assessHumanoidObjectSettledOnSupport } from "../world/humanoid/object-settled-support.js";
 import { humanoidObjectInsideZone } from "../world/humanoid/object-zone-relation.js";
 import type { HumanoidWorldSnapshot } from "../world/humanoid/world.js";
+import { humanoidObjectCapability } from "../world/humanoid/object-capability.js";
+import {
+  humanoidObjectInsideContainerGeometry,
+  humanoidObjectOnSupportGeometry
+} from "../world/humanoid/object-world-model.js";
 import { GoalValidationError } from "./goal-validation.js";
 
 interface PredicateEvaluation {
@@ -53,6 +58,38 @@ export function assertHumanoidGoalSupported(goal: Goal, scenario: Scenario): voi
       if (!object) throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
       if (!object.portable) {
         throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);
+      }
+    }
+    if (predicate.type === "object_inside") {
+      const object = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
+      const container = scenario.objects.find((candidate) => (
+        candidate.id === predicate.container_id
+      ));
+      if (!object) throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
+      if (!object.portable) throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);
+      if (!container) throw new GoalValidationError(`Unknown container: ${predicate.container_id}`);
+      if (!humanoidObjectCapability(container).container) {
+        throw new GoalValidationError(`Object is not a container: ${predicate.container_id}`);
+      }
+    }
+    if (predicate.type === "object_on") {
+      const object = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
+      const support = scenario.objects.find((candidate) => candidate.id === predicate.support_id);
+      if (!object) throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
+      if (!object.portable) throw new GoalValidationError(`Object is not movable: ${predicate.object_id}`);
+      if (!support) throw new GoalValidationError(`Unknown support: ${predicate.support_id}`);
+      if (!humanoidObjectCapability(support).supportSurface) {
+        throw new GoalValidationError(`Object is not a support surface: ${predicate.support_id}`);
+      }
+    }
+    if (predicate.type === "articulation_state") {
+      const object = scenario.objects.find((candidate) => candidate.id === predicate.object_id);
+      const articulation = object ? humanoidObjectCapability(object).articulation : undefined;
+      if (!object) throw new GoalValidationError(`Unknown object: ${predicate.object_id}`);
+      if (!articulation || articulation.joint_id !== predicate.joint_id) {
+        throw new GoalValidationError(
+          `Unknown articulation ${predicate.joint_id} on ${predicate.object_id}`
+        );
       }
     }
   }
@@ -383,6 +420,83 @@ function evaluatePredicates(
         }
       );
     }
+    if (predicate.type === "object_inside") {
+      const object = world.robot.objects[predicate.object_id];
+      const objectDescriptor = scenario.objects.find(({ id }) => id === predicate.object_id);
+      const container = world.robot.objects[predicate.container_id];
+      const containerDescriptor = scenario.objects.find(({ id }) => id === predicate.container_id);
+      const containerCapability = containerDescriptor
+        ? humanoidObjectCapability(containerDescriptor).container
+        : undefined;
+      const inside = object && objectDescriptor && container && containerCapability
+        ? humanoidObjectInsideContainerGeometry({
+            object: { ...object, size: objectDescriptor.size },
+            container,
+            descriptor: containerCapability,
+            tolerance: predicate.tolerance
+          })
+        : false;
+      return evaluation(name, inside === predicate.expected, {
+        object_id: predicate.object_id,
+        container_id: predicate.container_id,
+        inside,
+        expected: predicate.expected,
+        tolerance: predicate.tolerance,
+        object_position: object?.position ?? null,
+        container_position: container?.position ?? null
+      });
+    }
+    if (predicate.type === "object_on") {
+      const object = world.robot.objects[predicate.object_id];
+      const objectDescriptor = scenario.objects.find(({ id }) => id === predicate.object_id);
+      const support = world.robot.objects[predicate.support_id];
+      const supportDescriptor = scenario.objects.find(({ id }) => id === predicate.support_id);
+      const supportCapability = supportDescriptor
+        ? humanoidObjectCapability(supportDescriptor).supportSurface
+        : undefined;
+      const onSupport = object && objectDescriptor && support && supportCapability
+        ? humanoidObjectOnSupportGeometry({
+            object: { ...object, size: objectDescriptor.size },
+            support,
+            descriptor: supportCapability,
+            tolerance: predicate.tolerance
+          })
+        : false;
+      return evaluation(name, onSupport === predicate.expected, {
+        object_id: predicate.object_id,
+        support_id: predicate.support_id,
+        on_support: onSupport,
+        expected: predicate.expected,
+        tolerance: predicate.tolerance,
+        object_position: object?.position ?? null,
+        support_position: support?.position ?? null
+      });
+    }
+    if (predicate.type === "articulation_state") {
+      const object = world.robot.objects[predicate.object_id];
+      const descriptor = scenario.objects.find(({ id }) => id === predicate.object_id);
+      const articulation = descriptor
+        ? humanoidObjectCapability(descriptor).articulation
+        : undefined;
+      const observed = object?.articulation;
+      const openFraction = observed && articulation
+        ? clamp01(
+            (observed.position - articulation.closed_position)
+              / (articulation.open_position - articulation.closed_position)
+          )
+        : null;
+      const satisfied = openFraction !== null && (predicate.state === "open"
+        ? openFraction >= 1 - predicate.tolerance
+        : openFraction <= predicate.tolerance);
+      return evaluation(name, satisfied, {
+        object_id: predicate.object_id,
+        joint_id: predicate.joint_id,
+        requested_state: predicate.state,
+        open_fraction: openFraction,
+        joint_position: observed?.position ?? null,
+        tolerance: predicate.tolerance
+      });
+    }
     if (predicate.type === "end_effector_at") {
       const position = humanoidEndEffectorPosition(
         world.robot,
@@ -445,6 +559,10 @@ function observedEndEffectorRotation(
 
 function assertNever(value: never): never {
   throw new Error(`Unsupported humanoid goal predicate: ${JSON.stringify(value)}`);
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
 }
 
 function evaluation(

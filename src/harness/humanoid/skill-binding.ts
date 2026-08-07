@@ -1,0 +1,947 @@
+import { z } from "zod";
+import { Vec3Schema, type JsonValue, type Vec3 } from "../../domain/schema.js";
+import {
+  BeginHumanoidSkillSchema,
+  HUMANOID_SKILL_CONTRACTS,
+  HumanoidSkillInvocationSchema,
+  type BeginHumanoidSkill,
+  type HumanoidSkillInvocation
+} from "../../domain/humanoid-skill.js";
+import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
+import type { HumanoidWorldObservation } from "../../world/humanoid/world.js";
+import type { HumanoidObjectWorldModelEntry } from "../../world/humanoid/object-world-model.js";
+import type { HumanoidSolidToken } from "../../world/humanoid/solid-observation.js";
+
+export type SkillPlanningAction =
+  | "plan_humanoid_skill"
+  | "plan_whole_body_motion_candidates"
+  | "plan_humanoid_navigation";
+
+export interface ActiveHumanoidSkillBinding {
+  protocol: "humanoid-active-skill-v1";
+  transaction_id: string;
+  agent_id: string;
+  skill_plan_transaction_id: string | null;
+  skill_node_id: string | null;
+  invocation: HumanoidSkillInvocation;
+  invocation_sha256: string;
+  phase: string;
+  phase_authority: "navigation" | "whole_body" | "grasp";
+  planning_action: SkillPlanningAction;
+  observed_frame: number;
+  observed_world_revision: number;
+  skill_catalog_sha256: string;
+  target_position: Vec3 | null;
+  target_solid: Omit<HumanoidSolidToken, "currentContacts"> | null;
+  target_articulation: HumanoidObjectWorldModelEntry["articulation"];
+  eligible_interaction_points: HumanoidObjectWorldModelEntry["interaction_points"];
+  eligible_interaction_point_ids: string[];
+}
+
+const PersistedInteractionPointSchema = z.object({
+  id: z.string().trim().min(1),
+  kind: z.string().trim().min(1),
+  compatible_hands: z.enum(["left", "right", "either", "both"]),
+  world_position: Vec3Schema,
+  approach_direction_world: Vec3Schema.optional(),
+  clearance_m: z.number().finite().nonnegative(),
+  source: z.enum(["authored", "geometry"])
+}).strict();
+
+const PersistedArticulationSchema = z.object({
+  joint_id: z.string().trim().min(1),
+  parent_object_id: z.string().trim().min(1).nullable(),
+  type: z.enum(["hinge", "slide"]),
+  semantic: z.string().trim().min(1),
+  axis_world: Vec3Schema,
+  anchor_world: Vec3Schema,
+  position: z.number().finite().nullable(),
+  velocity: z.number().finite().nullable(),
+  range: z.object({
+    minimum: z.number().finite(),
+    maximum: z.number().finite()
+  }).strict(),
+  closed_position: z.number().finite(),
+  open_position: z.number().finite(),
+  open_fraction: z.number().finite().min(0).max(1).nullable(),
+  state: z.enum(["open", "closed", "intermediate", "unobserved"])
+}).strict();
+
+const PersistedSolidSchema = z.object({
+  id: z.string().trim().min(1),
+  sourceId: z.string().trim().min(1),
+  kind: z.enum(["block", "fixed_object"]),
+  center: Vec3Schema,
+  size: Vec3Schema
+}).strict();
+
+export const ActiveHumanoidSkillBindingSchema = z.object({
+    protocol: z.literal("humanoid-active-skill-v1"),
+    transaction_id: z.string().trim().min(1),
+    agent_id: z.string().trim().min(1),
+    skill_plan_transaction_id: z.string().trim().min(1).nullable(),
+    skill_node_id: z.string().trim().min(1).nullable(),
+    invocation: HumanoidSkillInvocationSchema,
+    invocation_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    phase: z.string().trim().min(1),
+    phase_authority: z.enum(["navigation", "whole_body", "grasp"]),
+    planning_action: z.enum([
+      "plan_humanoid_skill",
+      "plan_whole_body_motion_candidates",
+      "plan_humanoid_navigation"
+    ]),
+    observed_frame: z.number().int().nonnegative(),
+    observed_world_revision: z.number().int().nonnegative(),
+    skill_catalog_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    target_position: Vec3Schema.nullable(),
+    target_solid: PersistedSolidSchema.nullable().default(null),
+    target_articulation: PersistedArticulationSchema.nullable(),
+    eligible_interaction_points: z.array(PersistedInteractionPointSchema),
+    eligible_interaction_point_ids: z.array(z.string().trim().min(1))
+  }).strict().superRefine((binding, context) => {
+    if (binding.invocation_sha256 !== modelPayloadSha256(binding.invocation)) {
+      context.addIssue({
+        code: "custom",
+        path: ["invocation_sha256"],
+        message: "Active Skill invocation identity is invalid"
+      });
+    }
+    const pointIds = binding.eligible_interaction_points.map(({ id }) => id).sort();
+    const indexedIds = [...binding.eligible_interaction_point_ids].sort();
+    if (new Set(indexedIds).size !== indexedIds.length
+      || JSON.stringify(pointIds) !== JSON.stringify(indexedIds)) {
+      context.addIssue({
+        code: "custom",
+        path: ["eligible_interaction_point_ids"],
+        message: "Active Skill interaction-point index is invalid"
+      });
+    }
+  }) as unknown as z.ZodType<ActiveHumanoidSkillBinding>;
+
+export type HumanoidSkillBindingResult =
+  | { accepted: true; binding: ActiveHumanoidSkillBinding }
+  | {
+      accepted: false;
+      code: string;
+      detail: JsonValue;
+    };
+
+type InteractionPointValidation =
+  | {
+      accepted: true;
+      eligiblePointIds: string[];
+      eligiblePoints: HumanoidObjectWorldModelEntry["interaction_points"];
+    }
+  | { accepted: false; code: string; detail: JsonValue };
+
+export function bindHumanoidSkill(input: {
+  transactionId: string;
+  agentId: string;
+  request: BeginHumanoidSkill;
+  observation: HumanoidWorldObservation;
+}): HumanoidSkillBindingResult {
+  const request = BeginHumanoidSkillSchema.parse(input.request);
+  const invocation = request.invocation;
+  const contract = HUMANOID_SKILL_CONTRACTS[invocation.skill];
+  const process = contract.process.find(({ phase }) => phase === request.phase);
+  if (!process) {
+    return rejection("skill_phase_unknown", {
+      skill: invocation.skill,
+      requested_phase: request.phase,
+      available_phases: contract.process.map(({ phase, authority }) => ({
+        phase,
+        authority
+      }))
+    });
+  }
+  if (process.authority !== "navigation"
+    && process.authority !== "whole_body"
+    && process.authority !== "grasp") {
+    return rejection("skill_phase_not_actionable", {
+      skill: invocation.skill,
+      requested_phase: request.phase,
+      phase_authority: process.authority,
+      reason: process.authority === "sensor"
+        ? "The current observation already supplies sensor authority"
+        : "Checker authority must be expressed by a physical Motion Option terminal"
+    });
+  }
+  const worldModel = input.observation.interaction.object_world_model;
+  if (worldModel.frame !== input.observation.frame
+    || worldModel.world_revision !== input.observation.worldRevision) {
+    throw new Error("Object world model does not match its observation authority");
+  }
+  const objects = new Map(worldModel.objects.map((object) => [object.id, object]));
+  const targetId = invocationObjectId(invocation);
+  const target = targetId ? objects.get(targetId) : undefined;
+  const targetSolid = invocation.skill === "break_block"
+    ? input.observation.solidTokens.find(({ id }) => id === invocation.solid_id)
+    : undefined;
+  const explorationFrontier = invocation.skill === "explore"
+    ? input.observation.spatialBelief.frontiers.find(
+        ({ id }) => id === invocation.frontier_id
+      )
+    : undefined;
+  if (invocation.skill === "explore" && !explorationFrontier) {
+    return rejection("skill_frontier_unavailable", {
+      skill: invocation.skill,
+      frontier_id: invocation.frontier_id,
+      available_frontier_ids: input.observation.spatialBelief.frontiers.map(
+        ({ id }) => id
+      )
+    });
+  }
+  if (invocation.skill === "explore" && explorationFrontier
+    && explorationFrontier.travel_distance_m > invocation.maximum_travel_m) {
+    return rejection("skill_frontier_out_of_range", {
+      skill: invocation.skill,
+      frontier_id: invocation.frontier_id,
+      travel_distance_m: explorationFrontier.travel_distance_m,
+      maximum_travel_m: invocation.maximum_travel_m
+    });
+  }
+  if (invocation.skill === "break_block" && !targetSolid) {
+    return rejection("skill_solid_unobserved", {
+      skill: invocation.skill,
+      solid_id: invocation.solid_id,
+      observable_solid_ids: input.observation.solidTokens.map(({ id }) => id)
+    });
+  }
+  if (invocation.skill === "break_block" && targetSolid?.kind === "fixed_object") {
+    return rejection("skill_solid_not_removable", {
+      skill: invocation.skill,
+      solid_id: invocation.solid_id,
+      solid_kind: targetSolid.kind
+    });
+  }
+  if (targetId && (!target || target.status !== "visible")) {
+    return rejection("skill_target_unobserved", {
+      skill: invocation.skill,
+      object_id: targetId,
+      status: target?.status ?? "unknown"
+    });
+  }
+  if (target) {
+    const missingAffordances = contract.required_affordances.filter(
+      (affordance) => !target.affordances.includes(affordance)
+    );
+    if (missingAffordances.length > 0) {
+      return rejection("skill_affordance_missing", {
+        skill: invocation.skill,
+        object_id: target.id,
+        required_affordances: contract.required_affordances,
+        observed_affordances: target.affordances,
+        missing_affordances: missingAffordances
+      });
+    }
+  }
+  const interaction = validateInteractionPoints(invocation, target);
+  if (!interaction.accepted) return interaction;
+  const semantic = validateSkillSemantics(invocation, target, objects, input.observation);
+  if (semantic) return semantic;
+  const planningAction: SkillPlanningAction = "plan_humanoid_skill";
+  return {
+    accepted: true,
+    binding: {
+      protocol: "humanoid-active-skill-v1",
+      transaction_id: input.transactionId,
+      agent_id: input.agentId,
+      skill_plan_transaction_id: request.skill_plan_transaction_id,
+      skill_node_id: request.skill_node_id,
+      invocation: structuredClone(invocation),
+      invocation_sha256: modelPayloadSha256(invocation),
+      phase: request.phase,
+      phase_authority: process.authority,
+      planning_action: planningAction,
+      observed_frame: input.observation.frame,
+      observed_world_revision: input.observation.worldRevision,
+      skill_catalog_sha256:
+        input.observation.interaction.skill_catalog.contract_sha256,
+      target_position: target
+        ? { ...target.pose.position }
+        : explorationFrontier ? { ...explorationFrontier.target }
+          : targetSolid ? { ...targetSolid.center } : null,
+      target_solid: targetSolid ? {
+        id: targetSolid.id,
+        sourceId: targetSolid.sourceId,
+        kind: targetSolid.kind,
+        center: { ...targetSolid.center },
+        size: { ...targetSolid.size }
+      } : null,
+      target_articulation: target?.articulation
+        ? structuredClone(target.articulation)
+        : null,
+      eligible_interaction_points: structuredClone(interaction.eligiblePoints),
+      eligible_interaction_point_ids: interaction.eligiblePointIds
+    }
+  };
+}
+
+export function validateSkillPlanningReference(input: {
+  binding: ActiveHumanoidSkillBinding | undefined;
+  action: SkillPlanningAction;
+  rawInput: unknown;
+  currentWorldRevision: number;
+}): { accepted: true } | { accepted: false; code: string; detail: JsonValue } {
+  const binding = input.binding;
+  if (!binding) {
+    return rejection("active_skill_required", {
+      action: input.action,
+      recovery: "Observe, then bind one model-selected humanoid skill phase before planning"
+    });
+  }
+  const supplied = skillTransactionId(input.rawInput);
+  if (supplied !== binding.transaction_id) {
+    return rejection("skill_reference_mismatch", {
+      action: input.action,
+      supplied_skill_transaction_id: supplied,
+      active_skill_transaction_id: binding.transaction_id
+    });
+  }
+  if (binding.observed_world_revision !== input.currentWorldRevision) {
+    return rejection("skill_world_revision_stale", {
+      action: input.action,
+      skill: binding.invocation.skill,
+      skill_world_revision: binding.observed_world_revision,
+      current_world_revision: input.currentWorldRevision,
+      recovery: "Observe the changed world and bind the next skill phase again"
+    });
+  }
+  if (binding.planning_action !== input.action) {
+    return rejection("skill_phase_authority_mismatch", {
+      skill: binding.invocation.skill,
+      phase: binding.phase,
+      phase_authority: binding.phase_authority,
+      requested_action: input.action,
+      authorized_action: binding.planning_action
+    });
+  }
+  const outcome = input.action === "plan_humanoid_skill"
+    ? null
+    : input.action === "plan_humanoid_navigation"
+      ? validateNavigationOutcome(binding, input.rawInput)
+      : validateMotionOutcome(binding, input.rawInput);
+  return outcome ?? { accepted: true };
+}
+
+function validateInteractionPoints(
+  invocation: HumanoidSkillInvocation,
+  target: HumanoidObjectWorldModelEntry | undefined
+): InteractionPointValidation {
+  if (!target) {
+    return { accepted: true, eligiblePointIds: [], eligiblePoints: [] };
+  }
+  const requested = interactionPointIds(invocation);
+  const expectedKinds = interactionPointKinds(invocation.skill);
+  const hand = invocationHand(invocation);
+  const eligible = target.interaction_points.filter((point) => (
+    (expectedKinds.length === 0 || expectedKinds.includes(point.kind))
+      && (!hand || point.compatible_hands === "either"
+        || point.compatible_hands === "both"
+        || point.compatible_hands === hand)
+  ));
+  const eligibleIds = eligible.map(({ id }) => id).sort();
+  for (const pointId of requested) {
+    if (!eligibleIds.includes(pointId)) {
+      return rejection("skill_interaction_point_missing", {
+        skill: invocation.skill,
+        object_id: target.id,
+        interaction_point_id: pointId,
+        expected_kinds: expectedKinds,
+        compatible_hand: hand ?? null,
+        eligible_interaction_point_ids: eligibleIds
+      });
+    }
+  }
+  if (requested.length === 0 && skillNeedsInteractionPoint(invocation.skill)
+    && eligibleIds.length === 0) {
+    return rejection("skill_interaction_point_missing", {
+      skill: invocation.skill,
+      object_id: target.id,
+      expected_kinds: expectedKinds,
+      compatible_hand: hand ?? null,
+      eligible_interaction_point_ids: []
+    });
+  }
+  return {
+    accepted: true,
+    eligiblePointIds: eligibleIds,
+    eligiblePoints: structuredClone(eligible)
+  };
+}
+
+function validateSkillSemantics(
+  invocation: HumanoidSkillInvocation,
+  target: HumanoidObjectWorldModelEntry | undefined,
+  objects: ReadonlyMap<string, HumanoidObjectWorldModelEntry>,
+  observation: HumanoidWorldObservation
+): ReturnType<typeof rejection> | null {
+  if ((invocation.skill === "open" || invocation.skill === "close")) {
+    if (!target?.articulation
+      || target.articulation.joint_id !== invocation.joint_id
+      || target.articulation.position === null) {
+      return rejection("skill_articulation_unobserved", {
+        skill: invocation.skill,
+        object_id: target?.id ?? invocation.object_id,
+        joint_id: invocation.joint_id,
+        observed_joint_id: target?.articulation?.joint_id ?? null
+      });
+    }
+    const fraction = target.articulation.open_fraction;
+    if (fraction !== null && (invocation.skill === "open"
+      ? fraction >= invocation.minimum_open_fraction
+      : fraction <= invocation.maximum_open_fraction)) {
+      return rejection("skill_precondition_failed", {
+        skill: invocation.skill,
+        object_id: target.id,
+        joint_id: invocation.joint_id,
+        reason: invocation.skill === "open"
+          ? "articulation is already at the requested open fraction"
+          : "articulation is already at the requested closed fraction",
+        observed_open_fraction: fraction
+      });
+    }
+  }
+  if (invocation.skill === "place") {
+    if (invocation.destination.type !== "world_pose") {
+      const destinationId = invocation.destination.object_id;
+      const destination = objects.get(destinationId);
+      const expected = invocation.destination.type === "container"
+        ? "container"
+        : invocation.destination.type === "support_surface"
+          ? "support_surface"
+          : "insertable";
+      if (!destination || destination.status !== "visible"
+        || !destination.affordances.includes(expected)) {
+        return rejection("skill_destination_unavailable", {
+          skill: invocation.skill,
+          destination_id: destinationId,
+          required_affordance: expected,
+          observed_status: destination?.status ?? "unknown",
+          observed_affordances: destination?.affordances ?? []
+        });
+      }
+    }
+  }
+  const carrying = observation.interaction.carrying.bindings;
+  if (invocation.skill === "carry" || invocation.skill === "place"
+    || invocation.skill === "bimanual_carry") {
+    const boundHands = carrying
+      .filter(({ object_id }) => object_id === invocation.object_id)
+      .map(({ hand }) => hand);
+    const requiredHands = invocation.skill === "bimanual_carry"
+      ? ["left", "right"]
+      : invocation.skill === "carry" || invocation.skill === "place"
+        ? invocation.hands === "both" ? ["left", "right"] : [invocation.hands]
+        : [];
+    if (!requiredHands.every((hand) => boundHands.includes(hand as "left" | "right"))) {
+      return rejection("skill_precondition_failed", {
+        skill: invocation.skill,
+        object_id: invocation.object_id,
+        reason: "required carried-object binding is not verified",
+        required_hands: requiredHands,
+        bound_hands: boundHands
+      });
+    }
+  }
+  if (invocation.skill === "lift") {
+    const grasp = observation.interaction.manipulable_objects
+      .find(({ object_id }) => object_id === invocation.object_id)?.grasp
+      .find(({ hand }) => hand === invocation.hand);
+    if (!grasp?.verified) {
+      return rejection("skill_precondition_failed", {
+        skill: invocation.skill,
+        object_id: invocation.object_id,
+        hand: invocation.hand,
+        reason: "verified grasp is required before lift"
+      });
+    }
+  }
+  return null;
+}
+
+function validateNavigationOutcome(
+  binding: ActiveHumanoidSkillBinding,
+  rawInput: unknown
+): ReturnType<typeof rejection> | null {
+  const input = record(rawInput);
+  const target = vector(input?.target);
+  if (!target) return rejection("skill_navigation_target_invalid", {});
+  const invocation = binding.invocation;
+  const expected = invocation.skill === "carry"
+    || invocation.skill === "bimanual_carry"
+    || invocation.skill === "retreat"
+    ? invocation.target
+    : invocation.skill === "explore"
+      ? binding.target_position
+    : null;
+  if (expected && distance(target, expected) > 1e-6) {
+    return rejection("skill_navigation_target_mismatch", {
+      skill: invocation.skill,
+      requested_target: target,
+      skill_target: expected
+    });
+  }
+  if (invocation.skill === "approach" && binding.target_position) {
+    const selectedPoint = invocation.interaction_point_id === null
+      ? undefined
+      : binding.eligible_interaction_points.find(
+          ({ id }) => id === invocation.interaction_point_id
+        );
+    const referencePosition = selectedPoint?.world_position ?? binding.target_position;
+    const standoff = Math.hypot(
+      target.x - referencePosition.x,
+      target.z - referencePosition.z
+    );
+    if (Math.abs(standoff - invocation.standoff_m) > 0.1) {
+      return rejection("skill_navigation_target_mismatch", {
+        skill: invocation.skill,
+        object_id: invocation.object_id,
+        interaction_point_id: invocation.interaction_point_id,
+        requested_target: target,
+        standoff_reference: selectedPoint ? "interaction_point" : "object_origin",
+        observed_reference_position: referencePosition,
+        requested_standoff_m: invocation.standoff_m,
+        resulting_planar_standoff_m: standoff,
+        tolerance_m: 0.1,
+        recovery: "The navigation target may be physically reachable, but it is not authorized by the active approach Skill. Submit a new local Skill DAG whose approach.standoff_m matches this reachable target, bind that new node, then plan again."
+      });
+    }
+  }
+  return null;
+}
+
+function validateMotionOutcome(
+  binding: ActiveHumanoidSkillBinding,
+  rawInput: unknown
+): ReturnType<typeof rejection> | null {
+  const input = record(rawInput);
+  const termination = record(input?.termination);
+  const predicates = Array.isArray(termination?.predicates)
+    ? termination.predicates.map(record).filter((value) => value !== null)
+    : [];
+  const invocation = binding.invocation;
+  const phase = binding.phase;
+  const objectId = invocationObjectId(invocation) ?? undefined;
+  const has = (type: string, objectId?: string) => predicates.some((predicate) => (
+    predicate?.type === type
+      && (objectId === undefined || predicate.object_id === objectId)
+  ));
+  if ((invocation.skill === "open" || invocation.skill === "close")
+    && phase === "actuate_joint") {
+    const predicate = predicates.find((candidate) => (
+      candidate?.type === "articulation_state"
+        && candidate.object_id === invocation.object_id
+        && candidate.joint_id === invocation.joint_id
+        && candidate.state === invocation.skill
+    ));
+    const tolerance = typeof predicate?.tolerance === "number"
+      ? predicate.tolerance
+      : null;
+    const strongEnough = tolerance !== null && (invocation.skill === "open"
+      ? tolerance <= 1 - invocation.minimum_open_fraction + 1e-9
+      : tolerance <= invocation.maximum_open_fraction + 1e-9);
+    if (!strongEnough) {
+      return rejection("skill_terminal_contract_mismatch", {
+        skill: invocation.skill,
+        phase,
+        required_predicate: {
+          type: "articulation_state",
+          object_id: invocation.object_id,
+          joint_id: invocation.joint_id,
+          state: invocation.skill,
+          threshold: invocation.skill === "open"
+            ? invocation.minimum_open_fraction
+            : invocation.maximum_open_fraction
+        }
+      });
+    }
+  }
+  if ((invocation.skill === "push" || invocation.skill === "pull")
+    && phase === "apply_force") {
+    const mismatch = binding.target_articulation
+      ? articulationDisplacementMismatch(binding, {
+          directionWorld: invocation.direction_world,
+          distanceMeters: invocation.distance_m,
+          interactionPointId: invocation.interaction_point_id
+        }, predicates)
+      : objectDisplacementMismatch(binding, invocation, predicates);
+    if (mismatch) return mismatch;
+  }
+  if (invocation.skill === "press" && phase === "press_stroke") {
+    const articulation = binding.target_articulation;
+    if (!articulation || articulation.position === null) {
+      return rejection("skill_terminal_contract_mismatch", {
+        skill: invocation.skill,
+        phase,
+        reason: "press requires an observable articulation"
+      });
+    }
+    const directionWorld = articulation.open_position >= articulation.closed_position
+      ? articulation.axis_world
+      : scale(articulation.axis_world, -1);
+    const mismatch = articulationDisplacementMismatch(binding, {
+      directionWorld,
+      distanceMeters: invocation.travel_m,
+      interactionPointId: invocation.interaction_point_id
+    }, predicates);
+    if (mismatch) return mismatch;
+  }
+  if (invocation.skill === "grasp" && phase === "close_hand_under_contact"
+    && !predicates.some((predicate) => predicate?.type === "grasp_verified"
+      && predicate.object_id === invocation.object_id
+      && predicate.hand === invocation.hand)) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: invocation.skill,
+      phase,
+      required_predicate: "grasp_verified"
+    });
+  }
+  if (invocation.skill === "regrasp" && phase === "transfer_grasp"
+    && (!predicates.some((predicate) => predicate?.type === "grasp_verified"
+      && predicate.object_id === invocation.object_id
+      && predicate.hand === invocation.to_hand)
+      || !predicates.some((predicate) => predicate?.type === "object_released"
+        && predicate.object_id === invocation.object_id
+        && predicate.hand === invocation.from_hand))) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: invocation.skill,
+      phase,
+      required_predicates: [
+        { type: "grasp_verified", hand: invocation.to_hand },
+        { type: "object_released", hand: invocation.from_hand }
+      ]
+    });
+  }
+  if (invocation.skill === "bimanual_support"
+    && phase === "establish_two_hand_contact"
+    && !(["left", "right"] as const).every((hand) => predicates.some(
+      (predicate) => predicate?.type === "grasp_verified"
+        && predicate.object_id === invocation.object_id
+        && predicate.hand === hand
+    ))) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: invocation.skill,
+      phase,
+      required_predicates: [
+        { type: "grasp_verified", hand: "left" },
+        { type: "grasp_verified", hand: "right" }
+      ]
+    });
+  }
+  if (invocation.skill === "lift" && phase === "lift_whole_body"
+    && !predicates.some((predicate) => predicate?.type === "grasp_verified"
+      && predicate.object_id === invocation.object_id
+      && predicate.hand === invocation.hand)) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: invocation.skill,
+      phase,
+      required_predicate: "grasp_verified"
+    });
+  }
+  if (invocation.skill === "place" && phase === "settle_and_release"
+    && (!has("object_released", invocation.object_id)
+      || !has("object_settled_on_support", invocation.object_id)
+      || !placeRelationPredicatePresent(invocation, predicates))) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: invocation.skill,
+      phase,
+      required_predicates: [
+        "object_released",
+        "object_settled_on_support",
+        placeRelationPredicateName(invocation)
+      ]
+    });
+  }
+  if (invocation.skill === "stabilize" && phase === "recover_support"
+    && !predicates.some((predicate) => predicate?.type === "balance_stable"
+      && typeof predicate.minimum_support_margin_m === "number"
+      && predicate.minimum_support_margin_m
+        >= invocation.minimum_support_margin_m)) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: invocation.skill,
+      phase,
+      required_predicate: {
+        type: "balance_stable",
+        minimum_support_margin_m: invocation.minimum_support_margin_m
+      }
+    });
+  }
+  if ((phase === "reach_handle" || phase === "reach_interaction"
+    || phase === "solve_whole_body_reach" || phase === "establish_contact")
+    && objectId
+    && !has("hand_contact_object", objectId)
+    && !has("body_contact_object", objectId)
+    && !has("end_effector_near_point")) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: invocation.skill,
+      phase,
+      required_predicates: [
+        "hand_contact_object",
+        "body_contact_object",
+        "end_effector_near_point"
+      ]
+    });
+  }
+  return null;
+}
+
+function objectDisplacementMismatch(
+  binding: ActiveHumanoidSkillBinding,
+  invocation: Extract<HumanoidSkillInvocation, { skill: "push" | "pull" }>,
+  predicates: Array<Record<string, unknown> | null>
+): ReturnType<typeof rejection> | null {
+  const origin = binding.target_position;
+  const predicate = predicates.find((candidate) => (
+    candidate?.type === "object_displaced"
+      && candidate.object_id === invocation.object_id
+  ));
+  const predicateOrigin = vector(predicate?.origin);
+  const predicateDirection = vector(predicate?.direction_world);
+  const minimumDistance = number(predicate?.minimum_distance_m);
+  const maximumLateralError = number(predicate?.maximum_lateral_error_m);
+  const matched = origin && predicateOrigin && predicateDirection
+    && distance(origin, predicateOrigin) <= 1e-6
+    && dot(predicateDirection, invocation.direction_world) >= 1 - 1e-6
+    && minimumDistance !== null && minimumDistance >= invocation.distance_m
+    && maximumLateralError !== null
+    && maximumLateralError <= Math.max(0.05, invocation.distance_m * 0.25);
+  return matched ? null : rejection("skill_terminal_contract_mismatch", {
+    skill: invocation.skill,
+    phase: "apply_force",
+    required_predicate: {
+      type: "object_displaced",
+      object_id: invocation.object_id,
+      origin,
+      direction_world: invocation.direction_world,
+      minimum_distance_m: invocation.distance_m,
+      maximum_lateral_error_m: Math.max(0.05, invocation.distance_m * 0.25)
+    }
+  });
+}
+
+function articulationDisplacementMismatch(
+  binding: ActiveHumanoidSkillBinding,
+  request: {
+    directionWorld: Vec3;
+    distanceMeters: number;
+    interactionPointId: string | null;
+  },
+  predicates: Array<Record<string, unknown> | null>
+): ReturnType<typeof rejection> | null {
+  const articulation = binding.target_articulation;
+  const point = binding.eligible_interaction_points.find(
+    ({ id }) => id === request.interactionPointId
+  );
+  if (!articulation || articulation.position === null || !point) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: binding.invocation.skill,
+      phase: binding.phase,
+      reason: "articulated displacement requires a selected observable interaction point"
+    });
+  }
+  const displacement = articulation.type === "slide"
+    ? {
+        direction: dot(request.directionWorld, articulation.axis_world) >= 0
+          ? "increasing" as const : "decreasing" as const,
+        minimumDelta: request.distanceMeters
+      }
+    : hingeDisplacement(
+        articulation.axis_world,
+        articulation.anchor_world,
+        point.world_position,
+        request.directionWorld,
+        request.distanceMeters
+      );
+  const objectId = invocationObjectId(binding.invocation);
+  if (!objectId) {
+    return rejection("skill_terminal_contract_mismatch", {
+      skill: binding.invocation.skill,
+      phase: binding.phase,
+      reason: "articulated skill has no object identity"
+    });
+  }
+  const predicate = predicates.find((candidate) => (
+    candidate?.type === "articulation_displaced"
+      && candidate.object_id === objectId
+      && candidate.joint_id === articulation.joint_id
+  ));
+  const originPosition = number(predicate?.origin_position);
+  const minimumDelta = number(predicate?.minimum_delta);
+  const matched = predicate?.direction === displacement.direction
+    && originPosition !== null
+    && Math.abs(originPosition - articulation.position) <= 1e-6
+    && minimumDelta !== null
+    && minimumDelta >= displacement.minimumDelta;
+  return matched ? null : rejection("skill_terminal_contract_mismatch", {
+    skill: binding.invocation.skill,
+    phase: binding.phase,
+    required_predicate: {
+      type: "articulation_displaced",
+      object_id: objectId,
+      joint_id: articulation.joint_id,
+      origin_position: articulation.position,
+      direction: displacement.direction,
+      minimum_delta: displacement.minimumDelta
+    }
+  });
+}
+
+function hingeDisplacement(
+  axis: Vec3,
+  anchor: Vec3,
+  point: Vec3,
+  directionWorld: Vec3,
+  distanceMeters: number
+): { direction: "increasing" | "decreasing"; minimumDelta: number } {
+  const radial = subtract(point, anchor);
+  const tangent = cross(axis, radial);
+  const radius = length(tangent);
+  if (radius <= 1e-6) {
+    return { direction: "increasing", minimumDelta: Number.POSITIVE_INFINITY };
+  }
+  return {
+    direction: dot(directionWorld, tangent) >= 0 ? "increasing" : "decreasing",
+    minimumDelta: distanceMeters / radius
+  };
+}
+
+function placeRelationPredicatePresent(
+  invocation: Extract<HumanoidSkillInvocation, { skill: "place" }>,
+  predicates: Array<Record<string, unknown> | null>
+): boolean {
+  const relation = predicates.some((predicate) => {
+    if (!predicate || predicate.object_id !== invocation.object_id) return false;
+    if (invocation.destination.type === "container") {
+      return predicate.type === "object_inside"
+        && predicate.container_id === invocation.destination.object_id
+        && predicate.expected === true;
+    }
+    if (invocation.destination.type === "support_surface") {
+      return predicate.type === "object_on"
+        && predicate.support_id === invocation.destination.object_id
+        && predicate.expected === true;
+    }
+    if (invocation.destination.type === "world_pose") {
+      const target = vector(predicate.target);
+      return predicate.type === "object_near_point" && target !== null
+        && distance(target, invocation.destination.position) <= 1e-6
+        && typeof predicate.tolerance_m === "number"
+        && predicate.tolerance_m <= invocation.destination.position_tolerance_m;
+    }
+    return predicate.type === "object_near_point";
+  });
+  return relation;
+}
+
+function placeRelationPredicateName(
+  invocation: Extract<HumanoidSkillInvocation, { skill: "place" }>
+): string {
+  if (invocation.destination.type === "container") return "object_inside";
+  if (invocation.destination.type === "support_surface") return "object_on";
+  return "object_near_point";
+}
+
+function interactionPointIds(invocation: HumanoidSkillInvocation): string[] {
+  if (invocation.skill === "bimanual_support") {
+    return [
+      invocation.left_interaction_point_id,
+      invocation.right_interaction_point_id
+    ];
+  }
+  return "interaction_point_id" in invocation
+    && invocation.interaction_point_id !== null
+    ? [invocation.interaction_point_id]
+    : [];
+}
+
+function interactionPointKinds(skill: HumanoidSkillInvocation["skill"]): string[] {
+  if (skill === "grasp" || skill === "regrasp" || skill === "bimanual_support") {
+    return ["grasp"];
+  }
+  if (skill === "push") return ["push", "grasp"];
+  if (skill === "pull" || skill === "open") return ["pull", "grasp", "turn"];
+  if (skill === "close") return ["push", "pull", "grasp", "turn"];
+  if (skill === "press") return ["press"];
+  return [];
+}
+
+function skillNeedsInteractionPoint(skill: HumanoidSkillInvocation["skill"]): boolean {
+  return [
+    "reach", "grasp", "push", "pull", "press", "open", "close",
+    "bimanual_support"
+  ].includes(skill);
+}
+
+function invocationHand(invocation: HumanoidSkillInvocation): "left" | "right" | null {
+  if ("hand" in invocation) return invocation.hand;
+  return null;
+}
+
+function invocationObjectId(invocation: HumanoidSkillInvocation): string | null {
+  return "object_id" in invocation ? invocation.object_id : null;
+}
+
+function skillTransactionId(rawInput: unknown): string | null {
+  const value = record(rawInput)?.skill_transaction_id;
+  return typeof value === "string" && value ? value : null;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function vector(value: unknown): Vec3 | null {
+  const input = record(value);
+  return input && [input.x, input.y, input.z].every((part) => (
+    typeof part === "number" && Number.isFinite(part)
+  ))
+    ? { x: input.x as number, y: input.y as number, z: input.z as number }
+    : null;
+}
+
+function distance(left: Vec3, right: Vec3): number {
+  return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z);
+}
+
+function number(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function subtract(left: Vec3, right: Vec3): Vec3 {
+  return { x: left.x - right.x, y: left.y - right.y, z: left.z - right.z };
+}
+
+function scale(value: Vec3, scalar: number): Vec3 {
+  return { x: value.x * scalar, y: value.y * scalar, z: value.z * scalar };
+}
+
+function dot(left: Vec3, right: Vec3): number {
+  return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+function cross(left: Vec3, right: Vec3): Vec3 {
+  return {
+    x: left.y * right.z - left.z * right.y,
+    y: left.z * right.x - left.x * right.z,
+    z: left.x * right.y - left.y * right.x
+  };
+}
+
+function length(value: Vec3): number {
+  return Math.hypot(value.x, value.y, value.z);
+}
+
+function rejection(code: string, detail: Record<string, unknown>): {
+  accepted: false;
+  code: string;
+  detail: JsonValue;
+} {
+  return {
+    accepted: false,
+    code,
+    detail: JSON.parse(JSON.stringify({ automatic_actuation: false, ...detail })) as JsonValue
+  };
+}

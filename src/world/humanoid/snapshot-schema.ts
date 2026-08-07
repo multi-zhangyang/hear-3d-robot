@@ -72,7 +72,15 @@ const ContactSchema = z.object({
 }).strict();
 
 const ObjectSchema = LinkSchema.extend({
-  id: z.string().min(1)
+  id: z.string().min(1),
+  articulation: z.object({
+    type: z.enum(["hinge", "slide"]),
+    position: z.number().finite(),
+    velocity: z.number().finite(),
+    minimum: z.number().finite(),
+    maximum: z.number().finite(),
+    normalized: z.number().finite().min(0).max(1)
+  }).strict().optional()
 }).strict();
 
 const HumanoidSimulationSnapshotSchema = z.object({

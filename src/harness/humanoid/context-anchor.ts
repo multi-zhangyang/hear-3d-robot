@@ -111,6 +111,7 @@ export function createHumanoidContextAnchor(input: {
         navigation: input.world.navigation
       },
       interaction: input.observation.interaction,
+      spatial_belief: input.observation.spatialBelief,
       goal_state: checker,
       recent_physical_episodes: recentEmbodiedEpisodes(
         input.checkpoint.embodied_memory
@@ -155,14 +156,17 @@ function pendingExecutionAuthority(input: {
   const receipt = Object.values(input.checkpoint.committed_actions).findLast((candidate) => (
     candidate.accepted
       && sameAutonomousCycle(candidate.cycle, cycle)
-      && (candidate.action === "plan_whole_body_motion"
+      && (candidate.action === "plan_humanoid_skill"
+        || candidate.action === "plan_whole_body_motion"
         || candidate.action === "plan_whole_body_motion_candidates"
         || candidate.action === "plan_humanoid_navigation")
   ));
   if (!receipt) return null;
-  const executorAction = receipt.action === "plan_humanoid_navigation"
-    ? "execute_humanoid_navigation"
-    : "execute_whole_body_motion";
+  const executorAction = receipt.action === "plan_humanoid_skill"
+    ? "execute_humanoid_skill"
+    : receipt.action === "plan_humanoid_navigation"
+      ? "execute_humanoid_navigation"
+      : "execute_whole_body_motion";
   const detail = record(receipt.detail);
   const expiresRevision = typeof detail?.expires_revision === "number"
     && Number.isSafeInteger(detail.expires_revision)

@@ -54,6 +54,7 @@ import { humanoidMotionContactEvidenceSha256 } from "./motion-contact-evidence.j
 import { HumanoidCarriedObjectLifecycleCheckpointSchema } from "./carried-object-lifecycle.js";
 import { HumanoidStationKeepingAnchorSchema } from "./station-keeping.js";
 import { HumanoidNavigationArrivalHeadingSchema } from "./navigation-arrival.js";
+import { HumanoidSpatialBeliefMapCheckpointSchema } from "./spatial-belief-map.js";
 
 const FiniteArraySchema = z.array(z.number().finite());
 
@@ -737,6 +738,12 @@ const HumanoidWorldCheckpointBaseSchema = z.object({
   objectMemory: HumanoidObjectMemoryCheckpointSchema.default({
     version: 1,
     records: []
+  }),
+  spatialBelief: HumanoidSpatialBeliefMapCheckpointSchema.default({
+    version: 1,
+    resolution_m: 0.5,
+    last_updated_frame: -1,
+    cells: []
   })
 }).strict();
 

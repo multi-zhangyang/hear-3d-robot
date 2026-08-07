@@ -34,6 +34,16 @@ export const AGENT_MODEL_ROLES = [
 
 export type AgentModelRole = typeof AGENT_MODEL_ROLES[number];
 
+const ReasoningEffortSchema = z.enum([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+]);
+
 const ProviderConfigShape = {
   protocol: z.enum([
     "openai_compatible",
@@ -46,6 +56,8 @@ const ProviderConfigShape = {
   requestTimeoutMs: z.number().int().min(5_000).max(10 * 60_000).optional(),
   streamEventIdleTimeoutMs: z.number().int().min(5_000).max(10 * 60_000).optional(),
   temperature: z.number().min(0).max(2),
+  reasoningEffort: ReasoningEffortSchema.optional(),
+  toolChoice: z.enum(["auto", "required", "none"]).optional(),
   maxOutputTokens: z.number().int().positive().optional(),
   contextWindowTokens: z.number().int().positive(),
   compactTriggerTokens: z.number().int().positive(),
@@ -141,6 +153,8 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
       DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS
     ),
     temperature: numberFromEnv(env.AI_TEMPERATURE, 0.2),
+    reasoningEffort: reasoningEffortFromEnv(env.AI_REASONING_EFFORT),
+    toolChoice: toolChoiceFromEnv(env.AI_TOOL_CHOICE, "required"),
     maxOutputTokens,
     contextWindowTokens,
     compactTriggerTokens: numberFromEnv(
@@ -262,6 +276,14 @@ function loadAgentModelConfig(
       inherited.streamEventIdleTimeoutMs ?? DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS
     ),
     temperature: numberFromEnv(env[`${prefix}TEMPERATURE`], inherited.temperature),
+    reasoningEffort: reasoningEffortFromEnv(
+      env[`${prefix}REASONING_EFFORT`],
+      inherited.reasoningEffort
+    ),
+    toolChoice: toolChoiceFromEnv(
+      env[`${prefix}TOOL_CHOICE`],
+      inherited.toolChoice ?? "required"
+    ),
     maxOutputTokens,
     contextWindowTokens,
     compactTriggerTokens: numberFromEnv(
@@ -283,6 +305,31 @@ function loadAgentModelConfig(
 
 function stringFromEnv(value: string | undefined, inherited: string): string {
   return value?.trim() ? value : inherited;
+}
+
+function reasoningEffortFromEnv(
+  value: string | undefined,
+  inherited?: z.infer<typeof ReasoningEffortSchema>
+): z.infer<typeof ReasoningEffortSchema> | undefined {
+  if (!hasText(value)) return inherited;
+  const parsed = ReasoningEffortSchema.safeParse(value!.trim().toLowerCase());
+  if (!parsed.success) {
+    throw new Error(
+      "AI_REASONING_EFFORT must be none, minimal, low, medium, high, xhigh, or max"
+    );
+  }
+  return parsed.data;
+}
+
+function toolChoiceFromEnv(
+  value: string | undefined,
+  inherited: "auto" | "required" | "none"
+): "auto" | "required" | "none" {
+  const selected = value?.trim() || inherited;
+  if (selected === "auto" || selected === "required" || selected === "none") {
+    return selected;
+  }
+  throw new Error("AI_TOOL_CHOICE must be auto, required, or none");
 }
 
 function hasText(value: string | undefined): boolean {

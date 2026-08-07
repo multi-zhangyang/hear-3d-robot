@@ -14,12 +14,23 @@ import { G1_HAND_CONTACT_SURFACE_NAMES } from "./morphology.js";
 import type { HumanoidObjectToken } from "./object-memory.js";
 import { humanoidObjectZoneRelation } from "./object-zone-relation.js";
 import type { HumanoidSimulationSnapshot } from "./simulation.js";
+import {
+  createHumanoidObjectWorldModel,
+  type HumanoidObjectWorldModel
+} from "./object-world-model.js";
+import {
+  createHumanoidSkillCatalog,
+  type HumanoidSkillCatalog
+} from "./skill-catalog.js";
+import type { HumanoidSolidToken } from "./solid-observation.js";
 
 type Hand = "left" | "right";
 
 export interface HumanoidInteractionObservation {
   frame: number;
   world_revision: number;
+  object_world_model: HumanoidObjectWorldModel;
+  skill_catalog: HumanoidSkillCatalog;
   grasp_authority: {
     contract_sha256: string;
     minimum_distinct_contact_surfaces: number;
@@ -82,6 +93,7 @@ export function createHumanoidInteractionObservation(input: {
   scenario: Scenario;
   robot: HumanoidSimulationSnapshot;
   objectTokens: readonly HumanoidObjectToken[];
+  solidTokens?: readonly HumanoidSolidToken[];
   grasp: HumanoidWorldGraspState;
   graspContract: HumanoidGraspContract;
   carried: HumanoidCarriedObjectLifecycleCheckpoint;
@@ -158,9 +170,18 @@ export function createHumanoidInteractionObservation(input: {
       }];
     });
 
+  const objectWorldModel = createHumanoidObjectWorldModel({
+    frame: input.frame,
+    worldRevision: input.worldRevision,
+    scenario: input.scenario,
+    robot: input.robot,
+    objectTokens: input.objectTokens
+  });
   return {
     frame: input.frame,
     world_revision: input.worldRevision,
+    object_world_model: objectWorldModel,
+    skill_catalog: createHumanoidSkillCatalog(objectWorldModel, input.solidTokens ?? []),
     grasp_authority: {
       contract_sha256: input.grasp.contractSha256,
       minimum_distinct_contact_surfaces:

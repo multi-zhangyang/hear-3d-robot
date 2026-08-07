@@ -421,11 +421,10 @@ function assertModelBinding(boundAgentId: string, requestAgentId: string): void 
 }
 
 /**
- * Tool choice is required for every HEAR agent. Some compatible endpoints can
- * nevertheless return reasoning or prose without the required call. The SDK
- * asks again, which is useful once but becomes an unbounded loop if prose keeps
- * resetting the counter. This guard counts every response without a tool
- * decision, never supplies a decision and never swaps models.
+ * Every HEAR agent contract requires a real tool decision. Compatible endpoints
+ * may expose that contract through either required or auto tool choice, and can
+ * still return reasoning or prose without a call. This guard counts every such
+ * response, never supplies a decision and never swaps models.
  */
 class ModelDecisionGuard {
   readonly #consecutive = new Map<string, number>();

@@ -32,6 +32,7 @@ describe("provider context budget", () => {
     });
 
     expect(config.contextWindowTokens).toBe(262_144);
+    expect(config.toolChoice).toBe("required");
     expect(config.requestTimeoutMs).toBe(300_000);
     expect(config.streamEventIdleTimeoutMs).toBe(300_000);
     expect(config.compactTriggerTokens).toBe(Math.floor(262_144 * 0.85));
@@ -41,6 +42,49 @@ describe("provider context budget", () => {
     expect(config.agentModels?.executor.requestTimeoutMs).toBe(300_000);
     expect(config.agentModels?.executor.streamEventIdleTimeoutMs).toBe(300_000);
     expect(config.agentModels?.compactor.compactMaxOutputTokens).toBeUndefined();
+  });
+
+  it("supports provider-neutral automatic tool selection without a model special case", () => {
+    const config = loadProviderConfig({
+      ...required,
+      AI_TOOL_CHOICE: "auto",
+      AI_MOTION_TOOL_CHOICE: "required"
+    });
+
+    expect(config.toolChoice).toBe("auto");
+    expect(config.agentModels?.sentry.toolChoice).toBe("auto");
+    expect(config.agentModels?.motion.toolChoice).toBe("required");
+  });
+
+  it("applies provider-neutral reasoning effort and one-million-token context to every role", () => {
+    const config = loadProviderConfig({
+      ...required,
+      AI_CONTEXT_WINDOW_TOKENS: "1000000",
+      AI_REASONING_EFFORT: "high"
+    });
+
+    expect(config.contextWindowTokens).toBe(1_000_000);
+    expect(config.compactTriggerTokens).toBe(850_000);
+    expect(config.reasoningEffort).toBe("high");
+    for (const profile of Object.values(config.agentModels ?? {})) {
+      expect(profile.contextWindowTokens).toBe(1_000_000);
+      expect(profile.compactTriggerTokens).toBe(850_000);
+      expect(profile.reasoningEffort).toBe("high");
+    }
+  });
+
+  it("rejects unknown reasoning effort values", () => {
+    expect(() => loadProviderConfig({
+      ...required,
+      AI_REASONING_EFFORT: "ultra"
+    })).toThrow("AI_REASONING_EFFORT must be");
+  });
+
+  it("rejects unknown tool choice values", () => {
+    expect(() => loadProviderConfig({
+      ...required,
+      AI_TOOL_CHOICE: "sometimes"
+    })).toThrow("AI_TOOL_CHOICE must be auto, required, or none");
   });
 
   it("rejects a trigger that conflicts with an explicitly configured output limit", () => {

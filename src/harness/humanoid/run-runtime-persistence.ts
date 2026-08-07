@@ -11,6 +11,7 @@ type HumanoidPersistenceCut = Awaited<
 
 export function requiresHumanoidClockPause(action: string): boolean {
   return action === "observe_humanoid"
+    || action === "execute_humanoid_skill"
     || action === "execute_whole_body_motion"
     || action === "execute_humanoid_navigation"
     || action === "remove_world_block";
@@ -46,6 +47,8 @@ export function physicalExecutionCheckpointDue(
   if (committedFrameCount % interval === 0) return true;
   const planId = entry.admission.plan_id;
   return entry.action === "execute_whole_body_motion"
+    || entry.action === "execute_humanoid_skill"
+      && cut.worldCheckpoint.motions.some((motion) => motion.plan.id === planId)
     ? cut.worldCheckpoint.motions.some((motion) => (
         motion.plan.id === planId && motion.terminal !== null
       ))
@@ -70,12 +73,15 @@ export function cycleSummary(value: JsonValue): string {
 }
 
 export function completedPhysicalExecution(receipt: HumanoidActionReceipt): boolean {
-  return receipt.accepted && (
+  return receipt.accepted && (receipt.action === "execute_humanoid_skill"
+    ? receipt.code === "motion_option_succeeded"
+      || receipt.code === "navigation_completed"
+    : (
     receipt.action === "execute_whole_body_motion"
       ? receipt.code === "motion_option_succeeded"
       : receipt.action === "execute_humanoid_navigation"
         && receipt.code === "navigation_completed"
-  );
+    ));
 }
 
 export function physicalActuationReceipt(receipt: HumanoidActionReceipt): boolean {
@@ -83,7 +89,8 @@ export function physicalActuationReceipt(receipt: HumanoidActionReceipt): boolea
 }
 
 export function physicalExecutionReceipt(receipt: HumanoidActionReceipt): boolean {
-  return receipt.action === "execute_whole_body_motion"
+  return receipt.action === "execute_humanoid_skill"
+    || receipt.action === "execute_whole_body_motion"
     || receipt.action === "execute_humanoid_navigation";
 }
 
@@ -108,7 +115,8 @@ export function embodiedActionJournalReceipt(
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Humanoid action journal contains a non-object record");
   }
-  if (value.action !== "execute_whole_body_motion"
+  if (value.action !== "execute_humanoid_skill"
+    && value.action !== "execute_whole_body_motion"
     && value.action !== "execute_humanoid_navigation"
     && value.action !== "remove_world_block") return undefined;
   const { runtime_event_id: _runtimeEventId, ...receipt } = value;

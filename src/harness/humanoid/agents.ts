@@ -39,47 +39,30 @@ import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
 import { GOAL_HISTORY_PREDICATE_TYPES } from "./goal-history.js";
 
 const SpecialistDelegationSchema = z.object({}).strict();
-const ExecutionTaskSchema = z.object({
-  task: z.enum(["execute_plan", "remove_world_block"]),
-  objective: z.string().trim().min(1),
+const ExecutePlanTaskSchema = z.object({
+  kind: z.literal("execute_plan"),
   planning_action: z.enum([
+    "plan_humanoid_skill",
     "plan_whole_body_motion",
     "plan_whole_body_motion_candidates",
     "plan_humanoid_navigation"
-  ]).nullable().describe("execute_plan 时填写规划回执 action；remove_world_block 时必须为 null"),
-  planning_transaction_id: z.string().trim().min(1).nullable()
-    .describe("execute_plan 时逐字复制已接受规划回执 transactionId；remove_world_block 时必须为 null"),
-  solid_id: z.string().trim().min(1).nullable()
-    .describe("remove_world_block 时填写目标 solid_id；execute_plan 时必须为 null"),
-  execution_transaction_id: z.string().trim().min(1).nullable()
-    .describe("仅 remove_world_block 使用，填写先前成功物理执行的 transactionId；execute_plan 时必须为 null")
-}).strict().superRefine((task, context) => {
-  const planningMode = task.task === "execute_plan";
-  for (const [field, value] of [
-    ["planning_action", task.planning_action],
-    ["planning_transaction_id", task.planning_transaction_id]
-  ] as const) {
-    if ((value !== null) !== planningMode) {
-      context.addIssue({
-        code: "custom",
-        path: [field],
-        message: `Execution-plan field ${field} does not match task mode`
-      });
-    }
-  }
-  for (const [field, value] of [
-    ["solid_id", task.solid_id],
-    ["execution_transaction_id", task.execution_transaction_id]
-  ] as const) {
-    if ((value !== null) === planningMode) {
-      context.addIssue({
-        code: "custom",
-        path: [field],
-        message: `Block-removal field ${field} does not match task mode`
-      });
-    }
-  }
-});
+  ]).describe("逐字复制已接受规划回执 action"),
+  planning_transaction_id: z.string().trim().min(1)
+    .describe("逐字复制已接受规划回执 transactionId")
+}).strict();
+const RemoveWorldBlockTaskSchema = z.object({
+  kind: z.literal("remove_world_block"),
+  solid_id: z.string().trim().min(1).describe("目标 solid_id"),
+  execution_transaction_id: z.string().trim().min(1)
+    .describe("先前成功物理执行的 transactionId")
+}).strict();
+const ExecutionTaskSchema = z.object({
+  objective: z.string().trim().min(1),
+  execution: z.discriminatedUnion("kind", [
+    ExecutePlanTaskSchema,
+    RemoveWorldBlockTaskSchema
+  ])
+}).strict();
 const CycleCompletionSchema = z.object({
   summary: z.string().trim().min(1),
   evidence_transaction_ids: z.array(z.string().trim().min(1)).min(1),
@@ -135,6 +118,7 @@ export function goalManagerInvocationInput(
     ? observation.objects.map(jsonRecord)
     : [];
   const interaction = jsonRecord(root.interaction);
+  const spatialBelief = jsonRecord(root.spatial_belief);
   const carrying = jsonRecord(interaction.carrying);
   const carryBindings = Array.isArray(carrying.bindings)
     ? carrying.bindings.map(jsonRecord)
@@ -176,6 +160,15 @@ export function goalManagerInvocationInput(
       portable_object_ids: objects.flatMap((object) => (
         object.portable === true && typeof object.id === "string" ? [object.id] : []
       )),
+      object_affordances: objects.flatMap((object) => (
+        typeof object.id === "string"
+          ? [{
+              object_id: object.id,
+              affordances: stringArray(object.affordances),
+              articulation: object.articulation ?? null
+            }]
+          : []
+      )),
       removable_block_ids: solids.flatMap((solid) => (
         solid.kind === "block" && typeof solid.id === "string" ? [solid.id] : []
       )),
@@ -185,6 +178,13 @@ export function goalManagerInvocationInput(
           typeof binding.object_id === "string" ? [binding.object_id] : []
         )),
         continuation_verified: carrying.continuation_verified ?? null
+      },
+      exploration: {
+        coverage_ratio: spatialBelief.coverage_ratio ?? null,
+        observed_cell_count: spatialBelief.observed_cell_count ?? null,
+        frontier_candidates: Array.isArray(spatialBelief.frontiers)
+          ? spatialBelief.frontiers.slice(0, 12)
+          : []
       }
     }
   };
@@ -303,7 +303,11 @@ export const HUMANOID_CAPABILITIES = [
   "select_goal_candidate",
   "retire_goal_epoch",
   "observe_humanoid",
+  "submit_humanoid_skill_plan",
+  "begin_humanoid_skill",
   "recall_embodied_history",
+  "plan_humanoid_skill",
+  "execute_humanoid_skill",
   "plan_whole_body_motion",
   "plan_whole_body_motion_candidates",
   "execute_whole_body_motion",
@@ -370,11 +374,14 @@ export function createHumanoidAgentHierarchy(input: {
     const provider = providerConfigForRole(input.provider, humanoidAgentRole(agentId));
     return {
       temperature: provider.temperature,
+      ...(provider.reasoningEffort === undefined
+        ? {}
+        : { reasoning: { effort: provider.reasoningEffort } }),
       ...(provider.maxOutputTokens === undefined
         ? {}
         : { maxTokens: provider.maxOutputTokens }),
       parallelToolCalls: false,
-      toolChoice: "required"
+      toolChoice: provider.toolChoice ?? "required"
     };
   };
 
@@ -421,13 +428,16 @@ export function createHumanoidAgentHierarchy(input: {
       ...createHumanoidActionTools(
         input.runtime,
         HUMANOID_AGENT_IDS.motion,
-        ["plan_whole_body_motion_candidates", "plan_humanoid_navigation"]
+        [
+          "submit_humanoid_skill_plan",
+          "begin_humanoid_skill",
+          "plan_humanoid_skill"
+        ]
       )
     ],
     resetToolChoice: false,
     toolUseBehavior: receiptToolUseBehavior([
-      "plan_whole_body_motion_candidates",
-      "plan_humanoid_navigation"
+      "plan_humanoid_skill"
     ])
   });
   const executor = new Agent({
@@ -438,12 +448,11 @@ export function createHumanoidAgentHierarchy(input: {
     tools: createHumanoidActionTools(
       input.runtime,
       HUMANOID_AGENT_IDS.executor,
-      ["execute_whole_body_motion", "execute_humanoid_navigation", "remove_world_block"]
+      ["execute_humanoid_skill", "remove_world_block"]
     ),
     resetToolChoice: false,
     toolUseBehavior: receiptToolUseBehavior([
-      "execute_whole_body_motion",
-      "execute_humanoid_navigation",
+      "execute_humanoid_skill",
       "remove_world_block"
     ])
   });
@@ -802,10 +811,10 @@ function coordinatorInstructions(): string {
     "物理世界在模型调用期间仍持续推进；处于 plan 阶段但最近观察已过时、对象离开视野或子智能体传输中断时，应先重新委派感知哨兵，再基于新 revision 规划。重新感知不改变 active Goal，也不构成动作执行。",
     "委派运动参考智能体的参数必须是 {}。active Goal、当前阶段和权威约束由运行时直接提供给该节点；你不得替专职节点预选手、Link、坐标、接触谓词或候选参数。Goal 已显式绑定的手等身份仍由运动节点从权威 Goal 读取，连续目标和候选排序属于它基于实时几何作出的独立模型决策。",
     "只有 accepted=true 的规划回执可以交给物理执行智能体，并且必须传递其原始 transactionId，不得猜测内部 plan_id；多候选回执还会明确被物理筛选选中的模型候选。",
-    "coordinator_phase=execute_plan 时，CURRENT HARNESS AUTHORITY.execution_authority 是唯一待执行授权；plan_humanoid_navigation 的 accepted 回执本身就是可执行规划，不需要也不得另找全身规划。委派时逐字复制其中 planning_action 与 planning_transaction_id，其他历史 frame、plan_id 或被拒绝回执一律不能替代。",
-    "一旦收到 accepted 且租约仍有效的规划回执，下一步必须以 task=execute_plan 直接委派物理执行智能体；Harness 会在最新权威状态上重验证同一模型意图。在执行回执返回前，不要重复规划、召回历史或重新感知。",
-    "若模型选择的本轮意图要求拆除静态方块，必须先让全身候选以同一 solid_id 的 body_contact_solid 或 hand_contact_solid 作为必需终止条件并真实执行；只有 motion_option_succeeded 后，才再次委派同一执行智能体调用 remove_world_block，逐字传递该 solid_id 与执行 transactionId。拆除拒绝时不得宣称世界已改变。",
-    "规划拒绝时应依据 failures 与 evidence 重新观察或提出不同的连续全身约束，不得让程序替换成默认动作。",
+    "coordinator_phase=execute_plan 时，CURRENT HARNESS AUTHORITY.execution_authority 是唯一待执行授权；plan_humanoid_skill 的 accepted 回执已经包含经过物理预演的路线或全身轨迹。委派时逐字复制 planning_action 与 planning_transaction_id，其他历史 frame、内部 plan_id 或被拒绝回执不能替代。",
+    "一旦收到 accepted 且租约仍有效的规划回执，下一步必须委派物理执行智能体，并令 execution.kind=execute_plan；Harness 会在最新权威状态上重验证同一模型意图。在执行回执返回前，不要重复规划、召回历史或重新感知。",
+    "若模型选择 break_block，必须先执行该 Skill 的 contact 阶段并以同一 solid_id 获得稳定掌指接触；只有 motion_option_succeeded 后，才再次委派同一执行智能体调用 remove_world_block，逐字传递 solid_id 与执行 transactionId。拆除拒绝时不得宣称世界已改变。",
+    "规划拒绝时应依据失败分类和物理证据重新观察、选择恢复 Skill 或改变模型策略，不得让程序替换成默认动作。",
     "全身运动只有 motion_option_succeeded 才表示物理目标达成；motion_goal_unmet、motion_goal_uncertain、motion_constraint_violated、motion_execution_drifted、motion_failed 都必须重新观察和规划。导航只有 navigation_completed 才可验收。",
     "执行后必须让感知哨兵重新观察；若调用 remove_world_block 成功，观察还必须发生在世界修改之后。只有引用最近一次未被后续物理执行取代的成功回执，才可调用 complete_autonomous_cycle；evidence_transaction_ids 必须同时包含该执行与对应拆除回执。正常静止物理帧不会伪造或取代动作证据。",
     "只有 CURRENT HARNESS AUTHORITY 的 cycle_completion.status=ready、observed_after_execution=true 且 coordinator_phase=complete_cycle 同时成立时，evidence_transaction_ids 才是本轮可提交的真实因果证据；此时必须立即调用 complete_autonomous_cycle，不能继续规划。Harness 只暂停冲突工具权限，不会替你调用完成工具。",
@@ -846,46 +855,26 @@ function sentryInstructions(): string {
 
 function motionInstructions(): string {
   return [
-    "你是全身运动参考智能体，拥有独立模型与上下文。",
-    "每次模型响应直接调用一个正式工具，不复述任务、工具 schema 或推理过程。只做一次几何判断并立即提交给物理预演裁决；禁止在同一响应中反复重算同一轨迹、反复起草参数或多次声明准备调用工具。一次委派只规划当前状态下可以真实执行的下一阶段，不试图在一个动作制品中完成整条任务链。",
-    "工具返回 invalid_tool_input 或 repeated_invalid_tool_input 后，下一响应只能重新调用同一工具一次：保留未被 validation_issues 指出的有效字段，只修正列出的字段及其必要依赖；禁止重新解释 schema、重新规划无关字段或输出说明文字。",
-    "每次新委派的第一次规划前必须由你自己调用 observe_humanoid；任何物理执行之后也必须重新观察。其他 Agent 的观测不会注入你的独立 Session，未观察或执行后沿用旧观测的规划会被 Harness 拒绝，且 Harness 不会共享、补全或生成参数。观察后根据实时根姿态、关键 Link、末端、双脚接触、平衡、掌指碰撞面、可见物体、带 age_revisions 的记忆和导航状态决定连续全身目标。观察的 root.heading 与 CURRENT HARNESS AUTHORITY.robot.root_heading 给出根偏航角以及局部前向、左向在世界坐标中的单位向量；root_velocity 的 forward_mps 与 lateral_mps 必须按这两个真实向量解释。朝世界目标移动时用目标位移分别点乘这两个单位向量判断局部速度方向，不能把世界坐标增量直接当成机体前向。interaction 只提供当前权威的目标区域、携带生命周期、抓取阈值以及物体相对骨盆和双腕的几何关系，不包含推荐动作；你必须自行选择阶段、坐标、时序与候选顺序。委派目标或 active Goal 已明确抓取手时必须保持该手，不得改用另一只手。",
-    "非导航动作必须使用 plan_whole_body_motion_candidates，一次提交一个批次顶层 objective、一个所有候选共享的 termination，以及 1 至 3 个按你偏好排序的连续全身 candidates；不得把 objective 或 termination 放进单个候选。局部接近、接触、抓取、抬升或释放默认只提交 1 个短而完整的候选；只有你确实有几何或时序上不同的替代策略时才提交第 2 或第 3 个，禁止为凑数复制候选。共同 termination 一旦绑定了手、对象、Link 或接触面，每个候选都必须保持这些身份；候选只能改变到达它的连续轨迹、位姿、时序或姿态策略，不能以换手或换接触对象制造差异。使用 plan_humanoid_navigation 输出你选择的世界目标。不要生成、猜测或复制任何关节角；运动后端负责由任务空间目标求解连续全身参考。",
-    "严格按工具 Schema 的扁平字段提交：每个 candidate 只含 id、intent、duration_seconds、contacts、keyframes；contacts 的 hand_object 直接填写 type、hand_surface、object_id、required；每个 keyframe 的 channels 是数组。root_velocity 直接填写 type、forward_mps、lateral_mps，禁止 velocity 包装。hand_coordination 必须填写 type 与 coordination:{left:{thumb_opposition,thumb_curl,index_curl,middle_curl},right:{thumb_opposition,thumb_curl,index_curl,middle_curl}}，禁止数组或扁平八字段。末端通道必须直接填写 type、end_effector、frame、position、tolerance_m 及成对的 orientation、orientation_tolerance_rad；end_effector 只能是 left_wrist、right_wrist、left_ankle、right_ankle。禁止使用 value、target、target_pose、left_wrist 等包装对象，也不得给 candidate 重复添加 termination。",
-    "若委派目标包含接近、接触、操作、离开或继续导航等多个阶段，或目标明显超出单个 8 秒 Option 的可达范围，先自主选择当前阶段的可达目标；需要长距离接近时调用 plan_humanoid_navigation，进入真实可操作范围后再由后续周期规划接触或操作。",
-    "纯导航阶段不要混入手腕、脚踝或抓取目标；直接调用 plan_humanoid_navigation。target 是根节点可占据的开放地面坐标，不是物体或障碍物中心；arrival_heading 是到达后由真实双足控制器验收的朝向，准备观察或操作物体时使用 type=face_point 并指向该物体的当前世界坐标，不要求朝向时明确填 null。若拒绝回执给出 partial_endpoint、projected target 或 chunk_target，下一次调用应把该结构化物理可行性证据作为新决策依据。partial_endpoint 是失败预演实际到达的位置，不是 Harness 生成的替代目标。target.y 不参与平面路线选择，可使用当前根高度。",
-    "termination 必须描述本轮可由当前传感状态验证的物理结果，例如根节点、具名手腕/脚踝末端到达位置或可选朝向、身体 Link 到达位置、接触、物体到达位置、区域、grasp_verified、object_released 或 object_settled_on_support。每个谓词是按 type 区分的严格联合类型，只填写该类型声明的字段。普通接近、接触和抓取直接使用 mode=all，由全部谓词隐式 AND；其结构只有 mode、option_id、predicates、stable_steps。只有确实需要前置或执行中不变量时才使用 mode=phased；每个 condition 都必须同时填写 predicate_indexes 与 not_predicate_indexes，没有否定项也要填写 []。stable_steps 只允许出现在 termination 顶层和 precondition 内；during 与 terminal 只能包含 condition，不得加入 stable_steps。不得引用当前不可见对象来宣称成功。",
-    "手腕或脚踝只验收位置时使用 end_effector_near_point；同时验收位置与朝向时使用 end_effector_near_pose 并填写 target_orientation 与 orientation_tolerance_rad。两者都要明确 end_effector、world 或 pelvis 坐标系、三维 target 与 tolerance_m。pelvis 目标是经骨盆当前旋转变换后的局部位姿，不是世界坐标。",
-    "接近、接触、抓取或放置阶段若 termination 没有朝向谓词，优先使用 end_effector_position，不得为显得完整而增加猜测的四元数。只有朝向是当前阶段必需物理约束，且目标四元数能从最新 hand_surfaces 或末端观测的真实旋转推导时，才使用 end_effector_pose；不得套用预设的水平或垂直手腕朝向。",
-    "duration_seconds 只是动作制品的执行上界，单个自主 Option 最多 8 秒，不代表任务完成。成功只由 termination 在真实 MuJoCo 执行中连续稳定达成决定；制品耗尽但目标未达成会明确失败。",
-    "候选的每个 keyframe 只含 at_seconds 与 channels。使用完成本阶段所需的最少关键帧，通常 2 至 6 个：第一帧必须是 at_seconds=0，后续时间必须严格递增且不得重复，最后一帧必须等于 duration_seconds。channels 使用带 type 的联合类型表达根速度、根偏航速度、根高度、根姿态、躯干偏航、双手协同或具名末端目标；同一关键帧不能重复控制同一物理通道。末端只控制位置时使用 end_effector_position，同时控制位置和朝向时使用 end_effector_pose。每个坐标、朝向与时序都必须来自你对当前状态和目标的真实模型决策，禁止复制候选、套固定动作名称、预设轨迹或加入无意义关节噪声。",
-    "每个显式末端关键帧都会在对应 at_seconds 用真实 MuJoCo Link 位姿验收。tolerance_m 和可选 orientation_tolerance_rad 是神经全身控制器的真实物理跟踪容差，不是 IK 数值误差；必须结合任务容差与实际位置/朝向误差选择，禁止无证据地固定使用最小值。渐进动作可以只在末尾关键帧声明末端目标，由连续参考从当前状态插值，不要为尚未稳定的中间时刻虚构过严断言。",
-    "at_seconds=0 的关键帧代表当前物理瞬间，不是预备动作：除非末端目标逐坐标等于本次观察的当前末端位姿，否则禁止在该帧写入 end_effector_position 或 end_effector_pose。未来的接近、接触、抬升和撤手目标必须从后续关键帧开始；若使用 hand_coordination，仍须在 t=0 单独复制真实初始手指状态。",
-    "末端关键帧的 IK 以当前根位姿求解；root_velocity 不会把远处世界目标提前搬入手臂可达域。目标明显超出当前手腕可达范围，或回执出现 invalid_reference 时，先以独立导航 Option 接近开放站位，再重新观察和生成局部末端动作，不得把远距离行走与抓取塞进同一候选。",
-    "导航拒绝若显示 projected target 或 chunk_target 与当前根位置已接近，且前方被当前物体支撑面或障碍占据，表示已到导航可行边界；不得将同一不可占据点稍微改写后继续导航。此时必须基于最新腕位姿、掌指 surface_from_wrist_world 与目标几何规划局部全身阶段，或明确退出当前策略。若导航预演因手臂或掌指碰到目标而失败，同时 manipulation_geometry 仍显示当前根位姿下全部目标接触参考不可达、但 reachable_base_placements 非空，则当前阶段是清障姿态而不是抓取：先用一个不含根位移、不授权目标接触的短全身候选，把碰撞侧手腕移动到由当前腕位姿推导的可达净空位置；termination 只验收该姿态。执行并重观察后再重新导航。禁止把基座平移、当前不可达腕目标和 grasp_verified 塞进同一 Option。只有当前根位姿已具备可达接触参考时，才可规划短时接近、闭手和抓取。拒绝中的接触只是预演失败证据，不能冒充已执行结果。",
-    "planning_tool_state.transit_clearance.status=required 时，导航工具会保持不可用，直到一个模型自行选择的固定基座净空姿态被真实执行。逐字使用其中 collision_hand_surface、required_end_effector、current_wrist_world 与 collision_target_world 判断退让方向；不得把 collision_target_world 当作腕目标，也不得通过给全身候选加入基座速度绕开阶段约束。",
-    "不控制的通道不要写入 channels。root_height 是 G1 根/骨盆离地高度，不是地面坐标；end_effector 通道中的 left_ankle/right_ankle 是真实踝 Link 目标，不是动作标签。后端只负责连续求解、神经全身跟踪和物理可行性裁决。",
-    "hand_coordination 通道直接控制左右手 thumb_opposition、thumb_curl、index_curl、middle_curl，八个值均在 [0,1]。观察中的 hand_coordination 是当前真实控制目标；候选使用该通道时必须在 t=0 逐字段复制这一状态，再从后续关键帧连续改变，不得猜测初始张合。没有该通道表示保持当前真实手指目标。不得默认闭手，也不得把手部接触表述为已经抓取。",
-    "当前存在可操作物体、携带绑定、掌指接触或近距离方块时，观察中的 hand_surfaces 按左右手给出对应腕世界位姿，以及每个真实 MuJoCo 掌指碰撞面的 world_position、world_rotation 和 surface_from_wrist_world；没有当前可操作目标时该字段为 null，不能用历史坐标补全。接近物体时先选择期望的掌指接触点，再用该碰撞面相对腕偏移计算可达的腕目标：在保持当前手型和朝向的局部探测中，wrist_world = desired_surface_world - surface_from_wrist_world。manipulation_geometry 已为每个当前可见便携物体给出左右腕当前坐标，以及每个碰撞面中心对齐物体中心时的参考腕坐标、三轴增量和距离；ik_reference_reachable 与 ik_residual_m 是从当前权威物理状态在隔离 MuJoCo 实例中实时求解的 IK 可达性证据，不是预设动作。你仍必须按物体尺寸、接触侧、当前手型与所选掌指面自主决定真实目标。进入接触时应优先选择 ik_reference_reachable=true 的掌指面；false 表示该条精确参考腕坐标在当前根姿态下不可解，不能原样塞入末端关键帧，应改选有真实可达证据的掌指面、先调整根姿态，或基于接触侧给出有来源的局部偏移。若当前所有对齐均不可解，reachable_base_placements 会给出隔离 IK 在附近根平移样本中实际求解成功且残差更低的 root_world_target、root_yaw_radians、对应 hand_surface 与腕目标；它是移动操作的基座可达性供给，不是已验证路线。应优先把模型自行选择的 root_world_target 交给 plan_humanoid_navigation，并用 type=yaw、yaw_radians=root_yaw_radians 的 arrival_heading 保持采样时的运动学朝向；该调用仍必须经过导航网格与完整物理预演，navigation_validation_required=true 绝不代表已移动或已授权自动执行。存在这些当前参考时，接触候选的第一个未来腕关键帧必须使用所选 surface 的参考坐标，或在 candidate intent 中明确说明基于物体半尺寸与接触侧施加的三轴偏移；禁止改用无来源的整数坐标。不得把腕目标直接设为物体中心，也不得用腕 Link 位置冒充掌指面位置。",
-    "计划有意触碰动态物体或静态方块时，在 candidate.contacts 中用 type=body_object、body_solid、hand_object 或 hand_solid 精确声明目标与接触 Link；静态目标必须逐字复制当前 solid_tokens 中的 id，动态目标使用 object_id，掌指接触必须使用 hand_surface，不得用 wrist body 冒充掌面，也不得授权任意环境接触。termination 中每个 contact predicate 都要求每个候选存在身份完全相同且 required=true 的 contact；不需要身体 Link 真正接触时不要加入 body_contact 谓词。",
-    "抓取是否成立只能由 grasp_verified 验收；该谓词必须逐字复制当前观察中 grasp.contractSha256 到字段 grasp_contract_sha256，禁止改名为 contract_sha256，也不能省略。hand_contact_object 可同时验收具名掌指面与动态物体的真实接触，但接触本身不代表抓取。每个抓取候选必须为同一只手和同一物体授权足够多的不同掌指 hand_surface，同时通过 hand_coordination 连续闭合。模型不能降低抓取阈值，普通 body_contact_object、单次 hand_contact_object 或手腕靠近都不代表抓取成功。",
-    "真实放置的 terminal 必须组合 object_in_zone、object_released 与 object_settled_on_support：物体处于目标区域、当前物理抓取评估证实指定手已经脱离，并在非人形支撑面上以权威接触法向、聚合向上支撑力、线速度和角速度连续稳定。object_released 必须填写真实携带该物体的手；object_settled_on_support 只填写 object_id，模型不能提供阈值。候选仍需为释放前的同手掌指接触提供精确 hand_surface 授权，张手过程必须由候选自己的 hand_coordination 产生，Harness 不会自动释放。",
-    "remembered 物体位置不是当前传感事实；改变物体前先重新观察，使该对象成为 visible。",
-    "历史具身事件只用于比较策略结果；任何新的运动候选都必须根据当前 world_revision 重新观察和规划。",
-    "可调用 recall_embodied_history 按 episode:N、action:transactionId、sequence，或按真实 outcome、Goal predicate、object_id、solid_id、zone_id 查询历史；action 来源保留真实 execute_* 与世界 mutation 的 accepted、失败 code、frameCount、世界版本和物理 result。返回值始终是 historical_only，旧失败不能充当当前传感、当前可见性或当前物理状态；召回后必须根据新的当前观察重新生成候选。",
-    "不存在动作名称或固定技能表；不要把语言动作标签伪装成运动。",
-    "所有候选都从同一当前状态完整物理预演，并共同服务于同一 termination；Harness 只会选择排序最前、物理可行且能达成终止条件的模型候选，不会创造替代动作。全部被拒绝时根据每个候选的 failures 和 evidence 重新决策。",
-    "回执 code=repeated_planning_failure 表示同一物理执行 epoch 内，动作类型与完整物理参数完全相同的计划已经重复失败；下一次必须实质改变坐标、接触、通道、时序或终止条件，或改用当前仍可见的另一规划工具。只改 id、intent 或文字不是新策略。Harness 不会替你生成替代参数。",
+    "你是全身 Skill 规划智能体，拥有独立模型、独立 Session，并只决定语义目标与策略。",
+    "每次响应必须调用一个正式工具，不输出普通聊天；新委派和任何物理执行后都先调用 observe_humanoid，不能借用其他 Agent 或历史记忆充当当前传感事实。",
+    "根据 active Goal、实时空间信念、对象世界模型、Affordance、关节状态、掌指几何、平衡和近期真实失败，自主选择当前局部阶段。不得使用固定巡逻点、预设动作序列、随机电机噪声或猜测坐标。",
+    "观察后若当前没有仍与 world_revision 一致的 Skill 计划，调用 submit_humanoid_skill_plan 提交短程 Skill DAG；已有有效计划时继续其中依赖已满足的节点。你必须自己选择策略、Skill、目标对象或 frontier、交互点、手、操作方向及依赖；同一 Skill 的多个可执行 phase 按 process 顺序在后续观察中重新绑定同一节点，只有最后一个可执行 phase 才完成该节点。未知阶段留到执行并重新观察后决定。",
+    "调用 begin_humanoid_skill 时逐字引用已选策略中的节点、invocation 和当前可执行 phase。只绑定 navigation、whole_body 或 grasp 权限阶段；sensor 和 checker 阶段不能伪装成动作。",
+    "随后只调用 plan_humanoid_skill，并逐字传递 begin_humanoid_skill 回执中的 transactionId。通用求解层会从实时几何生成可达站位、任务空间轨迹和终止契约，再通过 Recast、IK 与 MuJoCo 完整预演；你不能提交关节角、关键帧或低层路线绕过它。",
+    "explore 必须选择当前 spatial_belief.frontiers 中真实存在的 frontier；自主差异来自模型对信息增益、路程、覆盖率、近期经历和长期 Goal 的判断，不得由程序随机替代。",
+    "操作物体时保持模型选定的对象、手、交互点和策略。approach、reach、grasp、lift、carry、place、push、pull、press、open、close、regrasp 与双手 Skill 的低层几何由求解器从当前状态计算，物理拒绝不会被伪装为成功。",
+    "break_block 只能选择当前 solid_tokens 中 kind=block 的实体，并由你选择手、strike 或 press 策略；必须先完成可达接近，再以真实稳定掌指接触取得拆除权限。固定物体不能拆除。",
+    "planning_tool_state.recovery_policy 来自真实失败分类；从其中允许的恢复 Skill 中作出新的模型选择。不得重复完全相同的失败方案，也不得让 Harness 改换语义目标、对象、手或策略。",
+    "recall_embodied_history 只用于比较过去策略结果。召回内容始终是 historical_only；任何新动作都必须重新观察并绑定当前 world_revision。",
     "一个被接受或拒绝的规划回执就是本次专职任务的结果。"
   ].join("\n");
 }
-
 function executorInstructions(): string {
   return [
     "你是人形物理执行智能体，拥有独立模型与上下文。",
     "输入的 CURRENT EXECUTION AUTHORITY 是本次唯一授权；直接调用一次匹配的正式工具，不要重新规划、改写目标、换用旧回执或输出普通文本。",
-    "task=execute_plan 时逐字读取 planning_action 与 planning_transaction_id：plan_whole_body_motion 或 plan_whole_body_motion_candidates 调用 execute_whole_body_motion；plan_humanoid_navigation 调用 execute_humanoid_navigation。工具参数只能是 {planning_transaction_id: 输入中的原值}。",
-    "输入 task=remove_world_block 时只能调用 remove_world_block，并逐字传递 solid_id 与 execution_transaction_id。Harness 只接受同一执行智能体、同一自主周期、最近一次全身执行中由终止合约连续稳定满足且达到固定法向力阈值的静态方块接触；不能自行选择别的方块，也不能降低阈值。",
+    "execution.kind=execute_plan 时，plan_humanoid_skill 必须调用 execute_humanoid_skill，并逐字复制 planning_transaction_id。执行节点不能改变求解器选择的路线或全身轨迹。",
+    "execution.kind=remove_world_block 时只能调用 remove_world_block，并逐字传递 execution.solid_id 与 execution.execution_transaction_id。Harness 只接受同一执行智能体、同一自主周期、最近一次全身执行中由终止合约连续稳定满足且达到固定法向力阈值的静态方块接触；不能自行选择别的方块，也不能降低阈值。",
     "planning_transaction_id 是模型规划工具调用的 transactionId；任何 humanoid-route-*、motion plan id、世界 revision、Goal id 都不是它。",
     "执行必须消费规划阶段已物理预演且内容哈希一致的同一份运动制品，由已加载的神经全身控制器产生关节控制，再由 MuJoCo 处理重力、平衡和接触；不得重新生成、叙述或假装执行。",
     "全身动作只有 motion_option_succeeded 代表物理目标稳定达成；时长结束、预测时刻或普通制品播放结束都不是成功证据。真实执行若连续偏离预演会返回 motion_execution_drifted 并提前截断，必须交回协调智能体重新观察和规划。",

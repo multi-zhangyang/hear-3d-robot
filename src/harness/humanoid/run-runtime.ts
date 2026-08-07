@@ -234,6 +234,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
     this.#actions = new HumanoidActionRuntime(this.#world, {
       receipts: this.#checkpoint.committed_actions,
+      state: this.#checkpoint.action_runtime_state,
       frameSink: (frame) => this.#physicalExecution.recordFrame(frame, "execution"),
       physicalFrameSink: (cut) => this.#physicalExecution.recordPhysicalCut(cut),
       receiptSink: (receipt) => this.#commitReceipt(receipt),
@@ -242,6 +243,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       prepareBlockRemoval: (request) => this.#prepareBlockRemoval(request),
       realtimeExecution: true,
       retainPhysicalTerminals: true,
+      requireSkillBinding: true,
       ...(this.#signal ? { signal: this.#signal } : {})
     });
     this.#physicsClock = new HumanoidPhysicsClock({
@@ -1459,11 +1461,6 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       await this.#reconcileActionCommits();
       return;
     }
-    const node = this.#node(receipt.agentId);
-    node.steps_used += 1;
-    node.status = "ready";
-    node.updated_at = new Date().toISOString();
-    this.#checkpoint.committed_actions[receipt.transactionId] = structuredClone(receipt);
     const physicalExecution = this.#checkpoint.action_execution_ledger.active[
       receipt.transactionId
     ];
@@ -1494,11 +1491,6 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       worldRevision: receipt.worldAfterRevision,
       receipt: json(receipt)
     });
-    this.#rememberGoalEvidence(actionEvidence);
-    const experience = physicalExecutionReceipt(receipt)
-      || receipt.action === "remove_world_block"
-      ? this.#rememberEmbodiedActionExperience(receipt, true)
-      : undefined;
     let physicalWorldDelta: ReturnType<typeof captureHumanoidPhysicalWorldDelta> = undefined;
     let projectedScenarioChunks: ReturnType<
       typeof projectHumanoidPhysicalWorldDelta
@@ -1536,13 +1528,18 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         blockRemoval
       );
     }
+    const rememberedExperience = physicalExecutionReceipt(receipt)
+      || receipt.action === "remove_world_block"
+      ? this.#prepareEmbodiedActionExperience(receipt, true)
+      : undefined;
+    const experience = rememberedExperience?.experience;
     const checkerScenario = projectedScenarioChunks
       ? materializeScenarioChunkDeltaState(
           this.#store.definition.scenario,
           projectedScenarioChunks
         )
       : this.#scenario;
-    this.#checkpoint.checker = activeGoal && this.#checkpoint.goal_progress
+    const nextChecker = activeGoal && this.#checkpoint.goal_progress
       ? inspectHumanoidGoal(
           activeGoal,
           checkerScenario,
@@ -1558,7 +1555,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       data: json({
         receipt: record,
         world: this.#checkpoint.world,
-        checker: this.#checkpoint.checker,
+        checker: nextChecker,
         ...(physicalWorldDelta
           ? { physical_world_delta: physicalWorldDelta }
           : {}),
@@ -1569,12 +1566,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         ...(experience
           ? {
               experience,
-              embodied_memory: this.#checkpoint.embodied_memory
+              embodied_memory: rememberedExperience?.state
+                ?? this.#checkpoint.embodied_memory
             }
           : {})
       })
     };
-    this.#checkpoint.action_commit_outbox = stageActionCommit(
+    const nextOutbox = stageActionCommit(
       this.#checkpoint.action_commit_outbox,
       {
         transactionId: receipt.transactionId,
@@ -1593,10 +1591,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         runtimeEvent
       }
     );
+    let nextExecutionLedger = this.#checkpoint.action_execution_ledger;
     if (physicalExecution) {
-      const staged = this.#checkpoint.action_commit_outbox.pending[receipt.transactionId];
+      const staged = nextOutbox.pending[receipt.transactionId];
       if (!staged) throw new Error("Physical action commit was not staged");
-      this.#checkpoint.action_execution_ledger = terminalizeActionExecution(
+      nextExecutionLedger = terminalizeActionExecution(
         this.#checkpoint.action_execution_ledger,
         {
           transactionId: receipt.transactionId,
@@ -1604,6 +1603,17 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         }
       );
     }
+    const node = this.#node(receipt.agentId);
+    node.steps_used += 1;
+    node.status = "ready";
+    node.updated_at = new Date().toISOString();
+    this.#checkpoint.committed_actions[receipt.transactionId] = structuredClone(receipt);
+    this.#checkpoint.checker = nextChecker;
+    if (rememberedExperience) {
+      this.#checkpoint.embodied_memory = rememberedExperience.state;
+    }
+    this.#checkpoint.action_commit_outbox = nextOutbox;
+    this.#checkpoint.action_execution_ledger = nextExecutionLedger;
     await this.#persist();
     await this.#reconcileActionCommits();
   }
@@ -1763,6 +1773,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     receipt: HumanoidActionReceipt,
     required: boolean
   ): HumanoidEmbodiedExperience | undefined {
+    const remembered = this.#prepareEmbodiedActionExperience(receipt, required);
+    if (!remembered) return undefined;
+    this.#checkpoint.embodied_memory = remembered.state;
+    return remembered.experience;
+  }
+
+  #prepareEmbodiedActionExperience(
+    receipt: HumanoidActionReceipt,
+    required: boolean
+  ): ReturnType<typeof rememberEmbodiedActionExperience> | undefined {
     const epochId = receipt.cycle?.goal_epoch_id;
     const epoch = epochId
       ? this.#checkpoint.goal_dag.epochs.find((entry) => entry.epoch_id === epochId)
@@ -1778,13 +1798,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       }
       return undefined;
     }
-    const remembered = rememberEmbodiedActionExperience({
+    return rememberEmbodiedActionExperience({
       state: this.#checkpoint.embodied_memory,
       execution: receipt,
       goal: candidate.goal
     });
-    this.#checkpoint.embodied_memory = remembered.state;
-    return remembered.experience;
   }
 
   async #finish(
@@ -2125,6 +2143,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       // cannot split this persisted world/world-checkpoint cut.
       this.#applyWorldPersistenceState(captured);
     }
+    this.#checkpoint.action_runtime_state = this.#actions.persistenceState();
     this.#assertActiveGoalProgress();
     this.#checkpoint.updated_at = new Date().toISOString();
     const snapshot = structuredClone(this.#checkpoint);
@@ -2200,7 +2219,8 @@ function usageTotalsDominate(
 }
 
 function isHumanoidPlanningReceipt(receipt: HumanoidActionReceipt): boolean {
-  return receipt.action === "plan_whole_body_motion"
+  return receipt.action === "plan_humanoid_skill"
+    || receipt.action === "plan_whole_body_motion"
     || receipt.action === "plan_whole_body_motion_candidates"
     || receipt.action === "plan_humanoid_navigation";
 }

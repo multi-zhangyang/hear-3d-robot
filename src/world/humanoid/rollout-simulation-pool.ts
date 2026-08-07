@@ -4,6 +4,7 @@ import {
   type HumanoidSimulationOptions,
   type HumanoidSimulationState
 } from "./simulation.js";
+import { resolveHumanoidSceneObject } from "./mujoco-runtime.js";
 
 type LeaseOperation<T> = (
   simulation: HumanoidSimulation
@@ -182,12 +183,7 @@ function cloneSimulationOptions(
       : {}),
     ...(options.objects
       ? {
-          objects: options.objects.map((object) => ({
-            id: object.id,
-            center: { ...object.center },
-            size: { ...object.size },
-            mass: object.mass
-          }))
+          objects: options.objects.map(resolveHumanoidSceneObject)
         }
       : {}),
     ...(options.controllerFactory

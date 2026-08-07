@@ -87,6 +87,32 @@ describe("humanoid navigation execution progress", () => {
     })).toThrow(/waypoint progress/i);
   });
 
+  it("keeps cumulative physical evidence across an online route replacement", async () => {
+    const simulation = new NavigationSimulation({ x: 0, y: 0.8, z: 0.2 });
+    const execution = new HumanoidNavigationExecution({
+      plan: route,
+      reference: neutralHumanoidReference(),
+      simulation: simulation.asHumanoidSimulation(),
+      progress: {
+        version: 1,
+        start_root_position: { x: 0, y: 0.8, z: 0 },
+        segment_start_root_position: { x: 0, y: 0.8, z: 0.2 },
+        waypoint_index: 1,
+        committed_frame_count: 5,
+        online_replan_count: 1,
+        stopping_frame_count: 0
+      }
+    });
+
+    expect((await execution.step(simulation.asHumanoidSimulation())).done).toBe(false);
+    expect(execution.checkpoint()).toMatchObject({
+      start_root_position: { x: 0, y: 0.8, z: 0 },
+      segment_start_root_position: { x: 0, y: 0.8, z: 0.2 },
+      committed_frame_count: 6,
+      online_replan_count: 1
+    });
+  });
+
   it("allows only the exact hand-surface contact authorized for a carried object", async () => {
     const allowedContact = contact({
       firstHandLink: "left_hand_thumb_2_link",
@@ -275,6 +301,51 @@ describe("humanoid navigation execution progress", () => {
     expect(execution.result().travelledDistance).toBeGreaterThanOrEqual(0.09);
   });
 
+  it("settles inside the physical locomotion deadband without chasing a new target", async () => {
+    const approachRoute: NavigationPlan = {
+      waypoints: [
+        { x: 0, y: 0.8, z: 0 },
+        { x: 0, y: 0.8, z: 0.4 }
+      ],
+      distance: 0.4,
+      resolvedTarget: { x: 0, y: 0.8, z: 0.4 },
+      projectionDistance: 0
+    };
+    const simulation = new NavigationSimulation(
+      { x: 0, y: 0.8, z: 0.333 },
+      [],
+      0.333,
+      0.05,
+      0.08
+    );
+    const execution = new HumanoidNavigationExecution({
+      plan: approachRoute,
+      reference: neutralHumanoidReference(),
+      simulation: simulation.asHumanoidSimulation(),
+      progress: {
+        version: 1,
+        start_root_position: { x: 0, y: 0.8, z: 0 },
+        waypoint_index: approachRoute.waypoints.length,
+        committed_frame_count: 66,
+        stopping_frame_count: 66,
+        stopping_settled_frame_count: 0,
+        arrival_position_latched: true
+      },
+      arrivalHeading: {
+        type: "yaw",
+        yaw_radians: 0,
+        tolerance_radians: 0.08
+      }
+    });
+
+    expect((await execution.step(simulation.asHumanoidSimulation())).done).toBe(true);
+
+    expect(execution.result().reason).toBeUndefined();
+    expect(execution.result()).toMatchObject({ completed: true });
+    expect(0.4 - execution.result().final.rootPosition.z).toBeCloseTo(0.067, 6);
+    expect(execution.result().travelledDistance).toBeGreaterThanOrEqual(0.3);
+  });
+
   it("physically aligns the requested arrival heading before completing", async () => {
     const simulation = new NavigationSimulation();
     const execution = new HumanoidNavigationExecution({
@@ -377,8 +448,12 @@ class NavigationSimulation {
 
   controllerDescriptor(): {
     controlStepSeconds: number;
+    minimumEffectivePlanarSpeedMetersPerSecond: number;
   } {
-    return { controlStepSeconds: 0.1 };
+    return {
+      controlStepSeconds: 0.1,
+      minimumEffectivePlanarSpeedMetersPerSecond: this.minimumCommandSpeed
+    };
   }
 
   resetController(_reference: HumanoidReference): void {

@@ -37,7 +37,9 @@ import {
   humanoidSceneSolidGeomName,
   loadHumanoidMujoco,
   removeHumanoidScene,
+  resolveHumanoidSceneObject,
   type HumanoidSceneObject,
+  type ResolvedHumanoidSceneObject,
   type HumanoidSceneSolid,
   type MujocoData,
   type MujocoModel,
@@ -104,6 +106,11 @@ export interface HumanoidSimulationOptions {
   controllerFactory?: () => Promise<HumanoidWholeBodyController>;
 }
 
+interface ResolvedHumanoidSimulationOptions
+  extends Omit<HumanoidSimulationOptions, "objects"> {
+  objects?: readonly ResolvedHumanoidSceneObject[];
+}
+
 interface HumanoidFootContactSnapshot {
   touching: boolean;
   contactCount: number;
@@ -127,6 +134,14 @@ export interface HumanoidContactSnapshot {
 
 export interface HumanoidObjectSnapshot extends HumanoidLinkSnapshot {
   id: string;
+  articulation?: {
+    type: "hinge" | "slide";
+    position: number;
+    velocity: number;
+    minimum: number;
+    maximum: number;
+    normalized: number;
+  } | undefined;
 }
 
 export interface HumanoidObjectSensorSnapshot {
@@ -261,8 +276,10 @@ export class HumanoidSimulation {
   readonly #handSurfaceGeometryIds = new Map<G1HandContactSurfaceName, number>();
   readonly #handActuator: G1HandActuator;
   readonly #objectJointBindings: readonly MujocoJointBinding[];
+  readonly #objectJointBindingsById = new Map<string, MujocoJointBinding>();
   readonly #objectNamesByBodyId = new Map<number, string>();
   readonly #objectSizesById = new Map<string, Vec3>();
+  readonly #objectDescriptorsById = new Map<string, ResolvedHumanoidSceneObject>();
   readonly #solidNamesByGeomId = new Map<number, string>();
   readonly #solidDescriptorsById = new Map<string, HumanoidSceneSolid>();
   readonly #pelvisBodyId: number;
@@ -272,16 +289,27 @@ export class HumanoidSimulation {
   readonly #spawn: HumanoidSpawn;
 
   static async create(options: HumanoidSimulationOptions = {}): Promise<HumanoidSimulation> {
+    const { objects, ...baseOptions } = options;
+    const resolvedOptions: ResolvedHumanoidSimulationOptions = {
+      ...baseOptions,
+      ...(objects
+        ? { objects: objects.map(resolveHumanoidSceneObject) }
+        : {})
+    };
     const [runtime, controller] = await Promise.all([
       loadHumanoidMujoco(),
-      options.controllerFactory
-        ? options.controllerFactory()
+      resolvedOptions.controllerFactory
+        ? resolvedOptions.controllerFactory()
         : YahmpController.create()
     ]);
     try {
       assertControllerTiming(controller);
-      const generatedPath = options.solids || options.objects
-        ? createHumanoidScenePath(runtime, options.solids ?? [], options.objects)
+      const generatedPath = resolvedOptions.solids || resolvedOptions.objects
+        ? createHumanoidScenePath(
+            runtime,
+            resolvedOptions.solids ?? [],
+            resolvedOptions.objects
+          )
         : undefined;
       let model: MujocoModel;
       try {
@@ -292,7 +320,13 @@ export class HumanoidSimulation {
       model.opt.timestep = controller.descriptor.physicsStepSeconds;
       const data = new runtime.MjData(model);
       try {
-        const instance = new HumanoidSimulation(runtime, model, data, controller, options);
+        const instance = new HumanoidSimulation(
+          runtime,
+          model,
+          data,
+          controller,
+          resolvedOptions
+        );
         instance.#initialize();
         return instance;
       } catch (error) {
@@ -311,7 +345,7 @@ export class HumanoidSimulation {
     model: MujocoModel,
     data: MujocoData,
     controller: HumanoidWholeBodyController,
-    options: HumanoidSimulationOptions
+    options: ResolvedHumanoidSimulationOptions
   ) {
     this.#runtime = runtime;
     this.#model = model;
@@ -357,8 +391,12 @@ export class HumanoidSimulation {
       this.#handSurfaceGeometryIds.set(surface, geometryId);
     }
     (options.objects ?? []).forEach((object, index) => {
+      if (this.#objectDescriptorsById.has(object.id)) {
+        throw new Error(`Duplicate MuJoCo scene object: ${object.id}`);
+      }
       this.#objectNamesByBodyId.set(this.#id("body", `world-object-${index}`), object.id);
       this.#objectSizesById.set(object.id, { ...object.size });
+      this.#objectDescriptorsById.set(object.id, structuredClone(object));
     });
     (options.solids ?? []).forEach((solid, index) => {
       if (this.#solidDescriptorsById.has(solid.id)) {
@@ -379,11 +417,19 @@ export class HumanoidSimulation {
         size: { ...solid.size }
       });
     });
+    const jointObjects = (options.objects ?? []).flatMap((object, index) => (
+      object.mobility.type === "fixed"
+        ? []
+        : [{ object, name: `world-object-joint-${index}` as const }]
+    ));
     this.#objectJointBindings = resolveMujocoJoints(
       runtime,
       model,
-      (options.objects ?? []).map((_object, index) => `world-object-joint-${index}`)
+      jointObjects.map(({ name }) => name)
     );
+    jointObjects.forEach(({ object }, index) => {
+      this.#objectJointBindingsById.set(object.id, this.#objectJointBindings[index]!);
+    });
     this.#pelvisBodyId = this.#id("body", "pelvis");
     this.#headBodyId = this.#id("body", g1MujocoBodyName("head_link"));
     this.#leftFootBodyId = this.#id("body", "left_ankle_roll_link");
@@ -562,12 +608,47 @@ export class HumanoidSimulation {
     const objects = Object.fromEntries([...this.#objectNamesByBodyId].map(([bodyId, id]) => {
       const positionOffset = bodyId * 3;
       const rotationOffset = bodyId * 4;
+      const descriptor = this.#objectDescriptorsById.get(id);
+      if (!descriptor) throw new Error(`Missing humanoid scene object descriptor: ${id}`);
+      const binding = this.#objectJointBindingsById.get(id);
+      const mobility = descriptor.mobility;
+      const articulated = mobility.type === "hinge" || mobility.type === "slide";
+      const bodyPosition = worldVector(this.#data.xpos, positionOffset);
+      const rotation = worldQuaternion(this.#data.xquat, rotationOffset);
+      const geometryOffset = articulated
+        ? rotateVector(rotation, subtract(descriptor.center, mobility.anchor))
+        : { x: 0, y: 0, z: 0 };
+      const angularVelocity = worldVector(this.#data.cvel, bodyId * 6);
+      const bodyLinearVelocity = worldVector(this.#data.cvel, bodyId * 6 + 3);
+      const position = articulated && binding
+        ? this.#data.qpos[binding.positionAddress]!
+        : null;
       return [id, {
         id,
-        position: worldVector(this.#data.xpos, positionOffset),
-        rotation: worldQuaternion(this.#data.xquat, rotationOffset),
-        linearVelocity: worldVector(this.#data.cvel, bodyId * 6 + 3),
-        angularVelocity: worldVector(this.#data.cvel, bodyId * 6)
+        position: add(bodyPosition, geometryOffset),
+        rotation,
+        linearVelocity: add(
+          bodyLinearVelocity,
+          crossProduct(angularVelocity, geometryOffset)
+        ),
+        angularVelocity,
+        ...(articulated && binding && position !== null
+          ? {
+              articulation: {
+                type: mobility.type,
+                position,
+                velocity: this.#data.qvel[binding.velocityAddress]!,
+                minimum: mobility.range.minimum,
+                maximum: mobility.range.maximum,
+                normalized: clamp(
+                  (position - mobility.range.minimum)
+                    / (mobility.range.maximum - mobility.range.minimum),
+                  0,
+                  1
+                )
+              }
+            }
+          : {})
       }];
     })) as HumanoidSimulationSnapshot["objects"];
     const up = rotate(rootQuaternion, [0, 0, 1]);
@@ -1021,6 +1102,15 @@ export class HumanoidSimulation {
       this.#data.qpos[this.#jointPositionAddresses[index]!] = (
         YAHMP_POLICY.defaultJointPositions[index]!
       );
+    }
+    for (const [id, descriptor] of this.#objectDescriptorsById) {
+      if (descriptor.mobility.type !== "hinge" && descriptor.mobility.type !== "slide") {
+        continue;
+      }
+      const binding = this.#objectJointBindingsById.get(id);
+      if (!binding) throw new Error(`Articulated humanoid object has no joint: ${id}`);
+      this.#data.qpos[binding.positionAddress] = descriptor.mobility.initialPosition;
+      this.#data.qvel[binding.velocityAddress] = 0;
     }
     this.#handActuator.holdCurrentPositions();
     const initialHandState = this.#handActuator.snapshot();
@@ -1582,6 +1672,14 @@ function vectorDifference(target: Vec3, current: Vec3): number[] {
 
 function vectorDistance(left: Vec3, right: Vec3): number {
   return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z);
+}
+
+function crossProduct(left: Vec3, right: Vec3): Vec3 {
+  return {
+    x: left.y * right.z - left.z * right.y,
+    y: left.z * right.x - left.x * right.z,
+    z: left.x * right.y - left.y * right.x
+  };
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

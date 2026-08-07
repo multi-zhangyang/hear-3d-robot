@@ -42,7 +42,8 @@ const HumanoidEmbodiedRecallInputSchema = z.object({
   outcomes: z.array(z.enum(HUMANOID_EXPERIENCE_OUTCOMES)).max(3)
     .nullable().optional()
     .describe("按真实执行结果筛选经验；同一字段内为任一匹配"),
-  predicate_types: z.array(z.enum(HUMANOID_GOAL_PREDICATE_TYPES)).max(7)
+  predicate_types: z.array(z.enum(HUMANOID_GOAL_PREDICATE_TYPES))
+    .max(HUMANOID_GOAL_PREDICATE_TYPES.length)
     .nullable().optional()
     .describe("按当时模型 Goal 的谓词类型筛选经验"),
   object_ids: z.array(z.string().trim().min(1).max(160)).max(32)
@@ -247,7 +248,19 @@ function referencedJsonSchema(
   if (schema.type !== "object" || schema.properties === undefined) {
     throw new Error("Humanoid action parameters must produce an object JSON schema");
   }
+  removeJsonSchemaDefaults(schema);
   return schema as FunctionTool<unknown, z.ZodObject, string>["parameters"];
+}
+
+function removeJsonSchemaDefaults(value: unknown): void {
+  if (Array.isArray(value)) {
+    value.forEach(removeJsonSchemaDefaults);
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  const record = value as Record<string, unknown>;
+  delete record.default;
+  Object.values(record).forEach(removeJsonSchemaDefaults);
 }
 
 function humanoidActionNames(): HumanoidActionName[] {

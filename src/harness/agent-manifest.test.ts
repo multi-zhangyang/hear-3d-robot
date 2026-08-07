@@ -74,10 +74,7 @@ describe("agent manifest", () => {
       tool_use_behavior: {
         kind: "harness_callback",
         contract_id: "accepted_humanoid_action_receipt_v1",
-        terminal_tool_names: [
-          "plan_whole_body_motion_candidates",
-          "plan_humanoid_navigation"
-        ]
+        terminal_tool_names: ["plan_humanoid_skill"]
       },
       settings: {
         temperature: 0.3,
@@ -89,7 +86,7 @@ describe("agent manifest", () => {
       "@openai/agents": "test-sdk",
       "@openai/agents-extensions": "test-bridge"
     });
-    expect(manifest.harness_contract_version).toBe(4);
+    expect(manifest.harness_contract_version).toBe(6);
     expect(manifest.agents.goal_manager.tool_use_behavior).toEqual({
       kind: "harness_callback",
       contract_id: "verified_harness_terminal_status_v1",
@@ -474,7 +471,7 @@ describe("agent manifest", () => {
     });
     expect(first.identity_sha256).toBe(second.identity_sha256);
     expect(first.identity_sha256).toBe(
-      "a6199bc7c8ea35cec0e97cb992ece6e90aa2207c22f1d1a6157e2a80ab474e0e"
+      "dccc7332ba9be5bf9c4c23489d5a638658227e194504ef00b949fd5eef8eefa9"
     );
   });
 

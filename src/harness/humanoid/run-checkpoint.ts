@@ -43,6 +43,7 @@ export function createHumanoidRunCheckpoint(input: {
     action_commit_outbox: structuredClone(EmptyActionCommitOutbox),
     action_execution_ledger: structuredClone(EmptyActionExecutionLedger),
     committed_actions: {},
+    action_runtime_state: null,
     context_memory: structuredClone(EmptyContextMemoryState),
     embodied_memory: structuredClone(EmptyHumanoidEmbodiedMemoryState),
     pending_lifecycle_events: [],
@@ -95,6 +96,8 @@ export function reconcileHumanoidHierarchyCapabilities(
   if (motion) motion.capabilities = [
     "observe_humanoid",
     "recall_embodied_history",
+    "submit_humanoid_skill_plan",
+    "begin_humanoid_skill",
     "plan_whole_body_motion_candidates",
     "plan_humanoid_navigation"
   ];
@@ -167,6 +170,8 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     capabilities: [
       "observe_humanoid",
       "recall_embodied_history",
+      "submit_humanoid_skill_plan",
+      "begin_humanoid_skill",
       "plan_whole_body_motion_candidates",
       "plan_humanoid_navigation"
     ],

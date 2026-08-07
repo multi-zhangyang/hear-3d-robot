@@ -140,7 +140,8 @@ const PendingActionCommitSchema = z.object({
   }
   if (entry.physical_world_delta !== undefined) {
     if (entry.physical_world_delta.transaction_id !== entry.transaction_id
-      || (action?.action !== "execute_whole_body_motion"
+      || (action?.action !== "execute_humanoid_skill"
+        && action?.action !== "execute_whole_body_motion"
         && action?.action !== "execute_humanoid_navigation")
       || entry.physical_world_delta.source_world_revision !== action?.worldAfterRevision) {
       context.addIssue({

@@ -189,8 +189,13 @@ export const HumanoidEmbodiedEpisodeSchema = z.object({
   source_ref: z.string().regex(/^episode:[1-9]\d*$/).optional(),
   causal_trace: HumanoidEpisodeCausalTraceSchema.optional(),
   transaction_id: z.string().min(1),
-  action: z.enum(["execute_whole_body_motion", "execute_humanoid_navigation"]),
+  action: z.enum([
+    "execute_humanoid_skill",
+    "execute_whole_body_motion",
+    "execute_humanoid_navigation"
+  ]),
   planning_action: z.enum([
+    "plan_humanoid_skill",
     "plan_whole_body_motion",
     "plan_whole_body_motion_candidates",
     "plan_humanoid_navigation"
@@ -309,7 +314,8 @@ export const HumanoidEmbodiedEpisodeSchema = z.object({
     });
   }
   if (episode.motion_option) {
-    if (episode.action !== "execute_whole_body_motion"
+    if ((episode.action !== "execute_whole_body_motion"
+        && episode.action !== "execute_humanoid_skill")
       || episode.motion_option.executed_prefix_frame_count
         > episode.motion_option.full_frame_count
       || episode.motion_option.actual_termination_frame
@@ -350,11 +356,13 @@ export const HumanoidEmbodiedExperienceSchema = z.object({
   transaction_id: z.string().trim().min(1),
   cycle: AutonomousCycleRefSchema,
   action: z.enum([
+    "execute_humanoid_skill",
     "execute_whole_body_motion",
     "execute_humanoid_navigation",
     "remove_world_block"
   ]),
   planning_action: z.enum([
+    "plan_humanoid_skill",
     "plan_whole_body_motion",
     "plan_whole_body_motion_candidates",
     "plan_humanoid_navigation"
@@ -506,6 +514,7 @@ const HumanoidRunCheckpointBaseShape = {
   world: HumanoidWorldSnapshotSchema,
   world_checkpoint: HumanoidWorldCheckpointSchema,
   committed_actions: z.record(z.string().min(1), PersistedHumanoidActionReceiptSchema),
+  action_runtime_state: JsonValueSchema.nullable().default(null),
   context_memory: ContextMemoryStateSchema,
   embodied_memory: HumanoidEmbodiedMemoryStateSchema,
   pending_lifecycle_events: z.array(RunLifecycleEventSchema),

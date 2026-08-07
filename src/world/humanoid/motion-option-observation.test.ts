@@ -57,6 +57,76 @@ const simulation = {
 } as unknown as HumanoidSimulation;
 
 describe("motion option transaction observation", () => {
+  it("binds an observable articulation descriptor to live MuJoCo joint state", () => {
+    const doorState = {
+      ...visibleState,
+      id: "door",
+      articulation: {
+        type: "hinge" as const,
+        position: 0.8,
+        velocity: 0.03,
+        minimum: 0,
+        maximum: 1,
+        normalized: 0.8
+      }
+    };
+    const doorScenario = {
+      visibility_radius: 2,
+      objects: [{
+        id: "door",
+        size: { x: 0.6, y: 0.9, z: 0.05 },
+        capability: {
+          articulation: {
+            joint_id: "door-hinge",
+            type: "hinge",
+            semantic: "door",
+            axis: { x: 0, y: 1, z: 0 },
+            anchor_world: { x: 0, y: 0, z: 0 },
+            range: { minimum: 0, maximum: 1 },
+            initial_position: 0,
+            closed_position: 0,
+            open_position: 1,
+            damping: 0.5,
+            friction_loss: 0.05
+          }
+        }
+      }],
+      zones: []
+    } as unknown as Scenario;
+    const doorSimulation = {
+      senseObjects: () => ({ objects: { door: doorState } }),
+      senseSolids: () => ({ solids: {} })
+    } as unknown as HumanoidSimulation;
+    const result = humanoidMotionOptionDetectorInputFromSimulation({
+      simulation: doorSimulation,
+      snapshot: {
+        contacts: [],
+        objects: { door: doorState }
+      } as unknown as HumanoidSimulationSnapshot,
+      option: {
+        contract: HumanoidMotionOptionContractSchema.parse({
+          option_id: "observe-door",
+          predicates: [{
+            type: "articulation_state",
+            object_id: "door",
+            joint_id: "door-hinge",
+            state: "open",
+            tolerance: 0.2
+          }],
+          stable_steps: 1
+        }),
+        scenario: doorScenario
+      }
+    });
+    expect(result.observableObjects[0]?.articulation).toEqual({
+      jointId: "door-hinge",
+      position: 0.8,
+      velocity: 0.03,
+      closedPosition: 0,
+      openPosition: 1
+    });
+  });
+
   it("keeps ordinary hidden objects private but follows the explicitly tracked release object", () => {
     const ordinary = humanoidMotionOptionDetectorInputFromSimulation({
       simulation,

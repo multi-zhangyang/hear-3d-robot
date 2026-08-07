@@ -30,7 +30,7 @@ import {
 
 const COMPACTOR_AGENT_ID = "humanoid-context-compactor";
 const COMPACTOR_AGENT_NAME = "Context Compactor";
-const HUMANOID_HARNESS_CONTRACT_VERSION = 4;
+const HUMANOID_HARNESS_CONTRACT_VERSION = 6;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
@@ -43,10 +43,9 @@ const PROTOCOL_ADAPTER_PACKAGE = {
 } as const satisfies Record<ModelProviderConfig["protocol"], string>;
 const RECEIPT_TERMINAL_TOOLS = {
   sentry: ["observe_humanoid"],
-  motion: ["plan_whole_body_motion_candidates", "plan_humanoid_navigation"],
+  motion: ["plan_humanoid_skill"],
   executor: [
-    "execute_whole_body_motion",
-    "execute_humanoid_navigation",
+    "execute_humanoid_skill",
     "remove_world_block"
   ]
 } as const;
@@ -127,6 +126,9 @@ export function createHumanoidAgentManifest(input: {
     instructions: compactorIdentity.instructions,
     modelSettings: modelSettingsIdentity({
       temperature: compactorProvider.temperature,
+      ...(compactorProvider.reasoningEffort === undefined
+        ? {}
+        : { reasoning: { effort: compactorProvider.reasoningEffort } }),
       ...(compactorOutputLimit === undefined
         ? {}
         : { maxTokens: compactorOutputLimit }),
@@ -284,6 +286,9 @@ function modelIdentity(
       request_timeout_ms:
         provider.requestTimeoutMs ?? DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
       temperature: provider.temperature,
+      ...(provider.reasoningEffort === undefined
+        ? {}
+        : { reasoning_effort: provider.reasoningEffort }),
       ...(provider.maxOutputTokens === undefined
         ? {}
         : { max_output_tokens: provider.maxOutputTokens }),

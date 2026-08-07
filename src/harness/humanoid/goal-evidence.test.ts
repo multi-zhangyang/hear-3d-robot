@@ -63,7 +63,7 @@ describe("Goal evidence artifacts", () => {
     });
     expect(GoalEvidenceArtifactSchema.parse(artifact)).toEqual(artifact);
     expect(artifact).toMatchObject({
-      version: 3,
+      version: 4,
       observation: {
         objects: [{
           id: "visible-object",
@@ -148,7 +148,7 @@ describe("Goal evidence artifacts", () => {
     };
 
     expect(hidden.observation?.visible_object_ids).toEqual([]);
-    if (hidden.version !== 3) throw new Error("Expected version 3 world evidence");
+    if (hidden.version !== 4) throw new Error("Expected version 4 world evidence");
     expect(hidden.observation?.objects).toEqual([]);
     expect(hidden.observation?.grasp.assessments).toEqual([]);
     expect(goalPredicateIsObservable({

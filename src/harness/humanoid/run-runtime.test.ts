@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentManifest } from "../../domain/agent-manifest.js";
+import type { HumanoidSkillInvocation } from "../../domain/humanoid-skill.js";
 import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import { createScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
 import { createScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
@@ -22,7 +23,7 @@ import { HumanoidWorld } from "../../world/humanoid/world.js";
 import { HUMANOID_AGENT_IDS } from "./agents.js";
 import { createHumanoidRunCheckpoint } from "./run-checkpoint.js";
 import { HumanoidRunRuntime } from "./run-runtime.js";
-import { humanoidActionFingerprint } from "./runtime.js";
+import { HumanoidActionRuntime, humanoidActionFingerprint } from "./runtime.js";
 
 const scenario = ScenarioSchema.parse({
   title: "人形持久运行场",
@@ -56,6 +57,147 @@ afterEach(async () => {
 });
 
 describe("HumanoidRunRuntime", () => {
+  it("restores pending Skill authority and advances its DAG after restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-skill-restart-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "恢复待执行的人形 Skill 计划",
+      scenarioId: "humanoid-skill-restart",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1",
+      runMode: "continuous"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    let tamperedWorld: HumanoidWorld | undefined;
+    let resumedWorld: HumanoidWorld | undefined;
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      const manifest = await activateGoal(runtime, scenario.default_goal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+
+      const target = {
+        ...world.snapshot().robot.rootPosition,
+        z: world.snapshot().robot.rootPosition.z + 0.35
+      };
+      const skillTransactionId = await bindPlanningSkill(
+        runtime,
+        "restart-retreat",
+        {
+          skill: "retreat",
+          target,
+          minimum_obstacle_clearance_m: 0.2
+        },
+        "route"
+      );
+      const planned = await invokeModelAction(
+        runtime,
+        "plan_humanoid_skill",
+        { skill_transaction_id: skillTransactionId },
+        "restart-retreat-navigation",
+        HUMANOID_AGENT_IDS.motion
+      );
+      expect(planned.accepted, JSON.stringify(planned)).toBe(true);
+
+      const persisted = await store.readHumanoidCheckpoint();
+      expect(persisted.action_runtime_state).toMatchObject({
+        version: 1,
+        skill_plans: [{
+          transaction_id: "restart-retreat-skill-plan",
+          completed_node_ids: []
+        }],
+        active_skills: [{ transaction_id: skillTransactionId }],
+        planning_skill_bindings: [{
+          planning_transaction_id: planned.transactionId,
+          binding: { transaction_id: skillTransactionId }
+        }]
+      });
+
+      tamperedWorld = await HumanoidWorld.create(
+        scenario,
+        persisted.world_checkpoint
+      );
+      const tamperedState = structuredClone(persisted.action_runtime_state) as {
+        planning_skill_bindings: unknown[];
+      };
+      tamperedState.planning_skill_bindings = [];
+      const ungrounded = new HumanoidActionRuntime(tamperedWorld, {
+        receipts: persisted.committed_actions,
+        state: tamperedState as never,
+        requireSkillBinding: true
+      });
+      const beforeRejectedExecution = tamperedWorld.snapshot();
+      await expect(ungrounded.invoke(
+        "execute_humanoid_skill",
+        { planning_transaction_id: planned.transactionId },
+        "missing-restored-skill-execution",
+        HUMANOID_AGENT_IDS.executor
+      )).resolves.toMatchObject({
+        accepted: false,
+        code: "planning_skill_authority_missing",
+        frameCount: 0
+      });
+      expect(tamperedWorld.snapshot()).toEqual(beforeRejectedExecution);
+      await tamperedWorld.dispose();
+      tamperedWorld = undefined;
+
+      resumedWorld = await HumanoidWorld.create(
+        scenario,
+        persisted.world_checkpoint
+      );
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: persisted
+      });
+      await resumed.initializeGoalAutonomy(manifest);
+      const executed = await invokeModelAction(
+        resumed,
+        "execute_humanoid_skill",
+        { planning_transaction_id: planned.transactionId },
+        "restored-skill-execution",
+        HUMANOID_AGENT_IDS.executor
+      );
+      expect(executed).toMatchObject({
+        accepted: true,
+        code: "navigation_completed",
+        frameCount: expect.any(Number)
+      });
+      expect(executed.frameCount).toBeGreaterThan(0);
+
+      const advanced = await store.readHumanoidCheckpoint();
+      expect(advanced.action_runtime_state).toMatchObject({
+        latest_physical_execution_revision: executed.worldAfterRevision,
+        skill_plans: [{
+          transaction_id: "restart-retreat-skill-plan",
+          completed_node_ids: ["restart-retreat-skill-node"]
+        }],
+        active_skill_plan_transactions: {
+          [HUMANOID_AGENT_IDS.motion]: "restart-retreat-skill-plan"
+        },
+        active_skills: [],
+        planning_skill_bindings: []
+      });
+    } finally {
+      await tamperedWorld?.dispose();
+      await resumedWorld?.dispose();
+      await world.dispose();
+    }
+  }, 45_000);
+
   it("persists lifecycle, physical frames, receipts and restart idempotency", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-humanoid-run-"));
     temporaryDirectories.push(root);
@@ -239,77 +381,28 @@ describe("HumanoidRunRuntime", () => {
       const pendingBefore = world.snapshot();
       const pendingTarget = {
         ...pendingBefore.robot.rootPosition,
-        z: pendingBefore.robot.rootPosition.z + 0.04
+        z: pendingBefore.robot.rootPosition.z + 0.25
       };
-      const pendingPlan = await invokeModelAction(runtime,
-        "plan_whole_body_motion_candidates",
+      const pendingSkillTransactionId = await bindPlanningSkill(
+        runtime,
+        "plan-unconsumed",
         {
-          objective: "比较下一次连续全身动作候选",
-          termination: {
-            mode: "all",
-            option_id: "persisted-forward-option",
-            predicates: [{
-              type: "root_near_point",
-              target: pendingTarget,
-              tolerance_m: 0.03
-            }],
-            stable_steps: 2
-          },
-          candidates: [
-            {
-              id: "unconsumed-reverse-motion",
-              intent: "没有实现前进目标",
-              duration_seconds: 0.8,
-              contacts: [],
-              keyframes: [{
-                at_seconds: 0,
-                channels: [{
-                  type: "root_velocity",
-                  forward_mps: -0.2,
-                  lateral_mps: 0
-                }]
-              }, {
-                at_seconds: 0.8,
-                channels: [{
-                  type: "root_velocity",
-                  forward_mps: -0.2,
-                  lateral_mps: 0
-                }]
-              }]
-            },
-            {
-              id: "unconsumed-balanced-motion",
-              intent: "保持双足支撑并连续前进",
-              duration_seconds: 0.8,
-              contacts: [],
-              keyframes: [
-                {
-                  at_seconds: 0,
-                  channels: [{
-                    type: "root_velocity",
-                    forward_mps: 0.2,
-                    lateral_mps: 0
-                  }]
-                },
-                {
-                  at_seconds: 0.8,
-                  channels: [{
-                    type: "root_velocity",
-                    forward_mps: 0.2,
-                    lateral_mps: 0
-                  }]
-                }
-              ]
-            }
-          ]
+          skill: "retreat",
+          target: pendingTarget,
+          minimum_obstacle_clearance_m: 0.1
         },
+        "route"
+      );
+      const pendingPlan = await invokeModelAction(runtime,
+        "plan_humanoid_skill",
+        { skill_transaction_id: pendingSkillTransactionId },
         "plan-unconsumed",
         HUMANOID_AGENT_IDS.motion
       );
-      expect(pendingPlan.accepted).toBe(true);
-      expect(pendingPlan.code).toBe("whole_body_candidates_validated");
+      expect(pendingPlan.accepted, JSON.stringify(pendingPlan)).toBe(true);
+      expect(pendingPlan.code).toBe("autonomous_skill_route_validated");
       const pendingExecution = await invokeModelAction(runtime,
-        "execute_whole_body_motion",
+        "execute_humanoid_skill",
         { planning_transaction_id: pendingPlan.transactionId },
         "execute-unconsumed",
         HUMANOID_AGENT_IDS.executor
@@ -326,7 +419,7 @@ describe("HumanoidRunRuntime", () => {
       );
       expect(runtime.validateCycleEvidence([pendingExecution.transactionId])).toMatchObject({
         transactionId: pendingExecution.transactionId,
-        code: "motion_option_succeeded"
+        code: "navigation_completed"
       });
       const removalInput = {
         solid_id: "lifecycle-block",
@@ -492,7 +585,7 @@ describe("HumanoidRunRuntime", () => {
             historical_only: true,
             transactionId: pendingExecution.transactionId,
             accepted: true,
-            code: "motion_option_succeeded",
+            code: "navigation_completed",
             frameCount: pendingExecution.frameCount,
             worldBeforeRevision: pendingExecution.worldBeforeRevision,
             worldAfterRevision: pendingExecution.worldAfterRevision,
@@ -573,6 +666,8 @@ describe("HumanoidRunRuntime", () => {
       expect(persisted.nodes[HUMANOID_AGENT_IDS.motion]!.capabilities).toEqual([
         "observe_humanoid",
         "recall_embodied_history",
+        "submit_humanoid_skill_plan",
+        "begin_humanoid_skill",
         "plan_whole_body_motion_candidates",
         "plan_humanoid_navigation"
       ]);
@@ -616,17 +711,9 @@ describe("HumanoidRunRuntime", () => {
             memory_id: expect.stringMatching(/^embodied-memory:/)
           },
           transaction_id: pendingExecution.transactionId,
-          action: "execute_whole_body_motion",
-          planning_action: "plan_whole_body_motion_candidates",
-          candidate_count: 2,
-          selected_rank: 2,
-          selected_candidate_id: "unconsumed-balanced-motion",
-          code: "motion_option_succeeded",
-          motion_option: {
-            option_id: "persisted-forward-option",
-            status: "succeeded",
-            termination_reason: "physical_success"
-          },
+          action: "execute_humanoid_skill",
+          planning_action: "plan_humanoid_skill",
+          code: "navigation_completed",
           world_after_revision: pendingExecution.worldAfterRevision,
           goal_success: true
         }]
@@ -1618,15 +1705,25 @@ describe("HumanoidRunRuntime", () => {
       await activateGoal(runtime, goal);
       await runtime.start(false);
 
+      const navigationSkillTransactionId = await bindPlanningSkill(
+        runtime,
+        "cycle-frame-cut-plan",
+        {
+          skill: "retreat",
+          target,
+          minimum_obstacle_clearance_m: 0.1
+        },
+        "route"
+      );
       const planned = await invokeModelAction(runtime,
-        "plan_humanoid_navigation",
-        { target, arrival_heading: null },
+        "plan_humanoid_skill",
+        { skill_transaction_id: navigationSkillTransactionId },
         "cycle-frame-cut-plan",
         HUMANOID_AGENT_IDS.motion
       );
       expect(planned.accepted, JSON.stringify(planned)).toBe(true);
       const executed = await invokeModelAction(runtime,
-        "execute_humanoid_navigation",
+        "execute_humanoid_skill",
         { planning_transaction_id: planned.transactionId },
         "cycle-frame-cut-execute",
         HUMANOID_AGENT_IDS.executor
@@ -1983,6 +2080,7 @@ async function invokeModelAction(
   agentId: string
 ) {
   if (agentId === HUMANOID_AGENT_IDS.motion
+    && action !== "observe_humanoid"
     && !runtime.isActionAvailable(action, agentId)) {
     await invokeModelAction(
       runtime,
@@ -2000,6 +2098,51 @@ async function invokeModelAction(
     agentId
   );
   return runtime.invoke(action, input, transactionId, agentId, authority);
+}
+
+async function bindPlanningSkill(
+  runtime: HumanoidRunRuntime,
+  prefix: string,
+  invocation: HumanoidSkillInvocation,
+  phase: string
+): Promise<string> {
+  const planTransactionId = `${prefix}-skill-plan`;
+  const nodeId = `${prefix}-skill-node`;
+  const proposal = {
+    objective: `Authorize ${prefix}`,
+    strategies: [{
+      strategy_id: `${prefix}-strategy`,
+      rationale: "Exercise the production Skill authority path in this runtime test",
+      nodes: [{
+        node_id: nodeId,
+        invocation,
+        depends_on_node_ids: []
+      }]
+    }],
+    selected_strategy_id: `${prefix}-strategy`
+  };
+  const registered = await invokeModelAction(
+    runtime,
+    "submit_humanoid_skill_plan",
+    proposal,
+    planTransactionId,
+    HUMANOID_AGENT_IDS.motion
+  );
+  expect(registered.accepted, JSON.stringify(registered)).toBe(true);
+  const binding = await invokeModelAction(
+    runtime,
+    "begin_humanoid_skill",
+    {
+      skill_plan_transaction_id: planTransactionId,
+      skill_node_id: nodeId,
+      invocation,
+      phase
+    },
+    `${prefix}-skill-binding`,
+    HUMANOID_AGENT_IDS.motion
+  );
+  expect(binding.accepted, JSON.stringify(binding)).toBe(true);
+  return binding.transactionId;
 }
 
 async function authorizeModelAction(

@@ -9,7 +9,9 @@ export function createHumanoidAutonomyContext(input: {
   goalDAG: GoalDAG;
   worldEvidence: GoalEvidenceArtifact;
 }) {
-  if ((input.worldEvidence.version !== 2 && input.worldEvidence.version !== 3)
+  if ((input.worldEvidence.version !== 2
+    && input.worldEvidence.version !== 3
+    && input.worldEvidence.version !== 4)
     || !input.worldEvidence.observation) {
     throw new Error("Autonomy context requires current affordance-bearing world evidence");
   }
@@ -53,23 +55,35 @@ export function createHumanoidAutonomyContext(input: {
         "object_grasped",
         "object_at",
         "object_in_zone",
-        "object_placed"
+        "object_placed",
+        "object_inside",
+        "object_on"
       ],
+      articulated_object_predicates: ["articulation_state"],
       static_solid_predicates: ["block_removed"]
     },
     object_frontier: observation.objects.map((object) => ({
       object_id: object.id,
       role: object.role,
       portable: object.portable,
+      affordances: "affordances" in object ? object.affordances : [],
+      articulation: "articulation" in object ? object.articulation : null,
       prior_goal_outcomes: outcome(objectCounts.get(object.id)),
-      supported_goal_predicates: object.portable
-        ? [
+      supported_goal_predicates: [
+        ...(object.portable
+          ? [
             "object_grasped",
             "object_at",
             "object_in_zone",
-            "object_placed"
+            "object_placed",
+            "object_inside",
+            "object_on"
           ]
-        : []
+          : []),
+        ...("articulation" in object && object.articulation
+          ? ["articulation_state"]
+          : [])
+      ]
     })),
     solid_frontier: "solids" in observation
       ? observation.solids.map((solid) => ({
@@ -144,6 +158,9 @@ function predicateObjectId(predicate: GoalPredicate): string | null {
     || predicate.type === "object_in_zone"
     || predicate.type === "object_placed"
     || predicate.type === "object_grasped"
+    || predicate.type === "object_inside"
+    || predicate.type === "object_on"
+    || predicate.type === "articulation_state"
     ? predicate.object_id
     : null;
 }

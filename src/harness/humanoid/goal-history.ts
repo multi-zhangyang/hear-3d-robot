@@ -19,6 +19,9 @@ export const GOAL_HISTORY_PREDICATE_TYPES = [
   "object_placed",
   "object_at",
   "object_grasped",
+  "object_inside",
+  "object_on",
+  "articulation_state",
   "end_effector_at"
 ] as const;
 
@@ -124,10 +127,17 @@ function matchesAny(
 function predicateObjectIds(
   predicate: GoalDAG["candidates"][string]["goal"]["predicates"][number]
 ): string[] {
+  if (predicate.type === "object_inside") {
+    return [predicate.object_id, predicate.container_id];
+  }
+  if (predicate.type === "object_on") {
+    return [predicate.object_id, predicate.support_id];
+  }
   if (predicate.type === "object_in_zone"
     || predicate.type === "object_placed"
     || predicate.type === "object_at"
-    || predicate.type === "object_grasped") {
+    || predicate.type === "object_grasped"
+    || predicate.type === "articulation_state") {
     return [predicate.object_id];
   }
   return [];

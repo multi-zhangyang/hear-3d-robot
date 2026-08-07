@@ -19,6 +19,7 @@ import {
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
 const PhysicalHumanoidActionSchema = z.enum([
+  "execute_humanoid_skill",
   "execute_whole_body_motion",
   "execute_humanoid_navigation"
 ]);

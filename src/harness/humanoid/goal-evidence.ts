@@ -17,6 +17,7 @@ import { assertGoalSupported } from "../../runtime/goal-validation.js";
 import type { HumanoidObjectToken } from "../../world/humanoid/object-memory.js";
 import type { HumanoidWorldGraspState } from "../../world/humanoid/grasp-world-state.js";
 import type { HumanoidSolidToken } from "../../world/humanoid/solid-observation.js";
+import { humanoidObjectCapability } from "../../world/humanoid/object-capability.js";
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
@@ -79,6 +80,25 @@ const WorldObjectAffordanceDescriptorSchema = z.object({
     normal_force_n: z.number().finite().nonnegative()
   }).strict())
 }).strict();
+
+const WorldObjectAffordanceDescriptorV4Schema =
+  WorldObjectAffordanceDescriptorSchema.extend({
+    shape: z.enum(["box", "sphere", "cylinder", "capsule"]),
+    mass_kg: z.number().finite().positive(),
+    mobility: z.enum(["fixed", "free", "articulated"]),
+    affordances: z.array(z.string().trim().min(1)),
+    interaction_points: z.array(z.object({
+      id: z.string().trim().min(1),
+      kind: z.string().trim().min(1),
+      compatible_hands: z.enum(["left", "right", "either", "both"])
+    }).strict()),
+    articulation: z.object({
+      joint_id: z.string().trim().min(1),
+      semantic: z.string().trim().min(1),
+      open_fraction: z.number().finite().min(0).max(1).nullable(),
+      state: z.enum(["open", "closed", "intermediate", "unobserved"])
+    }).strict().nullable()
+  }).strict();
 
 const WorldZoneAffordanceDescriptorSchema = z.object({
   id: z.string().trim().min(1),
@@ -147,6 +167,10 @@ const WorldObservationDescriptorV3Schema = WorldObservationDescriptorV2Schema.sa
   }
 });
 
+const WorldObservationDescriptorV4Schema = WorldObservationDescriptorV3Schema.safeExtend({
+  objects: z.array(WorldObjectAffordanceDescriptorV4Schema)
+}).strict();
+
 const GoalEvidenceArtifactV1Schema = z.object({
   version: z.literal(1),
   evidence: GoalPhysicalEvidenceSchema,
@@ -168,10 +192,18 @@ const GoalEvidenceArtifactV3Schema = z.object({
   observation: WorldObservationDescriptorV3Schema.nullable()
 }).strict();
 
+const GoalEvidenceArtifactV4Schema = z.object({
+  version: z.literal(4),
+  evidence: GoalPhysicalEvidenceSchema,
+  payload: JsonValueSchema,
+  observation: WorldObservationDescriptorV4Schema.nullable()
+}).strict();
+
 export const GoalEvidenceArtifactSchema = z.discriminatedUnion("version", [
   GoalEvidenceArtifactV1Schema,
   GoalEvidenceArtifactV2Schema,
-  GoalEvidenceArtifactV3Schema
+  GoalEvidenceArtifactV3Schema,
+  GoalEvidenceArtifactV4Schema
 ]).superRefine((artifact, context) => {
   if (artifact.evidence.content_sha256 !== modelPayloadSha256(artifact.payload)) {
     context.addIssue({
@@ -277,6 +309,11 @@ export function createWorldGoalEvidence(input: {
     worldRevision: number;
     robot: {
       rootPosition: { x: number; y: number; z: number };
+      objects?: Record<string, {
+        articulation?: {
+          position: number;
+        } | undefined;
+      }>;
     };
     grasp: HumanoidWorldGraspState;
   };
@@ -342,35 +379,70 @@ export function createWorldGoalEvidence(input: {
     visible_object_ids: visibleObjectIds,
     zone_ids: input.scenario.zones.map((zone) => zone.id).sort(compareCodePoints),
     bounds: structuredClone(input.scenario.bounds),
-    objects: visibleObjects.map((token) => ({
-      id: token.id,
-      role: token.role,
-      kind: token.kind,
-      color: token.color,
-      portable: token.portable,
-      size: structuredClone(token.size),
-      position: structuredClone(token.position),
-      linear_velocity: structuredClone(token.linearVelocity),
-      angular_velocity: structuredClone(token.angularVelocity),
-      relation: {
-        distance_to_robot_m: token.relation.distanceToRobot,
-        bearing_rad: token.relation.bearingRadians,
-        vertical_offset_m: token.relation.verticalOffset,
-        distance_to_left_wrist_m: token.relation.distanceToLeftWrist,
-        distance_to_right_wrist_m: token.relation.distanceToRightWrist
-      },
-      contacts: token.currentContacts.map((contact) => "body" in contact
-        ? {
-            surface_kind: "body" as const,
-            surface: contact.body,
-            normal_force_n: contact.normalForce
-          }
-        : {
-            surface_kind: "hand_surface" as const,
-            surface: contact.handSurface,
-            normal_force_n: contact.normalForce
-          })
-    })),
+    objects: visibleObjects.map((token) => {
+      const descriptor = input.scenario.objects.find(({ id }) => id === token.id);
+      if (!descriptor) throw new Error(`Goal evidence object descriptor is missing: ${token.id}`);
+      const capability = humanoidObjectCapability(descriptor);
+      const articulationPosition = input.world.robot.objects?.[token.id]
+        ?.articulation?.position;
+      const openFraction = capability.articulation && articulationPosition !== undefined
+        ? clamp01(
+            (articulationPosition - capability.articulation.closed_position)
+              / (capability.articulation.open_position
+                - capability.articulation.closed_position)
+          )
+        : null;
+      return {
+        id: token.id,
+        role: token.role,
+        kind: token.kind,
+        color: token.color,
+        portable: token.portable,
+        size: structuredClone(token.size),
+        position: structuredClone(token.position),
+        linear_velocity: structuredClone(token.linearVelocity),
+        angular_velocity: structuredClone(token.angularVelocity),
+        shape: capability.shape,
+        mass_kg: capability.massKg,
+        mobility: capability.mobility,
+        affordances: [...capability.affordances],
+        interaction_points: capability.interactionPoints.map((point) => ({
+          id: point.id,
+          kind: point.kind,
+          compatible_hands: point.compatibleHands
+        })),
+        articulation: capability.articulation
+          ? {
+              joint_id: capability.articulation.joint_id,
+              semantic: capability.articulation.semantic,
+              open_fraction: openFraction,
+              state: openFraction === null
+                ? "unobserved" as const
+                : openFraction >= 0.9
+                  ? "open" as const
+                  : openFraction <= 0.1 ? "closed" as const : "intermediate" as const
+            }
+          : null,
+        relation: {
+          distance_to_robot_m: token.relation.distanceToRobot,
+          bearing_rad: token.relation.bearingRadians,
+          vertical_offset_m: token.relation.verticalOffset,
+          distance_to_left_wrist_m: token.relation.distanceToLeftWrist,
+          distance_to_right_wrist_m: token.relation.distanceToRightWrist
+        },
+        contacts: token.currentContacts.map((contact) => "body" in contact
+          ? {
+              surface_kind: "body" as const,
+              surface: contact.body,
+              normal_force_n: contact.normalForce
+            }
+          : {
+              surface_kind: "hand_surface" as const,
+              surface: contact.handSurface,
+              normal_force_n: contact.normalForce
+            })
+      };
+    }),
     zones: input.scenario.zones
       .map((zone) => ({
         id: zone.id,
@@ -410,7 +482,7 @@ export function createWorldGoalEvidence(input: {
   });
   const contentSha256 = modelPayloadSha256(payload);
   return GoalEvidenceArtifactSchema.parse({
-    version: 3,
+    version: 4,
     evidence: {
       ref: `goal-world:${input.world.frame}:${input.world.worldRevision}:${contentSha256}`,
       kind: "world_checkpoint",
@@ -492,10 +564,32 @@ export function goalPredicateIsObservable(input: {
   }
   if (input.predicate.type === "object_at"
     || input.predicate.type === "object_in_zone"
-    || input.predicate.type === "object_placed") {
+    || input.predicate.type === "object_placed"
+    || input.predicate.type === "articulation_state") {
     const objectId = input.predicate.object_id;
+    return observations.some((observation) => {
+      if (!observation.visible_object_ids.includes(objectId)) return false;
+      if (input.predicate.type !== "articulation_state") return true;
+      if (!("objects" in observation)) return false;
+      const descriptor = observation.objects.find(({ id }) => id === objectId);
+      const parsed = WorldObjectAffordanceDescriptorV4Schema.safeParse(descriptor);
+      return parsed.success
+        && parsed.data.articulation?.joint_id === input.predicate.joint_id
+        && parsed.data.articulation.open_fraction !== null;
+    });
+  }
+  if (input.predicate.type === "object_inside") {
+    const { object_id: objectId, container_id: containerId } = input.predicate;
     return observations.some((observation) => (
       observation.visible_object_ids.includes(objectId)
+        && observation.visible_object_ids.includes(containerId)
+    ));
+  }
+  if (input.predicate.type === "object_on") {
+    const { object_id: objectId, support_id: supportId } = input.predicate;
+    return observations.some((observation) => (
+      observation.visible_object_ids.includes(objectId)
+        && observation.visible_object_ids.includes(supportId)
     ));
   }
   if (input.predicate.type === "object_grasped") {
@@ -608,4 +702,8 @@ function jsonRecord(value: JsonValue): Record<string, JsonValue> | undefined {
 
 function json(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
 }

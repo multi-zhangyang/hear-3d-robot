@@ -486,7 +486,7 @@ describe("humanoid Agents SDK tools", () => {
     const parameterDefinitions = (
       plan.parameters as Record<string, unknown>
     ).$defs as Record<string, unknown> | undefined;
-    expect(JSON.stringify(plan.parameters).length).toBeLessThan(18_000);
+    expect(JSON.stringify(plan.parameters).length).toBeLessThan(22_000);
     expect(Object.keys(parameterDefinitions ?? {})).not.toHaveLength(0);
 
     const output = await plan.invoke(

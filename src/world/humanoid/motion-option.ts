@@ -26,6 +26,11 @@ import {
 } from "../geometry.js";
 import { humanoidObjectInsideZone } from "./object-zone-relation.js";
 import {
+  humanoidObjectInsideContainerGeometry,
+  humanoidObjectOnSupportGeometry
+} from "./object-world-model.js";
+import type { HumanoidObjectCapabilityDescriptor } from "./object-capability.js";
+import {
   HumanoidMotionOptionContractSchema,
   humanoidMotionOptionConditionMetrics,
   humanoidMotionOptionContractSha256,
@@ -43,6 +48,10 @@ export {
 
 export interface HumanoidMotionOptionRobotSnapshot {
   rootPosition: Vec3;
+  fallen?: boolean;
+  balance?: {
+    supportMargin: number | null;
+  };
   links: Readonly<Partial<Record<HumanoidBodyName, {
     position: Vec3;
     rotation?: Quaternion;
@@ -70,6 +79,15 @@ export interface HumanoidMotionOptionObservableObject {
   position: Vec3;
   rotation: Quaternion;
   size: Vec3;
+  articulation?: {
+    jointId: string;
+    position: number;
+    velocity: number;
+    closedPosition: number;
+    openPosition: number;
+  };
+  container?: HumanoidObjectCapabilityDescriptor["container"];
+  supportSurface?: HumanoidObjectCapabilityDescriptor["supportSurface"];
 }
 
 interface HumanoidMotionOptionZone {
@@ -105,7 +123,11 @@ type PredicateUncertainty = "body_snapshot_missing"
   | "object_not_observable"
   | "solid_not_observable"
   | "zone_not_found"
-  | "grasp_assessment_missing";
+  | "grasp_assessment_missing"
+  | "articulation_not_observable"
+  | "relation_target_not_observable"
+  | "relation_capability_missing"
+  | "balance_snapshot_missing";
 
 interface PredicateEvidenceBase {
   predicateIndex: number;
@@ -205,6 +227,75 @@ type HumanoidMotionOptionPredicateEvidence =
         PredicateUncertainty,
         "object_not_observable" | "zone_not_found"
       >;
+    }
+  | PredicateEvidenceBase & {
+      type: "articulation_state";
+      objectId: string;
+      requestedJointId: string;
+      observedJointId: string | null;
+      requestedState: "open" | "closed";
+      objectObservable: boolean;
+      articulationObservable: boolean;
+      jointPosition: number | null;
+      jointVelocity: number | null;
+      openFraction: number | null;
+      tolerance: number;
+      reason?: Extract<
+        PredicateUncertainty,
+        "object_not_observable" | "articulation_not_observable"
+      > | "joint_id_mismatch";
+    }
+  | PredicateEvidenceBase & {
+      type: "object_inside" | "object_on";
+      objectId: string;
+      relationTargetId: string;
+      objectObservable: boolean;
+      relationTargetObservable: boolean;
+      relation: boolean | null;
+      expected: boolean;
+      toleranceMeters: number;
+      reason?: Extract<
+        PredicateUncertainty,
+        "object_not_observable" | "relation_target_not_observable"
+          | "relation_capability_missing"
+      >;
+    }
+  | PredicateEvidenceBase & {
+      type: "object_displaced";
+      objectId: string;
+      objectObservable: boolean;
+      origin: Vec3;
+      actualPosition: Vec3 | null;
+      directionWorld: Vec3;
+      projectedDistanceMeters: number | null;
+      lateralErrorMeters: number | null;
+      minimumDistanceMeters: number;
+      maximumLateralErrorMeters: number;
+      reason?: Extract<PredicateUncertainty, "object_not_observable">;
+    }
+  | PredicateEvidenceBase & {
+      type: "articulation_displaced";
+      objectId: string;
+      requestedJointId: string;
+      observedJointId: string | null;
+      objectObservable: boolean;
+      articulationObservable: boolean;
+      originPosition: number;
+      actualPosition: number | null;
+      signedDelta: number | null;
+      direction: "increasing" | "decreasing";
+      minimumDelta: number;
+      reason?: Extract<
+        PredicateUncertainty,
+        "object_not_observable" | "articulation_not_observable"
+      > | "joint_id_mismatch";
+    }
+  | PredicateEvidenceBase & {
+      type: "balance_stable";
+      fallen: boolean | null;
+      supportMarginMeters: number | null;
+      minimumSupportMarginMeters: number;
+      reason?: Extract<PredicateUncertainty, "balance_snapshot_missing">;
     }
   | PredicateEvidenceBase & {
       type: "grasp_verified";
@@ -701,6 +792,30 @@ function detectPredicate(
       ...assessment.evidence
     };
   }
+  if (predicate.type === "balance_stable") {
+    if (snapshot.fallen === undefined || snapshot.balance === undefined) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        fallen: snapshot.fallen ?? null,
+        supportMarginMeters: snapshot.balance?.supportMargin ?? null,
+        minimumSupportMarginMeters: predicate.minimum_support_margin_m,
+        reason: "balance_snapshot_missing"
+      };
+    }
+    const satisfied = !snapshot.fallen
+      && snapshot.balance.supportMargin !== null
+      && snapshot.balance.supportMargin >= predicate.minimum_support_margin_m;
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: satisfied ? "satisfied" : "unsatisfied",
+      fallen: snapshot.fallen,
+      supportMarginMeters: snapshot.balance.supportMargin,
+      minimumSupportMarginMeters: predicate.minimum_support_margin_m
+    };
+  }
   if (predicate.type === "body_contact_solid") {
     if (!solids.has(predicate.solid_id)) {
       return {
@@ -819,6 +934,214 @@ function detectPredicate(
       toleranceMeters: predicate.tolerance_m
     };
   }
+  if (predicate.type === "object_displaced") {
+    const delta = subtractVector(object.position, predicate.origin);
+    const projectedDistanceMeters = dotVector(delta, predicate.direction_world);
+    const lateral = subtractVector(
+      delta,
+      scaleVector(predicate.direction_world, projectedDistanceMeters)
+    );
+    const lateralErrorMeters = vectorLength(lateral);
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: projectedDistanceMeters >= predicate.minimum_distance_m
+        && lateralErrorMeters <= predicate.maximum_lateral_error_m
+        ? "satisfied"
+        : "unsatisfied",
+      objectId: predicate.object_id,
+      objectObservable: true,
+      origin: { ...predicate.origin },
+      actualPosition: { ...object.position },
+      directionWorld: { ...predicate.direction_world },
+      projectedDistanceMeters,
+      lateralErrorMeters,
+      minimumDistanceMeters: predicate.minimum_distance_m,
+      maximumLateralErrorMeters: predicate.maximum_lateral_error_m
+    };
+  }
+  if (predicate.type === "articulation_state") {
+    const articulation = object.articulation;
+    if (!articulation) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        objectId: predicate.object_id,
+        requestedJointId: predicate.joint_id,
+        observedJointId: null,
+        requestedState: predicate.state,
+        objectObservable: true,
+        articulationObservable: false,
+        jointPosition: null,
+        jointVelocity: null,
+        openFraction: null,
+        tolerance: predicate.tolerance,
+        reason: "articulation_not_observable"
+      };
+    }
+    if (articulation.jointId !== predicate.joint_id) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "unsatisfied",
+        objectId: predicate.object_id,
+        requestedJointId: predicate.joint_id,
+        observedJointId: articulation.jointId,
+        requestedState: predicate.state,
+        objectObservable: true,
+        articulationObservable: true,
+        jointPosition: articulation.position,
+        jointVelocity: articulation.velocity,
+        openFraction: null,
+        tolerance: predicate.tolerance,
+        reason: "joint_id_mismatch"
+      };
+    }
+    const openFraction = clamp01(
+      (articulation.position - articulation.closedPosition)
+        / (articulation.openPosition - articulation.closedPosition)
+    );
+    const satisfied = predicate.state === "open"
+      ? openFraction >= 1 - predicate.tolerance
+      : openFraction <= predicate.tolerance;
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: satisfied ? "satisfied" : "unsatisfied",
+      objectId: predicate.object_id,
+      requestedJointId: predicate.joint_id,
+      observedJointId: articulation.jointId,
+      requestedState: predicate.state,
+      objectObservable: true,
+      articulationObservable: true,
+      jointPosition: articulation.position,
+      jointVelocity: articulation.velocity,
+      openFraction,
+      tolerance: predicate.tolerance
+    };
+  }
+  if (predicate.type === "articulation_displaced") {
+    const articulation = object.articulation;
+    if (!articulation) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        objectId: predicate.object_id,
+        requestedJointId: predicate.joint_id,
+        observedJointId: null,
+        objectObservable: true,
+        articulationObservable: false,
+        originPosition: predicate.origin_position,
+        actualPosition: null,
+        signedDelta: null,
+        direction: predicate.direction,
+        minimumDelta: predicate.minimum_delta,
+        reason: "articulation_not_observable"
+      };
+    }
+    if (articulation.jointId !== predicate.joint_id) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "unsatisfied",
+        objectId: predicate.object_id,
+        requestedJointId: predicate.joint_id,
+        observedJointId: articulation.jointId,
+        objectObservable: true,
+        articulationObservable: true,
+        originPosition: predicate.origin_position,
+        actualPosition: articulation.position,
+        signedDelta: null,
+        direction: predicate.direction,
+        minimumDelta: predicate.minimum_delta,
+        reason: "joint_id_mismatch"
+      };
+    }
+    const signedDelta = predicate.direction === "increasing"
+      ? articulation.position - predicate.origin_position
+      : predicate.origin_position - articulation.position;
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: signedDelta >= predicate.minimum_delta ? "satisfied" : "unsatisfied",
+      objectId: predicate.object_id,
+      requestedJointId: predicate.joint_id,
+      observedJointId: articulation.jointId,
+      objectObservable: true,
+      articulationObservable: true,
+      originPosition: predicate.origin_position,
+      actualPosition: articulation.position,
+      signedDelta,
+      direction: predicate.direction,
+      minimumDelta: predicate.minimum_delta
+    };
+  }
+  if (predicate.type === "object_inside" || predicate.type === "object_on") {
+    const relationTargetId = predicate.type === "object_inside"
+      ? predicate.container_id
+      : predicate.support_id;
+    const relationTarget = objects.get(relationTargetId);
+    if (!relationTarget) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        objectId: predicate.object_id,
+        relationTargetId,
+        objectObservable: true,
+        relationTargetObservable: false,
+        relation: null,
+        expected: predicate.expected,
+        toleranceMeters: predicate.tolerance_m,
+        reason: "relation_target_not_observable"
+      };
+    }
+    const descriptor = predicate.type === "object_inside"
+      ? relationTarget.container
+      : relationTarget.supportSurface;
+    if (!descriptor) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        objectId: predicate.object_id,
+        relationTargetId,
+        objectObservable: true,
+        relationTargetObservable: true,
+        relation: null,
+        expected: predicate.expected,
+        toleranceMeters: predicate.tolerance_m,
+        reason: "relation_capability_missing"
+      };
+    }
+    const relation = predicate.type === "object_inside"
+      ? humanoidObjectInsideContainerGeometry({
+          object,
+          container: relationTarget,
+          descriptor: relationTarget.container!,
+          tolerance: predicate.tolerance_m
+        })
+      : humanoidObjectOnSupportGeometry({
+          object,
+          support: relationTarget,
+          descriptor: relationTarget.supportSurface!,
+          tolerance: predicate.tolerance_m
+        });
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: relation === predicate.expected ? "satisfied" : "unsatisfied",
+      objectId: predicate.object_id,
+      relationTargetId,
+      objectObservable: true,
+      relationTargetObservable: true,
+      relation,
+      expected: predicate.expected,
+      toleranceMeters: predicate.tolerance_m
+    };
+  }
   const zone = zones.get(predicate.zone_id);
   if (!zone) {
     return {
@@ -911,7 +1234,9 @@ function graspAssessmentIsPhysicallyUncertain(
 function unobservableObjectEvidence(
   predicate: Extract<HumanoidMotionOptionPredicate, {
     type: "body_contact_object" | "hand_contact_object"
-      | "object_near_point" | "object_in_zone";
+      | "object_near_point" | "object_in_zone" | "articulation_state"
+      | "object_inside" | "object_on" | "object_displaced"
+      | "articulation_displaced";
   }>,
   predicateIndex: number
 ): HumanoidMotionOptionPredicateEvidence {
@@ -955,6 +1280,76 @@ function unobservableObjectEvidence(
       reason: "object_not_observable"
     };
   }
+  if (predicate.type === "object_displaced") {
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: "uncertain",
+      objectId: predicate.object_id,
+      objectObservable: false,
+      origin: { ...predicate.origin },
+      actualPosition: null,
+      directionWorld: { ...predicate.direction_world },
+      projectedDistanceMeters: null,
+      lateralErrorMeters: null,
+      minimumDistanceMeters: predicate.minimum_distance_m,
+      maximumLateralErrorMeters: predicate.maximum_lateral_error_m,
+      reason: "object_not_observable"
+    };
+  }
+  if (predicate.type === "articulation_state") {
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: "uncertain",
+      objectId: predicate.object_id,
+      requestedJointId: predicate.joint_id,
+      observedJointId: null,
+      requestedState: predicate.state,
+      objectObservable: false,
+      articulationObservable: false,
+      jointPosition: null,
+      jointVelocity: null,
+      openFraction: null,
+      tolerance: predicate.tolerance,
+      reason: "object_not_observable"
+    };
+  }
+  if (predicate.type === "articulation_displaced") {
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: "uncertain",
+      objectId: predicate.object_id,
+      requestedJointId: predicate.joint_id,
+      observedJointId: null,
+      objectObservable: false,
+      articulationObservable: false,
+      originPosition: predicate.origin_position,
+      actualPosition: null,
+      signedDelta: null,
+      direction: predicate.direction,
+      minimumDelta: predicate.minimum_delta,
+      reason: "object_not_observable"
+    };
+  }
+  if (predicate.type === "object_inside" || predicate.type === "object_on") {
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: "uncertain",
+      objectId: predicate.object_id,
+      relationTargetId: predicate.type === "object_inside"
+        ? predicate.container_id
+        : predicate.support_id,
+      objectObservable: false,
+      relationTargetObservable: false,
+      relation: null,
+      expected: predicate.expected,
+      toleranceMeters: predicate.tolerance_m,
+      reason: "object_not_observable"
+    };
+  }
   return {
     predicateIndex,
     type: predicate.type,
@@ -968,6 +1363,10 @@ function unobservableObjectEvidence(
     toleranceMeters: predicate.tolerance_m,
     reason: "object_not_observable"
   };
+}
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
 }
 
 function maximumContactForce(
@@ -1044,4 +1443,20 @@ function uniqueById<T extends { id: string }>(
 
 function distance(left: Vec3, right: Vec3): number {
   return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z);
+}
+
+function subtractVector(left: Vec3, right: Vec3): Vec3 {
+  return { x: left.x - right.x, y: left.y - right.y, z: left.z - right.z };
+}
+
+function scaleVector(value: Vec3, scalar: number): Vec3 {
+  return { x: value.x * scalar, y: value.y * scalar, z: value.z * scalar };
+}
+
+function dotVector(left: Vec3, right: Vec3): number {
+  return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+function vectorLength(value: Vec3): number {
+  return Math.hypot(value.x, value.y, value.z);
 }

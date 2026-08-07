@@ -10,6 +10,8 @@ import { HumanoidWorld } from "../../world/humanoid/world.js";
 import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
 import { HumanoidActionRuntime } from "./runtime.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
+import { applyScenarioChunkDeltaMutation } from "../../domain/scenario-chunk-delta.js";
+import { createScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
 import { BlockRemovalAuthorityError } from "./block-removal-authority.js";
 
 const scenario = ScenarioSchema.parse({
@@ -32,6 +34,400 @@ const scenario = ScenarioSchema.parse({
 });
 
 describe("HumanoidActionRuntime", () => {
+  it("enforces observe, Skill binding, and referenced low-level planning in production mode", async () => {
+    const lightweight = lightweightObservationWorld(undefined, {
+      interaction: {
+        object_world_model: { frame: 0, world_revision: 0, objects: [] },
+        skill_catalog: {
+          contract_sha256: "a".repeat(64),
+          frame: 0,
+          world_revision: 0,
+          entries: []
+        },
+        carrying: { bindings: [] },
+        manipulable_objects: []
+      }
+    });
+    const runtime = new HumanoidActionRuntime(lightweight.world, {
+      requireSkillBinding: true
+    });
+    await runtime.invoke(
+      "observe_humanoid",
+      {},
+      "skill-observation",
+      "humanoid-motion-reference"
+    );
+    expect(runtime.isActionAvailable(
+      "begin_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(false);
+    expect(runtime.isActionAvailable(
+      "submit_humanoid_skill_plan",
+      "humanoid-motion-reference"
+    )).toBe(true);
+    expect(runtime.isActionAvailable(
+      "plan_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(false);
+    const candidate = {
+      skill_transaction_id: null,
+      objective: "restore support",
+      termination: {
+        mode: "all" as const,
+        option_id: "stabilize",
+        predicates: [{
+          type: "balance_stable" as const,
+          minimum_support_margin_m: 0.02
+        }],
+        stable_steps: 1
+      },
+      candidates: [{
+        id: "stabilize-current",
+        intent: "restore a balanced support posture",
+        duration_seconds: 0.5,
+        contacts: [],
+        keyframes: [
+          { at_seconds: 0, channels: [] },
+          { at_seconds: 0.5, channels: [] }
+        ]
+      }]
+    };
+    await expect(runtime.invoke(
+      "plan_whole_body_motion_candidates",
+      candidate,
+      "unbound-skill-plan",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({ accepted: false, code: "active_skill_required" });
+
+    const skillPlan = await runtime.invoke(
+      "submit_humanoid_skill_plan",
+      {
+        objective: "restore physical support",
+        strategies: [{
+          strategy_id: "support-recovery",
+          rationale: "recover support before further motion",
+          nodes: [{
+            node_id: "stabilize-now",
+            invocation: {
+              skill: "stabilize",
+              minimum_support_margin_m: 0.02
+            },
+            depends_on_node_ids: []
+          }]
+        }],
+        selected_strategy_id: "support-recovery"
+      },
+      "stabilize-plan",
+      "humanoid-motion-reference"
+    );
+    expect(skillPlan).toMatchObject({
+      accepted: true,
+      code: "humanoid_skill_plan_registered"
+    });
+    expect(runtime.isActionAvailable(
+      "submit_humanoid_skill_plan",
+      "humanoid-motion-reference"
+    )).toBe(false);
+    expect(runtime.isActionAvailable(
+      "begin_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(true);
+    expect(runtime.isActionAvailable(
+      "plan_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(false);
+    const skill = await runtime.invoke(
+      "begin_humanoid_skill",
+      {
+        skill_plan_transaction_id: "stabilize-plan",
+        skill_node_id: "stabilize-now",
+        invocation: {
+          skill: "stabilize",
+          minimum_support_margin_m: 0.02
+        },
+        phase: "recover_support"
+      },
+      "stabilize-skill",
+      "humanoid-motion-reference"
+    );
+    expect(skill).toMatchObject({ accepted: true, code: "humanoid_skill_bound" });
+    expect(runtime.isActionAvailable(
+      "submit_humanoid_skill_plan",
+      "humanoid-motion-reference"
+    )).toBe(false);
+    expect(runtime.isActionAvailable(
+      "begin_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(false);
+    expect(runtime.isActionAvailable(
+      "plan_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(true);
+    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+      active_skill: {
+        transaction_id: "stabilize-skill",
+        skill_plan_transaction_id: "stabilize-plan",
+        skill_node_id: "stabilize-now",
+        phase: "recover_support",
+        phase_authority: "whole_body",
+        planning_action: "plan_humanoid_skill"
+      }
+    });
+    await expect(runtime.invoke(
+      "plan_humanoid_skill",
+      { skill_transaction_id: "stabilize-skill" },
+      "bound-skill-plan",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({
+      code: "autonomous_skill_motion_rejected",
+      detail: {
+        skill_binding: {
+          transaction_id: "stabilize-skill",
+          invocation: { skill: "stabilize" }
+        }
+      }
+    });
+    expect(lightweight.candidatePlanningCalls()).toBe(1);
+    expect(runtime.isActionAvailable(
+      "submit_humanoid_skill_plan",
+      "humanoid-motion-reference"
+    )).toBe(true);
+    expect(runtime.isActionAvailable(
+      "begin_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(false);
+
+    await expect(runtime.invoke(
+      "submit_humanoid_skill_plan",
+      {
+        objective: "replace the rejected local Skill strategy",
+        strategies: [{
+          strategy_id: "replacement-support-recovery",
+          rationale: "the previous low-level physical plan was rejected",
+          nodes: [{
+            node_id: "replacement-stabilize",
+            invocation: {
+              skill: "stabilize",
+              minimum_support_margin_m: 0.03
+            },
+            depends_on_node_ids: []
+          }]
+        }],
+        selected_strategy_id: "replacement-support-recovery"
+      },
+      "replacement-stabilize-plan",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({
+      accepted: true,
+      code: "humanoid_skill_plan_registered"
+    });
+    expect(runtime.isActionAvailable(
+      "submit_humanoid_skill_plan",
+      "humanoid-motion-reference"
+    )).toBe(false);
+    expect(runtime.isActionAvailable(
+      "begin_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(true);
+    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+      active_skill: null,
+      skill_plan: {
+        transaction_id: "replacement-stabilize-plan",
+        selected_strategy_id: "replacement-support-recovery"
+      }
+    });
+  });
+
+  it("restores Recovery Policy and still requires a model-selected recovery Skill", async () => {
+    const lightweight = lightweightObservationWorld(undefined, {
+      interaction: {
+        object_world_model: { frame: 0, world_revision: 0, objects: [] },
+        skill_catalog: {
+          contract_sha256: "a".repeat(64),
+          frame: 0,
+          world_revision: 0,
+          entries: []
+        },
+        carrying: { bindings: [] },
+        manipulable_objects: []
+      }
+    });
+    const recoveryPolicy = {
+      protocol: "humanoid-recovery-policy-v1" as const,
+      source_execution_transaction_id: "failed-grasp-execution",
+      source_planning_transaction_id: "failed-grasp-plan",
+      source_skill_transaction_id: "failed-grasp-skill",
+      source_skill: "grasp" as const,
+      source_phase: "close_hand_under_contact",
+      physical_failure_code: "motion_goal_unmet",
+      failure_reason: "grasp_unstable" as const,
+      world_revision: 0,
+      candidate_skills: ["regrasp", "reach"] as const,
+      requires_model_selection: true as const,
+      automatic_actuation: false as const
+    };
+    const runtime = new HumanoidActionRuntime(lightweight.world, {
+      requireSkillBinding: true,
+      state: {
+        version: 1,
+        latest_physical_execution_revision: 0,
+        skill_plans: [],
+        active_skill_plan_transactions: {},
+        active_skills: [],
+        planning_skill_bindings: [],
+        recovery_policies: [{
+          agent_id: "humanoid-motion-reference",
+          policy: recoveryPolicy
+        }]
+      }
+    });
+
+    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+      recovery_policy: recoveryPolicy
+    });
+    await runtime.invoke(
+      "observe_humanoid",
+      {},
+      "recovery-observation",
+      "humanoid-motion-reference"
+    );
+    const proposal = {
+      objective: "select the next recovery Skill",
+      strategies: [{
+        strategy_id: "unsupported-recovery",
+        rationale: "exercise restored Recovery Policy authority",
+        nodes: [{
+          node_id: "stabilize-instead",
+          invocation: { skill: "stabilize" as const, minimum_support_margin_m: 0 },
+          depends_on_node_ids: []
+        }]
+      }],
+      selected_strategy_id: "unsupported-recovery"
+    };
+    await runtime.invoke(
+      "submit_humanoid_skill_plan",
+      proposal,
+      "recovery-skill-plan",
+      "humanoid-motion-reference"
+    );
+    await expect(runtime.invoke(
+      "begin_humanoid_skill",
+      {
+        skill_plan_transaction_id: "recovery-skill-plan",
+        skill_node_id: "stabilize-instead",
+        invocation: proposal.strategies[0]!.nodes[0]!.invocation,
+        phase: "recover_support"
+      },
+      "unsupported-recovery-binding",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({
+      accepted: false,
+      code: "recovery_skill_selection_required",
+      detail: {
+        automatic_actuation: false,
+        recovery_policy: recoveryPolicy,
+        selected_skill: "stabilize"
+      }
+    });
+  });
+
+  it("renews Skill authority across stationary physics but rejects material world changes", async () => {
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const runtime = new HumanoidActionRuntime(world, {
+        requireSkillBinding: true
+      });
+      await runtime.invoke(
+        "observe_humanoid",
+        {},
+        "lease-observation",
+        "humanoid-motion-reference"
+      );
+      const invocation = {
+        skill: "stabilize" as const,
+        minimum_support_margin_m: 0
+      };
+      const proposal = {
+        objective: "maintain stable physical support",
+        strategies: [{
+          strategy_id: "stationary-lease",
+          rationale: "continue from an unchanged physical observation",
+          nodes: [{
+            node_id: "stabilize-now",
+            invocation,
+            depends_on_node_ids: []
+          }]
+        }],
+        selected_strategy_id: "stationary-lease"
+      };
+      await runtime.invoke(
+        "submit_humanoid_skill_plan",
+        proposal,
+        "lease-skill-plan",
+        "humanoid-motion-reference"
+      );
+      const binding = await runtime.invoke(
+        "begin_humanoid_skill",
+        {
+          skill_plan_transaction_id: "lease-skill-plan",
+          skill_node_id: "stabilize-now",
+          invocation,
+          phase: "recover_support"
+        },
+        "lease-skill-binding",
+        "humanoid-motion-reference"
+      );
+      expect(binding.accepted).toBe(true);
+
+      const stationary = await world.advanceStationary();
+      expect(stationary?.worldRevision).toBeGreaterThan(0);
+      const renewed = await runtime.invoke(
+        "plan_humanoid_skill",
+        { skill_transaction_id: binding.transactionId },
+        "stationary-lease-plan",
+        "humanoid-motion-reference"
+      );
+      expect(renewed.code).not.toBe("skill_observation_changed");
+      expect(renewed.detail).toMatchObject({
+        skill_binding: {
+          transaction_id: binding.transactionId,
+          observed_world_revision: stationary!.worldRevision
+        }
+      });
+
+      const chunks = applyScenarioChunkDeltaMutation(
+        scenario,
+        createScenarioChunkDeltaState(scenario),
+        {
+          type: "create_block",
+          block: {
+            id: "lease-material-change",
+            center: { x: 1.5, y: 1.3, z: 2.5 },
+            size: { x: 0.4, y: 0.4, z: 0.4 },
+            material: "stone",
+            properties: {}
+          }
+        }
+      );
+      await world.synchronizeScenarioChunks(scenario, chunks);
+      expect(world.observe().solidTokens.map(({ id }) => id)).toContain(
+        "lease-material-change"
+      );
+      await expect(runtime.invoke(
+        "plan_humanoid_skill",
+        { skill_transaction_id: binding.transactionId },
+        "changed-world-plan",
+        "humanoid-motion-reference"
+      )).resolves.toMatchObject({
+        accepted: false,
+        code: "skill_observation_changed",
+        detail: { automatic_actuation: false }
+      });
+    } finally {
+      await world.dispose();
+    }
+  }, 30_000);
+
   it("requires the Motion Agent to own a fresh observation before planning", async () => {
     const lightweight = lightweightObservationWorld();
     const runtime = new HumanoidActionRuntime(lightweight.world);

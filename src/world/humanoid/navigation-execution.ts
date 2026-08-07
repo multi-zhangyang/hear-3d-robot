@@ -56,6 +56,7 @@ const NAVIGATION_PRECISION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.01;
 const NAVIGATION_WAYPOINT_TOLERANCE_METERS = 0.18;
 const NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS = 0.06;
 const CARRY_NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS = 0.12;
+const NAVIGATION_PHYSICAL_DEADBAND_TOLERANCE_METERS = 0.08;
 const NAVIGATION_POSITION_DISCRETIZATION_METERS = 0.001;
 const NAVIGATION_EFFECTIVE_COMMAND_MARGIN_METERS_PER_SECOND = 0.01;
 const NAVIGATION_ALREADY_AT_TARGET_TOLERANCE_METERS = 0.02;
@@ -72,6 +73,7 @@ const NAVIGATION_STOP_PLANAR_SPEED_TOLERANCE_METERS_PER_SECOND = 0.08;
 const NAVIGATION_STOP_COMMAND_TOLERANCE_METERS_PER_SECOND = 0.08;
 const NAVIGATION_STOP_YAW_COMMAND_TOLERANCE_RADIANS_PER_SECOND = 0.08;
 const NAVIGATION_STOP_POSITION_HOLD_COMMAND_METERS_PER_SECOND = 0.06;
+const NAVIGATION_PHYSICAL_DEADBAND_COMMAND_TOLERANCE_METERS_PER_SECOND = 0.11;
 const MAXIMUM_NAVIGATION_SECONDS = 90;
 const MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED = 1;
 const MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED = 2;
@@ -108,8 +110,10 @@ export interface HumanoidNavigationPreparedFrame {
 export const HumanoidNavigationExecutionProgressSchema = z.object({
   version: z.literal(1),
   start_root_position: Vec3Schema,
+  segment_start_root_position: Vec3Schema.optional(),
   waypoint_index: z.number().int().nonnegative(),
   committed_frame_count: z.number().int().nonnegative(),
+  online_replan_count: z.number().int().nonnegative().optional(),
   stopping_frame_count: z.number().int().nonnegative(),
   stopping_settled_frame_count: z.number().int().nonnegative().optional(),
   arrival_position_latched: z.boolean().optional()
@@ -138,6 +142,7 @@ export type HumanoidNavigationExecutionProgress = z.infer<
 export class HumanoidNavigationExecution {
   readonly #plan: NavigationPlan;
   readonly #startRootPosition: Vec3;
+  readonly #segmentStartRootPosition: Vec3;
   readonly #maximumTravelFrames: number;
   readonly #stoppingFrames: number;
   readonly #maximumStoppingFrames: number;
@@ -153,6 +158,7 @@ export class HumanoidNavigationExecution {
   readonly #graspTargets: readonly G1ContactAwareGraspTarget[];
   readonly #carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
   readonly #arrivalHeading: HumanoidNavigationArrivalHeading | null;
+  readonly #onlineReplanCount: number;
   #reference: HumanoidReference;
   #final: HumanoidSimulationSnapshot;
   #waypointIndex: number;
@@ -189,6 +195,7 @@ export class HumanoidNavigationExecution {
       || input.arrivalHeading === undefined
       ? null
       : HumanoidNavigationArrivalHeadingSchema.parse(input.arrivalHeading);
+    this.#onlineReplanCount = progress?.online_replan_count ?? 0;
     const controller = input.simulation.controllerDescriptor();
     const controlStepSeconds = controller.controlStepSeconds;
     this.#controlStepSeconds = controlStepSeconds;
@@ -232,10 +239,13 @@ export class HumanoidNavigationExecution {
     this.#startRootPosition = progress
       ? { ...progress.start_root_position }
       : { ...this.#final.rootPosition };
+    this.#segmentStartRootPosition = progress?.segment_start_root_position
+      ? { ...progress.segment_start_root_position }
+      : { ...this.#final.rootPosition };
     const finalTarget = this.#plan.waypoints.at(-1)!;
     const initialFinalDistance = Math.hypot(
-      finalTarget.x - this.#startRootPosition.x,
-      finalTarget.z - this.#startRootPosition.z
+      finalTarget.x - this.#segmentStartRootPosition.x,
+      finalTarget.z - this.#segmentStartRootPosition.z
     );
     this.#precisionArrival = initialFinalDistance <= (
       NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS
@@ -249,7 +259,19 @@ export class HumanoidNavigationExecution {
     const progressBudgetSpeed = this.#precisionArrival
       ? NAVIGATION_PRECISION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND
       : NAVIGATION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND;
-    this.#maximumTravelFrames = Math.ceil(
+    this.#maximumTravelFrames = (progress?.online_replan_count ?? 0) > 0
+      ? (progress?.committed_frame_count ?? 0) + Math.ceil(
+          Math.min(
+            MAXIMUM_NAVIGATION_SECONDS,
+            this.#plan.distance / progressBudgetSpeed
+              + NAVIGATION_STARTUP_SECONDS
+              + NAVIGATION_FINAL_CONVERGENCE_BUDGET_SECONDS
+              + (this.#arrivalHeading === null
+                ? 0
+                : NAVIGATION_ARRIVAL_HEADING_BUDGET_SECONDS)
+          ) / controlStepSeconds
+        )
+      : Math.ceil(
       Math.min(
         MAXIMUM_NAVIGATION_SECONDS,
         this.#plan.distance / progressBudgetSpeed
@@ -259,7 +281,7 @@ export class HumanoidNavigationExecution {
             ? 0
             : NAVIGATION_ARRIVAL_HEADING_BUDGET_SECONDS)
       ) / controlStepSeconds
-    );
+        );
     this.#waypointIndex = progress?.waypoint_index
       ?? Math.min(1, this.#plan.waypoints.length - 1);
     this.#frames = progress?.committed_frame_count ?? 0;
@@ -284,8 +306,10 @@ export class HumanoidNavigationExecution {
     return HumanoidNavigationExecutionProgressSchema.parse({
       version: 1,
       start_root_position: this.#startRootPosition,
+      segment_start_root_position: this.#segmentStartRootPosition,
       waypoint_index: this.#waypointIndex,
       committed_frame_count: this.#frames,
+      online_replan_count: this.#onlineReplanCount,
       stopping_frame_count: this.#stopFrames,
       stopping_settled_frame_count: this.#stopSettledFrames,
       arrival_position_latched: this.#arrivalPositionLatched
@@ -317,6 +341,10 @@ export class HumanoidNavigationExecution {
       } else {
         if (this.#resolveSettledStop()) return null;
         if (this.#stopFrames >= this.#maximumStoppingFrames) {
+          if (this.#physicallySettledWithinDeadband()) {
+            this.#finish(true);
+            return null;
+          }
           this.#finish(false, this.#failedToSettleReason());
           return null;
         }
@@ -586,7 +614,11 @@ export class HumanoidNavigationExecution {
     if (!this.#result && pending.stopping) {
       if (!this.#resolveSettledStop()
         && this.#stopFrames >= this.#maximumStoppingFrames) {
-        this.#finish(false, this.#failedToSettleReason());
+        if (this.#physicallySettledWithinDeadband()) {
+          this.#finish(true);
+        } else {
+          this.#finish(false, this.#failedToSettleReason());
+        }
       }
     }
     return {
@@ -710,6 +742,10 @@ export class HumanoidNavigationExecution {
 
   #failedToSettleReason(): string {
     const pelvisVelocity = this.#final.links?.pelvis?.linearVelocity;
+    const deadbandAcceptedDistance = this.#boundedFinalPositionTolerance(Math.max(
+      this.#baseFinalPositionTolerance(),
+      NAVIGATION_PHYSICAL_DEADBAND_TOLERANCE_METERS
+    )) + NAVIGATION_POSITION_DISCRETIZATION_METERS;
     return "navigation_failed_to_settle"
       + `:position=${point(this.#final.rootPosition)}`
       + `;distance=${this.#finalWaypointDistance().toFixed(6)}`
@@ -718,7 +754,16 @@ export class HumanoidNavigationExecution {
         : "unavailable"}`
       + `;command=${this.#reference.rootVelocity.map((value) => (
         value.toFixed(3)
-      )).join(",")}`;
+      )).join(",")}`
+      + `;deadband_accepted_distance=${deadbandAcceptedDistance.toFixed(6)}`
+      + `;heading_error=${this.#arrivalHeading === null
+        ? "none"
+        : Math.abs(humanoidNavigationArrivalHeadingError(
+            this.#arrivalHeading,
+            this.#final.rootPosition,
+            yawFromQuaternion(this.#final.rootRotation)
+          )).toFixed(6)}`
+      + `;yaw_command=${this.#reference.rootYawVelocity.toFixed(6)}`;
   }
 
   #planarApproachSpeed(dx: number, dz: number, distance: number): number {
@@ -758,6 +803,12 @@ export class HumanoidNavigationExecution {
   }
 
   #finalPositionTolerance(): number {
+    return this.#boundedFinalPositionTolerance(
+      this.#baseFinalPositionTolerance()
+    );
+  }
+
+  #boundedFinalPositionTolerance(baseTolerance: number): number {
     const target = this.#plan.waypoints.at(-1)!;
     const initialDistance = Math.hypot(
       target.x - this.#startRootPosition.x,
@@ -774,9 +825,37 @@ export class HumanoidNavigationExecution {
       )
     );
     return Math.min(
-      this.#baseFinalPositionTolerance(),
+      baseTolerance,
       initialDistance - requiredProgress
     );
+  }
+
+  #physicallySettledWithinDeadband(): boolean {
+    const pelvisVelocity = this.#final.links?.pelvis?.linearVelocity;
+    const planarSpeed = pelvisVelocity
+      ? Math.hypot(pelvisVelocity.x, pelvisVelocity.z)
+      : 0;
+    const acceptedDistance = this.#boundedFinalPositionTolerance(Math.max(
+      this.#baseFinalPositionTolerance(),
+      NAVIGATION_PHYSICAL_DEADBAND_TOLERANCE_METERS
+    )) + NAVIGATION_POSITION_DISCRETIZATION_METERS;
+    return this.#finalWaypointDistance() <= acceptedDistance
+      && humanoidNavigationArrivalHeadingSatisfied(
+        this.#arrivalHeading,
+        this.#final.rootPosition,
+        yawFromQuaternion(this.#final.rootRotation)
+      )
+      && planarSpeed
+        <= NAVIGATION_STOP_PLANAR_SPEED_TOLERANCE_METERS_PER_SECOND
+      && Math.hypot(...this.#reference.rootVelocity)
+        <= Math.max(
+          NAVIGATION_STOP_COMMAND_TOLERANCE_METERS_PER_SECOND,
+          NAVIGATION_PHYSICAL_DEADBAND_COMMAND_TOLERANCE_METERS_PER_SECOND,
+          this.#minimumPlanarCommandSpeed()
+            + NAVIGATION_EFFECTIVE_COMMAND_MARGIN_METERS_PER_SECOND
+        )
+      && Math.abs(this.#reference.rootYawVelocity)
+        <= NAVIGATION_STOP_YAW_COMMAND_TOLERANCE_RADIANS_PER_SECOND;
   }
 
   #baseFinalPositionTolerance(): number {

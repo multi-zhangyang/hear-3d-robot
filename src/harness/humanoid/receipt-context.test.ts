@@ -207,4 +207,57 @@ describe("humanoid receipt context", () => {
       recovery: "Choose materially different physical parameters."
     });
   });
+
+  it("keeps the exact active Skill identity visible without its geometry payload", () => {
+    const receipt: HumanoidActionReceipt = {
+      transactionId: "skill-binding-call",
+      agentId: "humanoid-motion-reference",
+      action: "begin_humanoid_skill",
+      input: {},
+      fingerprint: "fingerprint",
+      accepted: true,
+      code: "humanoid_skill_bound",
+      worldBeforeRevision: 52,
+      worldAfterRevision: 52,
+      frameCount: 0,
+      channels: [],
+      detail: {
+        automatic_actuation: false,
+        binding: {
+          transaction_id: "skill-binding-call",
+          skill_plan_transaction_id: "skill-plan-call",
+          skill_node_id: "approach-object",
+          invocation: {
+            skill: "approach",
+            object_id: "workpiece",
+            interaction_point_id: "geometry-x-negative",
+            standoff_m: 0.45
+          },
+          phase: "route",
+          phase_authority: "navigation",
+          planning_action: "plan_humanoid_navigation",
+          observed_world_revision: 52,
+          eligible_interaction_points: Array.from(
+            { length: 100 },
+            (_, index) => ({ id: `point-${index}` })
+          )
+        }
+      },
+      committedAt: "2026-08-06T00:00:00.000Z"
+    };
+
+    const projected = modelToolReceiptDetail(receipt);
+
+    expect(projected).toMatchObject({
+      automatic_actuation: false,
+      binding: {
+        transaction_id: "skill-binding-call",
+        skill_plan_transaction_id: "skill-plan-call",
+        skill_node_id: "approach-object",
+        phase: "route",
+        planning_action: "plan_humanoid_navigation"
+      }
+    });
+    expect(JSON.stringify(projected)).not.toContain("eligible_interaction_points");
+  });
 });

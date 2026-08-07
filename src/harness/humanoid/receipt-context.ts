@@ -35,7 +35,9 @@ const MODEL_RECEIPT_DETAIL_KEYS = [
   "source_id",
   "revalidation",
   "automatic_actuation",
-  "recovery"
+  "recovery",
+  "supplied_skill_transaction_id",
+  "active_skill_transaction_id"
 ] as const;
 
 export function recentReceiptContext(receipt: HumanoidActionReceipt): JsonValue {
@@ -75,6 +77,19 @@ export function modelReceiptDetail(value: JsonValue): Record<string, unknown> {
       }
       return summary;
     });
+  }
+  const binding = record(source.binding);
+  if (binding) {
+    projected.binding = projectRecord(binding, [
+      "transaction_id",
+      "skill_plan_transaction_id",
+      "skill_node_id",
+      "invocation",
+      "phase",
+      "phase_authority",
+      "planning_action",
+      "observed_world_revision"
+    ]);
   }
   const result = record(source.result);
   if (result) {

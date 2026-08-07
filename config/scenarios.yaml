@@ -152,3 +152,106 @@ scenarios:
             object_id: assembly_rod
             zone_id: assembly_bay
             tolerance: 0.05
+
+  humanoid_cabinet:
+    kind: authored
+    runtime: humanoid_g1
+    title: 人形柜体空间
+    scenario:
+      title: 人形柜体空间
+      bounds: { width: 20, depth: 18 }
+      visibility_radius: 9
+      robot: { x: 7, z: 2.8, yaw: 0 }
+      obstacles:
+        - id: side-workbench
+          center: { x: 13.5, y: 0.55, z: 10.5 }
+          size: { x: 3.2, y: 1.1, z: 1.2 }
+      objects:
+        - id: cabinet-frame
+          kind: cabinet
+          color: "#59645d"
+          position: { x: 7, y: 1, z: 6 }
+          size: { x: 1.5, y: 1.7, z: 0.72 }
+          portable: false
+          capability:
+            shape: box
+            mass_kg: 18
+            affordances: [container]
+            interaction_points: []
+            container:
+              interior_center: { x: 0, y: 0, z: 0 }
+              interior_size: { x: 1.4, y: 1.6, z: 0.65 }
+              opening_direction: { x: 0, y: 0, z: -1 }
+              wall_thickness_m: 0.045
+        - id: cabinet-door
+          kind: cabinet_door
+          color: "#8a7354"
+          position: { x: 7, y: 1, z: 5.595 }
+          size: { x: 1.5, y: 1.7, z: 0.055 }
+          portable: false
+          capability:
+            shape: box
+            mass_kg: 4.5
+            affordances: []
+            interaction_points:
+              - id: cabinet-door-handle
+                kind: pull
+                local_position: { x: 0.56, y: 0, z: -0.045 }
+                approach_direction: { x: 0, y: 0, z: 1 }
+                compatible_hands: either
+                clearance_m: 0.08
+            articulation:
+              joint_id: cabinet-door-hinge
+              parent_object_id: cabinet-frame
+              type: hinge
+              semantic: cabinet_door
+              axis: { x: 0, y: 1, z: 0 }
+              anchor_world: { x: 6.25, y: 1, z: 5.595 }
+              range: { minimum: 0, maximum: 1.65 }
+              initial_position: 0
+              closed_position: 0
+              open_position: 1.5
+              damping: 0.65
+              friction_loss: 0.08
+        - id: cabinet-workpiece
+          kind: workpiece
+          color: "#d38a43"
+          position: { x: 7, y: 0.32, z: 5.97 }
+          size: { x: 0.18, y: 0.3, z: 0.18 }
+          portable: true
+          capability:
+            shape: cylinder
+            mass_kg: 0.75
+            friction: { sliding: 0.65, torsional: 0.012, rolling: 0.002 }
+            affordances: []
+            interaction_points: []
+        - id: destination-bin
+          kind: container
+          color: "#4f8172"
+          position: { x: 11, y: 0.37, z: 6.5 }
+          size: { x: 1, y: 0.72, z: 1 }
+          portable: false
+          capability:
+            shape: box
+            mass_kg: 8
+            affordances: [container]
+            interaction_points: []
+            container:
+              interior_center: { x: 0, y: 0, z: 0 }
+              interior_size: { x: 0.9, y: 0.64, z: 0.9 }
+              opening_direction: { x: 0, y: 1, z: 0 }
+              wall_thickness_m: 0.045
+      zones: []
+      default_goal:
+        summary: 将柜内工件取出并放入目标容器，最后关闭柜门。
+        predicates:
+          - type: object_inside
+            object_id: cabinet-workpiece
+            container_id: destination-bin
+            expected: true
+            tolerance: 0.03
+          - type: articulation_state
+            object_id: cabinet-door
+            joint_id: cabinet-door-hinge
+            state: closed
+            tolerance: 0.08

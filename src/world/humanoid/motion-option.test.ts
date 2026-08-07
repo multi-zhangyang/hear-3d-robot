@@ -209,6 +209,203 @@ function graspDetectorInput(
 }
 
 describe("humanoid motion option detector", () => {
+  it("uses observed articulation qpos as open and closed terminal evidence", () => {
+    const articulationContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "open-cabinet-door",
+      predicates: [{
+        type: "articulation_state",
+        object_id: "cabinet-door",
+        joint_id: "cabinet-door-hinge",
+        state: "open",
+        tolerance: 0.1
+      }],
+      stable_steps: 1
+    });
+    const input = (position: number, jointId = "cabinet-door-hinge") => ({
+      snapshot: robot,
+      observableObjects: [{
+        id: "cabinet-door",
+        position: { x: 1, y: 1, z: 1 },
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+        size: { x: 0.8, y: 1, z: 0.05 },
+        articulation: {
+          jointId,
+          position,
+          velocity: 0.02,
+          closedPosition: 0,
+          openPosition: 1.5
+        }
+      }],
+      zones: []
+    });
+
+    expect(detectHumanoidMotionOption(articulationContract, input(1.4)))
+      .toMatchObject({
+        status: "satisfied",
+        evidence: [{
+          type: "articulation_state",
+          observedJointId: "cabinet-door-hinge",
+          jointPosition: 1.4,
+          openFraction: 1.4 / 1.5
+        }]
+      });
+    expect(detectHumanoidMotionOption(articulationContract, input(0.5)).status)
+      .toBe("unsatisfied");
+    expect(detectHumanoidMotionOption(
+      articulationContract,
+      input(1.5, "other-hinge")
+    )).toMatchObject({
+      status: "unsatisfied",
+      evidence: [{ reason: "joint_id_mismatch" }]
+    });
+    expect(detectHumanoidMotionOption(articulationContract, {
+      snapshot: robot,
+      observableObjects: [],
+      zones: []
+    })).toMatchObject({
+      status: "uncertain",
+      evidence: [{ reason: "object_not_observable" }]
+    });
+  });
+
+  it("verifies container and support relations from observable object geometry", () => {
+    const relationContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "place-object",
+      predicates: [{
+        type: "object_inside",
+        object_id: "payload",
+        container_id: "bin",
+        expected: true,
+        tolerance_m: 0.01
+      }, {
+        type: "object_on",
+        object_id: "payload-on-shelf",
+        support_id: "shelf",
+        expected: true,
+        tolerance_m: 0.02
+      }],
+      stable_steps: 1
+    });
+    const objects = [{
+      id: "payload",
+      position: { x: 0, y: 0, z: 0 },
+      rotation: { x: 0, y: 0, z: 0, w: 1 },
+      size: { x: 0.2, y: 0.2, z: 0.2 }
+    }, {
+      id: "bin",
+      position: { x: 0, y: 0, z: 0 },
+      rotation: { x: 0, y: 0, z: 0, w: 1 },
+      size: { x: 1.2, y: 1.2, z: 1.2 },
+      container: {
+        interior_center: { x: 0, y: 0, z: 0 },
+        interior_size: { x: 1, y: 1, z: 1 },
+        opening_direction: { x: 0, y: 1, z: 0 },
+        wall_thickness_m: 0.03
+      }
+    }, {
+      id: "payload-on-shelf",
+      position: { x: 2, y: 0.6, z: 0 },
+      rotation: { x: 0, y: 0, z: 0, w: 1 },
+      size: { x: 0.2, y: 0.2, z: 0.2 }
+    }, {
+      id: "shelf",
+      position: { x: 2, y: 0, z: 0 },
+      rotation: { x: 0, y: 0, z: 0, w: 1 },
+      size: { x: 1, y: 1, z: 1 },
+      supportSurface: {
+        local_center: { x: 0, y: 0.5, z: 0 },
+        size: { x: 1, y: 0, z: 1 },
+        normal: { x: 0, y: 1, z: 0 }
+      }
+    }];
+    expect(detectHumanoidMotionOption(relationContract, {
+      snapshot: robot,
+      observableObjects: objects,
+      zones: []
+    })).toMatchObject({
+      status: "satisfied",
+      evidence: [{ type: "object_inside", relation: true }, {
+        type: "object_on",
+        relation: true
+      }]
+    });
+    const hiddenContainer = detectHumanoidMotionOption(relationContract, {
+      snapshot: robot,
+      observableObjects: objects.filter(({ id }) => id !== "bin"),
+      zones: []
+    });
+    expect(hiddenContainer.status).toBe("uncertain");
+    expect(hiddenContainer.evidence[0]).toMatchObject({
+      reason: "relation_target_not_observable"
+    });
+  });
+
+  it("verifies directed displacement and balance without scripted actions", () => {
+    const physicalContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "push-and-stabilize",
+      predicates: [{
+        type: "object_displaced",
+        object_id: "cart",
+        origin: { x: 0, y: 0.3, z: 0 },
+        direction_world: { x: 1, y: 0, z: 0 },
+        minimum_distance_m: 0.5,
+        maximum_lateral_error_m: 0.05
+      }, {
+        type: "articulation_displaced",
+        object_id: "button",
+        joint_id: "button-slide",
+        origin_position: 0.1,
+        direction: "increasing",
+        minimum_delta: 0.2
+      }, {
+        type: "balance_stable",
+        minimum_support_margin_m: 0.02
+      }],
+      stable_steps: 1
+    });
+    const result = detectHumanoidMotionOption(physicalContract, {
+      snapshot: {
+        ...robot,
+        fallen: false,
+        balance: { supportMargin: 0.04 }
+      },
+      observableObjects: [{
+        id: "cart",
+        position: { x: 0.6, y: 0.3, z: 0.01 },
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+        size: { x: 0.5, y: 0.5, z: 0.5 }
+      }, {
+        id: "button",
+        position: { x: 1, y: 1, z: 1 },
+        rotation: { x: 0, y: 0, z: 0, w: 1 },
+        size: { x: 0.1, y: 0.1, z: 0.1 },
+        articulation: {
+          jointId: "button-slide",
+          position: 0.35,
+          velocity: 0.01,
+          closedPosition: 0,
+          openPosition: 0.4
+        }
+      }],
+      zones: []
+    });
+    expect(result.status).toBe("satisfied");
+    expect(result.evidence[0]).toMatchObject({
+      type: "object_displaced",
+      projectedDistanceMeters: 0.6
+    });
+    expect(result.evidence[1]).toMatchObject({
+      type: "articulation_displaced"
+    });
+    expect(result.evidence[1]?.type === "articulation_displaced"
+      ? result.evidence[1].signedDelta
+      : null).toBeCloseTo(0.25, 10);
+    expect(result.evidence[2]).toMatchObject({
+      type: "balance_stable",
+      supportMarginMeters: 0.04
+    });
+  });
+
   it("validates physical predicate contracts and stable steps", () => {
     expect(HumanoidMotionOptionContractSchema.parse(contract)).toEqual({
       ...contract,

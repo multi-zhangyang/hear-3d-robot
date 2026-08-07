@@ -31,7 +31,20 @@ export function captureHumanoidPhysicalWorldDelta(input: {
   transactionId: string;
 }): ScenarioPhysicalWorldDelta | undefined {
   const entities: ScenarioPhysicalDynamicEntity[] = [];
+  const activeScenario = materializeScenarioChunkDeltaState(
+    input.scenario,
+    input.chunks
+  );
+  const activeObjects = new Map(activeScenario.objects.map((object) => [
+    object.id,
+    object
+  ]));
   for (const [id, physical] of Object.entries(input.world.robot.objects)) {
+    const descriptor = activeObjects.get(id);
+    if (!descriptor) {
+      throw new Error(`MuJoCo object is not an active scenario entity: ${id}`);
+    }
+    if (!descriptor.portable) continue;
     const current = resolveScenarioChunkDeltaEntity(input.scenario, input.chunks, id);
     if (current.category !== "dynamic_entity"
       || !current.state.present
@@ -108,7 +121,19 @@ export function assertHumanoidPhysicalWorldDeltaRecovery(input: {
     .filter((object) => object.portable)
     .map((object) => object.id)
     .sort();
-  const checkpointPortableIds = Object.keys(input.world.robot.objects).sort();
+  const activeObjects = new Map(activeScenario.objects.map((object) => [
+    object.id,
+    object
+  ]));
+  const checkpointPortableIds = Object.keys(input.world.robot.objects)
+    .filter((id) => {
+      const descriptor = activeObjects.get(id);
+      if (!descriptor) {
+        throw new Error(`MuJoCo checkpoint contains an unknown scenario entity: ${id}`);
+      }
+      return descriptor.portable;
+    })
+    .sort();
   if (JSON.stringify(expectedPortableIds) !== JSON.stringify(checkpointPortableIds)) {
     throw new Error(
       "Portable entity topology changed without a matching physical checkpoint migration"

@@ -33,6 +33,7 @@ import type {
 import type { G1HandContactSurfaceName } from "./morphology.js";
 import type { G1HandCoordination } from "./hand-coordination.js";
 import type { HumanoidNavigationArrivalHeading } from "./navigation-arrival.js";
+import type { HumanoidSpatialBeliefObservation } from "./spatial-belief-map.js";
 
 export interface HumanoidWorldSnapshot {
   frame: number;
@@ -65,6 +66,7 @@ export interface HumanoidWorldObservation {
   manipulationBasePlacements: HumanoidManipulationBasePlacementObservation[];
   objectTokens: HumanoidObjectToken[];
   solidTokens: HumanoidSolidToken[];
+  spatialBelief: HumanoidSpatialBeliefObservation;
   grasp: HumanoidWorldGraspState;
   interaction: HumanoidInteractionObservation;
   navigation: HumanoidWorldSnapshot["navigation"];
@@ -144,6 +146,14 @@ export interface HumanoidExecutionReceipt {
     failures?: HumanoidMotionValidation["failures"];
     reason?: string;
     travelledDistance?: number;
+    online_replans?: Array<{
+      attempt: number;
+      trigger: string;
+      world_revision: number;
+      accepted: boolean;
+      reason: string | null;
+      waypoint_count: number;
+    }>;
     motion?: ReturnType<typeof humanoidMotionArtifactSummary>;
     physical_safety?: HumanoidPhysicalSafetyEvidence;
     revalidation?: {

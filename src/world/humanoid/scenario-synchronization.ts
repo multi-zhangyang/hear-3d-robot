@@ -46,10 +46,10 @@ export function analyzeHumanoidScenarioSynchronization(input: {
 
 function assertPortableTopologyCompatible(current: Scenario, next: Scenario): void {
   const currentPortable = current.objects
-    .filter(({ portable }) => portable)
+    .filter((object) => object.portable || object.capability?.articulation !== undefined)
     .map(({ id }) => id);
   const nextPortable = next.objects
-    .filter(({ portable }) => portable)
+    .filter((object) => object.portable || object.capability?.articulation !== undefined)
     .map(({ id }) => id);
   if (!sameJson(currentPortable, nextPortable)) {
     throw new Error(
@@ -65,6 +65,7 @@ function physicalGeometryProjection(scenario: Scenario): unknown {
       id: object.id,
       size: object.size,
       portable: object.portable,
+      capability: object.capability ?? null,
       ...(object.portable ? {} : { position: object.position })
     }))
   };
@@ -76,7 +77,8 @@ function objectDescriptorProjection(scenario: Scenario): unknown {
     kind: object.kind,
     color: object.color,
     size: object.size,
-    portable: object.portable
+    portable: object.portable,
+    capability: object.capability ?? null
   }));
 }
 

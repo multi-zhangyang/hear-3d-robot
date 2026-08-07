@@ -50,8 +50,8 @@ describe("HumanoidWorld", () => {
         invalidatedPlanIds: [plannedBefore.planId]
       });
       const after = world.snapshot();
-      expect(after.frame).toBe(before.frame);
-      expect(after.worldRevision).toBe(before.worldRevision);
+      expect(after.frame).toBe(before.frame + 1);
+      expect(after.worldRevision).toBe(before.worldRevision + 1);
       expect(after.robot.rootPosition).toEqual(before.robot.rootPosition);
       expect(world.checkpoint().routes).toEqual([]);
 

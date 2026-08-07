@@ -1,14 +1,11 @@
 import type { Scenario } from "../../domain/schema.js";
 import type { NavigationAgentProfile } from "../navigation.js";
 import type { HumanoidSimulationOptions } from "./simulation.js";
+import { humanoidObjectCapability } from "./object-capability.js";
 import {
   humanoidPhysicalRegionIncludesBox,
   type HumanoidPhysicalRegion
 } from "./physical-region.js";
-
-const PORTABLE_OBJECT_DENSITY_KG_PER_CUBIC_METER = 600;
-const MINIMUM_PORTABLE_OBJECT_MASS_KG = 0.25;
-const MAXIMUM_PORTABLE_OBJECT_MASS_KG = 2;
 
 export const HUMANOID_NAVIGATION_PROFILE: NavigationAgentProfile = {
   radius: 0.18,
@@ -28,7 +25,8 @@ export function humanoidEnvironment(
   physicalRegion?: HumanoidPhysicalRegion
 ): HumanoidSimulationOptions {
   const fixedObjects = scenario.objects
-    .filter((object) => !object.portable && (!physicalRegion
+    .filter((object) => !object.portable && object.capability === undefined
+      && (!physicalRegion
       || humanoidPhysicalRegionIncludesBox(physicalRegion, {
         center: object.position,
         size: object.size
@@ -38,20 +36,49 @@ export function humanoidEnvironment(
       center: object.position,
       size: object.size
     }));
-  const dynamicObjects = scenario.objects
-    .filter((object) => object.portable)
-    .map((object) => ({
-      id: object.id,
-      center: object.position,
-      size: object.size,
-      mass: Math.max(MINIMUM_PORTABLE_OBJECT_MASS_KG, Math.min(
-        MAXIMUM_PORTABLE_OBJECT_MASS_KG,
-        object.size.x
-          * object.size.y
-          * object.size.z
-          * PORTABLE_OBJECT_DENSITY_KG_PER_CUBIC_METER
-      ))
-    }));
+  const physicalObjects = scenario.objects
+    .filter((object) => object.portable || (
+      object.capability !== undefined
+        && (!physicalRegion || humanoidPhysicalRegionIncludesBox(physicalRegion, {
+          center: object.position,
+          size: object.size
+        }))
+    ))
+    .map((object) => {
+      const capability = humanoidObjectCapability(object);
+      const articulation = capability.articulation;
+      return {
+        id: object.id,
+        center: object.position,
+        size: object.size,
+        mass: capability.massKg,
+        shape: capability.shape,
+        friction: capability.friction,
+        mobility: articulation
+          ? {
+              type: articulation.type,
+              axis: { ...articulation.axis },
+              anchor: { ...articulation.anchor_world },
+              range: { ...articulation.range },
+              initialPosition: articulation.initial_position,
+              damping: articulation.damping,
+              frictionLoss: articulation.friction_loss
+            }
+          : capability.mobility === "free"
+            ? { type: "free" as const }
+            : { type: "fixed" as const },
+        ...(capability.container
+          ? {
+              container: {
+                interiorCenter: { ...capability.container.interior_center },
+                interiorSize: { ...capability.container.interior_size },
+                openingDirection: { ...capability.container.opening_direction },
+                wallThickness: capability.container.wall_thickness_m
+              }
+            }
+          : {})
+      };
+    });
   return {
     spawn: {
       position: { x: scenario.robot.x, y: 0, z: scenario.robot.z },
@@ -62,6 +89,6 @@ export function humanoidEnvironment(
         || humanoidPhysicalRegionIncludesBox(physicalRegion, solid)),
       ...fixedObjects
     ],
-    objects: dynamicObjects
+    objects: physicalObjects
   };
 }

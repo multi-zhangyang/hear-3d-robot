@@ -40,6 +40,7 @@ import {
   HumanoidObjectMemory,
   type HumanoidObjectMemoryCheckpoint
 } from "./object-memory.js";
+import { humanoidObjectCapability } from "./object-capability.js";
 import {
   neutralHumanoidReference,
   releaseReferenceTracking,
@@ -159,6 +160,11 @@ import {
   stationKeepingHumanoidReference,
   type HumanoidStationKeepingAnchor
 } from "./station-keeping.js";
+import {
+  HumanoidSpatialBeliefMap,
+  type HumanoidSpatialBeliefMapCheckpoint
+} from "./spatial-belief-map.js";
+import { onlineNavigationReplanDecision } from "./online-navigation-replanner.js";
 
 export interface WholeBodyMotionPlanningOptions {
   retainTerminalJointTracking?: boolean;
@@ -243,6 +249,7 @@ export class HumanoidWorld {
   #navigation: HumanoidNavigationPlanner;
   #physicalRegion: HumanoidPhysicalRegion;
   #objectMemory: HumanoidObjectMemory;
+  #spatialBelief: HumanoidSpatialBeliefMap;
   readonly #graspRegistry: HumanoidGraspRegistry;
   readonly #motionGenerator: HumanoidMotionGenerator;
   readonly #planIntentLeaseSeconds: number;
@@ -303,7 +310,8 @@ export class HumanoidWorld {
         options.planIntentLeaseSeconds
           ?? DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS,
         checkpoint?.objectMemory,
-        checkpoint?.graspRegistry
+        checkpoint?.graspRegistry,
+        checkpoint?.spatialBelief
       );
       if (checkpoint) world.#restore(checkpoint);
       else await world.#settle(80);
@@ -327,7 +335,8 @@ export class HumanoidWorld {
     motionGenerator: HumanoidMotionGenerator,
     planIntentLeaseSeconds: number,
     objectMemoryCheckpoint?: HumanoidObjectMemoryCheckpoint,
-    graspRegistryCheckpoint?: HumanoidGraspRegistryCheckpoint
+    graspRegistryCheckpoint?: HumanoidGraspRegistryCheckpoint,
+    spatialBeliefCheckpoint?: HumanoidSpatialBeliefMapCheckpoint
   ) {
     this.#scenario = scenario;
     this.#simulation = simulation;
@@ -337,6 +346,10 @@ export class HumanoidWorld {
     this.#motionGenerator = motionGenerator;
     this.#planIntentLeaseSeconds = planIntentLeaseSeconds;
     this.#objectMemory = new HumanoidObjectMemory(scenario, objectMemoryCheckpoint);
+    this.#spatialBelief = new HumanoidSpatialBeliefMap(
+      scenario,
+      spatialBeliefCheckpoint
+    );
     this.#graspRegistry = new HumanoidGraspRegistry({
       portableObjectIds: scenario.objects
         .filter((object) => object.portable)
@@ -376,6 +389,17 @@ export class HumanoidWorld {
       snapshot.worldRevision
     );
     const handSurfaces = this.#simulation.handSurfaceObservations(snapshot.robot);
+    const solidTokens = visibleHumanoidSolidTokens({
+      scenario: this.#scenario,
+      sensed: sensedSolids,
+      contacts: snapshot.robot.contacts
+    });
+    this.#spatialBelief.observe({
+      frame: snapshot.frame,
+      rootPosition: snapshot.robot.rootPosition,
+      sensor: sensed.sensor,
+      visibleSolids: solidTokens
+    });
     const { objects: _objects, ...robot } = snapshot.robot;
     return {
       frame: snapshot.frame,
@@ -392,11 +416,8 @@ export class HumanoidWorld {
       manipulationReachability: [],
       manipulationBasePlacements: [],
       objectTokens,
-      solidTokens: visibleHumanoidSolidTokens({
-        scenario: this.#scenario,
-        sensed: sensedSolids,
-        contacts: snapshot.robot.contacts
-      }),
+      solidTokens,
+      spatialBelief: this.#spatialBelief.observation(snapshot.robot.rootPosition),
       grasp: structuredClone(snapshot.grasp),
       interaction: createHumanoidInteractionObservation({
         frame: snapshot.frame,
@@ -404,6 +425,7 @@ export class HumanoidWorld {
         scenario: this.#scenario,
         robot: snapshot.robot,
         objectTokens,
+        solidTokens,
         grasp: snapshot.grasp,
         graspContract: this.#graspRegistry.contract,
         carried: this.#requiredCarriedObjectLifecycle().checkpoint()
@@ -486,7 +508,8 @@ export class HumanoidWorld {
       ...(this.#physicalSafety
         ? { physicalSafety: structuredClone(this.#physicalSafety) }
         : {}),
-      objectMemory: this.#objectMemory.checkpoint()
+      objectMemory: this.#objectMemory.checkpoint(),
+      spatialBelief: this.#spatialBelief.checkpoint()
     });
   }
 
@@ -525,12 +548,17 @@ export class HumanoidWorld {
         identity: this.#authorityIdentity(),
         simulation: this.#simulation.captureState(),
         physicalAnchors: this.#physicalAnchors(),
-        objectMemory: this.#objectMemory.checkpoint()
+        objectMemory: this.#objectMemory.checkpoint(),
+        spatialBelief: this.#spatialBelief.checkpoint()
       };
     });
     const nextObjectMemory = new HumanoidObjectMemory(
       analysis.scenario,
       captured.objectMemory
+    );
+    const nextSpatialBelief = new HumanoidSpatialBeliefMap(
+      analysis.scenario,
+      captured.spatialBelief
     );
     const nextResources = analysis.requiresResourceRebuild
       ? await createHumanoidWorldResources(
@@ -561,6 +589,7 @@ export class HumanoidWorld {
         ].sort();
         this.#scenario = analysis.scenario;
         this.#objectMemory = nextObjectMemory;
+        this.#spatialBelief = nextSpatialBelief;
         if (nextResources) {
           this.#simulation = nextResources.simulation;
           this.#rolloutPool = nextResources.rolloutPool;
@@ -570,6 +599,8 @@ export class HumanoidWorld {
         this.#motions.clear();
         this.#routes.clear();
         this.#planRegistryEpoch += 1;
+        this.#frame += 1;
+        this.#worldRevision += 1;
         this.#physicalSafety = undefined;
         this.#navigationState = {
           planId: null,
@@ -578,6 +609,10 @@ export class HumanoidWorld {
           waypoints: [],
           waypointIndex: null
         };
+        const synchronizedSnapshot = this.#simulation.snapshot();
+        this.#observeGraspFrame(this.#frame, synchronizedSnapshot);
+        this.#observeCarriedObjectFrame(synchronizedSnapshot);
+        this.#refreshCurrentObjectMemory();
         return { previous, invalidatedPlanIds };
       });
       resourcesInstalled = nextResources !== undefined;
@@ -1820,6 +1855,14 @@ export class HumanoidWorld {
       admission_state_sha256: admission.stateSha256
     };
     let execution: HumanoidNavigationExecution | undefined;
+    const onlineReplans: Array<{
+      attempt: number;
+      trigger: string;
+      world_revision: number;
+      accepted: boolean;
+      reason: string | null;
+      waypoint_count: number;
+    }> = [];
     let handle: HumanoidAuthorityCommandHandle<HumanoidExecutionReceipt>;
     try {
       handle = await this.#authority.submit({
@@ -1896,6 +1939,90 @@ export class HumanoidWorld {
             };
           }
           const result = execution.result();
+          const replanDecision = onlineNavigationReplanDecision({
+            reason: result.reason,
+            fallen: result.final.fallen,
+            attempts: stored.progress.online_replan_count ?? 0
+          });
+          if (!result.completed && replanDecision.replan) {
+            const context = this.#captureNavigationPlanningContext();
+            const replanned = await this.#validateNavigationIntent(
+              stored.requestedTarget,
+              stored.requestedArrivalHeading,
+              context
+            );
+            const attempt = (stored.progress.online_replan_count ?? 0) + 1;
+            onlineReplans.push({
+              attempt,
+              trigger: result.reason ?? "navigation_blocked",
+              world_revision: context.worldRevision,
+              accepted: replanned.accepted && replanned.plan !== null,
+              reason: replanned.reason ?? null,
+              waypoint_count: replanned.plan?.waypoints.length ?? 0
+            });
+            if (replanned.accepted && replanned.plan) {
+              validationRevision = context.worldRevision;
+              validationStateSha256 = context.stateSha256;
+              stored.plan = structuredClone(replanned.plan);
+              stored.arrivalHeading = replanned.arrivalHeading
+                ? structuredClone(replanned.arrivalHeading)
+                : null;
+              stored.releaseJointTracking = replanned.releaseJointTracking;
+              stored.revalidationCount += 1;
+              revalidation = {
+                ...revalidationEvidence(true, true, stored.revalidationCount),
+                admission_state_sha256: context.stateSha256
+              };
+              stored.carriedObjectBindings = structuredClone(
+                context.carriedObjectBindings
+              );
+              stored.carriedObjectTaskSpaceTargets = structuredClone(
+                context.carriedObjectTaskSpaceTargets
+              );
+              stored.carriedObjectContinuation = null;
+              stored.carriedObjectUnauthorizedContacts = [];
+              stored.progress = {
+                version: 1,
+                start_root_position: { ...stored.progress.start_root_position },
+                segment_start_root_position: { ...context.start },
+                waypoint_index: Math.min(1, replanned.plan.waypoints.length - 1),
+                committed_frame_count: stored.progress.committed_frame_count,
+                online_replan_count: attempt,
+                stopping_frame_count: 0,
+                stopping_settled_frame_count: 0,
+                arrival_position_latched: false
+              };
+              execution = new HumanoidNavigationExecution({
+                plan: stored.plan,
+                reference: this.#reference,
+                simulation: this.#simulation,
+                progress: stored.progress,
+                contactConstraints: humanoidCarriedObjectContactConstraints(
+                  stored.carriedObjectBindings
+                ),
+                graspTargets: contactAwareG1GraspTargetsForBindings({
+                  bindings: stored.carriedObjectBindings.bindings,
+                  graspRegistry: this.#graspRegistry
+                }),
+                carryTaskSpaceTargets: stored.carriedObjectTaskSpaceTargets,
+                arrivalHeading: stored.arrivalHeading
+              });
+              this.#navigationState = {
+                planId,
+                status: "executing",
+                target: { ...stored.requestedTarget },
+                waypoints: stored.plan.waypoints.map((point) => ({ ...point })),
+                waypointIndex: stored.progress.waypoint_index
+              };
+              await options.persistenceSink?.(this.#capturePersistenceState());
+              return {
+                ...(prepared && frameSink && !options.persistenceSink
+                  ? { snapshot: this.snapshot() }
+                  : {}),
+                done: false
+              };
+            }
+          }
           this.#navigationState.status = result.completed ? "completed" : "blocked";
           const receipt = this.#receipt(
             result.completed,
@@ -1904,6 +2031,7 @@ export class HumanoidWorld {
             {
               ...(result.reason ? { reason: result.reason } : {}),
               travelledDistance: result.travelledDistance,
+              online_replans: onlineReplans,
               carry: {
                 binding_set: structuredClone(stored.carriedObjectBindings),
                 continuation: stored.carriedObjectContinuation
@@ -2485,7 +2613,8 @@ export class HumanoidWorld {
         id: object.id,
         position: { ...object.pose.position },
         rotation: { ...object.pose.rotation },
-        size: { ...object.size }
+        size: { ...object.size },
+        ...this.#observableArticulation(object.id, snapshot)
       }]));
     for (const objectId of trackedObjectIds) {
       if (observableObjects.has(objectId)) continue;
@@ -2496,7 +2625,8 @@ export class HumanoidWorld {
         id: objectId,
         position: { ...state.position },
         rotation: { ...state.rotation },
-        size: { ...descriptor.size }
+        size: { ...descriptor.size },
+        ...this.#observableArticulation(objectId, snapshot)
       });
     }
     return {
@@ -2511,6 +2641,38 @@ export class HumanoidWorld {
         option,
         observedFrame
       )
+    };
+  }
+
+  #observableArticulation(
+    objectId: string,
+    snapshot: HumanoidSimulationSnapshot
+  ): Pick<
+    HumanoidMotionOptionObservableObject,
+    "articulation" | "container" | "supportSurface"
+  > {
+    const descriptor = this.#scenario.objects.find((object) => object.id === objectId);
+    const capability = descriptor ? humanoidObjectCapability(descriptor) : undefined;
+    const observed = snapshot.objects[objectId]?.articulation;
+    if (!capability) return {};
+    return {
+      ...(capability.articulation && observed
+        ? {
+            articulation: {
+              jointId: capability.articulation.joint_id,
+              position: observed.position,
+              velocity: observed.velocity,
+              closedPosition: capability.articulation.closed_position,
+              openPosition: capability.articulation.open_position
+            }
+          }
+        : {}),
+      ...(capability.container
+        ? { container: structuredClone(capability.container) }
+        : {}),
+      ...(capability.supportSurface
+        ? { supportSurface: structuredClone(capability.supportSurface) }
+        : {})
     };
   }
 

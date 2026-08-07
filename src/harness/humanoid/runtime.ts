@@ -1,3 +1,4 @@
+import { z } from "zod";
 import {
   HUMANOID_END_EFFECTORS,
   type JsonValue,
@@ -32,12 +33,34 @@ import {
   navigationTransitClearanceMotionRejection,
   type NavigationTransitClearanceRequirement
 } from "./navigation-transit-clearance.js";
+import {
+  bindHumanoidSkill,
+  ActiveHumanoidSkillBindingSchema,
+  validateSkillPlanningReference,
+  type ActiveHumanoidSkillBinding
+} from "./skill-binding.js";
+import {
+  createHumanoidRecoveryPolicy,
+  humanoidRecoverySelectionAccepted,
+  HumanoidRecoveryPolicyStateSchema,
+  type HumanoidRecoveryPolicyState
+} from "./recovery-policy.js";
+import {
+  advanceHumanoidSkillPlan,
+  authorizeHumanoidSkillPlanNode,
+  registerHumanoidSkillPlan,
+  RegisteredHumanoidSkillPlanSchema,
+  type RegisteredHumanoidSkillPlan
+} from "./skill-plan.js";
+import { planAutonomousHumanoidSkill } from "./autonomous-skill-planner.js";
 
-type HumanoidPlanningActionName = "plan_whole_body_motion"
+type HumanoidPlanningActionName = "plan_humanoid_skill"
+  | "plan_whole_body_motion"
   | "plan_whole_body_motion_candidates"
   | "plan_humanoid_navigation";
 
-type HumanoidPhysicalActionName = "execute_whole_body_motion"
+type HumanoidPhysicalActionName = "execute_humanoid_skill"
+  | "execute_whole_body_motion"
   | "execute_humanoid_navigation";
 
 interface ManipulationBasePlacementRequirement {
@@ -57,8 +80,76 @@ interface RepeatedPlanningFailure {
   lastCode: string;
 }
 
+const HumanoidActionRuntimeStateSchema = z.object({
+  version: z.literal(1),
+  latest_physical_execution_revision: z.number().int().nonnegative(),
+  skill_plans: z.array(RegisteredHumanoidSkillPlanSchema),
+  active_skill_plan_transactions: z.record(
+    z.string().trim().min(1),
+    z.string().trim().min(1)
+  ),
+  active_skills: z.array(ActiveHumanoidSkillBindingSchema),
+  planning_skill_bindings: z.array(z.object({
+    planning_transaction_id: z.string().trim().min(1),
+    binding: ActiveHumanoidSkillBindingSchema
+  }).strict()),
+  recovery_policies: z.array(z.object({
+    agent_id: z.string().trim().min(1),
+    policy: HumanoidRecoveryPolicyStateSchema
+  }).strict())
+}).strict().superRefine((state, context) => {
+  const planIds = new Set(state.skill_plans.map(({ transaction_id }) => transaction_id));
+  if (planIds.size !== state.skill_plans.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["skill_plans"],
+      message: "Persisted Skill plan transaction identities must be unique"
+    });
+  }
+  for (const [agentId, transactionId] of Object.entries(
+    state.active_skill_plan_transactions
+  )) {
+    const plan = state.skill_plans.find((entry) => entry.transaction_id === transactionId);
+    if (!plan || plan.agent_id !== agentId) {
+      context.addIssue({
+        code: "custom",
+        path: ["active_skill_plan_transactions", agentId],
+        message: "Active Skill plan index does not reference its Agent plan"
+      });
+    }
+  }
+  const activeAgents = state.active_skills.map(({ agent_id }) => agent_id);
+  if (new Set(activeAgents).size !== activeAgents.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["active_skills"],
+      message: "Only one active Skill binding is allowed per Agent"
+    });
+  }
+  const planningIds = state.planning_skill_bindings.map(
+    ({ planning_transaction_id }) => planning_transaction_id
+  );
+  if (new Set(planningIds).size !== planningIds.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["planning_skill_bindings"],
+      message: "Planning transaction Skill bindings must be unique"
+    });
+  }
+  const recoveryAgents = state.recovery_policies.map(({ agent_id }) => agent_id);
+  if (new Set(recoveryAgents).size !== recoveryAgents.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["recovery_policies"],
+      message: "Only one recovery policy is allowed per Agent"
+    });
+  }
+});
+
 const MANIPULATION_APPROACH_RADIUS_METERS = 1;
 const MANIPULATION_BASE_TARGET_TOLERANCE_METERS = 0.04;
+const SKILL_AUTHORITY_OBJECT_DRIFT_METERS = 0.015;
+const SKILL_AUTHORITY_ORIENTATION_DRIFT_RADIANS = 0.05;
 
 export interface HumanoidPhysicalExecutionIntent {
   transactionId: string;
@@ -125,8 +216,10 @@ export interface HumanoidActionRuntimeOptions {
     executionTransactionId: string;
   }) => ScenarioBlockRemovalTransaction | Promise<ScenarioBlockRemovalTransaction>;
   receipts?: Readonly<Record<string, HumanoidActionReceipt>>;
+  state?: JsonValue | null;
   realtimeExecution?: boolean;
   retainPhysicalTerminals?: boolean;
+  requireSkillBinding?: boolean;
   signal?: AbortSignal;
 }
 
@@ -142,6 +235,7 @@ export class HumanoidActionRuntime {
   readonly #prepareBlockRemoval: HumanoidActionRuntimeOptions["prepareBlockRemoval"];
   readonly #realtimeExecution: boolean;
   readonly #retainPhysicalTerminals: boolean;
+  readonly #requireSkillBinding: boolean;
   readonly #signal: AbortSignal | undefined;
   readonly #receipts = new Map<string, HumanoidActionReceipt>();
   readonly #transactions = new Map<string, {
@@ -154,6 +248,18 @@ export class HumanoidActionRuntime {
   readonly #planChannels = new Map<string, HumanoidBodyChannel[]>();
   readonly #inFlightTransactions = new Set<string>();
   readonly #observationRevisionByAgent = new Map<string, number>();
+  readonly #observationByAgent = new Map<string, HumanoidWorldObservation>();
+  readonly #activeSkillByAgent = new Map<string, ActiveHumanoidSkillBinding>();
+  readonly #skillByPlanningTransactionId = new Map<
+    string,
+    ActiveHumanoidSkillBinding
+  >();
+  readonly #recoveryPolicyByAgent = new Map<string, HumanoidRecoveryPolicyState>();
+  readonly #skillPlansByTransactionId = new Map<
+    string,
+    RegisteredHumanoidSkillPlan
+  >();
+  readonly #activeSkillPlanTransactionByAgent = new Map<string, string>();
   readonly #planningAttemptRevisionByAgent = new Map<string, number>();
   readonly #manipulationBasePlacementRequirementByAgent = new Map<
     string,
@@ -180,7 +286,11 @@ export class HumanoidActionRuntime {
     this.#prepareBlockRemoval = options.prepareBlockRemoval;
     this.#realtimeExecution = options.realtimeExecution ?? false;
     this.#retainPhysicalTerminals = options.retainPhysicalTerminals ?? false;
+    this.#requireSkillBinding = options.requireSkillBinding ?? false;
     this.#signal = options.signal;
+    if (options.state !== undefined && options.state !== null) {
+      this.#restoreState(options.state);
+    }
     for (const [transactionId, source] of Object.entries(options.receipts ?? {})) {
       const receipt = structuredClone(source);
       if (receipt.transactionId !== transactionId) {
@@ -207,7 +317,8 @@ export class HumanoidActionRuntime {
         }
       }
       if (receipt.accepted
-        && (receipt.action === "execute_whole_body_motion"
+        && (receipt.action === "execute_humanoid_skill"
+          || receipt.action === "execute_whole_body_motion"
           || receipt.action === "execute_humanoid_navigation")) {
         this.#latestPhysicalExecutionRevision = Math.max(
           this.#latestPhysicalExecutionRevision,
@@ -226,7 +337,8 @@ export class HumanoidActionRuntime {
         promise: Promise.resolve(receipt)
       });
       if (receipt.accepted
-        && (receipt.action === "plan_whole_body_motion"
+        && (receipt.action === "plan_humanoid_skill"
+          || receipt.action === "plan_whole_body_motion"
           || receipt.action === "plan_whole_body_motion_candidates"
           || receipt.action === "plan_humanoid_navigation")) {
         const planId = jsonObject(receipt.detail)?.plan_id;
@@ -236,6 +348,64 @@ export class HumanoidActionRuntime {
       }
     }
     this.#pruneTransactionHistory();
+  }
+
+  persistenceState(): JsonValue {
+    return jsonValue(HumanoidActionRuntimeStateSchema.parse({
+      version: 1,
+      latest_physical_execution_revision: this.#latestPhysicalExecutionRevision,
+      skill_plans: [...this.#skillPlansByTransactionId.values()]
+        .map((plan) => structuredClone(plan)),
+      active_skill_plan_transactions: Object.fromEntries(
+        this.#activeSkillPlanTransactionByAgent
+      ),
+      active_skills: [...this.#activeSkillByAgent.values()]
+        .map((binding) => structuredClone(binding)),
+      planning_skill_bindings: [...this.#skillByPlanningTransactionId]
+        .map(([planningTransactionId, binding]) => ({
+          planning_transaction_id: planningTransactionId,
+          binding: structuredClone(binding)
+        })),
+      recovery_policies: [...this.#recoveryPolicyByAgent]
+        .map(([agentId, policy]) => ({
+          agent_id: agentId,
+          policy: structuredClone(policy)
+        }))
+    }));
+  }
+
+  #restoreState(rawState: JsonValue): void {
+    const state = HumanoidActionRuntimeStateSchema.parse(rawState);
+    const currentWorldRevision = this.#world.snapshot().worldRevision;
+    if (state.latest_physical_execution_revision > currentWorldRevision) {
+      throw new Error(
+        "Humanoid action runtime state is ahead of the authoritative world"
+      );
+    }
+    this.#latestPhysicalExecutionRevision = state.latest_physical_execution_revision;
+    for (const plan of state.skill_plans) {
+      this.#skillPlansByTransactionId.set(
+        plan.transaction_id,
+        structuredClone(plan)
+      );
+    }
+    for (const [agentId, transactionId] of Object.entries(
+      state.active_skill_plan_transactions
+    )) {
+      this.#activeSkillPlanTransactionByAgent.set(agentId, transactionId);
+    }
+    for (const binding of state.active_skills) {
+      this.#activeSkillByAgent.set(binding.agent_id, structuredClone(binding));
+    }
+    for (const entry of state.planning_skill_bindings) {
+      this.#skillByPlanningTransactionId.set(
+        entry.planning_transaction_id,
+        structuredClone(entry.binding)
+      );
+    }
+    for (const { agent_id: agentId, policy } of state.recovery_policies) {
+      this.#recoveryPolicyByAgent.set(agentId, structuredClone(policy));
+    }
   }
 
   snapshot(): HumanoidWorldSnapshot {
@@ -257,6 +427,15 @@ export class HumanoidActionRuntime {
     const observedRevision = this.#observationRevisionByAgent.get(
       normalizedAgentId
     );
+    const latestFailureKey = this.#latestPlanningFailureKeyByAgent.get(
+      normalizedAgentId
+    );
+    const latestFailure = latestFailureKey === undefined
+      ? undefined
+      : this.#planningFailureByFingerprint.get(latestFailureKey);
+    const hasCurrentPlanningFailure = latestFailure !== undefined
+      && latestFailure.physicalExecutionRevision
+        === this.#latestPhysicalExecutionRevision;
     if (name === "observe_humanoid") {
       const lastPlanningAttempt = this.#planningAttemptRevisionByAgent.get(
         normalizedAgentId
@@ -265,17 +444,38 @@ export class HumanoidActionRuntime {
         || observedRevision < this.#latestPhysicalExecutionRevision
         || (lastPlanningAttempt ?? -1) >= observedRevision;
     }
+    if (name === "begin_humanoid_skill") {
+      const activePlan = this.#activeSkillPlan(normalizedAgentId);
+      return observedRevision !== undefined
+        && observedRevision >= this.#latestPhysicalExecutionRevision
+        && this.#observationByAgent.has(normalizedAgentId)
+        && (!this.#requireSkillBinding
+          || (activePlan !== null
+            && !this.#activeSkillByAgent.has(normalizedAgentId)));
+    }
+    if (name === "submit_humanoid_skill_plan") {
+      const observation = this.#observationByAgent.get(normalizedAgentId);
+      const activePlan = this.#activeSkillPlan(normalizedAgentId);
+      return observedRevision !== undefined
+        && observedRevision >= this.#latestPhysicalExecutionRevision
+        && observation !== undefined
+        && (!this.#requireSkillBinding
+          || (!this.#activeSkillByAgent.has(normalizedAgentId)
+            && (activePlan === null
+              || activePlan.world_revision !== observation.worldRevision))
+          || hasCurrentPlanningFailure);
+    }
     if (!isPlanningAction(name)) return true;
     if (observedRevision === undefined
       || observedRevision < this.#latestPhysicalExecutionRevision) {
       return false;
     }
-    const latestFailureKey = this.#latestPlanningFailureKeyByAgent.get(
-      normalizedAgentId
-    );
-    const latestFailure = latestFailureKey === undefined
-      ? undefined
-      : this.#planningFailureByFingerprint.get(latestFailureKey);
+    if (this.#requireSkillBinding) {
+      const skill = this.#activeSkillByAgent.get(normalizedAgentId);
+      if (!skill
+        || skill.observed_world_revision < this.#latestPhysicalExecutionRevision
+        || skill.planning_action !== name) return false;
+    }
     if (latestFailure?.action === name
       && latestFailure.physicalExecutionRevision
         === this.#latestPhysicalExecutionRevision
@@ -287,6 +487,7 @@ export class HumanoidActionRuntime {
 
   planningToolState(agentId: string): JsonValue {
     const normalizedAgentId = agentId.trim();
+    const activeSkill = this.#activeSkillByAgent.get(normalizedAgentId);
     const latestFailureKey = this.#latestPlanningFailureKeyByAgent.get(
       normalizedAgentId
     );
@@ -314,6 +515,7 @@ export class HumanoidActionRuntime {
     );
     return jsonValue({
       planning_actions: [
+        "plan_humanoid_skill",
         "plan_whole_body_motion_candidates",
         "plan_humanoid_navigation"
       ].map((action) => ({
@@ -326,6 +528,20 @@ export class HumanoidActionRuntime {
       cooldown,
       transit_clearance: transitClearance
         ? navigationTransitClearanceContext(transitClearance)
+        : null,
+      recovery_policy: this.#recoveryPolicyByAgent.get(normalizedAgentId) ?? null,
+      skill_plan: this.#activeSkillPlan(normalizedAgentId),
+      active_skill: activeSkill
+        ? {
+            transaction_id: activeSkill.transaction_id,
+            skill_plan_transaction_id: activeSkill.skill_plan_transaction_id,
+            skill_node_id: activeSkill.skill_node_id,
+            invocation: activeSkill.invocation,
+            phase: activeSkill.phase,
+            phase_authority: activeSkill.phase_authority,
+            planning_action: activeSkill.planning_action,
+            observed_world_revision: activeSkill.observed_world_revision
+          }
         : null
     });
   }
@@ -462,15 +678,72 @@ export class HumanoidActionRuntime {
       : baseReceipt;
     assertNormalizedReceiptIdentity(baseReceipt, receipt);
     this.#receipts.set(transactionId, receipt);
-    if (receipt.accepted
-      && (receipt.action === "execute_whole_body_motion"
-        || receipt.action === "execute_humanoid_navigation")) {
-      this.#latestPhysicalExecutionRevision = Math.max(
-        this.#latestPhysicalExecutionRevision,
-        receipt.worldAfterRevision
-      );
-      this.#planningFailureByFingerprint.clear();
-      this.#latestPlanningFailureKeyByAgent.clear();
+    if (receipt.accepted && isPlanningAction(receipt.action)) {
+      const skill = this.#activeSkillByAgent.get(receipt.agentId);
+      if (skill) {
+        this.#skillByPlanningTransactionId.set(
+          receipt.transactionId,
+          structuredClone(skill)
+        );
+      }
+    }
+    if (receipt.action === "execute_humanoid_skill"
+      || receipt.action === "execute_whole_body_motion"
+      || receipt.action === "execute_humanoid_navigation") {
+      const planningTransactionId = jsonObject(receipt.input)
+        ?.planning_transaction_id;
+      const skill = typeof planningTransactionId === "string"
+        ? this.#skillByPlanningTransactionId.get(planningTransactionId)
+        : undefined;
+      const physicallyAttempted = receipt.accepted
+        || receipt.frameCount > 0
+        || receipt.worldAfterRevision > receipt.worldBeforeRevision;
+      if (physicallyAttempted) {
+        this.#latestPhysicalExecutionRevision = Math.max(
+          this.#latestPhysicalExecutionRevision,
+          receipt.worldAfterRevision
+        );
+        this.#planningFailureByFingerprint.clear();
+        this.#latestPlanningFailureKeyByAgent.clear();
+        this.#activeSkillByAgent.clear();
+        this.#observationByAgent.clear();
+      }
+      if (skill && receipt.accepted) {
+        this.#recoveryPolicyByAgent.delete(skill.agent_id);
+      } else if (skill && receipt.frameCount > 0
+        && typeof planningTransactionId === "string") {
+        this.#recoveryPolicyByAgent.set(
+          skill.agent_id,
+          createHumanoidRecoveryPolicy({
+            executionTransactionId: receipt.transactionId,
+            planningTransactionId,
+            physicalFailureCode: receipt.code,
+            worldRevision: receipt.worldAfterRevision,
+            binding: skill
+          })
+        );
+      }
+      const skillPlanTransactionId = skill?.skill_plan_transaction_id;
+      const skillPlan = skillPlanTransactionId
+        ? this.#skillPlansByTransactionId.get(skillPlanTransactionId)
+        : undefined;
+      if (skill && skillPlan && receipt.accepted) {
+        const advanced = advanceHumanoidSkillPlan({
+          plan: skillPlan,
+          binding: skill,
+          worldRevision: receipt.worldAfterRevision,
+          executionSucceeded: true
+        });
+        if (advanced) {
+          this.#skillPlansByTransactionId.set(skillPlan.transaction_id, advanced);
+        }
+      } else if (skillPlanTransactionId && receipt.frameCount > 0) {
+        this.#skillPlansByTransactionId.delete(skillPlanTransactionId);
+        this.#activeSkillPlanTransactionByAgent.delete(skill!.agent_id);
+      }
+      if (typeof planningTransactionId === "string") {
+        this.#skillByPlanningTransactionId.delete(planningTransactionId);
+      }
     }
     this.#recordPlanningOutcome(receipt);
     this.#recordNavigationTransitClearance(receipt);
@@ -513,7 +786,8 @@ export class HumanoidActionRuntime {
   #recordNavigationTransitClearance(receipt: HumanoidActionReceipt): void {
     const motionAgentId = "humanoid-motion-reference";
     if (receipt.accepted
-      && (receipt.action === "execute_whole_body_motion"
+      && (receipt.action === "execute_humanoid_skill"
+        || receipt.action === "execute_whole_body_motion"
         || receipt.action === "execute_humanoid_navigation")) {
       this.#navigationTransitClearanceRequirementByAgent.delete(motionAgentId);
       return;
@@ -534,6 +808,91 @@ export class HumanoidActionRuntime {
         requirement
       );
     }
+  }
+
+  #renewObservationAuthority(agentId: string): HumanoidWorldObservation | undefined {
+    const observed = this.#observationByAgent.get(agentId);
+    if (!observed) return undefined;
+    const currentRevision = this.#world.snapshot().worldRevision;
+    if (observed.worldRevision === currentRevision) return observed;
+    if (observed.worldRevision < this.#latestPhysicalExecutionRevision) {
+      return undefined;
+    }
+    const current = this.#world.observe();
+    if (!humanoidSkillObservationCompatible(observed, current)) return undefined;
+    this.#observationRevisionByAgent.set(agentId, current.worldRevision);
+    this.#observationByAgent.set(agentId, current);
+    return current;
+  }
+
+  #renewPlanningSkillAuthority(agentId: string):
+    | { accepted: true; binding: ActiveHumanoidSkillBinding }
+    | { accepted: false; code: string; detail: JsonValue } {
+    const previous = this.#activeSkillByAgent.get(agentId);
+    if (!previous) {
+      return {
+        accepted: false,
+        code: "active_skill_required",
+        detail: jsonValue({
+          automatic_actuation: false,
+          recovery: "Observe, submit a local Skill DAG, and bind one model-selected Skill phase"
+        })
+      };
+    }
+    const observation = this.#renewObservationAuthority(agentId);
+    if (!observation) {
+      return {
+        accepted: false,
+        code: "skill_observation_changed",
+        detail: jsonValue({
+          automatic_actuation: false,
+          skill: previous.invocation.skill,
+          observed_world_revision: previous.observed_world_revision,
+          current_world_revision: this.#world.snapshot().worldRevision,
+          recovery: "The physical state changed materially; observe and submit a new local Skill DAG"
+        })
+      };
+    }
+    if (previous.observed_world_revision === observation.worldRevision) {
+      return { accepted: true, binding: previous };
+    }
+    const rebound = bindHumanoidSkill({
+      transactionId: previous.transaction_id,
+      agentId,
+      request: {
+        skill_plan_transaction_id: previous.skill_plan_transaction_id,
+        skill_node_id: previous.skill_node_id,
+        invocation: previous.invocation,
+        phase: previous.phase
+      },
+      observation
+    });
+    if (!rebound.accepted) return rebound;
+    this.#activeSkillByAgent.set(agentId, rebound.binding);
+    const planTransactionId = rebound.binding.skill_plan_transaction_id;
+    const plan = planTransactionId
+      ? this.#skillPlansByTransactionId.get(planTransactionId)
+      : undefined;
+    if (plan) {
+      this.#skillPlansByTransactionId.set(plan.transaction_id, {
+        ...plan,
+        world_revision: observation.worldRevision
+      });
+    }
+    return { accepted: true, binding: rebound.binding };
+  }
+
+  #planningSkillDetail(agentId: string): Record<string, JsonValue> {
+    const binding = this.#activeSkillByAgent.get(agentId);
+    return binding ? { skill_binding: jsonValue(binding) } : {};
+  }
+
+  #activeSkillPlan(agentId: string): RegisteredHumanoidSkillPlan | null {
+    const transactionId = this.#activeSkillPlanTransactionByAgent.get(agentId);
+    const plan = transactionId
+      ? this.#skillPlansByTransactionId.get(transactionId)
+      : undefined;
+    return plan ? structuredClone(plan) : null;
   }
 
   async #ensureReceiptCommitted(receipt: HumanoidActionReceipt): Promise<void> {
@@ -591,6 +950,31 @@ export class HumanoidActionRuntime {
           }
         };
       }
+      if (this.#requireSkillBinding && name !== "plan_whole_body_motion") {
+        const renewed = this.#renewPlanningSkillAuthority(invocation.agentId);
+        if (!renewed.accepted) {
+          return {
+            accepted: false,
+            code: renewed.code,
+            channels: [],
+            detail: renewed.detail
+          };
+        }
+        const skillReference = validateSkillPlanningReference({
+          binding: renewed.binding,
+          action: name,
+          rawInput,
+          currentWorldRevision: this.#world.snapshot().worldRevision
+        });
+        if (!skillReference.accepted) {
+          return {
+            accepted: false,
+            code: skillReference.code,
+            channels: [],
+            detail: skillReference.detail
+          };
+        }
+      }
       this.#planningAttemptRevisionByAgent.set(
         invocation.agentId,
         this.#world.snapshot().worldRevision
@@ -634,6 +1018,8 @@ export class HumanoidActionRuntime {
         invocation.agentId,
         observation.worldRevision
       );
+      this.#observationByAgent.set(invocation.agentId, observation);
+      this.#activeSkillByAgent.delete(invocation.agentId);
       if (invocation.agentId === "humanoid-motion-reference") {
         const requirement = manipulationBasePlacementRequirement(observation);
         if (requirement) {
@@ -652,6 +1038,348 @@ export class HumanoidActionRuntime {
         code: "humanoid_observed",
         channels: [],
         detail: modelObservation(observation)
+      };
+    }
+    if (name === "submit_humanoid_skill_plan") {
+      const proposal = HumanoidActionInputs.submit_humanoid_skill_plan.parse(rawInput);
+      const observation = this.#renewObservationAuthority(invocation.agentId);
+      const currentWorldRevision = this.#world.snapshot().worldRevision;
+      if (!observation || observation.worldRevision !== currentWorldRevision) {
+        return {
+          accepted: false,
+          code: "fresh_skill_observation_required",
+          channels: [],
+          detail: {
+            automatic_actuation: false,
+            observed_world_revision: observation?.worldRevision ?? null,
+            current_world_revision: currentWorldRevision,
+            recovery: "Call observe_humanoid before submitting a local Skill DAG"
+          }
+        };
+      }
+      const previous = this.#activeSkillPlanTransactionByAgent.get(invocation.agentId);
+      if (previous) this.#skillPlansByTransactionId.delete(previous);
+      const plan = registerHumanoidSkillPlan({
+        transactionId: invocation.transactionId,
+        agentId: invocation.agentId,
+        proposal,
+        observedFrame: observation.frame,
+        worldRevision: observation.worldRevision
+      });
+      this.#skillPlansByTransactionId.set(invocation.transactionId, plan);
+      this.#activeSkillPlanTransactionByAgent.set(
+        invocation.agentId,
+        invocation.transactionId
+      );
+      this.#activeSkillByAgent.delete(invocation.agentId);
+      this.#latestPlanningFailureKeyByAgent.delete(invocation.agentId);
+      return {
+        accepted: true,
+        code: "humanoid_skill_plan_registered",
+        channels: [],
+        detail: {
+          automatic_actuation: false,
+          skill_plan: plan
+        }
+      };
+    }
+    if (name === "begin_humanoid_skill") {
+      const request = HumanoidActionInputs.begin_humanoid_skill.parse(rawInput);
+      const observation = this.#renewObservationAuthority(invocation.agentId);
+      const currentWorldRevision = this.#world.snapshot().worldRevision;
+      if (!observation || observation.worldRevision !== currentWorldRevision) {
+        return {
+          accepted: false,
+          code: "fresh_skill_observation_required",
+          channels: [],
+          detail: {
+            automatic_actuation: false,
+            observed_world_revision: observation?.worldRevision ?? null,
+            current_world_revision: currentWorldRevision,
+            recovery: "Call observe_humanoid before binding a skill phase"
+          }
+        };
+      }
+      const planTransactionId = request.skill_plan_transaction_id;
+      let plan = planTransactionId
+        ? this.#skillPlansByTransactionId.get(planTransactionId)
+        : undefined;
+      if (plan && plan.agent_id === invocation.agentId
+        && plan.world_revision !== currentWorldRevision) {
+        plan = { ...plan, world_revision: currentWorldRevision };
+        this.#skillPlansByTransactionId.set(plan.transaction_id, plan);
+      }
+      if (this.#requireSkillBinding || planTransactionId || request.skill_node_id) {
+        const nodeAuthority = authorizeHumanoidSkillPlanNode({
+          plan,
+          planTransactionId,
+          nodeId: request.skill_node_id,
+          invocation: request.invocation,
+          agentId: invocation.agentId,
+          currentWorldRevision
+        });
+        if (!nodeAuthority.accepted) {
+          return {
+            accepted: false,
+            code: nodeAuthority.code,
+            channels: [],
+            detail: nodeAuthority.detail
+          };
+        }
+      }
+      const result = bindHumanoidSkill({
+        transactionId: invocation.transactionId,
+        agentId: invocation.agentId,
+        request,
+        observation
+      });
+      if (!result.accepted) {
+        return {
+          accepted: false,
+          code: result.code,
+          channels: [],
+          detail: result.detail
+        };
+      }
+      const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
+      if (recovery
+        && !humanoidRecoverySelectionAccepted(recovery, result.binding.invocation)) {
+        return {
+          accepted: false,
+          code: "recovery_skill_selection_required",
+          channels: [],
+          detail: {
+            automatic_actuation: false,
+            recovery_policy: recovery,
+            selected_skill: result.binding.invocation.skill,
+            reason: "The selected skill is not an authorized recovery entry for the last physical failure"
+          }
+        };
+      }
+      this.#activeSkillByAgent.set(invocation.agentId, result.binding);
+      return {
+        accepted: true,
+        code: "humanoid_skill_bound",
+        channels: [],
+        detail: {
+          automatic_actuation: false,
+          binding: result.binding,
+          recovery_policy: recovery ?? null
+        }
+      };
+    }
+    if (name === "plan_humanoid_skill") {
+      HumanoidActionInputs.plan_humanoid_skill.parse(rawInput);
+      const binding = this.#activeSkillByAgent.get(invocation.agentId);
+      const observation = this.#observationByAgent.get(invocation.agentId);
+      if (!binding || !observation) {
+        return {
+          accepted: false,
+          code: "autonomous_skill_authority_missing",
+          channels: [],
+          detail: {
+            automatic_actuation: false,
+            reason: "A current Skill binding and physical observation are required"
+          }
+        };
+      }
+      let plan: ReturnType<typeof planAutonomousHumanoidSkill>;
+      try {
+        plan = planAutonomousHumanoidSkill({ binding, observation });
+      } catch (error) {
+        return {
+          accepted: false,
+          code: "autonomous_skill_solver_failed",
+          channels: [],
+          detail: {
+            ...this.#planningSkillDetail(invocation.agentId),
+            automatic_actuation: false,
+            failure_class: "semantic_or_geometric_infeasibility",
+            reason: error instanceof Error ? error.message : String(error)
+          }
+        };
+      }
+      if (plan.kind === "motion") {
+        const result = await this.#world.planWholeBodyMotionCandidates(plan.batch);
+        if (result.accepted) this.#planChannels.set(result.planId, result.channels);
+        return {
+          accepted: result.accepted,
+          code: result.accepted
+            ? "autonomous_skill_motion_validated"
+            : "autonomous_skill_motion_rejected",
+          channels: result.channels,
+          detail: {
+            ...this.#planningSkillDetail(invocation.agentId),
+            automatic_actuation: false,
+            autonomous_plan_kind: "motion",
+            plan_id: result.planId,
+            created_revision: result.createdRevision,
+            expires_revision: result.expiresRevision,
+            intent_sha256: result.intentSha256,
+            selection: result.selection,
+            selected_candidate_id: result.selectedCandidateId,
+            selected_rank: result.selectedRank,
+            candidate_count: result.candidates.length,
+            option: result.option,
+            motion: result.motion,
+            candidates: result.candidates.map((candidate) => ({
+              rank: candidate.rank,
+              selected: candidate.planId === result.selectedCandidateId,
+              intent: candidate.intent,
+              validation: {
+                feasible: candidate.validation.feasible,
+                failures: candidate.validation.failures,
+                evidence: candidate.validation.evidence
+              }
+            }))
+          }
+        };
+      }
+      const attempts: Array<{
+        target: Vec3;
+        score: number;
+        accepted: boolean;
+        reason: string | null;
+      }> = [];
+      let selected: Awaited<ReturnType<HumanoidWorld["planNavigation"]>> | null = null;
+      for (const candidate of plan.targets.slice(0, 8)) {
+        const result = await this.#world.planNavigation(
+          candidate.target,
+          candidate.arrivalHeading
+        );
+        attempts.push({
+          target: { ...candidate.target },
+          score: candidate.score,
+          accepted: result.accepted,
+          reason: result.reason ?? null
+        });
+        if (result.accepted) {
+          selected = result;
+          break;
+        }
+      }
+      if (!selected) {
+        return {
+          accepted: false,
+          code: "autonomous_skill_route_rejected",
+          channels: ["locomotion"],
+          detail: {
+            ...this.#planningSkillDetail(invocation.agentId),
+            automatic_actuation: false,
+            autonomous_plan_kind: "navigation",
+            failure_class: "path_or_physical_preview_infeasible",
+            attempts
+          }
+        };
+      }
+      this.#planChannels.set(selected.planId, ["locomotion"]);
+      return {
+        accepted: true,
+        code: "autonomous_skill_route_validated",
+        channels: ["locomotion"],
+        detail: {
+          ...this.#planningSkillDetail(invocation.agentId),
+          automatic_actuation: false,
+          autonomous_plan_kind: "navigation",
+          plan_id: selected.planId,
+          created_revision: selected.createdRevision,
+          expires_revision: selected.expiresRevision,
+          intent_sha256: selected.intentSha256,
+          target: selected.target,
+          chunk_target: selected.chunkTarget,
+          arrival_heading: selected.arrivalHeading,
+          waypoints: selected.waypoints,
+          distance: selected.distance,
+          remaining_distance: selected.remainingDistance,
+          attempts
+        }
+      };
+    }
+    if (name === "execute_humanoid_skill") {
+      const input = HumanoidActionInputs.execute_humanoid_skill.parse(rawInput);
+      const reference = this.#planningReference(
+        input.planning_transaction_id,
+        ["plan_humanoid_skill"]
+      );
+      if (!reference.accepted) return reference.result;
+      const planningReceipt = this.#receipts.get(input.planning_transaction_id);
+      const planKind = planningReceipt
+        ? jsonObject(planningReceipt.detail)?.autonomous_plan_kind
+        : undefined;
+      if (planKind !== "motion" && planKind !== "navigation") {
+        return {
+          accepted: false,
+          code: "autonomous_skill_plan_kind_invalid",
+          channels: [],
+          detail: {
+            planning_transaction_id: input.planning_transaction_id,
+            automatic_actuation: false
+          }
+        };
+      }
+      const channels = this.#planChannels.get(reference.planId)
+        ?? (planKind === "navigation" ? ["locomotion"] : []);
+      if (!this.#world.consumablePlanIds().includes(reference.planId)) {
+        this.#planChannels.delete(reference.planId);
+        return {
+          accepted: false,
+          code: "plan_stale",
+          channels,
+          detail: {
+            planning_transaction_id: input.planning_transaction_id,
+            plan_id: reference.planId,
+            autonomous_plan_kind: planKind,
+            automatic_actuation: false
+          }
+        };
+      }
+      await this.#beforePhysicalExecution?.({
+        transactionId: invocation.transactionId,
+        agentId: invocation.agentId,
+        action: name,
+        fingerprint: invocation.fingerprint,
+        planningTransactionId: input.planning_transaction_id,
+        planId: reference.planId
+      });
+      const options = {
+        realtime: this.#realtimeExecution,
+        retainTerminal: this.#retainPhysicalTerminals,
+        ...(this.#physicalFrameSink
+          ? { persistenceSink: this.#physicalFrameSink }
+          : {}),
+        ...(this.#signal ? { signal: this.#signal } : {})
+      };
+      const result = planKind === "motion"
+        ? await this.#world.executeWholeBodyMotion(
+            reference.planId,
+            this.#frameSink,
+            options
+          )
+        : await this.#world.executeNavigation(
+            reference.planId,
+            this.#frameSink,
+            options
+          );
+      if (!this.#retainPhysicalTerminals) this.#planChannels.delete(reference.planId);
+      return {
+        accepted: result.accepted,
+        code: result.code,
+        channels,
+        causalFrameCount: result.frames,
+        causalWorldAfterRevision: result.finalSnapshot.worldRevision,
+        detail: {
+          planning_transaction_id: input.planning_transaction_id,
+          planning_action: "plan_humanoid_skill",
+          ...reference.candidateSelection,
+          plan_id: reference.planId,
+          autonomous_plan_kind: planKind,
+          frames: result.frames,
+          ...(result.terminalResultSha256
+            ? { terminal_result_sha256: result.terminalResultSha256 }
+            : {}),
+          result: result.detail,
+          final: conciseRobot(result.finalSnapshot.robot)
+        }
       };
     }
     if (name === "plan_whole_body_motion") {
@@ -679,6 +1407,7 @@ export class HumanoidActionRuntime {
         code: result.accepted ? "whole_body_plan_validated" : "whole_body_plan_rejected",
         channels: result.channels,
         detail: {
+          ...this.#planningSkillDetail(invocation.agentId),
           plan_id: result.planId,
           created_revision: result.createdRevision,
           expires_revision: result.expiresRevision,
@@ -728,6 +1457,7 @@ export class HumanoidActionRuntime {
           : "whole_body_candidates_rejected",
         channels: result.channels,
         detail: {
+          ...this.#planningSkillDetail(invocation.agentId),
           plan_id: result.planId,
           objective: batch.objective,
           created_revision: result.createdRevision,
@@ -857,6 +1587,7 @@ export class HumanoidActionRuntime {
         code: result.accepted ? "humanoid_route_validated" : "humanoid_route_rejected",
         channels: ["locomotion"],
         detail: {
+          ...this.#planningSkillDetail(invocation.agentId),
           plan_id: result.planId,
           created_revision: result.createdRevision,
           expires_revision: result.expiresRevision,
@@ -1028,6 +1759,16 @@ export class HumanoidActionRuntime {
         receipt.action
       );
     }
+    if (this.#requireSkillBinding
+      && receipt.action !== "plan_whole_body_motion"
+      && !this.#skillByPlanningTransactionId.has(transactionId)) {
+      return rejectedPlanningReference(
+        "planning_skill_authority_missing",
+        transactionId,
+        expectedActions,
+        receipt.action
+      );
+    }
     const planId = jsonObject(receipt.detail)?.plan_id;
     if (typeof planId !== "string" || !planId) {
       return rejectedPlanningReference(
@@ -1041,7 +1782,8 @@ export class HumanoidActionRuntime {
     const candidateCount = detail?.candidate_count;
     const selectedRank = detail?.selected_rank;
     const selectedCandidateId = detail?.selected_candidate_id;
-    const candidateSelection = receipt.action === "plan_whole_body_motion_candidates"
+    const candidateSelection = (receipt.action === "plan_whole_body_motion_candidates"
+        || receipt.action === "plan_humanoid_skill")
       && typeof candidateCount === "number"
       && Number.isSafeInteger(candidateCount)
       && typeof selectedRank === "number"
@@ -1064,9 +1806,95 @@ export class HumanoidActionRuntime {
 }
 
 function isPlanningAction(action: HumanoidActionName): action is HumanoidPlanningActionName {
-  return action === "plan_whole_body_motion"
+  return action === "plan_humanoid_skill"
+    || action === "plan_whole_body_motion"
     || action === "plan_whole_body_motion_candidates"
     || action === "plan_humanoid_navigation";
+}
+
+function humanoidSkillObservationCompatible(
+  observed: HumanoidWorldObservation,
+  current: HumanoidWorldObservation
+): boolean {
+  if (observed.robot.fallen !== current.robot.fallen
+    || pointDistance(observed.robot.rootPosition, current.robot.rootPosition)
+      > MANIPULATION_BASE_TARGET_TOLERANCE_METERS
+    || quaternionDistance(
+      observed.robot.rootRotation,
+      current.robot.rootRotation
+    ) > SKILL_AUTHORITY_ORIENTATION_DRIFT_RADIANS) {
+    return false;
+  }
+  const observedObjects = new Map(observed.interaction.object_world_model.objects
+    .filter(({ status }) => status === "visible")
+    .map((object) => [object.id, object]));
+  const currentObjects = new Map(current.interaction.object_world_model.objects
+    .filter(({ status }) => status === "visible")
+    .map((object) => [object.id, object]));
+  if (observedObjects.size !== currentObjects.size) return false;
+  for (const [objectId, before] of observedObjects) {
+    const after = currentObjects.get(objectId);
+    if (!after
+      || pointDistance(before.pose.position, after.pose.position)
+        > SKILL_AUTHORITY_OBJECT_DRIFT_METERS
+      || quaternionDistance(before.pose.rotation, after.pose.rotation)
+        > SKILL_AUTHORITY_ORIENTATION_DRIFT_RADIANS
+      || before.articulation?.joint_id !== after.articulation?.joint_id
+      || nullableDistance(
+        before.articulation?.position,
+        after.articulation?.position
+      ) > SKILL_AUTHORITY_OBJECT_DRIFT_METERS) {
+      return false;
+    }
+  }
+  if (!sameBindings(
+    observed.interaction.carrying.bindings,
+    current.interaction.carrying.bindings
+  )) return false;
+  const observedSolids = new Map(observed.solidTokens.map((solid) => [solid.id, solid]));
+  const currentSolids = new Map(current.solidTokens.map((solid) => [solid.id, solid]));
+  if (observedSolids.size !== currentSolids.size) return false;
+  for (const [solidId, before] of observedSolids) {
+    const after = currentSolids.get(solidId);
+    if (!after
+      || pointDistance(before.center, after.center) > 1e-9
+      || pointDistance(before.size, after.size) > 1e-9) return false;
+  }
+  return true;
+}
+
+function pointDistance(left: Vec3, right: Vec3): number {
+  return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z);
+}
+
+function quaternionDistance(
+  left: { x: number; y: number; z: number; w: number },
+  right: { x: number; y: number; z: number; w: number }
+): number {
+  const dot = Math.abs(
+    left.x * right.x + left.y * right.y + left.z * right.z + left.w * right.w
+  );
+  return 2 * Math.acos(Math.max(-1, Math.min(1, dot)));
+}
+
+function nullableDistance(
+  left: number | null | undefined,
+  right: number | null | undefined
+): number {
+  if (left === undefined || left === null || right === undefined || right === null) {
+    return left === right ? 0 : Number.POSITIVE_INFINITY;
+  }
+  return Math.abs(left - right);
+}
+
+function sameBindings(
+  left: HumanoidWorldObservation["interaction"]["carrying"]["bindings"],
+  right: HumanoidWorldObservation["interaction"]["carrying"]["bindings"]
+): boolean {
+  const identity = (bindings: typeof left) => bindings
+    .map(({ object_id: objectId, hand }) => `${objectId}\0${hand}`)
+    .sort();
+  return JSON.stringify(identity(left)) === JSON.stringify(identity(right));
 }
 
 function planIdFromReceipt(receipt: HumanoidActionReceipt): string | undefined {
@@ -1205,6 +2033,7 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
       }
     ])),
     manipulation_geometry: manipulationGeometry,
+    spatial_belief: snapshot.spatialBelief,
     hand_coordination: snapshot.handCoordination,
     hand_surfaces: exposeHandGeometry
       ? Object.fromEntries((["left", "right"] as const).map((hand) => {
@@ -1513,6 +2342,13 @@ function planningFailureFingerprint(
   fallback: string
 ): string {
   try {
+    if (action === "plan_humanoid_skill") {
+      return humanoidActionFingerprint(
+        action,
+        agentId,
+        HumanoidActionInputs.plan_humanoid_skill.parse(rawInput)
+      );
+    }
     if (action === "plan_humanoid_navigation") {
       const navigation = HumanoidActionInputs.plan_humanoid_navigation.parse(rawInput);
       return humanoidActionFingerprint(action, agentId, {

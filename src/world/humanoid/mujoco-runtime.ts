@@ -18,6 +18,59 @@ export interface HumanoidSceneSolid {
 
 export interface HumanoidSceneObject extends HumanoidSceneSolid {
   mass: number;
+  shape?: "box" | "sphere" | "cylinder" | "capsule" | undefined;
+  friction?: {
+    sliding: number;
+    torsional: number;
+    rolling: number;
+  } | undefined;
+  mobility?:
+    | { type: "fixed" }
+    | { type: "free" }
+    | {
+        type: "hinge" | "slide";
+        axis: { x: number; y: number; z: number };
+        anchor: { x: number; y: number; z: number };
+        range: { minimum: number; maximum: number };
+        initialPosition: number;
+        damping: number;
+        frictionLoss: number;
+      } | undefined;
+  container?: {
+    interiorCenter: { x: number; y: number; z: number };
+    interiorSize: { x: number; y: number; z: number };
+    openingDirection: { x: number; y: number; z: number };
+    wallThickness: number;
+  } | undefined;
+}
+
+export interface ResolvedHumanoidSceneObject extends HumanoidSceneSolid {
+  mass: number;
+  shape: "box" | "sphere" | "cylinder" | "capsule";
+  friction: {
+    sliding: number;
+    torsional: number;
+    rolling: number;
+  };
+  mobility: NonNullable<HumanoidSceneObject["mobility"]>;
+  container?: NonNullable<HumanoidSceneObject["container"]> | undefined;
+}
+
+export function resolveHumanoidSceneObject(
+  object: HumanoidSceneObject
+): ResolvedHumanoidSceneObject {
+  return {
+    id: object.id,
+    center: { ...object.center },
+    size: { ...object.size },
+    mass: object.mass,
+    shape: object.shape ?? "box",
+    friction: object.friction
+      ? { ...object.friction }
+      : { sliding: 0.8, torsional: 0.01, rolling: 0.001 },
+    mobility: object.mobility ? structuredClone(object.mobility) : { type: "free" },
+    ...(object.container ? { container: structuredClone(object.container) } : {})
+  };
 }
 
 const ASSET_ROOT = fileURLToPath(new URL("../../../assets/humanoid/g1/", import.meta.url));
@@ -95,16 +148,24 @@ function sceneXml(
     const halfSize = [solid.size.z / 2, solid.size.x / 2, solid.size.y / 2];
     return `    <geom name="${humanoidSceneSolidGeomName(index, solid.id)}" type="box" pos="${numbers(position)}" size="${numbers(halfSize)}" friction="0.9 0.01 0.001" rgba="0.34 0.38 0.31 1"/>`;
   }).join("\n");
-  const dynamicBodies = objects.map((object, index) => {
+  const objectBodies = objects.map(resolveHumanoidSceneObject).map((object, index) => {
     assertSolid(object);
     if (!Number.isFinite(object.mass) || object.mass <= 0) {
       throw new Error(`Invalid humanoid scene object mass: ${object.id}`);
     }
-    const position = [object.center.z, object.center.x, object.center.y];
-    const halfSize = [object.size.z / 2, object.size.x / 2, object.size.y / 2];
-    return `    <body name="world-object-${index}" pos="${numbers(position)}">
-      <freejoint name="world-object-joint-${index}"/>
-      <geom name="world-object-geom-${index}" type="box" size="${numbers(halfSize)}" mass="${Number(object.mass.toFixed(6))}" friction="0.8 0.01 0.001" rgba="0.64 0.44 0.23 1"/>
+    assertSceneObject(object);
+    const mobility = object.mobility;
+    const articulated = mobility.type === "hinge" || mobility.type === "slide";
+    const bodyPosition = articulated ? mobility.anchor : object.center;
+    const geometryOffset = articulated
+      ? subtractVector(object.center, mobility.anchor)
+      : { x: 0, y: 0, z: 0 };
+    const joint = sceneObjectJointXml(object, index);
+    const geometry = object.container
+      ? containerGeometriesXml(object, index)
+      : sceneObjectGeometryXml(object, index, geometryOffset);
+    return `    <body name="world-object-${index}" pos="${numbers(worldVector(bodyPosition))}">
+${joint}${geometry}
     </body>`;
   }).join("\n");
   return `<mujoco model="g1_43dof world">
@@ -122,9 +183,130 @@ function sceneXml(
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" friction="0.95 0.01 0.001"/>
 ${geoms}
-${dynamicBodies}
+${objectBodies}
   </worldbody>
 </mujoco>`;
+}
+
+function sceneObjectJointXml(object: ResolvedHumanoidSceneObject, index: number): string {
+  if (object.mobility.type === "fixed") return "";
+  if (object.mobility.type === "free") {
+    return `      <freejoint name="world-object-joint-${index}"/>\n`;
+  }
+  return `      <joint name="world-object-joint-${index}" type="${object.mobility.type}" axis="${numbers(worldVector(object.mobility.axis))}" range="${numbers([
+    object.mobility.range.minimum,
+    object.mobility.range.maximum
+  ])}" limited="true" damping="${number(object.mobility.damping)}" frictionloss="${number(object.mobility.frictionLoss)}"/>\n`;
+}
+
+function sceneObjectGeometryXml(
+  object: ResolvedHumanoidSceneObject,
+  index: number,
+  localPosition: HumanoidSceneSolid["center"]
+): string {
+  const geometry = shapeGeometry(object.shape, object.size);
+  return `      <geom name="world-object-geom-${index}" type="${geometry.type}" pos="${numbers(worldVector(localPosition))}" size="${numbers(geometry.size)}" mass="${number(object.mass)}" friction="${friction(object)}" rgba="0.64 0.44 0.23 1"/>`;
+}
+
+function containerGeometriesXml(
+  object: ResolvedHumanoidSceneObject,
+  index: number
+): string {
+  const container = object.container;
+  if (!container) throw new Error("Container geometry is missing");
+  const opening = dominantSignedAxis(container.openingDirection);
+  const half = {
+    x: container.interiorSize.x / 2,
+    y: container.interiorSize.y / 2,
+    z: container.interiorSize.z / 2
+  };
+  const t = container.wallThickness;
+  const faces = ([
+    ["x+", { x: half.x + t / 2, y: 0, z: 0 }, { x: t, y: container.interiorSize.y + 2 * t, z: container.interiorSize.z + 2 * t }],
+    ["x-", { x: -half.x - t / 2, y: 0, z: 0 }, { x: t, y: container.interiorSize.y + 2 * t, z: container.interiorSize.z + 2 * t }],
+    ["y+", { x: 0, y: half.y + t / 2, z: 0 }, { x: container.interiorSize.x + 2 * t, y: t, z: container.interiorSize.z + 2 * t }],
+    ["y-", { x: 0, y: -half.y - t / 2, z: 0 }, { x: container.interiorSize.x + 2 * t, y: t, z: container.interiorSize.z + 2 * t }],
+    ["z+", { x: 0, y: 0, z: half.z + t / 2 }, { x: container.interiorSize.x + 2 * t, y: container.interiorSize.y + 2 * t, z: t }],
+    ["z-", { x: 0, y: 0, z: -half.z - t / 2 }, { x: container.interiorSize.x + 2 * t, y: container.interiorSize.y + 2 * t, z: t }]
+  ] as const).filter(([face]) => face !== opening);
+  return faces.map(([face, offset, size], faceIndex) => {
+    const localPosition = addVector(container.interiorCenter, offset);
+    return `      <geom name="world-object-geom-${index}-${faceIndex}-${face}" type="box" pos="${numbers(worldVector(localPosition))}" size="${numbers(worldVector({
+      x: size.x / 2,
+      y: size.y / 2,
+      z: size.z / 2
+    }))}" mass="${number(object.mass / faces.length)}" friction="${friction(object)}" rgba="0.42 0.48 0.38 1"/>`;
+  }).join("\n");
+}
+
+function shapeGeometry(
+  shape: ResolvedHumanoidSceneObject["shape"],
+  size: ResolvedHumanoidSceneObject["size"]
+): { type: ResolvedHumanoidSceneObject["shape"]; size: number[] } {
+  if (shape === "box") {
+    return { type: shape, size: worldVector({ x: size.x / 2, y: size.y / 2, z: size.z / 2 }) };
+  }
+  if (shape === "sphere") {
+    return { type: shape, size: [Math.min(size.x, size.y, size.z) / 2] };
+  }
+  const radius = Math.min(size.x, size.z) / 2;
+  const halfHeight = shape === "capsule"
+    ? Math.max(0.001, size.y / 2 - radius)
+    : size.y / 2;
+  return { type: shape, size: [radius, halfHeight] };
+}
+
+function dominantSignedAxis(direction: HumanoidSceneSolid["center"]): string {
+  const axes = [
+    ["x", direction.x],
+    ["y", direction.y],
+    ["z", direction.z]
+  ] as const;
+  const [axis, value] = [...axes].sort((left, right) => (
+    Math.abs(right[1]) - Math.abs(left[1])
+  ))[0]!;
+  return `${axis}${value >= 0 ? "+" : "-"}`;
+}
+
+function friction(object: ResolvedHumanoidSceneObject): string {
+  return numbers([
+    object.friction.sliding,
+    object.friction.torsional,
+    object.friction.rolling
+  ]);
+}
+
+function assertSceneObject(object: ResolvedHumanoidSceneObject): void {
+  if (!object.id.trim()) throw new Error("Humanoid scene object ID is required");
+  if (![object.friction.sliding, object.friction.torsional, object.friction.rolling]
+    .every((value) => Number.isFinite(value) && value >= 0)) {
+    throw new Error(`Invalid humanoid scene object friction: ${object.id}`);
+  }
+  if (object.mobility.type === "hinge" || object.mobility.type === "slide") {
+    if (object.mobility.range.minimum >= object.mobility.range.maximum
+      || object.mobility.initialPosition < object.mobility.range.minimum
+      || object.mobility.initialPosition > object.mobility.range.maximum) {
+      throw new Error(`Invalid humanoid scene articulation: ${object.id}`);
+    }
+  }
+}
+
+function worldVector(value: HumanoidSceneSolid["center"]): number[] {
+  return [value.z, value.x, value.y];
+}
+
+function addVector(
+  left: HumanoidSceneSolid["center"],
+  right: HumanoidSceneSolid["center"]
+): HumanoidSceneSolid["center"] {
+  return { x: left.x + right.x, y: left.y + right.y, z: left.z + right.z };
+}
+
+function subtractVector(
+  left: HumanoidSceneSolid["center"],
+  right: HumanoidSceneSolid["center"]
+): HumanoidSceneSolid["center"] {
+  return { x: left.x - right.x, y: left.y - right.y, z: left.z - right.z };
 }
 
 function assertSolid(solid: HumanoidSceneSolid): void {
@@ -145,7 +327,11 @@ function assertSolid(solid: HumanoidSceneSolid): void {
 }
 
 function numbers(values: readonly number[]): string {
-  return values.map((value) => Number(value.toFixed(6))).join(" ");
+  return values.map(number).join(" ");
+}
+
+function number(value: number): number {
+  return Number(value.toFixed(6));
 }
 
 function xmlName(value: string): string {

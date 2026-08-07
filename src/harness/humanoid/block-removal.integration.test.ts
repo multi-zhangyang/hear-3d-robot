@@ -179,6 +179,8 @@ describe("block-removal autonomous transaction", () => {
         }
       });
       expect(world.observe().solidTokens.map(({ id }) => id)).not.toContain(BLOCK_ID);
+      const synchronizedWorldRevision = world.snapshot().worldRevision;
+      expect(synchronizedWorldRevision).toBe(removal.worldAfterRevision + 1);
       expect(runtime.checkpoint.checker).toMatchObject({ success: true });
       expect(runtime.executorDelegationAvailable()).toBe(false);
       expect(events).toEqual(expect.arrayContaining([
@@ -215,7 +217,7 @@ describe("block-removal autonomous transaction", () => {
       expect(observation).toMatchObject({
         accepted: true,
         code: "humanoid_observed",
-        worldBeforeRevision: removal.worldAfterRevision
+        worldBeforeRevision: synchronizedWorldRevision
       });
 
       expect(runtime.validateCycleEvidence([
@@ -259,7 +261,7 @@ describe("block-removal autonomous transaction", () => {
       expect(completed.embodied_memory.recent_episodes.at(-1)).toMatchObject({
         transaction_id: EXECUTION_TRANSACTION_ID,
         goal_success: true,
-        result_world_revision: removal.worldAfterRevision,
+        result_world_revision: synchronizedWorldRevision,
         causal_trace: {
           execution_transaction_id: EXECUTION_TRANSACTION_ID,
           world_mutation_transaction_ids: [REMOVAL_TRANSACTION_ID],

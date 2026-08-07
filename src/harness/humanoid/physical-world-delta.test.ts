@@ -27,6 +27,25 @@ const scenario = ScenarioSchema.parse({
     position: { x: 3, y: 0.25, z: 3 },
     size: { x: 0.5, y: 0.5, z: 0.5 },
     portable: true
+  }, {
+    id: "cabinet-frame",
+    kind: "cabinet",
+    color: "#59645d",
+    position: { x: 8, y: 1, z: 8 },
+    size: { x: 1.5, y: 1.7, z: 0.72 },
+    portable: false,
+    capability: {
+      shape: "box",
+      mass_kg: 18,
+      affordances: ["container"],
+      interaction_points: [],
+      container: {
+        interior_center: { x: 0, y: 0, z: 0 },
+        interior_size: { x: 1.4, y: 1.6, z: 0.65 },
+        opening_direction: { x: 0, y: 0, z: -1 },
+        wall_thickness_m: 0.045
+      }
+    }
   }],
   zones: [],
   default_goal: {
@@ -132,6 +151,13 @@ function physicalFrame(
           linearVelocity: stationary
             ? { x: 0, y: 0, z: 0 }
             : { x: 0.1, y: 0, z: -0.05 },
+          angularVelocity: { x: 0, y: 0, z: 0 }
+        },
+        "cabinet-frame": {
+          id: "cabinet-frame",
+          position: { x: 8, y: 1, z: 8 },
+          rotation: { x: 0, y: 0, z: 0, w: 1 },
+          linearVelocity: { x: 0, y: 0, z: 0 },
           angularVelocity: { x: 0, y: 0, z: 0 }
         }
       }

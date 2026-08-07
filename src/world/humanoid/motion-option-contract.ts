@@ -10,6 +10,10 @@ import { HUMANOID_BODY_NAMES } from "./model.js";
 import { G1_HAND_CONTACT_SURFACE_NAMES } from "./morphology.js";
 
 const PositionToleranceSchema = z.number().finite().positive().max(5);
+const UnitDirectionSchema = Vec3Schema.refine(
+  (value) => Math.abs(Math.hypot(value.x, value.y, value.z) - 1) <= 1e-3,
+  "direction must be normalized"
+);
 
 const RootNearPointPredicateSchema = z.object({
   type: z.literal("root_near_point"),
@@ -99,6 +103,59 @@ const ObjectInZonePredicateSchema = z.object({
   tolerance_m: z.number().finite().nonnegative().max(5)
 }).strict();
 
+const ArticulationStatePredicateSchema = z.object({
+  type: z.literal("articulation_state"),
+  object_id: z.string().trim().min(1),
+  joint_id: z.string().trim().min(1),
+  state: z.enum(["open", "closed"]),
+  tolerance: z.number().finite().min(0).max(0.49)
+}).strict();
+
+const ObjectInsidePredicateSchema = z.object({
+  type: z.literal("object_inside"),
+  object_id: z.string().trim().min(1),
+  container_id: z.string().trim().min(1),
+  expected: z.boolean(),
+  tolerance_m: z.number().finite().nonnegative().max(1)
+}).strict().refine(
+  (predicate) => predicate.object_id !== predicate.container_id,
+  { path: ["container_id"], message: "object cannot be inside itself" }
+);
+
+const ObjectOnPredicateSchema = z.object({
+  type: z.literal("object_on"),
+  object_id: z.string().trim().min(1),
+  support_id: z.string().trim().min(1),
+  expected: z.boolean(),
+  tolerance_m: z.number().finite().nonnegative().max(1)
+}).strict().refine(
+  (predicate) => predicate.object_id !== predicate.support_id,
+  { path: ["support_id"], message: "object cannot support itself" }
+);
+
+const ObjectDisplacedPredicateSchema = z.object({
+  type: z.literal("object_displaced"),
+  object_id: z.string().trim().min(1),
+  origin: Vec3Schema,
+  direction_world: UnitDirectionSchema,
+  minimum_distance_m: z.number().finite().positive().max(5),
+  maximum_lateral_error_m: z.number().finite().nonnegative().max(2)
+}).strict();
+
+const ArticulationDisplacedPredicateSchema = z.object({
+  type: z.literal("articulation_displaced"),
+  object_id: z.string().trim().min(1),
+  joint_id: z.string().trim().min(1),
+  origin_position: z.number().finite(),
+  direction: z.enum(["increasing", "decreasing"]),
+  minimum_delta: z.number().finite().positive()
+}).strict();
+
+const BalanceStablePredicateSchema = z.object({
+  type: z.literal("balance_stable"),
+  minimum_support_margin_m: z.number().finite().nonnegative().max(0.3)
+}).strict();
+
 const GraspVerifiedPredicateSchema = z.object({
   type: z.literal("grasp_verified"),
   object_id: z.string().trim().min(1),
@@ -127,6 +184,12 @@ const HumanoidMotionOptionPredicateSchema = z.discriminatedUnion("type", [
   HandContactSolidPredicateSchema,
   ObjectNearPointPredicateSchema,
   ObjectInZonePredicateSchema,
+  ArticulationStatePredicateSchema,
+  ObjectInsidePredicateSchema,
+  ObjectOnPredicateSchema,
+  ObjectDisplacedPredicateSchema,
+  ArticulationDisplacedPredicateSchema,
+  BalanceStablePredicateSchema,
   GraspVerifiedPredicateSchema,
   ObjectReleasedPredicateSchema,
   ObjectSettledOnSupportPredicateSchema

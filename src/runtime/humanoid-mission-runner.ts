@@ -284,6 +284,9 @@ async function executeHumanoidMission(input: {
           }, agentId)
         }),
         temperature: compactorProvider.temperature,
+        ...(compactorProvider.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: compactorProvider.reasoningEffort }),
         ...(compactorOutputLimit === undefined
           ? {}
           : { maxOutputTokens: compactorOutputLimit }),

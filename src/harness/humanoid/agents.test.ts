@@ -31,12 +31,12 @@ describe("humanoid agent hierarchy", () => {
   it("renders an exact executor authority envelope", () => {
     const rendered = HUMANOID_AGENT_TOOL_CONTRACTS.executor.inputBuilder({
       params: {
-        task: "execute_plan",
         objective: "执行已接受导航",
-        planning_action: "plan_humanoid_navigation",
-        planning_transaction_id: "planning-call-41",
-        solid_id: null,
-        execution_transaction_id: null
+        execution: {
+          kind: "execute_plan",
+          planning_action: "plan_humanoid_navigation",
+          planning_transaction_id: "planning-call-41"
+        }
       }
     });
 
@@ -133,8 +133,9 @@ describe("humanoid agent hierarchy", () => {
       '"mission_link":"直接推进长期任务","dependency_candidate_ids":[]'
     );
     expect(rendered).toContain(
-      '"visible_object_ids":["courtyard_crate"],"portable_object_ids":["courtyard_crate"],"removable_block_ids":["stone_column"]'
+      '"visible_object_ids":["courtyard_crate"],"portable_object_ids":["courtyard_crate"]'
     );
+    expect(rendered).toContain('"removable_block_ids":["stone_column"]');
     expect(rendered).toContain('"predicate_types":["robot_at","robot_in_zone"');
     expect(rendered).toContain(
       '"carrying":{"phase":"carrying","object_ids":["courtyard_crate"],"continuation_verified":true}'
@@ -187,6 +188,7 @@ describe("humanoid agent hierarchy", () => {
     const models: Model[] = [];
     const recallRequests: unknown[] = [];
     const goalRecallRequests: unknown[] = [];
+    const invokedActions: string[] = [];
     let cycleCompletion = {
       status: "not_ready" as "ready" | "not_ready",
       evidence_transaction_ids: [] as string[],
@@ -215,7 +217,10 @@ describe("humanoid agent hierarchy", () => {
       channels: ["left_arm"]
     });
     const runtime = {
-      invoke: async () => execution,
+      invoke: async (action: string) => {
+        invokedActions.push(action);
+        return { ...execution, action } as HumanoidActionReceipt;
+      },
       recallGoalHistory: async (request: unknown) => {
         goalRecallRequests.push(request);
         return {
@@ -246,7 +251,12 @@ describe("humanoid agent hierarchy", () => {
       runtime,
       createModel: (agentId) => {
         modelOwners.push(agentId);
-        const model = modelStub();
+        const model = agentId === "humanoid-executor"
+          ? functionCallModel(
+            "execute_humanoid_skill",
+            JSON.stringify({ planning_transaction_id: "planning-call-41" })
+          )
+          : modelStub();
         models.push(model);
         return model;
       },
@@ -308,12 +318,12 @@ describe("humanoid agent hierarchy", () => {
     expect(hierarchy.motion.tools.map((entry) => entry.name)).toEqual([
       "observe_humanoid",
       "recall_embodied_history",
-      "plan_whole_body_motion_candidates",
-      "plan_humanoid_navigation"
+      "submit_humanoid_skill_plan",
+      "begin_humanoid_skill",
+      "plan_humanoid_skill"
     ]);
     expect(hierarchy.executor.tools.map((entry) => entry.name)).toEqual([
-      "execute_whole_body_motion",
-      "execute_humanoid_navigation",
+      "execute_humanoid_skill",
       "remove_world_block"
     ]);
     expect(hierarchy.sentry.tools.map((entry) => entry.name)).not.toContain(
@@ -376,12 +386,12 @@ describe("humanoid agent hierarchy", () => {
     ).invoke(
       new RunContext({ runId: "unavailable-executor-delegation" }),
       JSON.stringify({
-        task: "execute_plan",
         objective: "尝试消费尚不存在的规划",
-        planning_action: "plan_humanoid_navigation",
-        planning_transaction_id: "missing-plan",
-        solid_id: null,
-        execution_transaction_id: null
+        execution: {
+          kind: "execute_plan",
+          planning_action: "plan_humanoid_skill",
+          planning_transaction_id: "missing-plan"
+        }
       }),
       {
         toolCall: {
@@ -433,12 +443,12 @@ describe("humanoid agent hierarchy", () => {
     ).invoke(
       new RunContext({ runId: "invalid-executor-delegation" }),
       JSON.stringify({
-        task: "execute_plan",
         objective: "缺少规划授权",
-        planning_action: "plan_humanoid_navigation",
-        planning_transaction_id: null,
-        solid_id: null,
-        execution_transaction_id: null
+        execution: {
+          kind: "execute_plan",
+          planning_action: "plan_humanoid_skill",
+          planning_transaction_id: null
+        }
       }),
       {
         toolCall: {
@@ -455,9 +465,34 @@ describe("humanoid agent hierarchy", () => {
       code: "invalid_tool_input",
       tool: "delegate_physics_executor",
       validation_issues: [expect.objectContaining({
-        path: "planning_transaction_id"
+        path: "execution.planning_transaction_id"
       })]
     });
+    coordinatorPhase = "execute_plan";
+    const validExecutorDelegation = await coordinatorTool(
+      "delegate_physics_executor"
+    ).invoke(
+      new RunContext({ runId: "valid-executor-delegation" }),
+      JSON.stringify({
+        objective: "执行已接受导航",
+        execution: {
+          kind: "execute_plan",
+          planning_action: "plan_humanoid_navigation",
+          planning_transaction_id: "planning-call-41"
+        }
+      }),
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "valid-executor-delegation",
+          name: "delegate_physics_executor",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    );
+    expect(String(validExecutorDelegation)).toContain('"accepted":true');
+    expect(invokedActions).toContain("execute_humanoid_skill");
     cycleCompletion = {
       status: "ready",
       evidence_transaction_ids: [execution.transactionId],
@@ -503,31 +538,22 @@ describe("humanoid agent hierarchy", () => {
       "complete_autonomous_cycle"
     ]);
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "object_in_zone、object_released 与 object_settled_on_support"
+      "submit_humanoid_skill_plan 提交短程 Skill DAG"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "at_seconds=0 的关键帧代表当前物理瞬间"
+      "只调用 plan_humanoid_skill"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "coordination:{left:{thumb_opposition,thumb_curl,index_curl,middle_curl},right:{thumb_opposition,thumb_curl,index_curl,middle_curl}}"
+      "不能提交关节角、关键帧或低层路线绕过它"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "字段 grasp_contract_sha256"
+      "break_block 只能选择当前 solid_tokens 中 kind=block 的实体"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "优先使用 end_effector_position"
+      "不得使用固定巡逻点、预设动作序列、随机电机噪声"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "已到导航可行边界"
-    ));
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "manipulation_geometry"
-    ));
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "ik_reference_reachable"
-    ));
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "其他 Agent 的观测不会注入你的独立 Session"
+      "不能借用其他 Agent 或历史记忆充当当前传感事实"
     ));
     expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
       "不得改 tolerance、删减谓词或拼接额外条件"
@@ -536,7 +562,7 @@ describe("humanoid agent hierarchy", () => {
       "一个 active Goal 可以跨越多次观察、规划、抓取、导航和执行周期"
     ));
     expect(hierarchy.executor.instructions).toEqual(expect.stringContaining(
-      "plan_humanoid_navigation 调用 execute_humanoid_navigation"
+      "plan_humanoid_skill 必须调用 execute_humanoid_skill"
     ));
 
     const coordinatorBehavior = hierarchy.coordinator.toolUseBehavior;
@@ -714,7 +740,12 @@ describe("humanoid agent hierarchy", () => {
         coordinator: { ...provider, model: "coordinator", temperature: 0.1 },
         sentry: { ...provider, model: "sentry", temperature: 0.2 },
         motion: { ...provider, model: "motion", temperature: 0.3 },
-        executor: { ...provider, model: "executor", temperature: 0.4 },
+        executor: {
+          ...provider,
+          model: "executor",
+          temperature: 0.4,
+          reasoningEffort: "high"
+        },
         compactor: { ...provider, model: "compactor", temperature: 0.5 }
       }
     };
@@ -747,6 +778,7 @@ describe("humanoid agent hierarchy", () => {
     expect(hierarchy.sentry.modelSettings.temperature).toBe(0.2);
     expect(hierarchy.motion.modelSettings.temperature).toBe(0.3);
     expect(hierarchy.executor.modelSettings.temperature).toBe(0.4);
+    expect(hierarchy.executor.modelSettings.reasoning).toEqual({ effort: "high" });
   });
 });
 
@@ -761,7 +793,7 @@ function modelStub(): Model {
   } as unknown as Model;
 }
 
-function functionCallModel(toolName: string): Model {
+function functionCallModel(toolName: string, args = "{}"): Model {
   return {
     getResponse: async () => ({
       responseId: `response-${toolName}`,
@@ -769,7 +801,7 @@ function functionCallModel(toolName: string): Model {
         type: "function_call",
         callId: `call-${toolName}`,
         name: toolName,
-        arguments: "{}"
+        arguments: args
       }],
       usage: new Usage({
         requests: 1,

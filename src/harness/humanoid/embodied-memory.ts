@@ -38,7 +38,8 @@ export function appendEmbodiedEpisode(input: {
 } {
   const state = HumanoidEmbodiedMemoryStateSchema.parse(input.state);
   if (!input.execution.accepted
-    || (input.execution.action !== "execute_whole_body_motion"
+    || (input.execution.action !== "execute_humanoid_skill"
+      && input.execution.action !== "execute_whole_body_motion"
       && input.execution.action !== "execute_humanoid_navigation")
     || input.execution.worldAfterRevision > input.world.worldRevision) {
     throw new Error("Embodied memory requires current accepted execution evidence");
@@ -94,7 +95,8 @@ export function appendEmbodiedEpisode(input: {
     },
     transaction_id: input.execution.transactionId,
     action: input.execution.action,
-    ...(planningAction === "plan_whole_body_motion"
+    ...(planningAction === "plan_humanoid_skill"
+      || planningAction === "plan_whole_body_motion"
       || planningAction === "plan_whole_body_motion_candidates"
       || planningAction === "plan_humanoid_navigation"
       ? { planning_action: planningAction }
@@ -182,7 +184,8 @@ export function rememberEmbodiedActionExperience(input: {
   created: boolean;
 } {
   const state = HumanoidEmbodiedMemoryStateSchema.parse(input.state);
-  if (input.execution.action !== "execute_whole_body_motion"
+  if (input.execution.action !== "execute_humanoid_skill"
+    && input.execution.action !== "execute_whole_body_motion"
     && input.execution.action !== "execute_humanoid_navigation"
     && input.execution.action !== "remove_world_block") {
     throw new Error("Embodied experience requires a physical execution or world mutation receipt");
@@ -215,7 +218,8 @@ export function rememberEmbodiedActionExperience(input: {
     transaction_id: input.execution.transactionId,
     cycle: input.execution.cycle,
     action: input.execution.action,
-    ...(planningAction === "plan_whole_body_motion"
+    ...(planningAction === "plan_humanoid_skill"
+      || planningAction === "plan_whole_body_motion"
       || planningAction === "plan_whole_body_motion_candidates"
       || planningAction === "plan_humanoid_navigation"
       ? { planning_action: planningAction }
@@ -386,10 +390,17 @@ function incrementOutcomeIndex(
 }
 
 function predicateObjectIds(predicate: GoalPredicate): string[] {
+  if (predicate.type === "object_inside") {
+    return [predicate.object_id, predicate.container_id];
+  }
+  if (predicate.type === "object_on") {
+    return [predicate.object_id, predicate.support_id];
+  }
   return predicate.type === "object_at"
     || predicate.type === "object_in_zone"
     || predicate.type === "object_placed"
     || predicate.type === "object_grasped"
+    || predicate.type === "articulation_state"
     ? [predicate.object_id]
     : [];
 }

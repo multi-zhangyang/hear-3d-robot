@@ -4,6 +4,7 @@ import {
   tool,
   type AgentInputItem,
   type Model,
+  type ModelSettings,
   type ModelResponse
 } from "@openai/agents";
 import { z } from "zod";
@@ -21,6 +22,11 @@ import {
   estimateModelInputTokens,
   estimateToolTokens
 } from "./token-budget.js";
+
+type ReasoningEffort = Exclude<
+  NonNullable<ModelSettings["reasoning"]>["effort"],
+  null | undefined
+>;
 
 const COMMIT_CONTEXT_TOOL = "commit_context_checkpoint";
 const COMMIT_CONTEXT_DESCRIPTION = "Commit the only context checkpoint for this compaction pass.";
@@ -108,6 +114,7 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
   readonly #runner: Runner;
   readonly #model: Model;
   readonly #temperature: number;
+  readonly #reasoningEffort: ReasoningEffort | undefined;
   readonly #maxOutputTokens: number | undefined;
   readonly #onModelResponseCompleted: (() => void | Promise<void>) | undefined;
   readonly #onAttemptFailure: ((event: {
@@ -118,6 +125,7 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
   constructor(input: {
     model: Model;
     temperature: number;
+    reasoningEffort?: ReasoningEffort;
     maxOutputTokens?: number;
     onModelResponseCompleted?: () => void | Promise<void>;
     onAttemptFailure?: (event: {
@@ -127,6 +135,7 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
   }) {
     this.#model = input.model;
     this.#temperature = input.temperature;
+    this.#reasoningEffort = input.reasoningEffort;
     this.#maxOutputTokens = input.maxOutputTokens;
     this.#onModelResponseCompleted = input.onModelResponseCompleted;
     this.#onAttemptFailure = input.onAttemptFailure;
@@ -195,6 +204,9 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
       const agent = compactorAgent({
         model: countedModel,
         temperature: this.#temperature,
+        ...(this.#reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: this.#reasoningEffort }),
         ...(this.#maxOutputTokens === undefined
           ? {}
           : { maxOutputTokens: this.#maxOutputTokens }),
@@ -316,6 +328,7 @@ export function isContextCompactionInterruption(error: unknown): boolean {
 function compactorAgent(input: {
   model: Model;
   temperature: number;
+  reasoningEffort?: ReasoningEffort;
   maxOutputTokens?: number;
   accepted: string[];
   blockers: string[];
@@ -332,6 +345,9 @@ function compactorAgent(input: {
     model: input.model,
     modelSettings: {
       temperature: input.temperature,
+      ...(input.reasoningEffort === undefined
+        ? {}
+        : { reasoning: { effort: input.reasoningEffort } }),
       ...(input.maxOutputTokens === undefined
         ? {}
         : { maxTokens: input.maxOutputTokens }),

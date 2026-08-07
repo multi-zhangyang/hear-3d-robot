@@ -29,6 +29,9 @@ export const HUMANOID_GOAL_PREDICATE_TYPES = [
   "object_placed",
   "object_at",
   "object_grasped",
+  "object_inside",
+  "object_on",
+  "articulation_state",
   "block_removed",
   "end_effector_at"
 ] as const;

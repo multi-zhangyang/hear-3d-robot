@@ -140,7 +140,8 @@ function validateHumanoidCycleCausalEvidenceCore(
   const pendingPlan = receipts.slice(executionIndex + 1).find((receipt) => (
     receipt.accepted
     && sameAutonomousCycle(receipt.cycle, activeCycle)
-    && (receipt.action === "plan_whole_body_motion"
+    && (receipt.action === "plan_humanoid_skill"
+      || receipt.action === "plan_whole_body_motion"
       || receipt.action === "plan_whole_body_motion_candidates"
       || receipt.action === "plan_humanoid_navigation")
   ));

@@ -1,6 +1,15 @@
 import { z } from "zod";
 
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+const ReasoningEffortSchema = z.enum([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+]);
 
 const AgentToolUseBehaviorIdentitySchema = z.discriminatedUnion("kind", [
   z.object({
@@ -47,6 +56,7 @@ const AgentToolContractSchema = z.object({
 const AgentModelSettingsIdentitySchema = z.object({
   request_timeout_ms: z.number().int().positive(),
   temperature: z.number().min(0).max(2),
+  reasoning_effort: ReasoningEffortSchema.optional(),
   max_output_tokens: z.number().int().positive().optional(),
   context_window_tokens: z.number().int().positive(),
   compact_trigger_tokens: z.number().int().positive(),

@@ -4,6 +4,7 @@ import {
   scenarioChunkIntegrityIssues,
   ScenarioChunkManifestSchema
 } from "./scenario-chunk.js";
+import { ScenarioObjectCapabilitySchema } from "./object-capability.js";
 
 export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
   z.string(),
@@ -88,6 +89,33 @@ const GoalPredicateUnionSchema = z.discriminatedUnion("type", [
     hand: z.enum(["left", "right", "either"])
   }).strict(),
   z.object({
+    type: z.literal("object_inside"),
+    object_id: z.string().trim().min(1),
+    container_id: z.string().trim().min(1),
+    expected: z.boolean(),
+    tolerance: z.number().finite().nonnegative()
+  }).strict().refine(
+    (predicate) => predicate.object_id !== predicate.container_id,
+    { path: ["container_id"], message: "object cannot be inside itself" }
+  ),
+  z.object({
+    type: z.literal("object_on"),
+    object_id: z.string().trim().min(1),
+    support_id: z.string().trim().min(1),
+    expected: z.boolean(),
+    tolerance: z.number().finite().nonnegative()
+  }).strict().refine(
+    (predicate) => predicate.object_id !== predicate.support_id,
+    { path: ["support_id"], message: "object cannot support itself" }
+  ),
+  z.object({
+    type: z.literal("articulation_state"),
+    object_id: z.string().trim().min(1),
+    joint_id: z.string().trim().min(1),
+    state: z.enum(["open", "closed"]),
+    tolerance: z.number().finite().min(0).max(0.49)
+  }).strict(),
+  z.object({
     type: z.literal("end_effector_at"),
     end_effector: HumanoidEndEffectorSchema,
     frame: z.enum(["world", "pelvis"]),
@@ -140,7 +168,8 @@ const ScenarioObjectSchema = z.object({
   color: z.string().trim().min(1),
   position: Vec3Schema,
   size: Size3Schema,
-  portable: z.boolean()
+  portable: z.boolean(),
+  capability: ScenarioObjectCapabilitySchema.optional()
 }).strict();
 
 const ScenarioZoneSchema = z.object({
