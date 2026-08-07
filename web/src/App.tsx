@@ -44,8 +44,8 @@ import type {
 } from "./types";
 import { UiButton } from "./ui/Button";
 import { DeferredBoundary } from "./ui/DeferredBoundary";
-import { LoadingView } from "./ui/LoadingView";
 import { runOptionLabel, runStatusLabel } from "./ui-text";
+import { MissionModal } from "./MissionModal";
 
 const FRAMEWORK_HISTORY_LIMIT = 300;
 const PROVIDER_HISTORY_LIMIT = 400;
@@ -55,10 +55,6 @@ interface LoadRunOptions {
   preserveStream?: boolean;
 }
 
-const loadMissionModal = () => import("./MissionModal").then((module) => ({
-  default: module.MissionModal
-}));
-const MissionModal = lazy(loadMissionModal);
 const WorkspaceView = lazy(() => import("./game/WorkspaceView").then((module) => ({
   default: module.WorkspaceView
 })));
@@ -105,10 +101,6 @@ export function App(): React.JSX.Element {
   useEffect(() => {
     selectedRunRef.current = selectedRunId;
   }, [selectedRunId]);
-
-  useEffect(() => {
-    if (bootstrap?.provider.configured) void loadMissionModal();
-  }, [bootstrap?.provider.configured]);
 
   const loadRun = useCallback(async (
     runId: string,
@@ -528,7 +520,6 @@ export function App(): React.JSX.Element {
               <UiButton
                 tone="primary"
                 disabled={missionControlsBusy || activeRun !== undefined || !bootstrap.provider.configured}
-                onPointerDown={() => void loadMissionModal()}
                 onClick={() => setMissionOpen(true)}
               >
                 <b aria-hidden="true">＋</b>新建任务
@@ -557,7 +548,6 @@ export function App(): React.JSX.Element {
               <UiButton
                 tone="primary"
                 disabled={missionControlsBusy || activeRun !== undefined || !bootstrap.provider.configured}
-                onPointerDown={() => void loadMissionModal()}
                 onClick={() => setMissionOpen(true)}
               >
                 <b aria-hidden="true">＋</b>新建任务
@@ -580,17 +570,13 @@ export function App(): React.JSX.Element {
           )}
         </div>
         {missionOpen && (
-          <DeferredBoundary resetKey="mission-open" modal>
-            <Suspense fallback={<LoadingView label="正在加载任务编辑器" modal />}>
-              <MissionModal
-                open
-                scenarios={bootstrap.scenarios}
-                submitting={submitting}
-                onCancel={() => setMissionOpen(false)}
-                onSubmit={createMission}
-              />
-            </Suspense>
-          </DeferredBoundary>
+          <MissionModal
+            open
+            scenarios={bootstrap.scenarios}
+            submitting={submitting}
+            onCancel={() => setMissionOpen(false)}
+            onSubmit={createMission}
+          />
         )}
     </GameShell>
   );

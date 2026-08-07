@@ -1,9 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import type { Bootstrap, Goal, HumanoidRunMode } from "../types";
 import { UiButton } from "../ui/Button";
+import { DeferredBoundary } from "../ui/DeferredBoundary";
+import { LoadingView } from "../ui/LoadingView";
 import { goalSummaryLabel, predicateLabel, scenarioLabel } from "../ui-text";
-import { GoalEditor } from "./GoalEditor";
 import { validGoal } from "./goal-form";
+
+const loadGoalEditor = () => import("./GoalEditor").then((module) => ({
+  default: module.GoalEditor
+}));
+const GoalEditor = lazy(loadGoalEditor);
 
 interface MissionModalProps {
   open: boolean;
@@ -53,6 +59,7 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
 
   useEffect(() => {
     if (!props.open) return;
+    void loadGoalEditor();
     setMission("");
     setScenarioId("");
     setGoal(null);
@@ -194,7 +201,11 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
 
           {scenario && goal ? (
             <>
-              <GoalEditor scenario={scenario} goal={goal} onChange={updateGoal} />
+              <DeferredBoundary resetKey={scenario.id}>
+                <Suspense fallback={<LoadingView label="正在加载目标编辑器" />}>
+                  <GoalEditor scenario={scenario} goal={goal} onChange={updateGoal} />
+                </Suspense>
+              </DeferredBoundary>
               <MissionContractReview goal={goal} />
             </>
           ) : (
