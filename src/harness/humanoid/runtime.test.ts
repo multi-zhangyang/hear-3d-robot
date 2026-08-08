@@ -68,6 +68,7 @@ describe("HumanoidActionRuntime", () => {
           protocol: "humanoid-learned-policy-v1",
           capabilities: ["balance", "locomotion", "joint_reference_tracking"]
         },
+        reference_control: null,
         motion_generator: { implementation: "test_task_space_generator" }
       }
     });
@@ -248,6 +249,34 @@ describe("HumanoidActionRuntime", () => {
       skill_plan: {
         transaction_id: "replacement-stabilize-plan",
         selected_strategy_id: "replacement-support-recovery"
+      }
+    });
+  });
+
+  it("exposes an independent reference-control route without merging trained capabilities", async () => {
+    const lightweight = lightweightObservationWorld(
+      undefined,
+      {},
+      0,
+      {},
+      true
+    );
+    const runtime = new HumanoidActionRuntime(lightweight.world);
+    const observation = await runtime.invoke(
+      "observe_humanoid",
+      {},
+      "routed-observation",
+      "humanoid-motion-reference"
+    );
+    expect(observation.detail).toMatchObject({
+      control_authority: {
+        learned_policy: { capabilities: ["balance", "locomotion"] },
+        reference_control: {
+          protocol: "humanoid-controller-capability-routing-v1",
+          strategy: "declared_capabilities",
+          mode: "reference_control",
+          implementation: "yahmp_onnx"
+        }
       }
     });
   });
@@ -1837,7 +1866,8 @@ function lightweightObservationWorld(
   navigationReceipt?: Awaited<ReturnType<HumanoidWorld["planNavigation"]>>,
   observationOverride: Record<string, unknown> = {},
   worldRevision = 0,
-  snapshotOverride: Record<string, unknown> = {}
+  snapshotOverride: Record<string, unknown> = {},
+  capabilityRouting = false
 ): {
   world: HumanoidWorld;
   observationCalls: () => number;
@@ -1920,9 +1950,21 @@ function lightweightObservationWorld(
               capabilities: [
                 "balance",
                 "locomotion",
-                "joint_reference_tracking"
+                ...(capabilityRouting ? [] : ["joint_reference_tracking"])
               ]
-            }
+            },
+            ...(capabilityRouting
+              ? {
+                  capabilityRouting: {
+                    protocol: "humanoid-controller-capability-routing-v1",
+                    strategy: "declared_capabilities",
+                    fallback: {
+                      mode: "reference_control",
+                      implementation: "yahmp_onnx"
+                    }
+                  }
+                }
+              : {})
           },
           rootPosition: { x: 0, y: 0, z: 0 },
           rootRotation: { x: 0, y: 0, z: 0, w: 1 },

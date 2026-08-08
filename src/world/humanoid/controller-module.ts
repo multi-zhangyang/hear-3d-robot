@@ -262,6 +262,32 @@ function assertControllerDescriptor(
   if (value.learnedPolicy !== undefined) {
     assertLearnedPolicyDescriptor(value.learnedPolicy);
   }
+  if (value.capabilityRouting !== undefined) {
+    assertCapabilityRoutingDescriptor(value.capabilityRouting, value.implementation);
+    if (value.learnedPolicy === undefined
+      || (isRecord(value.learnedPolicy)
+        && Array.isArray(value.learnedPolicy.capabilities)
+        && value.learnedPolicy.capabilities.includes("joint_reference_tracking"))) {
+      throw new Error(
+        "Humanoid capability routing requires a primary learned policy without reference tracking"
+      );
+    }
+  }
+}
+
+function assertCapabilityRoutingDescriptor(
+  value: unknown,
+  primaryImplementation: string
+): void {
+  if (!isRecord(value)
+    || value.protocol !== "humanoid-controller-capability-routing-v1"
+    || value.strategy !== "declared_capabilities"
+    || !isRecord(value.fallback)
+    || value.fallback.mode !== "reference_control"
+    || !isNonEmptyString(value.fallback.implementation)
+    || value.fallback.implementation === primaryImplementation) {
+    throw new Error("Humanoid controller declares invalid capability routing");
+  }
 }
 
 function assertLearnedPolicyDescriptor(value: unknown): void {

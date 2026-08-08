@@ -2,8 +2,7 @@ import { createHash } from "node:crypto";
 import * as ort from "onnxruntime-web";
 import { z } from "zod";
 import {
-  HUMANOID_JOINT_NAMES,
-  type HumanoidJointName
+  HUMANOID_JOINT_NAMES
 } from "../world/humanoid/model.js";
 import { assertHumanoidReference } from "../world/humanoid/reference.js";
 import type {
@@ -27,7 +26,6 @@ const REPORT_ASSET_ID = "training_report";
 const OBSERVATION_SIZE = 99;
 const CONTROL_STEP_SECONDS = 0.02;
 const PHYSICS_STEP_SECONDS = 0.005;
-const TASK_TRACKING_VELOCITY_LEAD_SECONDS = 0.08;
 
 const TrainingArtifactSchema = z.object({
   file: z.string().min(1),
@@ -182,7 +180,7 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
       for (const tensor of Object.values(result ?? {})) tensor.dispose();
       input.dispose();
     }
-    return this.#command(reference);
+    return this.#command();
   }
 
   advanceHistory(): void {}
@@ -243,30 +241,13 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
     return observation;
   }
 
-  #command(reference: HumanoidReference): HumanoidJointPositionCommand {
-    const positions = Float64Array.from(this.#previousAction, (action, index) => {
-      const defaultPosition = this.#policy.defaultJointPositions[index]!;
-      const weight = reference.jointTrackingWeights[index]!;
-      const residualAuthority = taskTrackingResidualAuthority(
-        HUMANOID_JOINT_NAMES[index]!
-      );
-      return defaultPosition
+  #command(): HumanoidJointPositionCommand {
+    const positions = Float64Array.from(this.#previousAction, (action, index) => (
+      this.#policy.defaultJointPositions[index]!
         + action * this.#policy.actionScale[index]!
-          * (1 - weight * (1 - residualAuthority))
-        + weight * (
-          reference.jointPositions[index]! - defaultPosition
-          + reference.jointVelocities[index]!
-            * TASK_TRACKING_VELOCITY_LEAD_SECONDS
-        );
-    });
-    const stiffness = Float64Array.from(this.#policy.stiffness, (value, index) => {
-      const joint = HUMANOID_JOINT_NAMES[index]!;
-      const target = Math.max(value, taskTrackingStiffness(joint));
-      return value + (target - value) * reference.jointTrackingWeights[index]!;
-    });
-    const damping = Float64Array.from(this.#policy.damping, (value, index) => (
-      value * Math.sqrt(stiffness[index]! / this.#policy.stiffness[index]!)
     ));
+    const stiffness = Float64Array.from(this.#policy.stiffness);
+    const damping = Float64Array.from(this.#policy.damping);
     if (![...positions, ...stiffness, ...damping].every(Number.isFinite)) {
       throw new Error("mjlab G1 policy produced a non-finite joint command");
     }
@@ -446,25 +427,6 @@ function arrayEqual(
 ): boolean {
   return left.length === right.length
     && Array.from(left).every((value, index) => value === right[index]);
-}
-
-function taskTrackingStiffness(joint: HumanoidJointName): number {
-  if (joint.includes("ankle")) return 55;
-  if (joint.startsWith("left_hip_")
-    || joint.startsWith("right_hip_")
-    || joint.includes("knee")) return 80;
-  if (joint.startsWith("waist_")) return 45;
-  if (joint.includes("wrist")) return 40;
-  return 80;
-}
-
-function taskTrackingResidualAuthority(joint: HumanoidJointName): number {
-  if (joint.startsWith("left_hip_")
-    || joint.startsWith("right_hip_")
-    || joint.includes("knee")
-    || joint.includes("ankle")) return 0.65;
-  if (joint.startsWith("waist_")) return 0.35;
-  return 0;
 }
 
 function inverseRotate(

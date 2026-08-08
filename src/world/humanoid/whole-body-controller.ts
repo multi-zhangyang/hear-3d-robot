@@ -142,6 +142,14 @@ export interface HumanoidControllerDescriptor {
   commandResponseHorizonSeconds?: number | undefined;
   minimumEffectivePlanarSpeedMetersPerSecond?: number | undefined;
   learnedPolicy?: HumanoidLearnedPolicyDescriptor | undefined;
+  capabilityRouting?: {
+    protocol: "humanoid-controller-capability-routing-v1";
+    strategy: "declared_capabilities";
+    fallback: {
+      mode: "reference_control";
+      implementation: string;
+    };
+  } | undefined;
 }
 
 export interface HumanoidJointPositionCommand {

@@ -2158,6 +2158,15 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
             capabilities: robot.controller.learnedPolicy.capabilities
           }
         : null,
+      reference_control: robot.controller.capabilityRouting
+        ? {
+            protocol: robot.controller.capabilityRouting.protocol,
+            strategy: robot.controller.capabilityRouting.strategy,
+            mode: robot.controller.capabilityRouting.fallback.mode,
+            implementation:
+              robot.controller.capabilityRouting.fallback.implementation
+          }
+        : null,
       motion_generator: snapshot.motionGenerator
     },
     sensor: {

@@ -102,6 +102,63 @@ describe("humanoid controller modules", () => {
     await expect(source.controllerFactory()).rejects.toThrow(/missing method: reset/);
   });
 
+  it("validates externally implemented capability-routing descriptors", async () => {
+    const directory = await temporaryDirectory();
+    const valid = join(directory, "routed.mjs");
+    await writeFile(valid, controllerModule("routed-policy").replace(
+      "physicsStepSeconds: 0.002",
+      `physicsStepSeconds: 0.002,
+      learnedPolicy: {
+        protocol: "humanoid-learned-policy-v1",
+        runtime: "test",
+        observationSpace: { protocol: "test-observation-v1", size: 1 },
+        actionSpace: { protocol: "test-action-v1", size: 29 },
+        capabilities: ["balance", "locomotion"]
+      },
+      capabilityRouting: {
+        protocol: "humanoid-controller-capability-routing-v1",
+        strategy: "declared_capabilities",
+        fallback: {
+          mode: "reference_control",
+          implementation: "reference-controller"
+        }
+      }`
+    ), "utf8");
+    const validSource = await loadHumanoidControllerSource(valid, directory);
+    await expect(validSource.controllerFactory()).resolves.toMatchObject({
+      descriptor: {
+        capabilityRouting: {
+          fallback: { implementation: "reference-controller" }
+        }
+      }
+    });
+
+    const invalid = join(directory, "invalid-routing.mjs");
+    await writeFile(invalid, controllerModule("invalid-route").replace(
+      "physicsStepSeconds: 0.002",
+      `physicsStepSeconds: 0.002,
+      learnedPolicy: {
+        protocol: "humanoid-learned-policy-v1",
+        runtime: "test",
+        observationSpace: { protocol: "test-observation-v1", size: 1 },
+        actionSpace: { protocol: "test-action-v1", size: 29 },
+        capabilities: ["balance", "locomotion"]
+      },
+      capabilityRouting: {
+        protocol: "humanoid-controller-capability-routing-v1",
+        strategy: "declared_capabilities",
+        fallback: {
+          mode: "reference_control",
+          implementation: "invalid-route"
+        }
+      }`
+    ), "utf8");
+    const invalidSource = await loadHumanoidControllerSource(invalid, directory);
+    await expect(invalidSource.controllerFactory()).rejects.toThrow(
+      /invalid capability routing/
+    );
+  });
+
   it("rejects a module that shares one stateful controller instance", async () => {
     const directory = await temporaryDirectory();
     const entry = join(directory, "shared.mjs");

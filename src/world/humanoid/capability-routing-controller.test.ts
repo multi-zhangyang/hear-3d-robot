@@ -1,0 +1,270 @@
+import { describe, expect, it } from "vitest";
+import type { HumanoidLearnedPolicyCapability } from "../../domain/humanoid-policy.js";
+import {
+  neutralHumanoidReference,
+  targetReference
+} from "./reference.js";
+import {
+  CapabilityRoutingHumanoidController,
+  humanoidControllerNeedsReferenceFallback
+} from "./capability-routing-controller.js";
+import { HUMANOID_JOINT_NAMES } from "./model.js";
+import type {
+  HumanoidControllerDescriptor,
+  HumanoidControllerInferenceOptions,
+  HumanoidControllerState,
+  HumanoidJointPositionCommand,
+  HumanoidPolicyState,
+  HumanoidWholeBodyController
+} from "./whole-body-controller.js";
+
+describe("humanoid controller capability routing", () => {
+  it("routes velocity control to the trained policy and joint tasks to reference control", async () => {
+    const primary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    const fallback = controller(
+      "reference-tracking",
+      ["balance", "locomotion", "joint_reference_tracking"],
+      2
+    );
+    const routed = new CapabilityRoutingHumanoidController(primary, fallback);
+    const state = policyState();
+    const navigation = neutralHumanoidReference();
+    const armTask = targetReference(navigation, {
+      joints: { right_shoulder_pitch_joint: 0.45 }
+    });
+
+    expect(routed.descriptor).toMatchObject({
+      implementation: "trained-velocity",
+      learnedPolicy: { capabilities: ["balance", "locomotion"] },
+      capabilityRouting: {
+        protocol: "humanoid-controller-capability-routing-v1",
+        strategy: "declared_capabilities",
+        fallback: {
+          mode: "reference_control",
+          implementation: "reference-tracking"
+        }
+      }
+    });
+
+    routed.reset(state, navigation);
+    expect((await routed.infer(state, navigation)).positions[0]).toBe(1);
+    routed.advanceHistory(state, navigation);
+    expect(primary.calls).toMatchObject({ reset: 1, infer: 1, advance: 1 });
+    expect(fallback.calls).toMatchObject({ reset: 1, infer: 0, advance: 0 });
+
+    expect((await routed.infer(state, armTask)).positions[0]).toBe(2);
+    routed.advanceHistory(state, armTask);
+    expect(fallback.calls).toMatchObject({ reset: 2, infer: 1, advance: 1 });
+
+    expect((await routed.infer(state, navigation)).positions[0]).toBe(1);
+    expect(primary.calls.reset).toBe(2);
+  });
+
+  it("routes a missing task capability without inventing it on the trained policy", async () => {
+    const primary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    const fallback = controller(
+      "reference-tracking",
+      ["balance", "locomotion", "joint_reference_tracking"],
+      2
+    );
+    const routed = new CapabilityRoutingHumanoidController(primary, fallback);
+    const state = policyState();
+    const reference = neutralHumanoidReference();
+    const options = taskOptions(["locomotion", "contact_rich_manipulation"]);
+
+    routed.reset(state, reference);
+    expect((await routed.infer(state, reference, options)).positions[0]).toBe(2);
+    routed.advanceHistory(state, reference, options);
+    expect(primary.calls.infer).toBe(0);
+    expect(fallback.calls.infer).toBe(1);
+    expect(routed.descriptor.learnedPolicy?.capabilities).toEqual([
+      "balance",
+      "locomotion"
+    ]);
+  });
+
+  it("captures both branches, restores the active route, and accepts legacy primary state", async () => {
+    const state = policyState();
+    const navigation = neutralHumanoidReference();
+    const task = targetReference(navigation, {
+      joints: { left_elbow_joint: 0.7 }
+    });
+    const firstPrimary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    const firstFallback = controller(
+      "reference-tracking",
+      ["balance", "locomotion", "joint_reference_tracking"],
+      2
+    );
+    const first = new CapabilityRoutingHumanoidController(
+      firstPrimary,
+      firstFallback
+    );
+    first.reset(state, navigation);
+    await first.infer(state, task);
+    first.advanceHistory(state, task);
+    const checkpoint = first.captureState();
+
+    expect(checkpoint).toMatchObject({
+      implementation: "trained-velocity",
+      payload: {
+        protocol: "humanoid-controller-capability-routing-state-v1",
+        active: "fallback",
+        primary: { implementation: "trained-velocity" },
+        fallback: { implementation: "reference-tracking" }
+      }
+    });
+
+    const restoredPrimary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    const restoredFallback = controller(
+      "reference-tracking",
+      ["balance", "locomotion", "joint_reference_tracking"],
+      2
+    );
+    const restored = new CapabilityRoutingHumanoidController(
+      restoredPrimary,
+      restoredFallback
+    );
+    restored.restoreState(checkpoint);
+    expect(restoredPrimary.calls.restore).toBe(1);
+    expect(restoredFallback.calls.restore).toBe(1);
+    await restored.infer(state, task);
+    expect(restoredFallback.calls.reset).toBe(0);
+
+    const legacyPrimary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    const legacyFallback = controller(
+      "reference-tracking",
+      ["balance", "locomotion", "joint_reference_tracking"],
+      2
+    );
+    const legacy = new CapabilityRoutingHumanoidController(
+      legacyPrimary,
+      legacyFallback
+    );
+    legacy.restoreState(firstPrimary.captureState());
+    await legacy.infer(state, navigation);
+    expect(legacyPrimary.calls.restore).toBe(1);
+    expect(legacyPrimary.calls.reset).toBe(0);
+    expect(legacyFallback.calls.restore).toBe(0);
+  });
+
+  it("rejects controller pairs that cannot switch at one physical control boundary", () => {
+    const primary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    expect(() => new CapabilityRoutingHumanoidController(
+      primary,
+      controller("wrong-timing", ["joint_reference_tracking"], 2, 0.04)
+    )).toThrow("identical timing and actuation");
+    expect(() => new CapabilityRoutingHumanoidController(
+      primary,
+      controller("no-reference-tracking", ["balance", "locomotion"], 2)
+    )).toThrow("must support joint-reference tracking");
+  });
+
+  it("does not wrap controllers without a learned policy or controllers already routed", () => {
+    const reference = controller(
+      "reference-only",
+      ["joint_reference_tracking"],
+      1
+    );
+    expect(humanoidControllerNeedsReferenceFallback(reference.descriptor)).toBe(false);
+    const primary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    expect(humanoidControllerNeedsReferenceFallback(primary.descriptor)).toBe(true);
+    const routed = new CapabilityRoutingHumanoidController(primary, reference);
+    expect(humanoidControllerNeedsReferenceFallback(routed.descriptor)).toBe(false);
+
+    const descriptorWithoutPolicy: HumanoidControllerDescriptor = {
+      protocol: "humanoid-controller-v1",
+      implementation: "classical-control",
+      actuation: "joint_position_pd",
+      controlStepSeconds: 0.02,
+      physicsStepSeconds: 0.005
+    };
+    expect(humanoidControllerNeedsReferenceFallback(descriptorWithoutPolicy)).toBe(false);
+  });
+});
+
+interface TestController extends HumanoidWholeBodyController {
+  calls: { reset: number; infer: number; advance: number; restore: number };
+}
+
+function controller(
+  implementation: string,
+  capabilities: HumanoidLearnedPolicyCapability[],
+  commandValue: number,
+  controlStepSeconds = 0.02
+): TestController {
+  let revision = 0;
+  const calls = { reset: 0, infer: 0, advance: 0, restore: 0 };
+  const descriptor: HumanoidControllerDescriptor = {
+    protocol: "humanoid-controller-v1",
+    implementation,
+    actuation: "joint_position_pd",
+    controlStepSeconds,
+    physicsStepSeconds: 0.005,
+    learnedPolicy: {
+      protocol: "humanoid-learned-policy-v1",
+      runtime: "test",
+      observationSpace: { protocol: "test-observation-v1", size: 1 },
+      actionSpace: { protocol: "test-action-v1", size: HUMANOID_JOINT_NAMES.length },
+      capabilities
+    }
+  };
+  return {
+    descriptor,
+    calls,
+    reset() {
+      calls.reset += 1;
+    },
+    async infer(): Promise<HumanoidJointPositionCommand> {
+      calls.infer += 1;
+      revision += 1;
+      return {
+        kind: "joint_position_pd",
+        positions: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(commandValue),
+        stiffness: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(1),
+        damping: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(1)
+      };
+    },
+    advanceHistory() {
+      calls.advance += 1;
+    },
+    captureState(): HumanoidControllerState {
+      return {
+        protocol: "humanoid-controller-state-v1",
+        version: 1,
+        implementation,
+        payload: { revision }
+      };
+    },
+    restoreState(value: HumanoidControllerState) {
+      if (value.implementation !== implementation) throw new Error("wrong state");
+      calls.restore += 1;
+      revision = Number((value.payload as { revision: number }).revision);
+    },
+    async dispose() {}
+  };
+}
+
+function policyState(): HumanoidPolicyState {
+  return {
+    jointPositions: new Float64Array(HUMANOID_JOINT_NAMES.length),
+    jointVelocities: new Float64Array(HUMANOID_JOINT_NAMES.length),
+    rootQuaternion: [1, 0, 0, 0],
+    rootAngularVelocity: [0, 0, 0]
+  };
+}
+
+function taskOptions(
+  requestedCapabilities: HumanoidLearnedPolicyCapability[]
+): HumanoidControllerInferenceOptions {
+  return {
+    taskCommand: {
+      protocol: "humanoid-controller-task-v1",
+      taskId: "capability-routing-test",
+      source: "motion_option",
+      requestedCapabilities,
+      goal: null,
+      endEffectors: [],
+      grasps: []
+    }
+  };
+}

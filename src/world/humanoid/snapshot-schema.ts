@@ -126,6 +126,14 @@ const HumanoidSimulationSnapshotSchema = z.object({
         z.enum(HUMANOID_POLICY_OBSERVATION_FEATURES)
       ).optional(),
       capabilities: z.array(z.enum(HUMANOID_LEARNED_POLICY_CAPABILITIES))
+    }).strict().optional(),
+    capabilityRouting: z.object({
+      protocol: z.literal("humanoid-controller-capability-routing-v1"),
+      strategy: z.literal("declared_capabilities"),
+      fallback: z.object({
+        mode: z.literal("reference_control"),
+        implementation: z.string().trim().min(1)
+      }).strict()
     }).strict().optional()
   }).strict(),
   rootPosition: Vec3Schema,

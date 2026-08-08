@@ -11,6 +11,7 @@ import {
 } from "../world/humanoid/reference.js";
 import { HumanoidSimulation } from "../world/humanoid/simulation.js";
 import { HUMANOID_JOINT_NAMES } from "../world/humanoid/model.js";
+import { HumanoidWorldSnapshotSchema } from "../world/humanoid/snapshot-schema.js";
 import type {
   HumanoidControllerModuleAsset,
   HumanoidControllerModuleContext
@@ -51,6 +52,18 @@ describe("mjlab G1 velocity controller", () => {
         ...initial.damping
       ].every(Number.isFinite)).toBe(true);
 
+      const tracked = targetReference(reference, {
+        joints: {
+          left_elbow_joint: 0.8,
+          right_shoulder_pitch_joint: -0.4
+        }
+      });
+      second.reset(state, tracked);
+      const trackedCommand = await second.infer(state, tracked);
+      expect([...trackedCommand.positions]).toEqual([...initial.positions]);
+      expect([...trackedCommand.stiffness]).toEqual([...initial.stiffness]);
+      expect([...trackedCommand.damping]).toEqual([...initial.damping]);
+
       const checkpoint = first.captureState();
       second.restoreState(checkpoint);
       const [continued, restored] = await Promise.all([
@@ -89,6 +102,34 @@ describe("mjlab G1 velocity controller", () => {
     const second = await HumanoidSimulation.create({ controllerFactory });
     try {
       const start = first.snapshot();
+      expect(start.controller).toMatchObject({
+        implementation: "mjlab_g1_velocity_onnx",
+        learnedPolicy: { capabilities: ["balance", "locomotion"] },
+        capabilityRouting: {
+          strategy: "declared_capabilities",
+          fallback: {
+            mode: "reference_control",
+            implementation: "yahmp_onnx"
+          }
+        }
+      });
+      expect(HumanoidWorldSnapshotSchema.safeParse({
+        frame: 0,
+        worldRevision: 0,
+        robot: start,
+        grasp: {
+          contractSha256:
+            "fc1e2d113bb5e5f5f8a75f0faa3efc8bd97ecc18eb41463da09d26bb52cfc193",
+          assessments: []
+        },
+        navigation: {
+          planId: null,
+          status: "idle",
+          target: null,
+          waypoints: [],
+          waypointIndex: null
+        }
+      }).success).toBe(true);
       const reference = targetReference(neutralHumanoidReference(), {
         rootVelocity: [0.5, 0]
       });
@@ -102,6 +143,20 @@ describe("mjlab G1 velocity controller", () => {
         snapshot.rootPosition.x - start.rootPosition.x,
         snapshot.rootPosition.z - start.rootPosition.z
       )).toBeGreaterThan(0.5);
+      expect(first.captureState().controller.payload).toMatchObject({
+        protocol: "humanoid-controller-capability-routing-state-v1",
+        active: "primary"
+      });
+
+      const taskReference = targetReference(reference, {
+        joints: { right_shoulder_pitch_joint: 0.35 }
+      });
+      snapshot = await first.step(taskReference);
+      expect(snapshot.fallen).toBe(false);
+      expect(first.captureState().controller.payload).toMatchObject({
+        protocol: "humanoid-controller-capability-routing-state-v1",
+        active: "fallback"
+      });
 
       const checkpoint = first.captureState();
       second.restoreState(checkpoint);

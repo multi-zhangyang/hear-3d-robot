@@ -69,6 +69,10 @@ import {
   YahmpController
 } from "./yahmp-controller.js";
 import {
+  CapabilityRoutingHumanoidController,
+  humanoidControllerNeedsReferenceFallback
+} from "./capability-routing-controller.js";
+import {
   humanoidEndEffectorJointIndexes,
   humanoidEndEffectorPoseJointIndexes,
   humanoidEndEffectorTrackingJointIndexes
@@ -306,13 +310,26 @@ export class HumanoidSimulation {
         ? { objects: objects.map(resolveHumanoidSceneObject) }
         : {})
     };
-    const [runtime, controller] = await Promise.all([
+    const [runtime, primaryController] = await Promise.all([
       loadHumanoidMujoco(),
       resolvedOptions.controllerFactory
         ? resolvedOptions.controllerFactory()
         : YahmpController.create()
     ]);
+    let controller = primaryController;
     try {
+      if (humanoidControllerNeedsReferenceFallback(primaryController.descriptor)) {
+        const fallback = await YahmpController.create();
+        try {
+          controller = new CapabilityRoutingHumanoidController(
+            primaryController,
+            fallback
+          );
+        } catch (error) {
+          await fallback.dispose();
+          throw error;
+        }
+      }
       assertControllerTiming(controller);
       const generatedPath = resolvedOptions.solids || resolvedOptions.objects
         ? createHumanoidScenePath(
