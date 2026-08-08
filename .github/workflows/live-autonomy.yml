@@ -33,6 +33,11 @@ on:
         required: true
         default: "30"
         type: string
+      controller_module:
+        description: Optional humanoid controller module specifier
+        required: false
+        default: hear/controllers/mjlab-g1-velocity
+        type: string
 
 permissions:
   contents: read
@@ -55,6 +60,7 @@ jobs:
       AI_CONTEXT_WINDOW_TOKENS: ${{ vars.HEAR_LIVE_AI_CONTEXT_WINDOW_TOKENS }}
       AI_MAX_OUTPUT_TOKENS: ${{ vars.HEAR_LIVE_AI_MAX_OUTPUT_TOKENS }}
       AI_COMPACT_TRIGGER_TOKENS: ${{ vars.HEAR_LIVE_AI_COMPACT_TRIGGER_TOKENS }}
+      HEAR_HUMANOID_CONTROLLER_MODULE: ${{ inputs.controller_module }}
       HEAR_LIVE_SCENARIO: ${{ inputs.scenario }}
       HEAR_LIVE_MANIPULATION_SCENARIO: ${{ inputs.manipulation_scenario }}
       HEAR_LIVE_SEED: ${{ inputs.seed }}

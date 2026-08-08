@@ -9,6 +9,8 @@ import {
 } from "../dist/config/load.js";
 import { resolveRunDirectory, RunStore } from "../dist/persistence/run-store.js";
 import { RunManager } from "../dist/server/run-manager.js";
+import { loadConfiguredHumanoidControllerSource } from
+  "../dist/world/humanoid/controller-module.js";
 import { drawSeed } from "../dist/world/world-generator.js";
 
 loadEnvironment();
@@ -21,12 +23,18 @@ const runsDir = resolve(optionalText("HEAR_RUNS_DIR") ?? "runs");
 const reportPath = optionalText("HEAR_LIVE_REPORT");
 
 await mkdir(runsDir, { recursive: true });
-const [catalog, provider] = await Promise.all([
+const [catalog, provider, controllerSource] = await Promise.all([
   loadRuntimeCatalog(),
-  Promise.resolve(loadProviderConfig())
+  Promise.resolve(loadProviderConfig()),
+  loadConfiguredHumanoidControllerSource()
 ]);
 const scenario = catalog.materialize(scenarioId, seed);
-const manager = new RunManager({ runsDir, catalog, provider });
+const manager = new RunManager({
+  runsDir,
+  catalog,
+  provider,
+  ...(controllerSource ? { controllerSource } : {})
+});
 const startedAt = Date.now();
 let runId;
 
@@ -39,6 +47,11 @@ try {
     seed
   });
   const store = await RunStore.open(resolveRunDirectory(runsDir, runId));
+  assert.equal(
+    store.definition.controller_source_sha256,
+    controllerSource?.sourceSha256,
+    "Continuous run did not retain the configured humanoid controller source"
+  );
   await observeContinuousRun(manager, store, runId, observationMs);
 
   manager.stop(runId, "Continuous observation window ended");

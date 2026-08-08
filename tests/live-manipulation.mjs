@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -5,6 +6,8 @@ import { loadEnvironment, loadProviderConfig, loadRuntimeCatalog } from
   "../dist/config/load.js";
 import { RunStore } from "../dist/persistence/run-store.js";
 import { startHumanoidMission } from "../dist/runtime/humanoid-mission-runner.js";
+import { loadConfiguredHumanoidControllerSource } from
+  "../dist/world/humanoid/controller-module.js";
 import { drawSeed } from "../dist/world/world-generator.js";
 import { inspectLiveManipulationEvidence } from "./live-manipulation-evidence.mjs";
 
@@ -18,9 +21,10 @@ const runsDir = resolve(optionalText("HEAR_RUNS_DIR") ?? "runs");
 const reportPath = optionalText("HEAR_LIVE_REPORT");
 
 await mkdir(runsDir, { recursive: true });
-const [catalog, provider] = await Promise.all([
+const [catalog, provider, controllerSource] = await Promise.all([
   loadRuntimeCatalog(),
-  Promise.resolve(loadProviderConfig())
+  Promise.resolve(loadProviderConfig()),
+  loadConfiguredHumanoidControllerSource()
 ]);
 const scenario = catalog.materialize(scenarioId, seed);
 const startedAt = Date.now();
@@ -33,10 +37,16 @@ const result = await startHumanoidMission({
   provider,
   runMode: "mission",
   seed,
-  signal: AbortSignal.timeout(timeoutMs)
+  signal: AbortSignal.timeout(timeoutMs),
+  ...(controllerSource ? { controllerSource } : {})
 });
 
 const store = await RunStore.open(result.runDir);
+assert.equal(
+  store.definition.controller_source_sha256,
+  controllerSource?.sourceSha256,
+  "Manipulation run did not retain the configured humanoid controller source"
+);
 const evidence = await inspectLiveManipulationEvidence({ store, scenario });
 const report = { ...evidence, duration_ms: Date.now() - startedAt };
 if (reportPath) {

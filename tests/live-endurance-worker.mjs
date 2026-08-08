@@ -3,6 +3,8 @@ import { resolve } from "node:path";
 
 import { loadEnvironment, loadProviderConfig, loadRuntimeCatalog } from "../dist/config/load.js";
 import { RunManager } from "../dist/server/run-manager.js";
+import { loadConfiguredHumanoidControllerSource } from
+  "../dist/world/humanoid/controller-module.js";
 
 loadEnvironment();
 
@@ -10,12 +12,18 @@ const scenarioId = requiredText("HEAR_LIVE_SCENARIO");
 const seed = requiredSeed("HEAR_LIVE_SEED");
 const runsDir = resolve(requiredText("HEAR_RUNS_DIR"));
 const readyPath = resolve(requiredText("HEAR_LIVE_WORKER_READY"));
-const [catalog, provider] = await Promise.all([
+const [catalog, provider, controllerSource] = await Promise.all([
   loadRuntimeCatalog(),
-  Promise.resolve(loadProviderConfig())
+  Promise.resolve(loadProviderConfig()),
+  loadConfiguredHumanoidControllerSource()
 ]);
 const scenario = catalog.materialize(scenarioId, seed);
-const manager = new RunManager({ runsDir, catalog, provider });
+const manager = new RunManager({
+  runsDir,
+  catalog,
+  provider,
+  ...(controllerSource ? { controllerSource } : {})
+});
 
 process.on("message", (message) => {
   if (message && typeof message === "object" && message.type === "crash") {

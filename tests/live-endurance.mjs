@@ -10,6 +10,8 @@ import {
 } from "../dist/config/load.js";
 import { resolveRunDirectory, RunStore } from "../dist/persistence/run-store.js";
 import { RunManager } from "../dist/server/run-manager.js";
+import { loadConfiguredHumanoidControllerSource } from
+  "../dist/world/humanoid/controller-module.js";
 import { drawSeed } from "../dist/world/world-generator.js";
 
 loadEnvironment();
@@ -24,9 +26,10 @@ const readyPath = join(runsDir, "worker-ready.json");
 const reportPath = optionalText("HEAR_LIVE_REPORT");
 
 await mkdir(runsDir, { recursive: true });
-const [catalog, provider] = await Promise.all([
+const [catalog, provider, controllerSource] = await Promise.all([
   loadRuntimeCatalog(),
-  Promise.resolve(loadProviderConfig())
+  Promise.resolve(loadProviderConfig()),
+  loadConfiguredHumanoidControllerSource()
 ]);
 const startedAt = Date.now();
 const child = spawn(process.execPath, ["tests/live-endurance-worker.mjs"], {
@@ -47,6 +50,11 @@ let runId;
 try {
   runId = await waitForWorkerReady(readyPath, childExit, 10 * 60_000);
   const store = await RunStore.open(resolveRunDirectory(runsDir, runId));
+  assert.equal(
+    store.definition.controller_source_sha256,
+    controllerSource?.sourceSha256,
+    "Endurance run did not retain the configured humanoid controller source"
+  );
   await observeWorkerRun(store, childExit, observationMs);
   const manifestBefore = await store.readAgentManifest();
 
@@ -54,7 +62,12 @@ try {
   const exit = await childExit;
   assert.equal(exit.code, 137, "Endurance worker did not perform an abrupt process exit");
 
-  manager = new RunManager({ runsDir, catalog, provider });
+  manager = new RunManager({
+    runsDir,
+    catalog,
+    provider,
+    ...(controllerSource ? { controllerSource } : {})
+  });
   const recoveredCount = await manager.recoverOrphanedRuns();
   assert.equal(recoveredCount, 1, "New operator did not recover the orphaned run");
   const interrupted = await store.readHumanoidCheckpoint();
