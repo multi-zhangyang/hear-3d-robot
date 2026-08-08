@@ -60,6 +60,13 @@ interface RecoveredHistory {
   };
 }
 
+interface ToolHistoryNormalization {
+  items: AgentInputItem[];
+  removed: number;
+  incompleteCalls: number;
+  orphanResults: number;
+}
+
 /**
  * Bounds every model request while leaving the SDK RunState and the append-only
  * context journal untouched. A scope is a concrete hierarchy node, so sibling
@@ -76,7 +83,7 @@ export class LongRunContextManager {
   readonly #pendingModelEstimates = new Map<string, number>();
   readonly #sessionRollbackScopes = new Set<string>();
   readonly #sessionRollbackRebaseScopes = new Set<string>();
-  readonly #authorityHistoryNormalizationScopes = new Set<string>();
+  readonly #historyNormalizationScopes = new Set<string>();
   #observedCompactorContextWindowTokens: number | undefined;
   #memoryPersistence: Promise<void> = Promise.resolve();
   #state: ContextMemoryState;
@@ -196,21 +203,37 @@ export class LongRunContextManager {
     const scope = this.#scope(node, config, summaryOutputTokens);
     const physicalInput = modelData.input;
     const recoveredLogicalInput = await this.#logicalInput(scope, physicalInput);
-    const normalized = withoutHarnessAuthorityItems(recoveredLogicalInput);
-    const logicalInput = normalized.items;
-    if (normalized.removed > 0) {
-      this.#authorityHistoryNormalizationScopes.add(scope.scope_id);
+    const authorityNormalized = withoutHarnessAuthorityItems(recoveredLogicalInput);
+    const toolNormalized = normalizeFunctionToolHistory(authorityNormalized.items);
+    const logicalInput = toolNormalized.items;
+    if (authorityNormalized.removed > 0 || toolNormalized.removed > 0) {
+      this.#historyNormalizationScopes.add(scope.scope_id);
       this.#recoveredInputs.set(scope.scope_id, {
         physical: structuredClone(physicalInput),
         logical: structuredClone(logicalInput),
         sessionRewritePending: true
       });
+    }
+    if (authorityNormalized.removed > 0) {
       await this.#runtime.recordProvider({
         status: "context_authority_history_normalized",
         source: "harness_revision_filter",
         scope_id: scope.scope_id,
         agent_id: node.id,
-        removed_authority_items: normalized.removed,
+        removed_authority_items: authorityNormalized.removed,
+        semantic_session_preserved: true,
+        automatic_actuation: false
+      }, node.id);
+    }
+    if (toolNormalized.removed > 0) {
+      await this.#runtime.recordProvider({
+        status: "context_tool_history_normalized",
+        source: "openai_tool_message_invariant",
+        scope_id: scope.scope_id,
+        agent_id: node.id,
+        removed_tool_items: toolNormalized.removed,
+        incomplete_function_calls: toolNormalized.incompleteCalls,
+        orphan_function_results: toolNormalized.orphanResults,
         semantic_session_preserved: true,
         automatic_actuation: false
       }, node.id);
@@ -528,16 +551,14 @@ export class LongRunContextManager {
 
   #recordRawDelta(scope: ContextScopeState, items: AgentInputItem[]): JsonValue | undefined {
     const explicitSessionRollback = this.#sessionRollbackScopes.delete(scope.scope_id);
-    const normalizedAuthorityHistory = this.#authorityHistoryNormalizationScopes.delete(
-      scope.scope_id
-    );
-    let branch = explicitSessionRollback || normalizedAuthorityHistory;
+    const normalizedHistory = this.#historyNormalizationScopes.delete(scope.scope_id);
+    let branch = explicitSessionRollback || normalizedHistory;
     const priorCount = scope.raw_item_count;
     const priorHash = scope.raw_chain_hash;
-    if (explicitSessionRollback || normalizedAuthorityHistory || priorCount > items.length
+    if (explicitSessionRollback || normalizedHistory || priorCount > items.length
       || (priorCount > 0 && chainHash(items.slice(0, priorCount)) !== priorHash)) {
       branch = true;
-      const preserveCheckpoint = explicitSessionRollback || normalizedAuthorityHistory;
+      const preserveCheckpoint = explicitSessionRollback || normalizedHistory;
       const retainedMatches = scope.summary !== null
         && scope.retained_item_count <= items.length
         && (scope.retained_item_count === 0
@@ -842,7 +863,9 @@ export class LongRunContextManager {
       "CURRENT HARNESS AUTHORITY",
       "This block is rebuilt from the live checkpoint for every model request. It overrides compact memory and older observations.",
       ...exactIdentifiers,
-      JSON.stringify(authority)
+      JSON.stringify(authority),
+      "END CURRENT HARNESS AUTHORITY",
+      "Follow the stable Agent instructions now. Return the required formal function call; prose is not a tool decision."
     ].join("\n");
     const authorityItem = currentAuthorityItem(authorityBlock);
     if (!scope.summary) return {
@@ -1086,6 +1109,76 @@ function withoutHarnessAuthorityItems(items: AgentInputItem[]): {
     items: semantic,
     removed: items.length - semantic.length
   };
+}
+
+/**
+ * OpenAI-compatible chat transports require every tool result to belong to
+ * the immediately preceding assistant tool-call group. A cancelled SDK turn
+ * can leave only one half of that pair in a durable Session. Keep complete
+ * groups and discard only the unusable protocol fragments; authoritative
+ * action receipts remain in the Harness journals and current authority block.
+ */
+function normalizeFunctionToolHistory(items: AgentInputItem[]): ToolHistoryNormalization {
+  const normalized: AgentInputItem[] = [];
+  let incompleteCalls = 0;
+  let orphanResults = 0;
+  let index = 0;
+  while (index < items.length) {
+    const item = items[index]!;
+    if (!isFunctionToolHistoryItem(item)) {
+      normalized.push(item);
+      index += 1;
+      continue;
+    }
+
+    const group: AgentInputItem[] = [];
+    while (index < items.length && isFunctionToolHistoryItem(items[index]!)) {
+      group.push(items[index]!);
+      index += 1;
+    }
+    const retained = new Set<number>();
+    const pendingCalls = new Map<string, number>();
+    for (let groupIndex = 0; groupIndex < group.length; groupIndex += 1) {
+      const candidate = group[groupIndex]!;
+      const callId = functionToolCallId(candidate);
+      if (candidate.type === "function_call") {
+        if (callId !== undefined) pendingCalls.set(callId, groupIndex);
+        continue;
+      }
+      if (candidate.type !== "function_call_result") continue;
+      const callIndex = callId === undefined ? undefined : pendingCalls.get(callId);
+      const call = callIndex === undefined ? undefined : group[callIndex];
+      if (callIndex === undefined || call?.type !== "function_call"
+        || (candidate.name !== undefined && call.name !== candidate.name)) {
+        orphanResults += 1;
+        continue;
+      }
+      retained.add(callIndex);
+      retained.add(groupIndex);
+      pendingCalls.delete(callId!);
+    }
+    incompleteCalls += group.reduce((count, candidate, groupIndex) =>
+      candidate.type === "function_call" && !retained.has(groupIndex)
+        ? count + 1
+        : count, 0);
+    normalized.push(...group.filter((_candidate, groupIndex) => retained.has(groupIndex)));
+  }
+  return {
+    items: normalized,
+    removed: items.length - normalized.length,
+    incompleteCalls,
+    orphanResults
+  };
+}
+
+function isFunctionToolHistoryItem(item: AgentInputItem): boolean {
+  return item.type === "function_call" || item.type === "function_call_result";
+}
+
+function functionToolCallId(item: AgentInputItem): string | undefined {
+  return "callId" in item && typeof item.callId === "string" && item.callId.length > 0
+    ? item.callId
+    : undefined;
 }
 
 function chainHash(items: AgentInputItem[]): string {

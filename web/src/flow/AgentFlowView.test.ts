@@ -173,6 +173,54 @@ describe("agent flow context meter", () => {
     expect(html).toContain("目标管理智能体正在选择 · 2 个候选");
     expect(html).toContain("目标选择");
   });
+
+  it("presents a terminal run as completed even when resumable Goal candidates remain", () => {
+    const root = {
+      ...treeNode("root", null, [], "2026-08-03T00:00:00.000Z"),
+      status: "completed" as const
+    };
+    const checkpoint = {
+      version: 6,
+      status: "succeeded",
+      root_id: "root",
+      active_agent_id: null,
+      active_agent_ids: [],
+      nodes: { root },
+      goal_dag: {
+        status: "awaiting_model_selection",
+        candidates: {
+          first: { status: "proposed" },
+          second: { status: "proposed" }
+        }
+      },
+      checker: null,
+      world: { worldRevision: 3 },
+      cycle_index: 1,
+      embodied_memory: { recent_episodes: [] },
+      context_memory: {
+        version: 1,
+        context_window_tokens: 1_000_000,
+        compact_trigger_tokens: 850_000,
+        compact_recent_model_turns: 4,
+        compact_max_output_tokens: 4_096,
+        active_scope_id: "root",
+        active_estimated_tokens: 900,
+        total_compactions: 0,
+        last_compacted_at: null,
+        scopes: {}
+      }
+    } as unknown as HumanoidRunCheckpoint;
+
+    const html = renderToStaticMarkup(createElement(AgentFlowView, {
+      checkpoint,
+      actions: [],
+      framework: []
+    }));
+
+    expect(html).toContain("任务已完成");
+    expect(html).toContain("任务状态");
+    expect(html).not.toContain("目标管理智能体正在选择");
+  });
 });
 
 function treeNode(

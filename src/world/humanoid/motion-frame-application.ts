@@ -18,6 +18,12 @@ import type {
   HumanoidSimulationSnapshot
 } from "./simulation.js";
 import type { HumanoidControllerTaskCommand } from "./whole-body-controller.js";
+import type {
+  HumanoidControllerTaskGoal
+} from "./whole-body-controller.js";
+import type {
+  HumanoidLearnedPolicyCapability
+} from "../../domain/humanoid-policy.js";
 import type { HumanoidEndEffectorBody } from "./task-space-targets.js";
 import type { HumanoidTaskSpaceServoTarget } from "./task-space-servo.js";
 import {
@@ -41,6 +47,7 @@ export async function applyHumanoidMotionArtifactFrame(
     stationKeepingAnchor?: HumanoidStationKeepingAnchor;
     stationKeepingCommand?: readonly [number, number];
     taskId?: string;
+    taskGoal?: HumanoidControllerTaskGoal | null;
   } = {}
 ): Promise<HumanoidMotionFrameApplication> {
   const artifactReference = hydrateHumanoidReference(frame.reference);
@@ -128,6 +135,7 @@ export async function applyHumanoidMotionArtifactFrame(
       ? {
           taskCommand: controllerTaskCommand({
             taskId: options.taskId ?? "motion-option",
+            taskGoal: options.taskGoal ?? null,
             taskSpaceTargets: taskSpaceTargets ?? [],
             carryTaskSpaceTargets: options.carryTaskSpaceTargets ?? [],
             graspTargets: options.graspTargets ?? []
@@ -144,6 +152,7 @@ export async function applyHumanoidMotionArtifactFrame(
 
 function controllerTaskCommand(input: {
   taskId: string;
+  taskGoal: HumanoidControllerTaskGoal | null;
   taskSpaceTargets: readonly HumanoidTaskSpaceServoTarget[];
   carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
   graspTargets: readonly G1ContactAwareGraspTarget[];
@@ -152,6 +161,8 @@ function controllerTaskCommand(input: {
     protocol: "humanoid-controller-task-v1",
     taskId: input.taskId,
     source: "motion_option",
+    requestedCapabilities: requestedPolicyCapabilities(input),
+    goal: input.taskGoal ? structuredClone(input.taskGoal) : null,
     endEffectors: [
       ...input.taskSpaceTargets.map((target) => ({
         body: target.body,
@@ -182,4 +193,46 @@ function controllerTaskCommand(input: {
         target.minimumDistinctContactSurfaces ?? 1
     }))
   };
+}
+
+function requestedPolicyCapabilities(input: {
+  taskGoal: HumanoidControllerTaskGoal | null;
+  taskSpaceTargets: readonly HumanoidTaskSpaceServoTarget[];
+  carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
+  graspTargets: readonly G1ContactAwareGraspTarget[];
+}): HumanoidLearnedPolicyCapability[] {
+  const capabilities = new Set<HumanoidLearnedPolicyCapability>();
+  if (input.taskSpaceTargets.length > 0
+    || input.carryTaskSpaceTargets.length > 0) {
+    capabilities.add("joint_reference_tracking");
+  }
+  const contactGoal = input.taskGoal?.protocol === "humanoid-controller-motion-goal-v1"
+    && input.taskGoal.predicates.some(({ type }) => [
+      "body_contact_object",
+      "hand_contact_object",
+      "hand_contact_object_any",
+      "hand_contact_object_region",
+      "body_contact_solid",
+      "hand_contact_solid",
+      "grasp_verified",
+      "object_released",
+      "object_settled_on_support",
+      "articulation_state",
+      "articulation_displaced"
+    ].includes(type));
+  if (input.graspTargets.length > 0 || contactGoal) {
+    capabilities.add("contact_rich_manipulation");
+  }
+  const hands = new Set(input.graspTargets.map(({ hand }) => hand));
+  for (const target of [
+    ...input.taskSpaceTargets,
+    ...input.carryTaskSpaceTargets
+  ]) {
+    if (target.body.startsWith("left_wrist")) hands.add("left");
+    if (target.body.startsWith("right_wrist")) hands.add("right");
+  }
+  if (hands.size > 1 && capabilities.has("contact_rich_manipulation")) {
+    capabilities.add("bimanual_manipulation");
+  }
+  return [...capabilities];
 }

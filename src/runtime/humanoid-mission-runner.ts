@@ -84,7 +84,7 @@ setTracingDisabled(true);
 
 const MAX_TRANSPORT_RECOVERIES = 8;
 const SERVER_ERROR_CONTEXT_RECOVERY_ATTEMPT = 3;
-const MAX_MODEL_DECISION_RECOVERIES = 3;
+const MAX_MODEL_DECISION_FOLLOW_UPS = 3;
 const HUMANOID_PROMPT_CACHE_NAMESPACE = "hear-humanoid-agent-profile-v1";
 
 export interface HumanoidMissionRunResult {
@@ -447,8 +447,61 @@ async function executeHumanoidMission(input: {
       };
     }
 
+    const acceptVerifiedTransition = async (
+      output: string
+    ): Promise<HumanoidMissionRunResult | undefined> => {
+      const completion = assertCycleOutput(output);
+      await contextManager.compactSessionHistories(sessionForAgent);
+      if (completion.status === "cycle_completed") {
+        const activeGoalCompleted = await input.runtime.completeCycle(output);
+        if (input.runtime.checkpoint.status === "succeeded") {
+          return {
+            runId: input.runtime.runId,
+            runDir: input.runtime.store.runDir,
+            output
+          };
+        }
+        if (humanoidRunShouldFinish({
+          mode: input.runtime.store.definition.run_mode,
+          activeGoalCompleted,
+          missionGoalCompleted: input.runtime.missionGoalCompleted()
+        })) {
+          await input.runtime.succeed(output);
+          return {
+            runId: input.runtime.runId,
+            runDir: input.runtime.store.runDir,
+            output
+          };
+        }
+      } else if (completion.status === "satisfied_goal_completed") {
+        const activeGoalCompleted = await input.runtime.completeSatisfiedGoal(output);
+        if (input.runtime.checkpoint.status === "succeeded") {
+          return {
+            runId: input.runtime.runId,
+            runDir: input.runtime.store.runDir,
+            output
+          };
+        }
+        if (humanoidRunShouldFinish({
+          mode: input.runtime.store.definition.run_mode,
+          activeGoalCompleted,
+          missionGoalCompleted: input.runtime.missionGoalCompleted()
+        })) {
+          await input.runtime.succeed(output);
+          return {
+            runId: input.runtime.runId,
+            runDir: input.runtime.store.runDir,
+            output
+          };
+        }
+      } else {
+        input.runtime.validateGoalTransition();
+      }
+      return undefined;
+    };
+
     let serializedState = await resumableAgentState(input.runtime, sessions);
-    let decisionRecoveries = 0;
+    let decisionFollowUp: ModelDecisionFollowUpState | undefined;
     for (;;) {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
@@ -481,8 +534,8 @@ async function executeHumanoidMission(input: {
             continue;
           }
         } else {
-          runInput = decisionRecoveries > 0
-            ? autonomousDecisionRecoveryInput(input.runtime, decisionRecoveries)
+          runInput = decisionFollowUp
+            ? autonomousDecisionFollowUpInput(input.runtime, decisionFollowUp.attempt)
             : autonomousCycleInput(input.runtime);
         }
         serializedState = undefined;
@@ -517,57 +570,38 @@ async function executeHumanoidMission(input: {
         const output = typeof stream.finalOutput === "string"
           ? stream.finalOutput
           : JSON.stringify(stream.finalOutput);
-        const completion = assertCycleOutput(output);
-        await contextManager.compactSessionHistories(sessionForAgent);
-        if (completion.status === "cycle_completed") {
-          const activeGoalCompleted = await input.runtime.completeCycle(output);
-          if (input.runtime.checkpoint.status === "succeeded") {
-            return {
-              runId: input.runtime.runId,
-              runDir: input.runtime.store.runDir,
-              output
-            };
-          }
-          if (humanoidRunShouldFinish({
-            mode: input.runtime.store.definition.run_mode,
-            activeGoalCompleted,
-            missionGoalCompleted: input.runtime.missionGoalCompleted()
-          })) {
-            await input.runtime.succeed(output);
-            return {
-              runId: input.runtime.runId,
-              runDir: input.runtime.store.runDir,
-              output
-            };
-          }
-        } else {
-          input.runtime.validateGoalTransition();
-        }
+        const result = await acceptVerifiedTransition(output);
+        if (result) return result;
         await input.runtime.store.clearAgentState();
-        decisionRecoveries = 0;
+        decisionFollowUp = undefined;
         await input.runtime.setActiveAgent(input.runtime.rootAgentId);
       } catch (error) {
         if (input.signal?.aborted) throw error;
         const decisionStall = modelDecisionStallFrom(error);
-        if (decisionStall) {
-          const restoredAgentIds = await restoreHumanoidSessionBaseline(
-            sessions,
-            sessionBaseline
-          );
-          acceptRestoredSessions(restoredAgentIds);
-        }
-        if (decisionStall && decisionRecoveries < MAX_MODEL_DECISION_RECOVERIES) {
-          decisionRecoveries += 1;
+        const nextDecisionFollowUp = decisionStall
+          ? nextModelDecisionFollowUpState(
+              decisionFollowUp,
+              humanoidAgentStateFingerprint(input.runtime.checkpoint)
+            )
+          : null;
+        if (decisionStall && nextDecisionFollowUp) {
+          const followUpBudgetReset = decisionFollowUp !== undefined
+            && decisionFollowUp.authorityFingerprint
+              !== nextDecisionFollowUp.authorityFingerprint;
+          decisionFollowUp = nextDecisionFollowUp;
           await input.runtime.store.clearAgentState();
           await input.runtime.recordProvider({
-            status: "model_decision_recovery",
+            status: "model_decision_follow_up",
             agent_id: decisionStall.agentId,
-            recovery_attempt: decisionRecoveries,
-            maximum_recoveries: MAX_MODEL_DECISION_RECOVERIES,
-            error: decisionStall.message,
+            follow_up_attempt: decisionFollowUp.attempt,
+            maximum_follow_ups: MAX_MODEL_DECISION_FOLLOW_UPS,
+            follow_up_scope: "unchanged_authoritative_harness_state",
+            follow_up_budget_reset: followUpBudgetReset,
+            reason: decisionStall.message,
+            invalid_response_retained: true,
             session_history_preserved: true,
             prompt_cache_prefix_preserved: true,
-            recovery_baseline: "cycle_attempt_prefix",
+            continuation: "same_agent_model_and_session",
             ...(decisionStall.evidence
               ? { stall_evidence: decisionStall.evidence }
               : {}),
@@ -855,28 +889,48 @@ function autonomousCycleInput(runtime: HumanoidRunRuntime): string {
       ? [`循环身份：${checkpoint.active_cycle.cycle_id}`]
       : []),
     "当前 frame、revision、阶段和待执行 transactionId 只以每次请求重建的 CURRENT HARNESS AUTHORITY 为准；忽略会话中的旧值。",
-    "完成一次真实物理执行后，必须先委派感知哨兵重新观察；只有 cycle_completion.observed_after_execution=true 且 coordinator_phase=complete_cycle 时，才用 Harness 给出的 accepted 因果证据调用 complete_autonomous_cycle。"
+    "完成一次真实物理执行后，必须先委派感知哨兵重新观察；只有 cycle_completion.observed_after_execution=true 且 coordinator_phase=complete_cycle 时，才用 Harness 给出的 accepted 因果证据调用 complete_autonomous_cycle。若 coordinator_phase=complete_satisfied_goal，必须直接提交物理 checker 验证，禁止为了制造本周期执行回执而重复移动。"
   ].join("\n");
 }
 
-function autonomousDecisionRecoveryInput(
+function autonomousDecisionFollowUpInput(
   runtime: HumanoidRunRuntime,
-  recoveryAttempt: number
+  followUpAttempt: number
 ): string {
   return [
     "继续当前人形自主闭环。上一次模型分支没有产生 Harness 可验收的正式工具决策。",
-    `恢复轮次：${recoveryAttempt}`,
+    `续行轮次：${followUpAttempt}`,
     `当前循环：${runtime.checkpoint.cycle_index + 1}`,
     "保留此前已完成的各 Agent 会话、工具回执和物理证据；根据末尾 CURRENT HARNESS AUTHORITY 直接选择当前阶段允许的正式工具。",
+    "若上一条完整响应只用普通文字描述了选择，现在必须把该选择改为真正的 function_call；不要把工具名或参数继续写在普通 content 中。",
     "不得复述任务、输出普通说明或重复已经失败且没有新证据的参数。"
   ].join("\n");
 }
 
+export interface ModelDecisionFollowUpState {
+  authorityFingerprint: string;
+  attempt: number;
+}
+
+export function nextModelDecisionFollowUpState(
+  previous: ModelDecisionFollowUpState | undefined,
+  authorityFingerprint: string
+): ModelDecisionFollowUpState | null {
+  const attempt = previous?.authorityFingerprint === authorityFingerprint
+    ? previous.attempt + 1
+    : 1;
+  return attempt > MAX_MODEL_DECISION_FOLLOW_UPS
+    ? null
+    : { authorityFingerprint, attempt };
+}
+
+class CompletedResponseDecisionStallError extends ModelDecisionStallError {}
+
 function assertCycleOutput(output: string | undefined): {
-  status: "cycle_completed" | "goal_transition_completed";
+  status: "cycle_completed" | "goal_transition_completed" | "satisfied_goal_completed";
 } {
   if (!output?.trim()) {
-    throw new ModelDecisionStallError(
+    throw new CompletedResponseDecisionStallError(
       HUMANOID_AGENT_IDS.coordinator,
       "Humanoid coordinator returned no cycle output"
     );
@@ -885,16 +939,18 @@ function assertCycleOutput(output: string | undefined): {
   try {
     parsed = JSON.parse(output);
   } catch {
-    throw new ModelDecisionStallError(
+    throw new CompletedResponseDecisionStallError(
       HUMANOID_AGENT_IDS.coordinator,
-      "Humanoid coordinator did not return the cycle completion tool result"
+      "Humanoid coordinator did not return a formal tool result"
     );
   }
   const status = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>).status
     : undefined;
-  if (status !== "cycle_completed" && status !== "goal_transition_completed") {
-    throw new ModelDecisionStallError(
+  if (status !== "cycle_completed"
+    && status !== "goal_transition_completed"
+    && status !== "satisfied_goal_completed") {
+    throw new CompletedResponseDecisionStallError(
       HUMANOID_AGENT_IDS.coordinator,
       "Humanoid coordinator did not complete a verified runtime transition"
     );

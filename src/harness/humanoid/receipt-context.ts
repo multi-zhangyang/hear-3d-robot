@@ -26,6 +26,9 @@ const MODEL_RECEIPT_DETAIL_KEYS = [
   "selected_candidate_id",
   "selected_rank",
   "candidate_count",
+  "autonomous_plan_kind",
+  "failure_class",
+  "recovery_kind",
   "termination",
   "frames",
   "travelledDistance",
@@ -77,6 +80,29 @@ export function modelReceiptDetail(value: JsonValue): Record<string, unknown> {
       }
       return summary;
     });
+  }
+  if (Array.isArray(source.attempts)) {
+    projected.attempts = source.attempts.slice(0, 8).map((attempt) => {
+      const attemptRecord = record(attempt);
+      return attemptRecord
+        ? projectRecord(attemptRecord, ["target", "score", "accepted", "reason"])
+        : {};
+    });
+  }
+  const skillBinding = record(source.skill_binding);
+  if (skillBinding) {
+    projected.skill_binding = projectRecord(skillBinding, [
+      "transaction_id",
+      "skill_plan_transaction_id",
+      "skill_node_id",
+      "invocation",
+      "phase",
+      "phase_authority",
+      "planning_action",
+      "observed_world_revision",
+      "target_position",
+      "control_mode"
+    ]);
   }
   const binding = record(source.binding);
   if (binding) {

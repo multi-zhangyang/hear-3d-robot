@@ -121,7 +121,9 @@ export function compileHumanoidSkillDependencies(
   const compiled = structuredClone(proposal);
   for (const strategy of compiled.strategies) {
     strategy.nodes.forEach((node, index) => {
-      const prerequisiteSkills = prerequisiteSkillGroups(node.invocation.skill);
+      const prerequisiteSkills = HUMANOID_SKILL_CONTRACTS[
+        node.invocation.skill
+      ].prerequisite_skill_groups;
       for (const alternatives of prerequisiteSkills) {
         const prerequisite = strategy.nodes.slice(0, index).findLast((candidate) => (
           alternatives.includes(candidate.invocation.skill)
@@ -137,24 +139,6 @@ export function compileHumanoidSkillDependencies(
     });
   }
   return HumanoidSkillPlanProposalSchema.parse(compiled);
-}
-
-function prerequisiteSkillGroups(
-  skill: HumanoidSkillInvocation["skill"]
-): HumanoidSkillInvocation["skill"][][] {
-  if (skill === "reach") return [["approach"]];
-  if (skill === "grasp") return [["reach"], ["approach"]];
-  if (skill === "lift") return [["grasp", "regrasp", "bimanual_support"]];
-  if (skill === "carry" || skill === "bimanual_carry") {
-    return [["lift", "grasp", "regrasp", "bimanual_support"]];
-  }
-  if (skill === "place") {
-    return [["carry", "bimanual_carry", "lift", "grasp", "regrasp"]];
-  }
-  if (["push", "pull", "press", "open", "close", "turn"].includes(skill)) {
-    return [["reach"], ["approach"]];
-  }
-  return [];
 }
 
 function invocationsShareTarget(

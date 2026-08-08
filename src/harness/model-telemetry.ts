@@ -93,7 +93,11 @@ export function withModelTelemetry(
         await runtime.recordModelCallFailed?.(modelCallId, agentId);
       }
       await onModelResponseCompleted?.(agentId, response.usage);
-      const hasDecision = decisionGuard.observe(agentId, response.output);
+      const hasDecision = decisionGuard.observe(
+        agentId,
+        response.output,
+        request.outputType !== "text"
+      );
       const progressSnapshot = runtime.modelProgressSnapshot?.(agentId);
       if (hasDecision && observeProgress && progressSnapshot) {
         observeProgress(agentId, progressSnapshot);
@@ -207,7 +211,11 @@ async function* claimAndStream(
         }
         clearAgentInvocationTransportInterruption();
         await onModelResponseCompleted?.(agentId, response.usage);
-        const hasDecision = decisionGuard.observe(agentId, response.output);
+        const hasDecision = decisionGuard.observe(
+          agentId,
+          response.output,
+          request.outputType !== "text"
+        );
         const progressSnapshot = runtime.modelProgressSnapshot?.(agentId);
         if (hasDecision && observeProgress && progressSnapshot) {
           observeProgress(agentId, progressSnapshot);
@@ -437,8 +445,13 @@ class ModelDecisionGuard {
     }
   }
 
-  observe(agentId: string, output: ModelResponse["output"]): boolean {
-    const { hasDecision } = modelResponseDisposition(output);
+  observe(
+    agentId: string,
+    output: ModelResponse["output"],
+    structuredOutputDecision = false
+  ): boolean {
+    const { hasDecision: nativeToolDecision } = modelResponseDisposition(output);
+    const hasDecision = nativeToolDecision || structuredOutputDecision;
     if (hasDecision) {
       this.#consecutive.set(agentId, 0);
       return true;

@@ -181,7 +181,12 @@ export function createHumanoidInteractionObservation(input: {
     frame: input.frame,
     world_revision: input.worldRevision,
     object_world_model: objectWorldModel,
-    skill_catalog: createHumanoidSkillCatalog(objectWorldModel, input.solidTokens ?? []),
+    skill_catalog: createHumanoidSkillCatalog(
+      objectWorldModel,
+      input.solidTokens ?? [],
+      input.robot.controller?.learnedPolicy?.capabilities ?? [],
+      zones.map(({ id }) => id)
+    ),
     grasp_authority: {
       contract_sha256: input.grasp.contractSha256,
       minimum_distinct_contact_surfaces:

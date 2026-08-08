@@ -154,6 +154,9 @@ describe("LongRunContextManager hierarchy identity", () => {
     expect(authorityText).toContain(
       'required_executor_action="execute_humanoid_navigation"'
     );
+    expect(authorityText).toMatch(
+      /END CURRENT HARNESS AUTHORITY\nFollow the stable Agent instructions now\. Return the required formal function call; prose is not a tool decision\.$/
+    );
     expect(filtered.instructions).not.toContain("current_world_revision=41");
   });
 
@@ -255,6 +258,100 @@ describe("LongRunContextManager hierarchy identity", () => {
     expect(third.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
     expect(JSON.stringify(third.input)).not.toContain("current_world_revision=1");
     expect(JSON.stringify(third.input.at(-1))).toContain("current_world_revision=3");
+  });
+
+  it("removes incomplete function-tool fragments before an OpenAI-compatible request", async () => {
+    let memory = structuredClone(EmptyContextMemoryState);
+    const providerEvents: unknown[] = [];
+    const node = taskNode("humanoid-motion-reference", "运动参考");
+    const runtime = {
+      rootAgentId: "humanoid-coordinator",
+      signal: undefined,
+      store: {},
+      activeNode: () => node,
+      contextAnchor: () => ({ world_revision: 7 }),
+      contextMemory: () => structuredClone(memory),
+      contextWorldIdentity: () => ({ worldRevision: 7 }),
+      contextReceipts: () => ({}),
+      assertContextSummaryEvidence: () => undefined,
+      async updateContextMemory(state: ContextMemoryState) {
+        memory = structuredClone(state);
+      },
+      async recordCompactionModelCall() {},
+      async reconcileCompactionModelCalls() {},
+      async recordProvider(event: unknown) {
+        providerEvents.push(event);
+      }
+    } as unknown as LongRunContextRuntime;
+    const manager = new LongRunContextManager({
+      runtime,
+      provider: providerConfig(),
+      createGenerator: () => ({
+        async generate() {
+          throw new Error("Compaction was not expected in this test");
+        }
+      })
+    });
+    const input = [
+      { type: "message", role: "user", content: "Plan." },
+      {
+        type: "function_call",
+        callId: "complete-call",
+        name: "observe_humanoid",
+        arguments: "{}",
+        status: "completed"
+      },
+      {
+        type: "function_call_result",
+        callId: "complete-call",
+        name: "observe_humanoid",
+        output: "observed",
+        status: "completed"
+      },
+      {
+        type: "function_call",
+        callId: "missing-result",
+        name: "submit_humanoid_skill_plan",
+        arguments: "{}",
+        status: "completed"
+      },
+      { type: "message", role: "user", content: "Retry." },
+      {
+        type: "function_call_result",
+        callId: "missing-call",
+        name: "submit_humanoid_skill_plan",
+        output: "Tool not found.",
+        status: "completed"
+      },
+      { type: "message", role: "user", content: "Continue." }
+    ] as AgentInputItem[];
+
+    const filtered = await manager.filter({
+      modelData: {
+        instructions: `${agentInvocationMarker(node.id)}\nPlan motion.`,
+        input
+      },
+      agent: { name: node.name, tools: [] }
+    } as never);
+
+    expect(filtered.input.slice(0, -1)).toEqual([
+      input[0],
+      input[1],
+      input[2],
+      input[4],
+      input[6]
+    ]);
+    expect(providerEvents).toContainEqual(expect.objectContaining({
+      status: "context_tool_history_normalized",
+      source: "openai_tool_message_invariant",
+      removed_tool_items: 2,
+      incomplete_function_calls: 1,
+      orphan_function_results: 1
+    }));
+    expect(manager.snapshot.scopes[node.id]).toMatchObject({
+      raw_item_count: 5,
+      retained_item_count: 5
+    });
   });
 
   it("calibrates the provider-neutral estimate from reported input usage", async () => {

@@ -236,7 +236,8 @@ function restoreRoutes(input: {
       intentSha256: entry.intentSha256
         ?? humanoidNavigationIntentSha256(
           entry.requestedTarget,
-          entry.requestedArrivalHeading
+          entry.requestedArrivalHeading,
+          entry.acceptedPositionToleranceMeters
         ),
       revalidationCount: entry.revalidationCount ?? 0,
       carriedObjectBindings,

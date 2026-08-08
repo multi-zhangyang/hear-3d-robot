@@ -1,12 +1,22 @@
 import { z } from "zod";
-import { Vec3Schema, type JsonValue, type Vec3 } from "../../domain/schema.js";
+import {
+  Vec3Schema,
+  type Goal,
+  type JsonValue,
+  type Vec3
+} from "../../domain/schema.js";
 import {
   BeginHumanoidSkillSchema,
   HUMANOID_SKILL_CONTRACTS,
   HumanoidSkillInvocationSchema,
+  humanoidSkillPhaseLearnedPolicyCapabilities,
   type BeginHumanoidSkill,
   type HumanoidSkillInvocation
 } from "../../domain/humanoid-skill.js";
+import {
+  HUMANOID_LEARNED_POLICY_CAPABILITIES,
+  type HumanoidLearnedPolicyCapability
+} from "../../domain/humanoid-policy.js";
 import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import type { HumanoidWorldObservation } from "../../world/humanoid/world.js";
 import type { HumanoidObjectWorldModelEntry } from "../../world/humanoid/object-world-model.js";
@@ -15,6 +25,7 @@ import {
   humanoidArticulationGoal,
   type HumanoidArticulationGoal
 } from "./articulation-control.js";
+import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
 
 export type SkillPlanningAction =
   | "plan_humanoid_skill"
@@ -40,6 +51,9 @@ export interface ActiveHumanoidSkillBinding {
   target_articulation: HumanoidObjectWorldModelEntry["articulation"];
   eligible_interaction_points: HumanoidObjectWorldModelEntry["interaction_points"];
   eligible_interaction_point_ids: string[];
+  learned_policy_required_capabilities: HumanoidLearnedPolicyCapability[];
+  learned_policy_missing_capabilities: HumanoidLearnedPolicyCapability[];
+  control_mode: "learned_policy" | "reference_control_fallback";
 }
 
 const PersistedInteractionPointSchema = z.object({
@@ -101,7 +115,17 @@ export const ActiveHumanoidSkillBindingSchema = z.object({
     target_solid: PersistedSolidSchema.nullable().default(null),
     target_articulation: PersistedArticulationSchema.nullable(),
     eligible_interaction_points: z.array(PersistedInteractionPointSchema),
-    eligible_interaction_point_ids: z.array(z.string().trim().min(1))
+    eligible_interaction_point_ids: z.array(z.string().trim().min(1)),
+    learned_policy_required_capabilities: z.array(
+      z.enum(HUMANOID_LEARNED_POLICY_CAPABILITIES)
+    ).default([]),
+    learned_policy_missing_capabilities: z.array(
+      z.enum(HUMANOID_LEARNED_POLICY_CAPABILITIES)
+    ).default([]),
+    control_mode: z.enum([
+      "learned_policy",
+      "reference_control_fallback"
+    ]).default("reference_control_fallback")
   }).strict().superRefine((binding, context) => {
     if (binding.invocation_sha256 !== modelPayloadSha256(binding.invocation)) {
       context.addIssue({
@@ -144,6 +168,8 @@ export function bindHumanoidSkill(input: {
   request: BeginHumanoidSkill;
   observation: HumanoidWorldObservation;
   articulationGoal?: HumanoidArticulationGoal;
+  activeGoal?: Goal;
+  recoveryAuthorized?: boolean;
 }): HumanoidSkillBindingResult {
   const request = BeginHumanoidSkillSchema.parse(input.request);
   const invocation = request.invocation;
@@ -187,6 +213,20 @@ export function bindHumanoidSkill(input: {
         ({ id }) => id === invocation.frontier_id
       )
     : undefined;
+  const targetZone = invocation.skill === "navigate_to_zone"
+    ? input.observation.interaction.zones.find(
+        ({ zone_id: id }) => id === invocation.zone_id
+      )
+    : undefined;
+  if (invocation.skill === "navigate_to_zone" && !targetZone) {
+    return rejection("skill_zone_unavailable", {
+      skill: invocation.skill,
+      zone_id: invocation.zone_id,
+      observable_zone_ids: input.observation.interaction.zones.map(
+        ({ zone_id: id }) => id
+      )
+    });
+  }
   if (invocation.skill === "explore" && !explorationFrontier) {
     return rejection("skill_frontier_unavailable", {
       skill: invocation.skill,
@@ -250,6 +290,30 @@ export function bindHumanoidSkill(input: {
     input.articulationGoal
   );
   if (semantic) return semantic;
+  if (input.activeGoal) {
+    const alignment = alignHumanoidSkillToGoal({
+      goal: input.activeGoal,
+      invocation,
+      observation: input.observation,
+      ...(input.recoveryAuthorized ? { recoveryAuthorized: true } : {})
+    });
+    if (!alignment.accepted) {
+      return rejection("skill_goal_misaligned", {
+        skill: invocation.skill,
+        active_goal: input.activeGoal,
+        reason: alignment.reason,
+        recovery: "Choose a Skill whose target advances an active Goal predicate, establishes a matching object prerequisite, or is authorized by current physical recovery evidence"
+      });
+    }
+  }
+  const learnedPolicyRequiredCapabilities =
+    humanoidSkillPhaseLearnedPolicyCapabilities(invocation, request.phase);
+  const learnedPolicyCapabilities = new Set(
+    input.observation.robot.controller?.learnedPolicy?.capabilities ?? []
+  );
+  const learnedPolicyMissingCapabilities = learnedPolicyRequiredCapabilities.filter(
+    (capability) => !learnedPolicyCapabilities.has(capability)
+  );
   const planningAction: SkillPlanningAction = "plan_humanoid_skill";
   return {
     accepted: true,
@@ -270,6 +334,7 @@ export function bindHumanoidSkill(input: {
         input.observation.interaction.skill_catalog.contract_sha256,
       target_position: target
         ? { ...target.pose.position }
+        : targetZone ? { ...targetZone.center }
         : explorationFrontier ? { ...explorationFrontier.target }
           : targetSolid ? { ...targetSolid.center } : null,
       target_solid: targetSolid ? {
@@ -283,7 +348,12 @@ export function bindHumanoidSkill(input: {
         ? structuredClone(target.articulation)
         : null,
       eligible_interaction_points: structuredClone(interaction.eligiblePoints),
-      eligible_interaction_point_ids: interaction.eligiblePointIds
+      eligible_interaction_point_ids: interaction.eligiblePointIds,
+      learned_policy_required_capabilities: learnedPolicyRequiredCapabilities,
+      learned_policy_missing_capabilities: learnedPolicyMissingCapabilities,
+      control_mode: learnedPolicyMissingCapabilities.length === 0
+        ? "learned_policy"
+        : "reference_control_fallback"
     }
   };
 }
@@ -576,7 +646,7 @@ function validateNavigationOutcome(
     || invocation.skill === "bimanual_carry"
     || invocation.skill === "retreat"
     ? invocation.target
-    : invocation.skill === "explore"
+    : invocation.skill === "explore" || invocation.skill === "navigate_to_zone"
       ? binding.target_position
     : null;
   if (expected && distance(target, expected) > 1e-6) {

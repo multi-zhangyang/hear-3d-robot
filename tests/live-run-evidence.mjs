@@ -12,15 +12,24 @@ import {
 } from "../dist/runtime/autonomy-signature.js";
 
 export async function inspectLiveRunEvidence(input) {
-  const [checkpoint, actions, modelCalls, goalEvidence, episodes, manifest] =
+  const [checkpoint, actions, modelCalls, goalEvidence, episodes, manifest, archivedManifests] =
     await Promise.all([
       input.store.readHumanoidCheckpoint(),
       input.store.readJournal("actions"),
       input.store.readJournal("model_calls"),
       input.store.readJournal("goal_evidence"),
       input.store.readJournal("episodes"),
-      input.store.readAgentManifest()
+      input.store.readAgentManifest(),
+      input.store.readArchivedAgentManifests()
     ]);
+  const manifests = [...archivedManifests, manifest];
+  const manifestsByIdentity = new Map();
+  for (const candidate of manifests) {
+    const existing = manifestsByIdentity.get(candidate.identity_sha256);
+    assert.ok(!existing || existing.epoch_id === candidate.epoch_id,
+      `Agent manifest identity was rebound: ${candidate.identity_sha256}`);
+    manifestsByIdentity.set(candidate.identity_sha256, candidate);
+  }
 
   assert.equal(checkpoint.status, input.expectedStatus,
     `Live run ended as ${checkpoint.status}, expected ${input.expectedStatus}`);
@@ -46,14 +55,16 @@ export async function inspectLiveRunEvidence(input) {
   assert.ok(Object.keys(checkpoint.model_usage.by_agent).length > 0,
     "Live run did not attribute provider usage to an Agent");
 
-  const manifestAgents = Object.values(manifest.agents);
-  assert.equal(new Set(manifestAgents.map((agent) => agent.agent_id)).size,
-    manifestAgents.length, "Agent manifest does not contain one identity per role");
-  assert.ok(manifestAgents.every((agent) => typeof agent.endpoint_sha256 === "string"),
-    "Agent manifest is missing endpoint identity hashes");
-  assert.ok(manifestAgents.every((agent) => !Object.hasOwn(agent, "endpoint")
-    && !Object.hasOwn(agent, "api_key")),
-  "Agent manifest contains raw provider configuration");
+  for (const epochManifest of manifests) {
+    const manifestAgents = Object.values(epochManifest.agents);
+    assert.equal(new Set(manifestAgents.map((agent) => agent.agent_id)).size,
+      manifestAgents.length, "Agent manifest does not contain one identity per role");
+    assert.ok(manifestAgents.every((agent) => typeof agent.endpoint_sha256 === "string"),
+      "Agent manifest is missing endpoint identity hashes");
+    assert.ok(manifestAgents.every((agent) => !Object.hasOwn(agent, "endpoint")
+      && !Object.hasOwn(agent, "api_key")),
+    "Agent manifest contains raw provider configuration");
+  }
 
   const startedCalls = modelCalls.filter((record) => (
     isRecord(record) && record.lifecycle === "started"
@@ -94,7 +105,8 @@ export async function inspectLiveRunEvidence(input) {
   const executions = actions.filter((receipt) => (
     isRecord(receipt)
       && (receipt.action === "execute_whole_body_motion"
-        || receipt.action === "execute_humanoid_navigation")
+        || receipt.action === "execute_humanoid_navigation"
+        || receipt.action === "execute_humanoid_skill")
       && receipt.accepted === true
       && Number.isSafeInteger(receipt.frameCount)
       && receipt.frameCount > 0
@@ -119,9 +131,10 @@ export async function inspectLiveRunEvidence(input) {
       `Action model call belongs to another cycle: ${receipt.transactionId}`);
     assert.equal(decision.agent_id, receipt.agentId,
       `Action decision belongs to another Agent: ${receipt.transactionId}`);
-    assert.equal(decision.agent_manifest_sha256, manifest.identity_sha256,
-      `Action decision uses another Agent manifest: ${receipt.transactionId}`);
-    assert.equal(decision.agent_manifest_epoch_id, manifest.epoch_id,
+    const decisionManifest = manifestsByIdentity.get(decision.agent_manifest_sha256);
+    assert.ok(decisionManifest,
+      `Action decision references an unknown Agent manifest: ${receipt.transactionId}`);
+    assert.equal(decision.agent_manifest_epoch_id, decisionManifest.epoch_id,
       `Action decision uses another manifest epoch: ${receipt.transactionId}`);
     assert.equal(decision.response_id, modelCall.response_id,
       `Action response identity changed: ${receipt.transactionId}`);
@@ -297,6 +310,7 @@ export async function inspectLiveRunEvidence(input) {
     travelled_distance_m: travelledDistance,
     evidence_count: evidenceRefs.size,
     context_compaction_count: checkpoint.context_memory.total_compactions,
+    agent_manifest_epoch_count: manifests.length,
     embodied_episode_count: checkpoint.embodied_memory.total_episodes,
     causal_episode_count: episodeByExecution.size,
     ...(missionCompletion
@@ -328,7 +342,8 @@ export async function inspectLiveRunEvidence(input) {
 function isPlanningAction(action) {
   return action === "plan_whole_body_motion"
     || action === "plan_whole_body_motion_candidates"
-    || action === "plan_humanoid_navigation";
+    || action === "plan_humanoid_navigation"
+    || action === "plan_humanoid_skill";
 }
 
 function selectedGoals(checkpoint) {

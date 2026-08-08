@@ -390,6 +390,30 @@ describe("humanoid Agents SDK tools", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it("can keep a long-running Agent tool schema stable while Harness authority changes", async () => {
+    const runtime = {
+      isActionAvailable: () => false,
+      invoke: vi.fn()
+    } as unknown as HumanoidActionInvoker;
+    const dynamic = createHumanoidActionTools(
+      runtime,
+      "motion-agent",
+      ["observe_humanoid"]
+    )[0];
+    const stable = createHumanoidActionTools(
+      runtime,
+      "motion-agent",
+      ["observe_humanoid"],
+      { availability: "stable" }
+    )[0];
+    if (!dynamic || !stable) throw new Error("Action tools are missing");
+    const context = new RunContext({ runId: "stable-motion-tool-schema" });
+    const agent = {} as never;
+
+    expect(await dynamic.isEnabled?.(context, agent)).toBe(false);
+    expect(await stable.isEnabled?.(context, agent)).toBe(true);
+  });
+
   it("returns exact validation issues to the model without invoking physics", async () => {
     const invoke = vi.fn();
     const plan = createHumanoidActionTools(

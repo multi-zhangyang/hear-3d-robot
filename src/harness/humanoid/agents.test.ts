@@ -198,6 +198,8 @@ describe("humanoid agent hierarchy", () => {
     };
     let coordinatorPhase = "observe_or_plan" as
       | "goal_selection"
+      | "goal_transition"
+      | "complete_satisfied_goal"
       | "observe_or_plan"
       | "plan"
       | "replan_or_retire"
@@ -205,7 +207,7 @@ describe("humanoid agent hierarchy", () => {
       | "post_execution"
       | "complete_cycle";
     let executorDelegationAvailable = false;
-    let goalRetirementDelegationAvailable = true;
+    let goalRetirementDelegationAvailable = false;
     let sentryDelegationAvailable = true;
     const execution = receipt({
       transactionId: "execute-accepted",
@@ -244,7 +246,13 @@ describe("humanoid agent hierarchy", () => {
       coordinatorPhase: () => coordinatorPhase,
       executorDelegationAvailable: () => executorDelegationAvailable,
       goalRetirementDelegationAvailable: () => goalRetirementDelegationAvailable,
-      sentryDelegationAvailable: () => sentryDelegationAvailable
+      sentryDelegationAvailable: () => sentryDelegationAvailable,
+      validateGoalTransition: () => ({ status: "superseded" }),
+      validateSatisfiedGoal: () => ({
+        epoch_id: "goal-epoch:test",
+        cycle_id: "autonomous-cycle:test",
+        physical_execution_required: false
+      })
     } as never;
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
@@ -307,7 +315,8 @@ describe("humanoid agent hierarchy", () => {
       "delegate_motion_reference",
       "delegate_physics_executor",
       "complete_autonomous_cycle",
-      "complete_goal_transition"
+      "complete_goal_transition",
+      "complete_satisfied_goal"
     ]);
     expect(hierarchy.coordinator.tools.map((entry) => entry.name)).not.toContain(
       "execute_whole_body_motion"
@@ -320,10 +329,12 @@ describe("humanoid agent hierarchy", () => {
       "recall_embodied_history",
       "submit_humanoid_skill_plan",
       "begin_humanoid_skill",
-      "plan_humanoid_skill"
+      "plan_humanoid_skill",
+      "plan_whole_body_motion_candidates"
     ]);
     expect(hierarchy.executor.tools.map((entry) => entry.name)).toEqual([
       "execute_humanoid_skill",
+      "execute_whole_body_motion",
       "remove_world_block"
     ]);
     expect(hierarchy.sentry.tools.map((entry) => entry.name)).not.toContain(
@@ -436,7 +447,26 @@ describe("humanoid agent hierarchy", () => {
     });
     goalRetirementDelegationAvailable = true;
     expect(await visibleCoordinatorTools()).toContain("delegate_goal_manager");
+    coordinatorPhase = "goal_transition";
+    expect(await visibleCoordinatorTools()).toEqual(["delegate_goal_manager"]);
+    coordinatorPhase = "complete_satisfied_goal";
+    goalRetirementDelegationAvailable = false;
+    expect(await visibleCoordinatorTools()).toEqual(["complete_satisfied_goal"]);
+    const satisfiedGoalCompletion = await coordinatorTool(
+      "complete_satisfied_goal"
+    ).invoke(
+      new RunContext({ runId: "satisfied-goal-completion" }),
+      JSON.stringify({ summary: "当前实时物理状态已经满足目标" })
+    );
+    expect(JSON.parse(String(satisfiedGoalCompletion))).toMatchObject({
+      status: "satisfied_goal_completed",
+      verification: {
+        physical_execution_required: false
+      }
+    });
     coordinatorPhase = "observe_or_plan";
+    goalRetirementDelegationAvailable = false;
+    expect(await visibleCoordinatorTools()).not.toContain("delegate_goal_manager");
     executorDelegationAvailable = true;
     const invalidExecutorDelegation = await coordinatorTool(
       "delegate_physics_executor"
@@ -565,6 +595,71 @@ describe("humanoid agent hierarchy", () => {
       "plan_humanoid_skill 必须调用 execute_humanoid_skill"
     ));
 
+    const motionBehavior = hierarchy.motion.toolUseBehavior;
+    if (typeof motionBehavior !== "function") {
+      throw new Error("Motion Agent must validate action receipts");
+    }
+    const motionTool = (name: string) => {
+      const selected = hierarchy.motion.tools.find((entry) => entry.name === name);
+      if (!selected) throw new Error(`Motion tool is missing: ${name}`);
+      return selected;
+    };
+    const submitSkillPlanTool = motionTool("submit_humanoid_skill_plan");
+    const rejectedMotionStep = await motionBehavior(
+      new RunContext({ runId: "rejected-motion-step" }),
+      [{
+        type: "function_output",
+        tool: submitSkillPlanTool,
+        output: JSON.stringify({
+          transactionId: "rejected-motion-step",
+          action: "submit_humanoid_skill_plan",
+          accepted: false
+        })
+      }] as never
+    );
+    expect(rejectedMotionStep).toMatchObject({
+      isFinalOutput: true,
+      finalOutput: expect.stringContaining("rejected-motion-step")
+    });
+    for (const [index, action] of [
+      "observe_humanoid",
+      "submit_humanoid_skill_plan",
+      "begin_humanoid_skill"
+    ].entries()) {
+      const acceptedMotionStep = await motionBehavior(
+        new RunContext({ runId: `accepted-motion-step-${index}` }),
+        [{
+          type: "function_output",
+          tool: motionTool(action),
+          output: JSON.stringify({
+            transactionId: `accepted-motion-step-${index}`,
+            action,
+            accepted: true
+          })
+        }] as never
+      );
+      expect(acceptedMotionStep).toEqual({
+        isFinalOutput: false,
+        isInterrupted: undefined
+      });
+    }
+    const acceptedMotionPlan = await motionBehavior(
+      new RunContext({ runId: "accepted-motion-plan" }),
+      [{
+        type: "function_output",
+        tool: motionTool("plan_humanoid_skill"),
+        output: JSON.stringify({
+          transactionId: "accepted-motion-plan",
+          action: "plan_humanoid_skill",
+          accepted: true
+        })
+      }] as never
+    );
+    expect(acceptedMotionPlan).toMatchObject({
+      isFinalOutput: true,
+      finalOutput: expect.stringContaining("accepted-motion-plan")
+    });
+
     const coordinatorBehavior = hierarchy.coordinator.toolUseBehavior;
     if (typeof coordinatorBehavior !== "function") {
       throw new Error("Coordinator must validate terminal tool output");
@@ -592,6 +687,18 @@ describe("humanoid agent hierarchy", () => {
     expect(acceptedTerminal).toMatchObject({
       isFinalOutput: true,
       finalOutput: JSON.stringify({ status: "goal_transition_completed" })
+    });
+    const acceptedSatisfiedGoal = await coordinatorBehavior(
+      new RunContext({ runId: "accepted-satisfied-goal" }),
+      [{
+        type: "function_output",
+        tool: { name: "complete_satisfied_goal" },
+        output: JSON.stringify({ status: "satisfied_goal_completed" })
+      }] as never
+    );
+    expect(acceptedSatisfiedGoal).toMatchObject({
+      isFinalOutput: true,
+      finalOutput: JSON.stringify({ status: "satisfied_goal_completed" })
     });
 
     coordinatorPhase = "observe_or_plan";

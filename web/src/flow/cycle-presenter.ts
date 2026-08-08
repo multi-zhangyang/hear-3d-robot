@@ -71,7 +71,7 @@ export function presentAutonomousCycles(input: {
     ? moment.cycleId === activeCycle.cycle_id
     : moment.cycleId === null);
   const live = input.checkpoint.status === "starting" || input.checkpoint.status === "running";
-  if (live || currentActions.length > 0 || currentMoments.length > 0) {
+  if (live || activeCycle !== null) {
     cycles.push(currentCycle(
       activeCycle?.cycle_index ?? input.checkpoint.cycle_index + 1,
       activeCycle?.cycle_id ?? null,
@@ -236,7 +236,8 @@ function waitingStage(
 function isPlanning(action: HumanoidActionReceipt): boolean {
   return action.action === "plan_whole_body_motion"
     || action.action === "plan_whole_body_motion_candidates"
-    || action.action === "plan_humanoid_navigation";
+    || action.action === "plan_humanoid_navigation"
+    || action.action === "plan_humanoid_skill";
 }
 
 function actionsForEpisode(
@@ -259,7 +260,8 @@ function actionsForEpisode(
 
 function isExecution(action: HumanoidActionReceipt): boolean {
   return action.action === "execute_whole_body_motion"
-    || action.action === "execute_humanoid_navigation";
+    || action.action === "execute_humanoid_navigation"
+    || action.action === "execute_humanoid_skill";
 }
 
 function planningTransactionId(action: HumanoidActionReceipt | undefined): string | null {

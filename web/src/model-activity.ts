@@ -72,7 +72,10 @@ export function reduceProviderActivity(
   if (status === "usable_stream" || status === "transport_recovered") {
     return { ...current, phase: "verified", agentId, completedAt: at };
   }
-  if (status === "transport_interrupted" || status === "model_decision_recovery") {
+  if (status === "model_decision_follow_up") {
+    return { ...current, phase: "active", agentId, startedAt: at, completedAt: null };
+  }
+  if (status === "transport_interrupted") {
     return { ...current, phase: "recovering", agentId, completedAt: at };
   }
   if (status === "no_text" || status.includes("error")) {

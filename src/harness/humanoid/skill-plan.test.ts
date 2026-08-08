@@ -135,7 +135,10 @@ describe("registered humanoid Skill DAG", () => {
       target_solid: null,
       target_articulation: null,
       eligible_interaction_points: [],
-      eligible_interaction_point_ids: ["handle"]
+      eligible_interaction_point_ids: ["handle"],
+      learned_policy_required_capabilities: ["locomotion"],
+      learned_policy_missing_capabilities: [],
+      control_mode: "learned_policy"
     } as const satisfies ActiveHumanoidSkillBinding;
     const advanced = advanceHumanoidSkillPlan({
       plan: registered,

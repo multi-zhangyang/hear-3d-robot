@@ -45,7 +45,7 @@ const AgentToolContractSchema = z.object({
   run_options: z.object({
     session_agent_id: z.string().trim().min(1),
     context_source: z.literal("parent_run_context"),
-    max_turns: z.literal("sdk_default")
+    max_turns: z.literal("unbounded")
   }).strict(),
   resume_context_strategy: z.enum(["merge", "replace", "preferSerialized"]),
   include_input_schema: z.literal(false),

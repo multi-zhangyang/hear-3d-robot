@@ -69,6 +69,21 @@ describe("model activity lifecycle", () => {
     expect(settleModelActivity({ ...interrupted, phase: "active" }, false).phase).toBe("ready");
   });
 
+  it("shows a same-session decision follow-up as active work", () => {
+    const continued = reduceProviderActivity(createModelActivity(true), {
+      status: "model_decision_follow_up",
+      at: "2026-08-03T00:00:00.000Z",
+      source: "model",
+      agentId: "humanoid-coordinator"
+    });
+    expect(continued).toMatchObject({
+      phase: "active",
+      agentId: "humanoid-coordinator",
+      startedAt: "2026-08-03T00:00:00.000Z",
+      completedAt: null
+    });
+  });
+
   it("ignores provider bookkeeping that is not a request transition", () => {
     const verified = { ...createModelActivity(true), phase: "verified" as const };
     expect(reduceProviderActivity(verified, {

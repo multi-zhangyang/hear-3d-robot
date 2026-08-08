@@ -49,6 +49,11 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
   const selectedUsage = selected ? checkpoint.model_usage?.by_agent[selected.id] : undefined;
   const goal = activeCheckpointGoal(checkpoint);
   const selectionLabel = goalSelectionLabel(checkpoint);
+  const inactiveGoalLabel = checkpoint.status === "succeeded"
+    ? "任务已完成"
+    : checkpoint.status === "failed"
+      ? "运行已结束"
+      : selectionLabel ?? "等待本轮目标";
   const cycles = useMemo(() => presentAutonomousCycles({
     checkpoint,
     actions: props.actions,
@@ -74,7 +79,7 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
           <span className={`flow-live ${isLive(checkpoint.status) ? "active" : ""}`}>
             <i /> {isLive(checkpoint.status) ? "实时运行中" : runStatusLabel(checkpoint.status)}
           </span>
-          <p>{goal ? goalSummaryLabel(goal) : selectionLabel ?? "等待本轮目标"}</p>
+          <p>{goal ? goalSummaryLabel(goal) : inactiveGoalLabel}</p>
         </div>
         <div className="flow-hero-metrics">
           <div
@@ -96,8 +101,8 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
             <i />
           </div>
           <div className="flow-progress" style={{ "--flow-progress": `${Math.min(100, progress * 100)}%` } as React.CSSProperties}>
-            <strong>{goal ? formatPercent(progress) : "—"}</strong>
-            <span>{goal ? "目标进度" : "目标选择"}</span>
+            <strong>{goal ? formatPercent(progress) : checkpoint.status === "succeeded" ? "完成" : "—"}</strong>
+            <span>{goal ? "目标进度" : checkpoint.status === "succeeded" ? "任务状态" : "目标选择"}</span>
           </div>
         </div>
       </header>

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   HUMANOID_END_EFFECTORS,
+  type Goal,
   type JsonValue,
   type Vec3
 } from "../../domain/schema.js";
@@ -224,6 +225,7 @@ export interface HumanoidActionRuntimeOptions {
   realtimeExecution?: boolean;
   retainPhysicalTerminals?: boolean;
   requireSkillBinding?: boolean;
+  activeGoal?: () => Goal | undefined;
   signal?: AbortSignal;
 }
 
@@ -240,6 +242,7 @@ export class HumanoidActionRuntime {
   readonly #realtimeExecution: boolean;
   readonly #retainPhysicalTerminals: boolean;
   readonly #requireSkillBinding: boolean;
+  readonly #activeGoal: HumanoidActionRuntimeOptions["activeGoal"];
   readonly #signal: AbortSignal | undefined;
   readonly #receipts = new Map<string, HumanoidActionReceipt>();
   readonly #transactions = new Map<string, {
@@ -291,6 +294,7 @@ export class HumanoidActionRuntime {
     this.#realtimeExecution = options.realtimeExecution ?? false;
     this.#retainPhysicalTerminals = options.retainPhysicalTerminals ?? false;
     this.#requireSkillBinding = options.requireSkillBinding ?? false;
+    this.#activeGoal = options.activeGoal;
     this.#signal = options.signal;
     if (options.state !== undefined && options.state !== null) {
       this.#restoreState(options.state);
@@ -424,8 +428,12 @@ export class HumanoidActionRuntime {
   isActionAvailable(name: HumanoidActionName, agentId: string): boolean {
     const normalizedAgentId = agentId.trim();
     if (normalizedAgentId !== "humanoid-motion-reference") return true;
-    if (name === "plan_humanoid_navigation"
-      && this.#navigationTransitClearanceRequirementByAgent.has(normalizedAgentId)) {
+    const transitClearance = this.#navigationTransitClearanceRequirementByAgent.has(
+      normalizedAgentId
+    );
+    if (transitClearance
+      && (name === "plan_humanoid_navigation"
+        || name === "plan_humanoid_skill")) {
       return false;
     }
     const observedRevision = this.#observationRevisionByAgent.get(
@@ -478,7 +486,9 @@ export class HumanoidActionRuntime {
       const skill = this.#activeSkillByAgent.get(normalizedAgentId);
       if (!skill
         || skill.observed_world_revision < this.#latestPhysicalExecutionRevision
-        || skill.planning_action !== name) return false;
+        || (skill.planning_action !== name
+          && !(transitClearance
+            && name === "plan_whole_body_motion_candidates"))) return false;
     }
     if (latestFailure?.action === name
       && latestFailure.physicalExecutionRevision
@@ -696,6 +706,12 @@ export class HumanoidActionRuntime {
       || receipt.action === "execute_humanoid_navigation") {
       const planningTransactionId = jsonObject(receipt.input)
         ?.planning_transaction_id;
+      const planningReceipt = typeof planningTransactionId === "string"
+        ? this.#receipts.get(planningTransactionId)
+        : undefined;
+      const transitClearanceRecovery = planningReceipt !== undefined
+        && jsonObject(planningReceipt.detail)?.recovery_kind
+          === "navigation_transit_clearance";
       const skill = typeof planningTransactionId === "string"
         ? this.#skillByPlanningTransactionId.get(planningTransactionId)
         : undefined;
@@ -731,7 +747,7 @@ export class HumanoidActionRuntime {
       const skillPlan = skillPlanTransactionId
         ? this.#skillPlansByTransactionId.get(skillPlanTransactionId)
         : undefined;
-      if (skill && skillPlan && receipt.accepted) {
+      if (skill && skillPlan && receipt.accepted && !transitClearanceRecovery) {
         const advanced = advanceHumanoidSkillPlan({
           plan: skillPlan,
           binding: skill,
@@ -796,21 +812,30 @@ export class HumanoidActionRuntime {
       this.#navigationTransitClearanceRequirementByAgent.delete(motionAgentId);
       return;
     }
-    if (receipt.agentId !== motionAgentId
-      || receipt.action !== "plan_humanoid_navigation"
-      || receipt.accepted) return;
+    if (receipt.agentId !== motionAgentId || receipt.accepted) return;
     const detail = jsonObject(receipt.detail);
-    const requirement = navigationTransitClearanceFromRejection({
-      reason: detail?.reason,
-      transactionId: receipt.transactionId,
-      worldRevision: receipt.worldAfterRevision,
-      snapshot: this.#world.snapshot()
-    });
-    if (requirement) {
-      this.#navigationTransitClearanceRequirementByAgent.set(
-        motionAgentId,
-        requirement
-      );
+    const reasons = receipt.action === "plan_humanoid_navigation"
+      ? [detail?.reason]
+      : receipt.action === "plan_humanoid_skill"
+        && detail?.autonomous_plan_kind === "navigation"
+        && Array.isArray(detail.attempts)
+        ? detail.attempts.map((attempt) => jsonObject(attempt)?.reason)
+        : [];
+    for (const reason of reasons) {
+      const requirement = navigationTransitClearanceFromRejection({
+        reason,
+        transactionId: receipt.transactionId,
+        blockedAction: receipt.action as "plan_humanoid_navigation" | "plan_humanoid_skill",
+        worldRevision: receipt.worldAfterRevision,
+        snapshot: this.#world.snapshot()
+      });
+      if (requirement) {
+        this.#navigationTransitClearanceRequirementByAgent.set(
+          motionAgentId,
+          requirement
+        );
+        return;
+      }
     }
   }
 
@@ -823,10 +848,43 @@ export class HumanoidActionRuntime {
       return undefined;
     }
     const current = this.#world.observe();
-    if (!humanoidSkillObservationCompatible(observed, current)) return undefined;
+    const compatible = humanoidSkillObservationCompatible(observed, current);
+    this.#reconcileSkillPlanWorldAuthority(
+      agentId,
+      observed,
+      current,
+      compatible
+    );
+    if (!compatible) return undefined;
     this.#observationRevisionByAgent.set(agentId, current.worldRevision);
     this.#observationByAgent.set(agentId, current);
     return current;
+  }
+
+  #reconcileSkillPlanWorldAuthority(
+    agentId: string,
+    previous: HumanoidWorldObservation | undefined,
+    current: HumanoidWorldObservation,
+    compatible = previous !== undefined
+      && humanoidSkillObservationCompatible(previous, current)
+  ): void {
+    const transactionId = this.#activeSkillPlanTransactionByAgent.get(agentId);
+    const plan = transactionId
+      ? this.#skillPlansByTransactionId.get(transactionId)
+      : undefined;
+    if (!plan) return;
+    if (plan.world_revision === current.worldRevision) return;
+    if (previous && plan.world_revision === previous.worldRevision && compatible) {
+      this.#skillPlansByTransactionId.set(plan.transaction_id, {
+        ...plan,
+        observed_frame: current.frame,
+        world_revision: current.worldRevision
+      });
+      return;
+    }
+    this.#skillPlansByTransactionId.delete(plan.transaction_id);
+    this.#activeSkillPlanTransactionByAgent.delete(agentId);
+    this.#activeSkillByAgent.delete(agentId);
   }
 
   #renewPlanningSkillAuthority(agentId: string):
@@ -860,6 +918,8 @@ export class HumanoidActionRuntime {
     if (previous.observed_world_revision === observation.worldRevision) {
       return { accepted: true, binding: previous };
     }
+    const activeGoal = this.#activeGoal?.();
+    const recovery = this.#recoveryPolicyByAgent.get(agentId);
     const rebound = bindHumanoidSkill({
       transactionId: previous.transaction_id,
       agentId,
@@ -869,20 +929,15 @@ export class HumanoidActionRuntime {
         invocation: previous.invocation,
         phase: previous.phase
       },
-      observation
+      observation,
+      ...(activeGoal ? { activeGoal } : {}),
+      ...(recovery
+        && humanoidRecoverySelectionAccepted(recovery, previous.invocation)
+        ? { recoveryAuthorized: true }
+        : {})
     });
     if (!rebound.accepted) return rebound;
     this.#activeSkillByAgent.set(agentId, rebound.binding);
-    const planTransactionId = rebound.binding.skill_plan_transaction_id;
-    const plan = planTransactionId
-      ? this.#skillPlansByTransactionId.get(planTransactionId)
-      : undefined;
-    if (plan) {
-      this.#skillPlansByTransactionId.set(plan.transaction_id, {
-        ...plan,
-        world_revision: observation.worldRevision
-      });
-    }
     return { accepted: true, binding: rebound.binding };
   }
 
@@ -954,6 +1009,10 @@ export class HumanoidActionRuntime {
           }
         };
       }
+      const transitClearanceRecovery = name === "plan_whole_body_motion_candidates"
+        && this.#navigationTransitClearanceRequirementByAgent.has(
+          invocation.agentId
+        );
       if (this.#requireSkillBinding && name !== "plan_whole_body_motion") {
         const renewed = this.#renewPlanningSkillAuthority(invocation.agentId);
         if (!renewed.accepted) {
@@ -964,12 +1023,18 @@ export class HumanoidActionRuntime {
             detail: renewed.detail
           };
         }
-        const skillReference = validateSkillPlanningReference({
-          binding: renewed.binding,
-          action: name,
-          rawInput,
-          currentWorldRevision: this.#world.snapshot().worldRevision
-        });
+        const skillReference = transitClearanceRecovery
+          ? transitClearanceSkillReference(
+              renewed.binding,
+              rawInput,
+              this.#world.snapshot().worldRevision
+            )
+          : validateSkillPlanningReference({
+              binding: renewed.binding,
+              action: name,
+              rawInput,
+              currentWorldRevision: this.#world.snapshot().worldRevision
+            });
         if (!skillReference.accepted) {
           return {
             accepted: false,
@@ -1018,6 +1083,12 @@ export class HumanoidActionRuntime {
       const observation = invocation.agentId === "humanoid-motion-reference"
         ? await this.#world.observeManipulationReachability()
         : this.#world.observe();
+      const previousObservation = this.#observationByAgent.get(invocation.agentId);
+      this.#reconcileSkillPlanWorldAuthority(
+        invocation.agentId,
+        previousObservation,
+        observation
+      );
       this.#observationRevisionByAgent.set(
         invocation.agentId,
         observation.worldRevision
@@ -1109,14 +1180,9 @@ export class HumanoidActionRuntime {
         };
       }
       const planTransactionId = request.skill_plan_transaction_id;
-      let plan = planTransactionId
+      const plan = planTransactionId
         ? this.#skillPlansByTransactionId.get(planTransactionId)
         : undefined;
-      if (plan && plan.agent_id === invocation.agentId
-        && plan.world_revision !== currentWorldRevision) {
-        plan = { ...plan, world_revision: currentWorldRevision };
-        this.#skillPlansByTransactionId.set(plan.transaction_id, plan);
-      }
       if (this.#requireSkillBinding || planTransactionId || request.skill_node_id) {
         const nodeAuthority = authorizeHumanoidSkillPlanNode({
           plan,
@@ -1136,11 +1202,18 @@ export class HumanoidActionRuntime {
           };
         }
       }
+      const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
+      const activeGoal = this.#activeGoal?.();
       const result = bindHumanoidSkill({
         transactionId: invocation.transactionId,
         agentId: invocation.agentId,
         request,
-        observation
+        observation,
+        ...(activeGoal ? { activeGoal } : {}),
+        ...(recovery
+          && humanoidRecoverySelectionAccepted(recovery, request.invocation)
+          ? { recoveryAuthorized: true }
+          : {})
       });
       if (!result.accepted) {
         return {
@@ -1150,7 +1223,6 @@ export class HumanoidActionRuntime {
           detail: result.detail
         };
       }
-      const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
       if (recovery
         && !humanoidRecoverySelectionAccepted(recovery, result.binding.invocation)) {
         return {
@@ -1179,6 +1251,20 @@ export class HumanoidActionRuntime {
     }
     if (name === "plan_humanoid_skill") {
       HumanoidActionInputs.plan_humanoid_skill.parse(rawInput);
+      const transitClearance = this.#navigationTransitClearanceRequirementByAgent.get(
+        invocation.agentId
+      );
+      if (transitClearance) {
+        return {
+          accepted: false,
+          code: "navigation_transit_clearance_required",
+          channels: [],
+          detail: {
+            ...navigationTransitClearanceContext(transitClearance) as Record<string, JsonValue>,
+            recovery: "Submit a short model-selected fixed-base whole-body candidate that moves the collision-side wrist, execute it, and observe before replanning the Skill."
+          }
+        };
+      }
       const binding = this.#activeSkillByAgent.get(invocation.agentId);
       const observation = this.#observationByAgent.get(invocation.agentId);
       if (!binding || !observation) {
@@ -1194,7 +1280,17 @@ export class HumanoidActionRuntime {
       }
       let plan: ReturnType<typeof planAutonomousHumanoidSkill>;
       try {
-        plan = planAutonomousHumanoidSkill({ binding, observation });
+        const activeGoal = this.#activeGoal?.();
+        const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
+        plan = planAutonomousHumanoidSkill({
+          binding,
+          observation,
+          ...(activeGoal ? { activeGoal } : {}),
+          ...(recovery
+            && humanoidRecoverySelectionAccepted(recovery, binding.invocation)
+            ? { recoveryAuthorized: true }
+            : {})
+        });
       } catch (error) {
         return {
           accepted: false,
@@ -1246,6 +1342,7 @@ export class HumanoidActionRuntime {
       }
       const attempts: Array<{
         target: Vec3;
+        accepted_position_tolerance_m: number | null;
         score: number;
         accepted: boolean;
         reason: string | null;
@@ -1254,10 +1351,13 @@ export class HumanoidActionRuntime {
       for (const candidate of plan.targets.slice(0, 8)) {
         const result = await this.#world.planNavigation(
           candidate.target,
-          candidate.arrivalHeading
+          candidate.arrivalHeading,
+          candidate.acceptedPositionToleranceMeters ?? null
         );
         attempts.push({
           target: { ...candidate.target },
+          accepted_position_tolerance_m:
+            candidate.acceptedPositionToleranceMeters ?? null,
           score: candidate.score,
           accepted: result.accepted,
           reason: result.reason ?? null
@@ -1463,7 +1563,8 @@ export class HumanoidActionRuntime {
       const clearanceRejection = transitClearance
         ? navigationTransitClearanceMotionRejection(
             batch.candidates,
-            transitClearance
+            transitClearance,
+            batch.termination
           )
         : null;
       if (clearanceRejection) return clearanceRejection;
@@ -1489,6 +1590,9 @@ export class HumanoidActionRuntime {
         channels: result.channels,
         detail: {
           ...this.#planningSkillDetail(invocation.agentId),
+          ...(transitClearance
+            ? { recovery_kind: "navigation_transit_clearance" }
+            : {}),
           plan_id: result.planId,
           objective: batch.objective,
           created_revision: result.createdRevision,
@@ -1843,6 +1947,46 @@ function isPlanningAction(action: HumanoidActionName): action is HumanoidPlannin
     || action === "plan_humanoid_navigation";
 }
 
+function transitClearanceSkillReference(
+  binding: ActiveHumanoidSkillBinding,
+  rawInput: unknown,
+  currentWorldRevision: number
+): { accepted: true } | { accepted: false; code: string; detail: JsonValue } {
+  const suppliedValue = rawInput !== null
+    && typeof rawInput === "object"
+    && !Array.isArray(rawInput)
+    ? (rawInput as Record<string, unknown>).skill_transaction_id
+    : undefined;
+  const supplied = typeof suppliedValue === "string" ? suppliedValue : null;
+  if (supplied !== binding.transaction_id) {
+    return {
+      accepted: false,
+      code: "skill_reference_mismatch",
+      detail: jsonValue({
+        action: "plan_whole_body_motion_candidates",
+        supplied_skill_transaction_id: supplied ?? null,
+        active_skill_transaction_id: binding.transaction_id,
+        automatic_actuation: false
+      })
+    };
+  }
+  if (binding.observed_world_revision !== currentWorldRevision) {
+    return {
+      accepted: false,
+      code: "skill_world_revision_stale",
+      detail: jsonValue({
+        action: "plan_whole_body_motion_candidates",
+        skill: binding.invocation.skill,
+        skill_world_revision: binding.observed_world_revision,
+        current_world_revision: currentWorldRevision,
+        automatic_actuation: false,
+        recovery: "Observe the changed world before planning another transit-clearance posture"
+      })
+    };
+  }
+  return { accepted: true };
+}
+
 function humanoidSkillObservationCompatible(
   observed: HumanoidWorldObservation,
   current: HumanoidWorldObservation
@@ -1856,10 +2000,20 @@ function humanoidSkillObservationCompatible(
     ) > SKILL_AUTHORITY_ORIENTATION_DRIFT_RADIANS) {
     return false;
   }
-  const observedObjects = new Map(observed.interaction.object_world_model.objects
+  const observedObjectTokens = observed.interaction?.object_world_model?.objects;
+  const currentObjectTokens = current.interaction?.object_world_model?.objects;
+  const observedCarryBindings = observed.interaction?.carrying?.bindings;
+  const currentCarryBindings = current.interaction?.carrying?.bindings;
+  if (!observedObjectTokens
+    || !currentObjectTokens
+    || !observedCarryBindings
+    || !currentCarryBindings) {
+    return false;
+  }
+  const observedObjects = new Map(observedObjectTokens
     .filter(({ status }) => status === "visible")
     .map((object) => [object.id, object]));
-  const currentObjects = new Map(current.interaction.object_world_model.objects
+  const currentObjects = new Map(currentObjectTokens
     .filter(({ status }) => status === "visible")
     .map((object) => [object.id, object]));
   if (observedObjects.size !== currentObjects.size) return false;
@@ -1879,8 +2033,8 @@ function humanoidSkillObservationCompatible(
     }
   }
   if (!sameBindings(
-    observed.interaction.carrying.bindings,
-    current.interaction.carrying.bindings
+    observedCarryBindings,
+    currentCarryBindings
   )) return false;
   const observedSolids = new Map(observed.solidTokens.map((solid) => [solid.id, solid]));
   const currentSolids = new Map(current.solidTokens.map((solid) => [solid.id, solid]));

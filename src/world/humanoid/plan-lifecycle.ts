@@ -20,18 +20,37 @@ export function humanoidMotionIntentSha256(
 
 export function humanoidNavigationIntentSha256(
   target: Vec3,
-  arrivalHeading: HumanoidNavigationArrivalHeading | null = null
+  arrivalHeading: HumanoidNavigationArrivalHeading | null = null,
+  acceptedPositionToleranceMeters: number | null = null
 ): string {
   const normalizedTarget = {
     x: finiteCoordinate(target.x, "x"),
     y: finiteCoordinate(target.y, "y"),
     z: finiteCoordinate(target.z, "z")
   };
-  if (arrivalHeading === null) return sha256(JSON.stringify(normalizedTarget));
+  if (arrivalHeading === null && acceptedPositionToleranceMeters === null) {
+    return sha256(JSON.stringify(normalizedTarget));
+  }
   return sha256(JSON.stringify({
     target: normalizedTarget,
-    arrival_heading: HumanoidNavigationArrivalHeadingSchema.parse(arrivalHeading)
+    ...(arrivalHeading === null
+      ? {}
+      : { arrival_heading: HumanoidNavigationArrivalHeadingSchema.parse(arrivalHeading) }),
+    ...(acceptedPositionToleranceMeters === null
+      ? {}
+      : {
+          accepted_position_tolerance_m: finitePositionTolerance(
+            acceptedPositionToleranceMeters
+          )
+        })
   }));
+}
+
+function finitePositionTolerance(value: number): number {
+  if (!Number.isFinite(value) || value <= 0 || value > 1) {
+    throw new Error("Humanoid navigation position tolerance must be within (0, 1] meters");
+  }
+  return value;
 }
 
 export function humanoidPlanExpiryRevision(input: {

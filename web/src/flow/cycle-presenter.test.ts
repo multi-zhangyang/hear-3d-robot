@@ -157,6 +157,67 @@ describe("autonomous cycle presenter", () => {
     expect(cycle?.phaseLabel).toBe("目标管理智能体正在选择 · 2 个候选");
     expect(cycle?.stages.every((stage) => stage.state === "waiting")).toBe(true);
   });
+
+  it("does not invent a new cycle for an already completed run", () => {
+    const episode = embodiedEpisode();
+    const checkpoint = checkpointWith([episode], 3, "succeeded", 225);
+
+    const cycles = presentAutonomousCycles({
+      checkpoint,
+      actions: [],
+      framework: [{
+        at: "2026-08-03T00:00:05.000Z",
+        agent_name: "humanoid-coordinator",
+        event: {
+          type: "run_item_stream_event",
+          name: "message_output_created",
+          item: { rawItem: { content: [{ type: "output_text", text: "运行已经完成。" }] } }
+        }
+      }]
+    });
+
+    expect(cycles).toHaveLength(1);
+    expect(cycles[0]).toMatchObject({ index: 3, state: "completed" });
+  });
+
+  it("recognizes autonomous skill planning and execution receipts", () => {
+    const planning = receipt({
+      transactionId: "skill-plan-3",
+      action: "plan_humanoid_skill",
+      at: "2026-08-03T00:00:02.000Z",
+      before: 150,
+      after: 150
+    });
+    const execution = receipt({
+      transactionId: "skill-execute-3",
+      action: "execute_humanoid_skill",
+      at: "2026-08-03T00:00:03.000Z",
+      before: 150,
+      after: 225,
+      input: { planning_transaction_id: "skill-plan-3" },
+      frames: 75
+    });
+    const episode = {
+      ...embodiedEpisode(),
+      transaction_id: "skill-execute-3",
+      action: "execute_humanoid_skill" as const,
+      planning_action: "plan_humanoid_skill" as const,
+      causal_trace: {
+        ...embodiedEpisode().causal_trace!,
+        planning_transaction_id: "skill-plan-3",
+        execution_transaction_id: "skill-execute-3"
+      }
+    };
+
+    const [cycle] = presentAutonomousCycles({
+      checkpoint: checkpointWith([episode], 3, "succeeded", 225),
+      actions: [planning, execution],
+      framework: []
+    });
+
+    expect(cycle?.stages[1]).toMatchObject({ state: "success" });
+    expect(cycle?.stages[2]).toMatchObject({ state: "success" });
+  });
 });
 
 function receipt(input: {

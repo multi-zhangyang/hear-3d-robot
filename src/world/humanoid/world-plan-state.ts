@@ -54,6 +54,7 @@ export interface StoredHumanoidNavigationPlan {
   requestedTarget: Vec3;
   requestedArrivalHeading: HumanoidNavigationArrivalHeading | null;
   arrivalHeading: HumanoidNavigationArrivalHeading | null;
+  acceptedPositionToleranceMeters: number | null;
   releaseJointTracking: boolean;
   createdRevision: number;
   validatedRevision: number;

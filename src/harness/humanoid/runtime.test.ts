@@ -8,7 +8,11 @@ import { yawFromQuaternion } from "../../world/geometry.js";
 import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.js";
 import { HumanoidWorld } from "../../world/humanoid/world.js";
 import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
-import { HumanoidActionRuntime } from "./runtime.js";
+import {
+  HumanoidActionRuntime,
+  humanoidActionFingerprint,
+  type HumanoidActionReceipt
+} from "./runtime.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
 import { applyScenarioChunkDeltaMutation } from "../../domain/scenario-chunk-delta.js";
 import { createScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
@@ -1025,6 +1029,310 @@ describe("HumanoidActionRuntime", () => {
     });
   });
 
+  it("turns Skill navigation hand collisions into a bounded transit-clearance state", () => {
+    const transactionId = "skill-navigation-hand-collision";
+    const input = { skill_transaction_id: "explore-skill" };
+    const receipt: HumanoidActionReceipt = {
+      transactionId,
+      agentId: "humanoid-motion-reference",
+      action: "plan_humanoid_skill",
+      input,
+      fingerprint: humanoidActionFingerprint(
+        "plan_humanoid_skill",
+        "humanoid-motion-reference",
+        input
+      ),
+      accepted: false,
+      code: "autonomous_skill_route_rejected",
+      worldBeforeRevision: 42,
+      worldAfterRevision: 42,
+      frameCount: 0,
+      channels: ["locomotion"],
+      detail: {
+        autonomous_plan_kind: "navigation",
+        failure_class: "path_or_physical_preview_infeasible",
+        attempts: [{
+          target: { x: 4, y: 0, z: 5 },
+          score: 3.5,
+          accepted: false,
+          reason: "environment_contact:left_hand_index_1_link:stone-column; preview_frames=353"
+        }]
+      },
+      committedAt: "2026-08-08T00:00:00.000Z"
+    };
+    const world = {
+      snapshot: () => ({
+        frame: 10,
+        worldRevision: 42,
+        robot: {
+          links: {
+            left_wrist_yaw_link: {
+              position: { x: 1, y: 0.9, z: 2 },
+              rotation: { x: 0, y: 0, z: 0, w: 1 }
+            },
+            left_ankle_roll_link: {
+              position: { x: 0.9, y: 0.05, z: 2 },
+              rotation: { x: 0, y: 0, z: 0, w: 1 }
+            },
+            right_ankle_roll_link: {
+              position: { x: 1.1, y: 0.05, z: 2 },
+              rotation: { x: 0, y: 0, z: 0, w: 1 }
+            }
+          },
+          objects: {
+            "stone-column": {
+              id: "stone-column",
+              position: { x: 1.2, y: 0.8, z: 2.1 }
+            }
+          }
+        }
+      }),
+      consumablePlanIds: () => []
+    } as unknown as HumanoidWorld;
+
+    const runtime = new HumanoidActionRuntime(world, {
+      receipts: { [transactionId]: receipt }
+    });
+
+    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+      transit_clearance: {
+        status: "required",
+        blocked_action: "plan_humanoid_skill",
+        source_transaction_id: transactionId,
+        observed_world_revision: 42,
+        collision_hand_surface: "left_hand_index_1_link",
+        required_end_effector: "left_wrist",
+        collision_target_id: "stone-column",
+        current_wrist_world: { x: 1, y: 0.9, z: 2 },
+        fixed_foot_world_targets: {
+          left: { x: 0.9, y: 0.05, z: 2 },
+          right: { x: 1.1, y: 0.05, z: 2 }
+        },
+        collision_target_world: { x: 1.2, y: 0.8, z: 2.1 },
+        automatic_actuation: false
+      }
+    });
+  });
+
+  it("opens only the model-selected whole-body recovery path after a Skill route collision", async () => {
+    const collisionReason =
+      "environment_contact:left_hand_index_1_link:stone-column; preview_frames=353";
+    const lightweight = lightweightObservationWorld({
+      accepted: false,
+      planId: "",
+      createdRevision: 0,
+      validatedStateSha256: "a".repeat(64),
+      expiresRevision: 100,
+      intentSha256: "b".repeat(64),
+      target: { x: 4, y: 0, z: 5 },
+      chunkTarget: { x: 4, y: 0, z: 5 },
+      requestedArrivalHeading: null,
+      arrivalHeading: null,
+      waypoints: [],
+      distance: 5,
+      remainingDistance: 5,
+      carry: { binding_set_sha256: "c".repeat(64), bindings: [] },
+      reason: collisionReason
+    }, {
+      spatialBelief: {
+        protocol: "humanoid-spatial-belief-v1",
+        resolution_m: 0.5,
+        observed_cell_count: 20,
+        free_cell_count: 18,
+        occupied_cell_count: 2,
+        visited_cell_count: 4,
+        total_cell_count: 100,
+        coverage_ratio: 0.2,
+        frontiers: [{
+          id: "frontier:8:10",
+          target: { x: 4, y: 0, z: 5 },
+          expected_information_gain: 12,
+          travel_distance_m: 5,
+          revisit_penalty: 0,
+          score: 6
+        }]
+      },
+      interaction: {
+        object_world_model: { frame: 0, world_revision: 0, objects: [] },
+        skill_catalog: { contract_sha256: "d".repeat(64) },
+        carrying: { bindings: [] },
+        manipulable_objects: []
+      }
+    }, 0, {
+      robot: {
+        links: {
+          left_wrist_yaw_link: {
+            position: { x: 1, y: 0.9, z: 2 },
+            rotation: { x: 0, y: 0, z: 0, w: 1 }
+          },
+          left_ankle_roll_link: {
+            position: { x: 0.9, y: 0.05, z: 2 },
+            rotation: { x: 0, y: 0, z: 0, w: 1 }
+          },
+          right_ankle_roll_link: {
+            position: { x: 1.1, y: 0.05, z: 2 },
+            rotation: { x: 0, y: 0, z: 0, w: 1 }
+          }
+        },
+        objects: {
+          "stone-column": {
+            id: "stone-column",
+            position: { x: 1.2, y: 0.8, z: 2.1 }
+          }
+        }
+      }
+    });
+    const runtime = new HumanoidActionRuntime(lightweight.world, {
+      requireSkillBinding: true
+    });
+    await runtime.invoke(
+      "observe_humanoid",
+      {},
+      "clearance-observation",
+      "humanoid-motion-reference"
+    );
+    const invocation = {
+      skill: "explore" as const,
+      frontier_id: "frontier:8:10",
+      strategy: "information_gain" as const,
+      maximum_travel_m: 6
+    };
+    await runtime.invoke(
+      "submit_humanoid_skill_plan",
+      {
+        objective: "inspect the selected frontier",
+        strategies: [{
+          strategy_id: "frontier-route",
+          rationale: "the frontier has current information gain",
+          nodes: [{
+            node_id: "reach-frontier",
+            invocation,
+            depends_on_node_ids: []
+          }]
+        }],
+        selected_strategy_id: "frontier-route"
+      },
+      "clearance-skill-plan",
+      "humanoid-motion-reference"
+    );
+    await runtime.invoke(
+      "begin_humanoid_skill",
+      {
+        skill_plan_transaction_id: "clearance-skill-plan",
+        skill_node_id: "reach-frontier",
+        invocation,
+        phase: "route_to_frontier"
+      },
+      "clearance-skill",
+      "humanoid-motion-reference"
+    );
+    await expect(runtime.invoke(
+      "plan_humanoid_skill",
+      { skill_transaction_id: "clearance-skill" },
+      "clearance-route-plan",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({
+      accepted: false,
+      code: "autonomous_skill_route_rejected",
+      detail: {
+        attempts: [{ accepted: false, reason: collisionReason }]
+      }
+    });
+
+    expect(runtime.isActionAvailable(
+      "plan_humanoid_skill",
+      "humanoid-motion-reference"
+    )).toBe(false);
+    expect(runtime.isActionAvailable(
+      "plan_whole_body_motion_candidates",
+      "humanoid-motion-reference"
+    )).toBe(true);
+    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+      planning_actions: expect.arrayContaining([
+        { action: "plan_humanoid_skill", available: false },
+        { action: "plan_whole_body_motion_candidates", available: true }
+      ]),
+      transit_clearance: {
+        status: "required",
+        blocked_action: "plan_humanoid_skill",
+        required_end_effector: "left_wrist"
+      }
+    });
+
+    await expect(runtime.invoke(
+      "plan_whole_body_motion_candidates",
+      {
+        skill_transaction_id: "clearance-skill",
+        objective: "move the colliding wrist clear while keeping the base fixed",
+        termination: {
+          mode: "all",
+          option_id: "left-wrist-clear",
+          predicates: [{
+            type: "end_effector_near_point",
+            end_effector: "left_wrist",
+            frame: "world",
+            target: { x: 0.8, y: 1.05, z: 1.8 },
+            tolerance_m: 0.04
+          }],
+          stable_steps: 2
+        },
+        candidates: [{
+          id: "lift-left-wrist-away",
+          intent: "clear the left hand from the obstacle",
+          duration_seconds: 0.5,
+          contacts: [],
+          keyframes: [
+            {
+              at_seconds: 0,
+              channels: [{
+                type: "end_effector_position",
+                end_effector: "left_ankle",
+                frame: "world",
+                position: { x: 0.9, y: 0.05, z: 2 },
+                tolerance_m: 0.04
+              }, {
+                type: "end_effector_position",
+                end_effector: "right_ankle",
+                frame: "world",
+                position: { x: 1.1, y: 0.05, z: 2 },
+                tolerance_m: 0.04
+              }]
+            },
+            {
+              at_seconds: 0.5,
+              channels: [{
+                type: "end_effector_position",
+                end_effector: "left_ankle",
+                frame: "world",
+                position: { x: 0.9, y: 0.05, z: 2 },
+                tolerance_m: 0.04
+              }, {
+                type: "end_effector_position",
+                end_effector: "right_ankle",
+                frame: "world",
+                position: { x: 1.1, y: 0.05, z: 2 },
+                tolerance_m: 0.04
+              }, {
+                type: "end_effector_position",
+                end_effector: "left_wrist",
+                frame: "world",
+                position: { x: 0.8, y: 1.05, z: 1.8 },
+                tolerance_m: 0.04
+              }]
+            }
+          ]
+        }]
+      },
+      "clearance-posture-plan",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({
+      accepted: false,
+      code: "whole_body_candidates_rejected",
+      detail: { recovery_kind: "navigation_transit_clearance" }
+    });
+    expect(lightweight.candidatePlanningCalls()).toBe(1);
+  });
+
   it("exposes only authority-prepared block-removal transactions", async () => {
     const lightweight = lightweightObservationWorld();
     const prepared: Array<{
@@ -1528,7 +1836,8 @@ function record(value: JsonValue | undefined): Record<string, JsonValue> {
 function lightweightObservationWorld(
   navigationReceipt?: Awaited<ReturnType<HumanoidWorld["planNavigation"]>>,
   observationOverride: Record<string, unknown> = {},
-  worldRevision = 0
+  worldRevision = 0,
+  snapshotOverride: Record<string, unknown> = {}
 ): {
   world: HumanoidWorld;
   observationCalls: () => number;
@@ -1537,7 +1846,11 @@ function lightweightObservationWorld(
   let observationCalls = 0;
   let candidatePlanningCalls = 0;
   const worldShape = {
-    snapshot: () => ({ frame: 0, worldRevision }),
+    snapshot: () => ({
+      frame: 0,
+      worldRevision,
+      ...structuredClone(snapshotOverride)
+    }),
     consumablePlanIds: () => [],
     planNavigation: async () => structuredClone(navigationReceipt ?? {
       accepted: false,

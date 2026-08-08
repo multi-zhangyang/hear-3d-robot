@@ -21,6 +21,25 @@ export interface ToolInputRecovery {
   ): string | undefined;
 }
 
+export function recoverInvalidToolInputOutput(
+  output: string,
+  input: string,
+  schema: ZodType,
+  toolName: string,
+  recovery: ToolInputRecovery
+): string {
+  const parsed = jsonObject(output);
+  if (parsed?.accepted !== false
+    || parsed.tool !== toolName
+    || (parsed.code !== "invalid_tool_input"
+      && parsed.code !== "repeated_invalid_tool_input")) {
+    return output;
+  }
+  const recovered = recovery.preflight(input, schema, toolName);
+  if (recovered === undefined) return output;
+  return JSON.stringify({ ...parsed, ...jsonObject(recovered) });
+}
+
 export function createToolInputRecovery(): ToolInputRecovery {
   let previousAttempt: InvalidInputAttempt | undefined;
   return {
@@ -236,6 +255,14 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object"
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function jsonObject(value: string): Record<string, unknown> | undefined {
+  try {
+    return objectRecord(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
 }
 
 function validationIssues(values: unknown): ValidationIssue[] {

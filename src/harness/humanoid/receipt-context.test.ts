@@ -134,6 +134,73 @@ describe("humanoid receipt context", () => {
     expect(JSON.stringify(projected).length).toBeLessThan(1_000);
   });
 
+  it("exposes bounded autonomous route failure causes to replanning Agents", () => {
+    const receipt: HumanoidActionReceipt = {
+      transactionId: "autonomous-route-rejected-1",
+      agentId: "humanoid-motion-reference",
+      action: "plan_humanoid_skill",
+      input: { skill_transaction_id: "skill-binding-1" },
+      fingerprint: "fingerprint",
+      accepted: false,
+      code: "autonomous_skill_route_rejected",
+      worldBeforeRevision: 42,
+      worldAfterRevision: 42,
+      frameCount: 0,
+      channels: ["locomotion"],
+      detail: {
+        autonomous_plan_kind: "navigation",
+        failure_class: "path_or_physical_preview_infeasible",
+        skill_binding: {
+          transaction_id: "skill-binding-1",
+          skill_plan_transaction_id: "skill-plan-1",
+          skill_node_id: "explore_frontier_22_21",
+          invocation: {
+            skill: "explore",
+            frontier_id: "frontier:22:21",
+            strategy: "balanced",
+            maximum_travel_m: 8
+          },
+          phase: "route_to_frontier",
+          phase_authority: "navigation",
+          planning_action: "plan_humanoid_skill",
+          observed_world_revision: 42,
+          target_position: { x: 11.25, y: 0, z: 10.75 },
+          control_mode: "learned_policy",
+          hidden_catalog: { large: true }
+        },
+        attempts: [{
+          target: { x: 11.25, y: 0, z: 10.75 },
+          score: 2.56,
+          accepted: false,
+          reason: "environment_contact:left_hand_index_1_link:environment; preview_frames=353; preview_travelled_m=1.765946",
+          hidden_trajectory: Array.from({ length: 500 }, (_, frame) => ({ frame }))
+        }]
+      },
+      committedAt: "2026-08-08T00:00:00.000Z"
+    };
+
+    const projected = recentReceiptContext(receipt);
+
+    expect(projected).toMatchObject({
+      detail: {
+        autonomous_plan_kind: "navigation",
+        failure_class: "path_or_physical_preview_infeasible",
+        skill_binding: {
+          skill_node_id: "explore_frontier_22_21",
+          target_position: { x: 11.25, y: 0, z: 10.75 },
+          control_mode: "learned_policy"
+        },
+        attempts: [{
+          accepted: false,
+          reason: "environment_contact:left_hand_index_1_link:environment; preview_frames=353; preview_travelled_m=1.765946"
+        }]
+      }
+    });
+    expect(JSON.stringify(projected)).not.toContain("hidden_trajectory");
+    expect(JSON.stringify(projected)).not.toContain("hidden_catalog");
+    expect(JSON.stringify(projected).length).toBeLessThan(1_500);
+  });
+
   it("preserves IK-validated base placements without exposing motion trajectories", () => {
     const receipt: HumanoidActionReceipt = {
       transactionId: "base-placement-required-1",

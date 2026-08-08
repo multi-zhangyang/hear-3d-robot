@@ -1,4 +1,4 @@
-import type { Quaternion, Vec3 } from "../../domain/schema.js";
+import type { Goal, Quaternion, Vec3 } from "../../domain/schema.js";
 import type { HumanoidSkillInvocation } from "../../domain/humanoid-skill.js";
 import type { HumanoidMotionCandidateBatch } from "../../world/humanoid/motion-plan.js";
 import type { HumanoidMotionOptionContract } from "../../world/humanoid/motion-option.js";
@@ -29,8 +29,13 @@ import {
 import type { HumanoidNavigationArrivalHeading } from "../../world/humanoid/navigation-arrival.js";
 import { solveG1PregraspPose } from "../../world/humanoid/pregrasp-pose.js";
 import { minimumHumanoidManipulationRootStandoff } from "../../world/humanoid/manipulation-reachability.js";
+import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
 
 type HumanoidMotionOptionPredicate = HumanoidMotionOptionContract["predicates"][number];
+
+const MINIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS = 0.18;
+const MAXIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS = 0.5;
+const MAXIMUM_GOAL_SETTLING_RESERVE_METERS = 0.05;
 
 export type AutonomousHumanoidSkillPlan =
   | {
@@ -38,6 +43,7 @@ export type AutonomousHumanoidSkillPlan =
       targets: Array<{
         target: Vec3;
         arrivalHeading: HumanoidNavigationArrivalHeading | null;
+        acceptedPositionToleranceMeters?: number;
         score: number;
       }>;
     }
@@ -47,9 +53,37 @@ export function planAutonomousHumanoidSkill(input: {
   binding: ActiveHumanoidSkillBinding;
   observation: HumanoidWorldObservation;
   articulationGoal?: HumanoidArticulationGoal;
+  activeGoal?: Goal;
+  recoveryAuthorized?: boolean;
 }): AutonomousHumanoidSkillPlan {
+  if (input.activeGoal) {
+    const alignment = alignHumanoidSkillToGoal({
+      goal: input.activeGoal,
+      invocation: input.binding.invocation,
+      observation: input.observation,
+      ...(input.recoveryAuthorized ? { recoveryAuthorized: true } : {})
+    });
+    if (!alignment.accepted) {
+      throw new Error(`Selected Skill is not causally aligned with the active Goal: ${alignment.reason}`);
+    }
+  }
   if (input.binding.phase_authority === "navigation") {
-    return navigationSkillPlan(input.binding, input.observation);
+    const plan = navigationSkillPlan(input.binding, input.observation);
+    return {
+      ...plan,
+      targets: plan.targets.map((candidate) => ({
+        ...candidate,
+        ...(candidate.acceptedPositionToleranceMeters === undefined
+          ? {}
+          : {
+              acceptedPositionToleranceMeters: goalConstrainedPositionTolerance(
+                candidate.target,
+                candidate.acceptedPositionToleranceMeters,
+                input.activeGoal
+              )
+            })
+      }))
+    };
   }
   return {
     kind: "motion",
@@ -61,11 +95,49 @@ export function planAutonomousHumanoidSkill(input: {
   };
 }
 
+function goalConstrainedPositionTolerance(
+  target: Vec3,
+  semanticTolerance: number,
+  activeGoal: Goal | undefined
+): number {
+  const remainingGoalMargins = activeGoal?.predicates.flatMap((predicate) => {
+    if (predicate.type !== "robot_at") return [];
+    const margin = predicate.tolerance - planarDistance(target, predicate.target);
+    if (margin <= 0) return [];
+    const settlingReserve = Math.min(
+      MAXIMUM_GOAL_SETTLING_RESERVE_METERS,
+      margin * 0.5
+    );
+    return [margin - settlingReserve];
+  }) ?? [];
+  return remainingGoalMargins.length === 0
+    ? semanticTolerance
+    : Math.min(semanticTolerance, ...remainingGoalMargins);
+}
+
 function navigationSkillPlan(
   binding: ActiveHumanoidSkillBinding,
   observation: HumanoidWorldObservation
 ): Extract<AutonomousHumanoidSkillPlan, { kind: "navigation" }> {
   const invocation = binding.invocation;
+  if (invocation.skill === "navigate_to_zone") {
+    const zone = observation.interaction.zones.find(
+      ({ zone_id: zoneId }) => zoneId === invocation.zone_id
+    );
+    if (!zone) throw new Error("Selected navigation zone is no longer observable");
+    return {
+      kind: "navigation",
+      targets: [{
+        target: requiredTargetPosition(binding),
+        arrivalHeading: null,
+        acceptedPositionToleranceMeters: Math.min(
+          1,
+          Math.max(0.06, Math.min(zone.size.x, zone.size.z) * 0.25)
+        ),
+        score: 1
+      }]
+    };
+  }
   if (invocation.skill === "explore") {
     const selected = observation.spatialBelief.frontiers.find(
       ({ id }) => id === invocation.frontier_id
@@ -76,16 +148,40 @@ function navigationSkillPlan(
       targets: [selected].map((frontier) => ({
         target: { ...frontier.target },
         arrivalHeading: null,
+        acceptedPositionToleranceMeters: clamp(
+          observation.spatialBelief.resolution_m * 0.5,
+          MINIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS,
+          MAXIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS
+        ),
         score: explorationScore(frontier, invocation.strategy)
       })).sort((left, right) => right.score - left.score)
     };
   }
   if (invocation.skill === "carry"
-    || invocation.skill === "bimanual_carry"
-    || invocation.skill === "retreat") {
+    || invocation.skill === "bimanual_carry") {
     return {
       kind: "navigation",
-      targets: [{ target: { ...invocation.target }, arrivalHeading: null, score: 1 }]
+      targets: [{
+        target: { ...invocation.target },
+        arrivalHeading: null,
+        acceptedPositionToleranceMeters: invocation.tolerance_m,
+        score: 1
+      }]
+    };
+  }
+  if (invocation.skill === "retreat") {
+    return {
+      kind: "navigation",
+      targets: [{
+        target: { ...invocation.target },
+        arrivalHeading: null,
+        acceptedPositionToleranceMeters: clamp(
+          invocation.minimum_obstacle_clearance_m * 0.4,
+          MINIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS,
+          MAXIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS
+        ),
+        score: 1
+      }]
     };
   }
   if (invocation.skill === "break_block") {

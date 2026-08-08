@@ -10,14 +10,21 @@ import type {
   HumanoidObjectWorldModelEntry
 } from "./object-world-model.js";
 import type { HumanoidSolidToken } from "./solid-observation.js";
+import type {
+  HumanoidLearnedPolicyCapability
+} from "../../domain/humanoid-policy.js";
 
 interface HumanoidSkillCatalogEntry extends HumanoidSkillContract {
   observable_target_ids: string[];
   observable_solid_ids: string[];
+  observable_zone_ids: string[];
   remembered_target_ids: string[];
   destination_ids: string[];
   available: boolean;
   unavailable_reasons: string[];
+  learned_policy_ready: boolean;
+  learned_policy_required_capabilities: HumanoidLearnedPolicyCapability[];
+  learned_policy_missing_capabilities: HumanoidLearnedPolicyCapability[];
 }
 
 export interface HumanoidSkillCatalog {
@@ -30,7 +37,9 @@ export interface HumanoidSkillCatalog {
 
 export function createHumanoidSkillCatalog(
   world: HumanoidObjectWorldModel,
-  solids: readonly HumanoidSolidToken[] = []
+  solids: readonly HumanoidSolidToken[] = [],
+  learnedPolicyCapabilities: readonly HumanoidLearnedPolicyCapability[] = [],
+  zoneIds: readonly string[] = []
 ): HumanoidSkillCatalog {
   const contracts = HUMANOID_SKILL_IDS.map((id) => structuredClone(
     HUMANOID_SKILL_CONTRACTS[id]
@@ -40,14 +49,22 @@ export function createHumanoidSkillCatalog(
     contract_sha256: modelPayloadSha256(contracts),
     world_frame: world.frame,
     world_revision: world.world_revision,
-    entries: contracts.map((contract) => catalogEntry(contract, world.objects, solids))
+    entries: contracts.map((contract) => catalogEntry(
+      contract,
+      world.objects,
+      solids,
+      learnedPolicyCapabilities,
+      zoneIds
+    ))
   };
 }
 
 function catalogEntry(
   contract: HumanoidSkillContract,
   objects: readonly HumanoidObjectWorldModelEntry[],
-  solids: readonly HumanoidSolidToken[]
+  solids: readonly HumanoidSolidToken[],
+  learnedPolicyCapabilities: readonly HumanoidLearnedPolicyCapability[],
+  zoneIds: readonly string[]
 ): HumanoidSkillCatalogEntry {
   const objectTargetRequired = skillNeedsObject(contract.id);
   const targets = objectTargetRequired ? objects.filter((object) => (
@@ -67,6 +84,9 @@ function catalogEntry(
   const observableSolids = contract.id === "break_block"
     ? solids.filter(({ kind }) => kind === "block").map(({ id }) => id).sort()
     : [];
+  const observableZones = contract.id === "navigate_to_zone"
+    ? [...new Set(zoneIds)].sort()
+    : [];
   const reasons: string[] = [];
   if (objectTargetRequired && observable.length === 0) {
     reasons.push(targets.length === 0
@@ -76,17 +96,33 @@ function catalogEntry(
   if (contract.id === "break_block" && observableSolids.length === 0) {
     reasons.push("no removable block is currently visible");
   }
+  if (contract.id === "navigate_to_zone" && observableZones.length === 0) {
+    reasons.push("no semantic zone is currently observable");
+  }
   if (contract.id === "place" && destinations.length === 0) {
     reasons.push("no observable container, support surface or insertion point");
   }
+  const learnedPolicyRequiredCapabilities = [...new Set(
+    contract.process.flatMap(({ learned_policy_capabilities: capabilities }) => (
+      capabilities
+    ))
+  )];
+  const availableCapabilities = new Set(learnedPolicyCapabilities);
+  const learnedPolicyMissingCapabilities = learnedPolicyRequiredCapabilities.filter(
+    (capability) => !availableCapabilities.has(capability)
+  );
   return {
     ...contract,
     observable_target_ids: observable,
     observable_solid_ids: observableSolids,
+    observable_zone_ids: observableZones,
     remembered_target_ids: remembered,
     destination_ids: destinations,
     available: reasons.length === 0,
-    unavailable_reasons: reasons
+    unavailable_reasons: reasons,
+    learned_policy_ready: learnedPolicyMissingCapabilities.length === 0,
+    learned_policy_required_capabilities: learnedPolicyRequiredCapabilities,
+    learned_policy_missing_capabilities: learnedPolicyMissingCapabilities
   };
 }
 

@@ -206,13 +206,89 @@ describe("humanoid navigation execution progress", () => {
       simulation: simulation.asHumanoidSimulation()
     });
 
-    for (let guard = 0; !execution.done && guard < 1_000; guard += 1) {
-      await execution.step(simulation.asHumanoidSimulation());
-    }
-
-    expect(execution.done).toBe(true);
+    await complete(execution, simulation, 1_000);
     expect(execution.result()).toMatchObject({ completed: true });
     expect(execution.result().frames).toBeGreaterThan(330);
+  });
+
+  it("accepts a model-selected region target inside its explicit spatial tolerance", async () => {
+    const simulation = new NavigationSimulation(undefined, [], 0.84, 0.2);
+    const execution = new HumanoidNavigationExecution({
+      plan: route,
+      reference: neutralHumanoidReference(),
+      simulation: simulation.asHumanoidSimulation(),
+      acceptedPositionToleranceMeters: 0.2
+    });
+
+    await complete(execution, simulation);
+    expect(execution.result()).toMatchObject({ completed: true });
+    expect(1 - execution.result().final.rootPosition.z).toBeGreaterThan(0.06);
+    expect(1 - execution.result().final.rootPosition.z).toBeLessThanOrEqual(0.2);
+  });
+
+  it("does not tighten an explicit Goal tolerance below a learned locomotion deadband", async () => {
+    const targetDistance = 0.338;
+    const shortGoalRoute: NavigationPlan = {
+      waypoints: [
+        { x: 0, y: 0.8, z: 0 },
+        { x: 0, y: 0.8, z: targetDistance }
+      ],
+      distance: targetDistance,
+      resolvedTarget: { x: 0, y: 0.8, z: targetDistance },
+      projectionDistance: 0
+    };
+    const simulation = new NavigationSimulation(
+      undefined,
+      [],
+      0.147,
+      0.147,
+      0.18
+    );
+    const execution = new HumanoidNavigationExecution({
+      plan: shortGoalRoute,
+      reference: neutralHumanoidReference(),
+      simulation: simulation.asHumanoidSimulation(),
+      acceptedPositionToleranceMeters: 0.25
+    });
+
+    await complete(execution, simulation);
+    expect(execution.result()).toMatchObject({ completed: true });
+    expect(targetDistance - execution.result().final.rootPosition.z).toBeCloseTo(0.191, 6);
+    expect(execution.result().travelledDistance).toBeCloseTo(0.147, 6);
+  });
+
+  it("settles a region arrival with a stationary command instead of chasing its center", async () => {
+    const simulation = new ResidualVelocitySimulation(
+      { x: 0, y: 0.8, z: 0.504 },
+      0.094
+    );
+    const movingReference = {
+      ...neutralHumanoidReference(),
+      rootVelocity: [-0.06, 0.06] as const
+    };
+    const execution = new HumanoidNavigationExecution({
+      plan: route,
+      reference: movingReference,
+      simulation: simulation.asHumanoidSimulation(),
+      acceptedPositionToleranceMeters: 0.5,
+      progress: {
+        version: 1,
+        start_root_position: { x: 0, y: 0.8, z: 0 },
+        waypoint_index: route.waypoints.length,
+        committed_frame_count: 7,
+        stopping_frame_count: 7,
+        stopping_settled_frame_count: 0
+      }
+    });
+
+    await complete(execution, simulation);
+
+    expect(simulation.planarCommands.length).toBeGreaterThanOrEqual(4);
+    expect(simulation.planarCommands).toEqual(
+      simulation.planarCommands.map(() => [0, 0])
+    );
+    expect(execution.result()).toMatchObject({ completed: true });
+    expect(execution.result().final.rootPosition.z).toBeCloseTo(0.504, 12);
   });
 
   it("physically advances toward a short target instead of treating it as already reached", async () => {
@@ -411,9 +487,10 @@ const route: NavigationPlan = {
 
 async function complete(
   execution: HumanoidNavigationExecution,
-  simulation: NavigationSimulation
+  simulation: NavigationSimulation,
+  maximumSteps = 100
 ): Promise<void> {
-  for (let guard = 0; !execution.done && guard < 100; guard += 1) {
+  for (let guard = 0; !execution.done && guard < maximumSteps; guard += 1) {
     await execution.step(simulation.asHumanoidSimulation());
   }
   expect(execution.done).toBe(true);
@@ -483,6 +560,38 @@ class NavigationSimulation {
       );
     }
     this.yaw += reference.rootYawVelocity * 0.1;
+    return this.snapshot();
+  }
+}
+
+class ResidualVelocitySimulation extends NavigationSimulation {
+  readonly planarCommands: Array<readonly [number, number]> = [];
+  residualPlanarSpeed: number;
+
+  constructor(
+    position: { x: number; y: number; z: number },
+    residualPlanarSpeed: number
+  ) {
+    super(position, [], position.z, 0);
+    this.residualPlanarSpeed = residualPlanarSpeed;
+  }
+
+  override snapshot(): HumanoidSimulationSnapshot {
+    return {
+      ...super.snapshot(),
+      links: {
+        pelvis: {
+          linearVelocity: { x: 0, y: 0, z: this.residualPlanarSpeed }
+        }
+      }
+    } as unknown as HumanoidSimulationSnapshot;
+  }
+
+  override async step(
+    reference: HumanoidReference
+  ): Promise<HumanoidSimulationSnapshot> {
+    this.planarCommands.push([...reference.rootVelocity]);
+    this.residualPlanarSpeed = Math.max(0, this.residualPlanarSpeed - 0.02);
     return this.snapshot();
   }
 }

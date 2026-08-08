@@ -147,6 +147,13 @@ function observation(): HumanoidWorldObservation {
         contract_sha256: "a".repeat(64)
       },
       carrying: { bindings: [] },
+      zones: [{
+        zone_id: "assembly-zone",
+        center: { x: 6, y: 0.01, z: 7 },
+        size: { x: 2, y: 0.02, z: 2 },
+        robot_planar_distance_m: Math.hypot(5, 6),
+        robot_inside_horizontal: false
+      }],
       manipulable_objects: []
     }
   } as unknown as HumanoidWorldObservation;
@@ -178,6 +185,45 @@ function dynamicWorkpiece(): HumanoidObjectWorldModelEntry {
 }
 
 describe("humanoid skill binding", () => {
+  it("grounds a model-selected semantic zone in its live world geometry", () => {
+    const current = observation();
+    const result = bindHumanoidSkill({
+      transactionId: "zone-navigation-call",
+      agentId: "humanoid-motion-reference",
+      request: {
+        invocation: {
+          skill: "navigate_to_zone",
+          zone_id: "assembly-zone"
+        },
+        phase: "enter_zone"
+      },
+      observation: current
+    });
+    if (!result.accepted) throw new Error("Expected zone-navigation binding");
+    expect(result.binding).toMatchObject({
+      planning_action: "plan_humanoid_skill",
+      invocation: {
+        skill: "navigate_to_zone",
+        zone_id: "assembly-zone"
+      },
+      target_position: { x: 6, y: 0.01, z: 7 },
+      learned_policy_required_capabilities: ["locomotion"],
+      control_mode: "reference_control_fallback"
+    });
+    expect(planAutonomousHumanoidSkill({
+      binding: result.binding,
+      observation: current
+    })).toEqual({
+      kind: "navigation",
+      targets: [{
+        target: { x: 6, y: 0.01, z: 7 },
+        arrivalHeading: null,
+        acceptedPositionToleranceMeters: 0.5,
+        score: 1
+      }]
+    });
+  });
+
   it("binds one model-selected information frontier without substituting it", () => {
     const current = observation();
     const result = bindHumanoidSkill({
@@ -207,7 +253,39 @@ describe("humanoid skill binding", () => {
       targets: [{
         target: { x: 2.25, y: 0, z: 3.25 },
         arrivalHeading: null,
+        acceptedPositionToleranceMeters: 0.25,
         score: 19
+      }]
+    });
+  });
+
+  it("uses spatial tolerance for a recovery stance", () => {
+    const current = observation();
+    const result = bindHumanoidSkill({
+      transactionId: "retreat-skill-call",
+      agentId: "humanoid-motion-reference",
+      request: {
+        invocation: {
+          skill: "retreat",
+          target: { x: 2.5, y: 0.75, z: 3.5 },
+          minimum_obstacle_clearance_m: 0.5
+        },
+        phase: "route"
+      },
+      observation: current
+    });
+    if (!result.accepted) throw new Error("Expected retreat binding");
+
+    expect(planAutonomousHumanoidSkill({
+      binding: result.binding,
+      observation: current
+    })).toEqual({
+      kind: "navigation",
+      targets: [{
+        target: { x: 2.5, y: 0.75, z: 3.5 },
+        arrivalHeading: null,
+        acceptedPositionToleranceMeters: 0.2,
+        score: 1
       }]
     });
   });
@@ -403,7 +481,16 @@ describe("humanoid skill binding", () => {
         phase_authority: "whole_body",
         planning_action: "plan_humanoid_skill",
         observed_world_revision: 7,
-        eligible_interaction_point_ids: ["door-handle"]
+        eligible_interaction_point_ids: ["door-handle"],
+        learned_policy_required_capabilities: [
+          "joint_reference_tracking",
+          "contact_rich_manipulation"
+        ],
+        learned_policy_missing_capabilities: [
+          "joint_reference_tracking",
+          "contact_rich_manipulation"
+        ],
+        control_mode: "reference_control_fallback"
       }
     });
     if (!result.accepted) throw new Error("Expected skill binding");

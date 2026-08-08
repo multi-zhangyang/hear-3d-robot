@@ -575,6 +575,9 @@ const HumanoidWorldCheckpointBaseSchema = z.object({
     arrivalHeading: HumanoidNavigationArrivalHeadingSchema
       .nullable()
       .default(null),
+    acceptedPositionToleranceMeters: z.number().finite().positive().max(1)
+      .nullable()
+      .default(null),
     releaseJointTracking: z.boolean().default(false),
     createdRevision: z.number().int().nonnegative(),
     validatedRevision: z.number().int().nonnegative().optional(),
@@ -598,7 +601,8 @@ const HumanoidWorldCheckpointBaseSchema = z.object({
     if (route.intentSha256 !== undefined
       && route.intentSha256 !== humanoidNavigationIntentSha256(
         route.requestedTarget,
-        route.requestedArrivalHeading
+        route.requestedArrivalHeading,
+        route.acceptedPositionToleranceMeters
       )) {
       context.addIssue({
         code: "custom",

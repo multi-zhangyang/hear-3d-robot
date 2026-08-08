@@ -36,6 +36,9 @@ export interface ModelMoment {
 
 const HUMANOID_SENSE_ACTIONS = new Set(["observe_humanoid"]);
 const HUMANOID_PLAN_ACTIONS = new Set([
+  "submit_humanoid_skill_plan",
+  "begin_humanoid_skill",
+  "plan_humanoid_skill",
   "plan_whole_body_motion",
   "plan_whole_body_motion_candidates",
   "plan_humanoid_navigation"
@@ -164,7 +167,7 @@ export function presentFramework(entries: unknown[]): ModelMoment[] {
 
     if (event.name === "message_output_created") {
       const text = textFromContent(raw?.content);
-      const detail = modelOutputLabel(text);
+      const detail = presentedModelOutput(text);
       if (!detail) return;
       moments.push({
         id: `message-${recordId}`,
@@ -313,6 +316,15 @@ function actionDetail(action: HumanoidActionReceipt): string {
     return `动作被拒绝：${resultCodeLabel(action.code)}。`;
   }
   const target = pointText(input?.target);
+  if (name === "submit_humanoid_skill_plan") {
+    const strategies = Array.isArray(input?.strategies) ? input.strategies.length : 0;
+    return strategies > 0
+      ? `模型提交了 ${strategies} 种技能策略，Harness 已绑定本轮选择。`
+      : "模型已提交推进当前目标的技能策略。";
+  }
+  if (name === "begin_humanoid_skill") return "技能阶段已绑定当前 Goal 与实时世界版本。";
+  if (name === "plan_humanoid_skill") return "技能路线已完成导航、全身控制与 MuJoCo 物理预演。";
+  if (name === "execute_humanoid_skill") return "机器人已执行模型选择并通过预演的技能路线。";
   if (name === "plan_humanoid_navigation" && target) return `已对前往 ${target} 的双足路线完成物理预演。`;
   if (name === "execute_humanoid_navigation") return "机器人已执行模型选择的双足导航分块。";
   if (name === "plan_whole_body_motion_candidates") {
@@ -339,6 +351,17 @@ function actionDetail(action: HumanoidActionReceipt): string {
     return `使用${action.channels.map(bodyChannelLabel).join("、")}控制通道完成动作。`;
   }
   return resultCodeLabel(action.code);
+}
+
+function presentedModelOutput(value: unknown): string | null {
+  const raw = typeof value === "string" ? value : JSON.stringify(value);
+  if (/coordinator_phase/iu.test(raw) && /cycle_completion/iu.test(raw)) {
+    return "当前物理执行、执行后感知与目标验收证据已经齐备。";
+  }
+  if (/goal_dag(?:_status|\.status)/iu.test(raw) && /current_goal_epoch_id/iu.test(raw)) {
+    return "当前目标阶段已收束，正在等待目标管理智能体选择下一目标。";
+  }
+  return modelOutputLabel(value);
 }
 
 function physicalOptionDetail(action: HumanoidActionReceipt): string | null {

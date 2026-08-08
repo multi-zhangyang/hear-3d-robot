@@ -30,7 +30,7 @@ import {
 
 const COMPACTOR_AGENT_ID = "humanoid-context-compactor";
 const COMPACTOR_AGENT_NAME = "Context Compactor";
-const HUMANOID_HARNESS_CONTRACT_VERSION = 6;
+const HUMANOID_HARNESS_CONTRACT_VERSION = 13;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
@@ -43,9 +43,13 @@ const PROTOCOL_ADAPTER_PACKAGE = {
 } as const satisfies Record<ModelProviderConfig["protocol"], string>;
 const RECEIPT_TERMINAL_TOOLS = {
   sentry: ["observe_humanoid"],
-  motion: ["plan_humanoid_skill"],
+  motion: [
+    "plan_humanoid_skill",
+    "plan_whole_body_motion_candidates"
+  ],
   executor: [
     "execute_humanoid_skill",
+    "execute_whole_body_motion",
     "remove_world_block"
   ]
 } as const;
@@ -56,7 +60,8 @@ const VERIFIED_STATUS_TERMINAL_TOOLS = {
   },
   coordinator: {
     complete_autonomous_cycle: "cycle_completed",
-    complete_goal_transition: "goal_transition_completed"
+    complete_goal_transition: "goal_transition_completed",
+    complete_satisfied_goal: "satisfied_goal_completed"
   }
 } as const;
 

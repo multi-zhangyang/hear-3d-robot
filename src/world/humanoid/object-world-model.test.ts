@@ -142,22 +142,38 @@ describe("object-centered humanoid world model", () => {
       relations: { connected_to: ["bin"] }
     });
 
-    const catalog = createHumanoidSkillCatalog(world);
+    const catalog = createHumanoidSkillCatalog(world, [], [
+      "balance",
+      "locomotion",
+      "joint_reference_tracking"
+    ], ["assembly-zone"]);
+    expect(catalog.entries.find(({ id }) => id === "navigate_to_zone")).toMatchObject({
+      available: true,
+      observable_zone_ids: ["assembly-zone"],
+      learned_policy_ready: true,
+      learned_policy_missing_capabilities: []
+    });
     expect(catalog.entries.find(({ id }) => id === "grasp")).toMatchObject({
       available: true,
       observable_target_ids: ["parcel"],
-      recovery_entry: ["regrasp", "reach"]
+      recovery_entry: ["regrasp", "reach"],
+      learned_policy_ready: false,
+      learned_policy_missing_capabilities: ["contact_rich_manipulation"]
     });
     expect(catalog.entries.find(({ id }) => id === "open")).toMatchObject({
       available: true,
-      observable_target_ids: ["door"]
+      observable_target_ids: ["door"],
+      learned_policy_ready: false,
+      learned_policy_missing_capabilities: ["contact_rich_manipulation"]
     });
     expect(catalog.entries.find(({ id }) => id === "place")).toMatchObject({
       destination_ids: ["bin"]
     });
     expect(catalog.entries.find(({ id }) => id === "explore")).toMatchObject({
       available: true,
-      observable_target_ids: []
+      observable_target_ids: [],
+      learned_policy_ready: true,
+      learned_policy_missing_capabilities: []
     });
   });
 });

@@ -68,13 +68,16 @@ describe("agent manifest", () => {
         temperature: 0.3,
         maxTokens: 2048,
         parallelToolCalls: false,
-        toolChoice: "required"
+        toolChoice: "auto"
       },
       reset_tool_choice: false,
       tool_use_behavior: {
         kind: "harness_callback",
         contract_id: "accepted_humanoid_action_receipt_v1",
-        terminal_tool_names: ["plan_humanoid_skill"]
+        terminal_tool_names: [
+          "plan_humanoid_skill",
+          "plan_whole_body_motion_candidates"
+        ]
       },
       settings: {
         temperature: 0.3,
@@ -86,7 +89,7 @@ describe("agent manifest", () => {
       "@openai/agents": "test-sdk",
       "@openai/agents-extensions": "test-bridge"
     });
-    expect(manifest.harness_contract_version).toBe(6);
+    expect(manifest.harness_contract_version).toBe(13);
     expect(manifest.agents.goal_manager.tool_use_behavior).toEqual({
       kind: "harness_callback",
       contract_id: "verified_harness_terminal_status_v1",
@@ -95,7 +98,11 @@ describe("agent manifest", () => {
     expect(manifest.agents.coordinator.tool_use_behavior).toEqual({
       kind: "harness_callback",
       contract_id: "verified_harness_terminal_status_v1",
-      terminal_tool_names: ["complete_autonomous_cycle", "complete_goal_transition"]
+      terminal_tool_names: [
+        "complete_autonomous_cycle",
+        "complete_goal_transition",
+        "complete_satisfied_goal"
+      ]
     });
     expect(manifest.agent_tool_contracts).toEqual([
       expect.objectContaining({
@@ -113,7 +120,7 @@ describe("agent manifest", () => {
         run_options: {
           session_agent_id: "humanoid-sentry",
           context_source: "parent_run_context",
-          max_turns: "sdk_default"
+          max_turns: "unbounded"
         },
         resume_context_strategy: "merge"
       }),
@@ -265,7 +272,7 @@ describe("agent manifest", () => {
       provider,
       epochId: base.epoch_id,
       runtimeSdkIdentity: base.runtime_sdk_identity
-    })).toThrow("missing terminal tool complete_goal_transition");
+    })).toThrow("missing terminal tool complete_satisfied_goal");
 
     const changedSdk = createHumanoidAgentManifest({
       hierarchy,
@@ -471,7 +478,7 @@ describe("agent manifest", () => {
     });
     expect(first.identity_sha256).toBe(second.identity_sha256);
     expect(first.identity_sha256).toBe(
-      "dfd9fe393e16a68d2bb543009b540c595d5a6c73e3c0ba0dd5cb04762a044b46"
+      "005753ec021e70a1581759e9364c6c4f3d064122689171af8ce4d8d66fe747bd"
     );
   });
 

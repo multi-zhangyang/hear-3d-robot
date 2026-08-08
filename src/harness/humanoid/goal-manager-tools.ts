@@ -7,7 +7,11 @@ import {
 } from "../../domain/model-call-authority.js";
 import { GoalSchema, type JsonValue } from "../../domain/schema.js";
 import { GOAL_RETIREMENT_STATUSES } from "../../domain/goal-epoch-retirement.js";
-import { invalidToolInputResult } from "../tool-input-recovery.js";
+import {
+  createToolInputRecovery,
+  invalidToolInputResult,
+  recoverInvalidToolInputOutput
+} from "../tool-input-recovery.js";
 import {
   GOAL_HISTORY_PREDICATE_TYPES,
   GOAL_HISTORY_STATUSES,
@@ -187,7 +191,8 @@ function goalHistoryTool(
   runtime: GoalManagerRuntime
 ): FunctionTool<unknown, typeof RecallGoalHistorySchema, string> {
   const name = "recall_goal_history";
-  return tool<typeof RecallGoalHistorySchema, unknown, string>({
+  const inputRecovery = createToolInputRecovery();
+  const historyTool = tool<typeof RecallGoalHistorySchema, unknown, string>({
     name,
     description: "只读召回完整 Goal DAG 中未装入当前工作集的候选与结果。可按 candidate、状态、谓词、对象、方块或区域检索；历史结果不能代替当前物理观察。",
     parameters: RecallGoalHistorySchema,
@@ -209,6 +214,18 @@ function goalHistoryTool(
       limit: input.limit
     }))
   });
+  const invoke = historyTool.invoke;
+  historyTool.invoke = async (context, input, details) => {
+    const output = await invoke(context, input, details);
+    return recoverInvalidToolInputOutput(
+      output,
+      input,
+      RecallGoalHistorySchema,
+      name,
+      inputRecovery
+    );
+  };
+  return historyTool;
 }
 
 function goalTool(
@@ -219,7 +236,8 @@ function goalTool(
     authority: GoalToolCallAuthority
   ) => Promise<JsonValue>
 ): FunctionTool<unknown, z.ZodObject, string> {
-  return tool<z.ZodObject, unknown, string>({
+  const inputRecovery = createToolInputRecovery();
+  const transitionTool = tool<z.ZodObject, unknown, string>({
     name,
     description: goalToolDescription(name),
     parameters,
@@ -258,6 +276,18 @@ function goalTool(
       }
     }
   });
+  const sdkInvoke = transitionTool.invoke;
+  transitionTool.invoke = async (context, input, details) => {
+    const output = await sdkInvoke(context, input, details);
+    return recoverInvalidToolInputOutput(
+      output,
+      input,
+      parameters,
+      name,
+      inputRecovery
+    );
+  };
+  return transitionTool;
 }
 
 function goalToolDescription(name: string): string {

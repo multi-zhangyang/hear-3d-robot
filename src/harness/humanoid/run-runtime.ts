@@ -102,7 +102,10 @@ import {
   recallGoalHistory as recallDurableGoalHistory,
   type GoalHistoryRecallRequest
 } from "./goal-history.js";
-import { recoverableBlockedGoalEvidence } from "./goal-retirement-evidence.js";
+import {
+  recoverableBlockedGoalActionReceipt,
+  recoverableBlockedGoalEvidence
+} from "./goal-retirement-evidence.js";
 import {
   assertPendingActionReceipt,
   cycleSummary,
@@ -148,6 +151,8 @@ import { HumanoidPhysicalExecutionRuntime } from "./physical-execution-runtime.j
 
 export type HumanoidCoordinatorPhase =
   | "goal_selection"
+  | "goal_transition"
+  | "complete_satisfied_goal"
   | "observe_or_plan"
   | "plan"
   | "replan_or_retire"
@@ -244,6 +249,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       realtimeExecution: true,
       retainPhysicalTerminals: true,
       requireSkillBinding: true,
+      activeGoal: () => this.#activeGoal(),
       ...(this.#signal ? { signal: this.#signal } : {})
     });
     this.#physicsClock = new HumanoidPhysicsClock({
@@ -485,9 +491,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         : null;
       if (recoverable) {
         throw new Error(
-          `Goal remains physically recoverable: ${recoverable.code} returned `
-          + `${recoverable.reachableBasePlacementCount} IK-validated base placement(s); `
-          + "continue motion planning instead of marking it blocked"
+          `Goal remains physically recoverable: ${recoverable.receiptCode}; `
+          + `${recoverable.recovery}; continue motion planning instead of marking it blocked`
         );
       }
       const resolvedWorldRevision = artifacts[0]!.evidence.world_revision;
@@ -542,6 +547,34 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       resolved_world_revision: latest.resolved_world_revision,
       evidence_refs: latest.physical_evidence_refs.resolution,
       goal_dag_state_sha256: this.#checkpoint.goal_dag.state_sha256
+    });
+  }
+
+  validateSatisfiedGoal(): JsonValue {
+    if (this.coordinatorPhase() !== "complete_satisfied_goal") {
+      throw new Error("The active Goal is not ready for execution-free completion");
+    }
+    const activeGoal = this.#requiredActiveGoal();
+    const activeCycle = this.#requiredActiveCycleRef();
+    const world = this.#world.snapshot();
+    const progress = this.#checkpoint.goal_progress;
+    if (!progress) throw new Error("Active Goal progress is unavailable");
+    const projected = world.frame === progress.last_world_frame
+      && world.worldRevision === progress.last_world_revision
+      ? {
+          progress,
+          checker: inspectHumanoidGoal(activeGoal, this.#scenario, world, progress)
+        }
+      : advanceHumanoidGoal(activeGoal, this.#scenario, world, progress);
+    if (!projected.checker.success) {
+      throw new Error("The active Goal is no longer physically satisfied");
+    }
+    return json({
+      epoch_id: activeCycle.goal_epoch_id,
+      cycle_id: activeCycle.cycle_id,
+      goal: activeGoal,
+      checker: projected.checker,
+      physical_execution_required: false
     });
   }
 
@@ -700,6 +733,18 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const latestAcceptedPlanIndex = cycleReceipts.findLastIndex((receipt) => (
       receipt.accepted && isHumanoidPlanningReceipt(receipt)
     ));
+    const activeGoal = this.#activeGoal();
+    if (this.#store.definition.run_mode === "mission"
+      && activeGoal
+      && goalSha256(activeGoal) !== goalSha256(this.#missionGoal)
+      && this.#missionGoalPhysicallySatisfied()) {
+      return "goal_transition";
+    }
+    if (activeGoal
+      && latestAcceptedPlanIndex <= latestExecutionIndex
+      && this.#activeGoalPhysicallySatisfied(activeGoal)) {
+      return "complete_satisfied_goal";
+    }
     if (latestAcceptedPlanIndex > latestExecutionIndex) return "execute_plan";
     const phaseStart = Math.max(0, latestExecutionIndex + 1);
     const observed = cycleReceipts.slice(phaseStart).some((receipt) => (
@@ -724,7 +769,9 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   goalRetirementDelegationAvailable(): boolean {
-    if (this.coordinatorPhase() !== "replan_or_retire") return false;
+    const phase = this.coordinatorPhase();
+    if (phase === "goal_transition") return true;
+    if (phase !== "replan_or_retire") return false;
     const activeCycle = this.#activeCycleRef();
     if (!activeCycle) return false;
     const latestRejectedPlan = Object.values(this.#checkpoint.committed_actions)
@@ -732,8 +779,9 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         sameAutonomousCycle(receipt.cycle, activeCycle)
           && !receipt.accepted
           && isHumanoidPlanningReceipt(receipt)
-      ));
+    ));
     if (!latestRejectedPlan) return false;
+    if (recoverableBlockedGoalActionReceipt(latestRejectedPlan)) return false;
     const detail = object(latestRejectedPlan.detail);
     const placements = detail?.reachable_base_placements;
     if (Array.isArray(placements) && placements.length > 0) return false;
@@ -747,6 +795,27 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     ));
     return latestMotionObservation === undefined
       || !observationHasReachableBasePlacements(latestMotionObservation);
+  }
+
+  #missionGoalPhysicallySatisfied(): boolean {
+    const world = this.#world.snapshot();
+    return inspectHumanoidGoal(
+      this.#missionGoal,
+      this.#scenario,
+      world,
+      createHumanoidGoalProgress(this.#missionGoal, world)
+    ).success;
+  }
+
+  #activeGoalPhysicallySatisfied(activeGoal: Goal): boolean {
+    const world = this.#world.snapshot();
+    const progress = this.#checkpoint.goal_progress;
+    if (!progress) return false;
+    return (world.frame === progress.last_world_frame
+      && world.worldRevision === progress.last_world_revision
+      ? inspectHumanoidGoal(activeGoal, this.#scenario, world, progress)
+      : advanceHumanoidGoal(activeGoal, this.#scenario, world, progress).checker
+    ).success;
   }
 
   sentryDelegationAvailable(): boolean {
@@ -1211,6 +1280,86 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         });
       }
       return checker.success;
+    }));
+  }
+
+  async completeSatisfiedGoal(output: string): Promise<boolean> {
+    return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      if (this.coordinatorPhase() !== "complete_satisfied_goal") {
+        throw new Error("The active Goal is not ready for execution-free completion");
+      }
+      let cycleOutput: JsonValue;
+      try {
+        cycleOutput = json(JSON.parse(output));
+      } catch {
+        cycleOutput = output;
+      }
+      const activeGoal = this.#requiredActiveGoal();
+      const activeCycle = this.#requiredActiveCycleRef();
+      const captured = await this.#world.capturePersistenceState();
+      this.#applyWorldPersistenceState(captured);
+      const progress = this.#checkpoint.goal_progress;
+      if (!progress) throw new Error("Active Goal progress is unavailable");
+      const checker = inspectHumanoidGoal(
+        activeGoal,
+        this.#scenario,
+        captured.world,
+        progress
+      );
+      if (!checker.success) {
+        throw new Error("The active Goal is no longer physically satisfied");
+      }
+      if (this.cycleCompletionReadiness().status === "ready") {
+        throw new Error(
+          "A Goal with new physical execution must complete through causal cycle evidence"
+        );
+      }
+
+      const evaluation = createGoalEvaluationEvidence({
+        epochId: activeCycle.goal_epoch_id,
+        goalContentSha256: goalSha256(activeGoal),
+        worldFrame: captured.world.frame,
+        worldRevision: captured.world.worldRevision,
+        evaluation: json(checker)
+      });
+      this.#rememberGoalEvidence(evaluation);
+      await this.#persistGoalEvidence([evaluation.evidence.ref]);
+      this.#checkpoint.goal_dag = completeGoalEpoch(this.#checkpoint.goal_dag, {
+        resolution_evidence_refs: [evaluation.evidence.ref],
+        resolved_world_revision: captured.world.worldRevision
+      }, this.#goalHarness());
+      this.#checkpoint.goal_progress = null;
+      this.#checkpoint.checker = null;
+      this.#checkpoint.cycle_index = activeCycle.cycle_index;
+      this.#checkpoint.last_cycle = cycleOutput;
+      this.#checkpoint.active_cycle = null;
+
+      const missionCompleted = this.#store.definition.run_mode === "mission"
+        && this.missionGoalCompleted();
+      if (missionCompleted) {
+        this.#continuousPhysicsEnabled = false;
+        this.#stageFinish("succeeded", output, null, "run_succeeded");
+      }
+
+      await this.#persist();
+      await this.#store.append("checker", json(checker));
+      await this.emit("autonomous_goal_satisfied", {
+        cycle: json(activeCycle),
+        output: cycleOutput,
+        checker: json(checker),
+        physical_execution_required: false,
+        goal_epoch_completed: true
+      });
+      await this.#emitGoalState("epoch_completed");
+      if (missionCompleted) {
+        await reconcileLifecycleOutbox({
+          store: this.#store,
+          checkpoint: this.#checkpoint,
+          persistCheckpoint: () => this.#persist(),
+          eventSink: this.#eventSink
+        });
+      }
+      return true;
     }));
   }
 

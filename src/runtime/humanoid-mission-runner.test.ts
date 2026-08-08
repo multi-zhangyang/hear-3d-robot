@@ -1,4 +1,8 @@
-import { MemorySession, UserError, type RunStreamEvent } from "@openai/agents";
+import {
+  MemorySession,
+  UserError,
+  type RunStreamEvent
+} from "@openai/agents";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +36,7 @@ import { HumanoidWorld } from "../world/humanoid/world.js";
 import { captureHumanoidSessionStateIdentity } from "./humanoid-agent-state.js";
 import {
   humanoidModelProgressSnapshot,
+  nextModelDecisionFollowUpState,
   recoverableDynamicToolRunStateError,
   resumeHumanoidMission,
   shouldPersistHumanoidAgentState
@@ -391,97 +396,141 @@ describe("humanoid mission initialization recovery", () => {
     }
   });
 
-  it("removes the stalled cycle attempt while preserving its durable Session prefix", async () => {
+  it("continues prose-only decisions in the same Agent Session", async () => {
     const store = await createCheckpointedRun();
     const config = provider();
     const manifest = createManifest(config);
     await store.writeAgentManifest(manifest);
-    const sessions = new Map(Object.values(HUMANOID_AGENT_IDS).map((agentId) => (
-      [agentId, missionSession(store, manifest.epoch_id, agentId)] as const
-    )));
-    await Promise.all([...sessions.entries()].map(async ([agentId, session]) => {
-      await session.addItems([{ role: "user", content: `baseline:${agentId}` }]);
-    }));
+    const coordinatorSession = missionSession(
+      store,
+      manifest.epoch_id,
+      HUMANOID_AGENT_IDS.coordinator
+    );
+    await coordinatorSession.addItems([{ role: "user", content: "durable-prefix" }]);
+    const inputs: unknown[] = [];
+    let activeSession: FileSession | undefined;
     runnerControl.run.mockImplementation(async (
-      _agent,
-      _runInput,
-      options: { session: FileSession }
+      agent: { name: string },
+      runInput,
+      options: { session?: FileSession; maxTurns?: number | null }
     ) => {
+      expect(agent.name).toBe("人形自主协调智能体");
+      expect(options.maxTurns).toBeNull();
+      inputs.push(runInput);
+      if (activeSession) expect(options.session).toBe(activeSession);
+      else activeSession = options.session;
       const attempt = runnerControl.run.mock.calls.length;
-      await options.session.addItems([{
+      await options.session?.addItems([{
         role: "assistant",
-        content: `durable-prefix:${attempt}:${HUMANOID_AGENT_IDS.coordinator}`
+        content: `prose-only-response:${attempt}`
       }]);
       return {
-        state: { toString: () => `decision-recovery-state:${attempt}` },
+        state: { toString: () => `completed-prose-state:${attempt}` },
         completed: Promise.resolve(),
-        finalOutput: undefined,
-        async *[Symbol.asyncIterator]() {
-          yield {
-            type: "raw_model_stream_event",
-            data: { type: "response_started" }
-          };
-          await options.session.addItems([{
-            role: "assistant",
-            content: `failed-decision:${attempt}:${HUMANOID_AGENT_IDS.coordinator}`
-          }]);
-          throw new ModelDecisionStallError(
-            HUMANOID_AGENT_IDS.motion,
-            "motion decision stalled"
-          );
-        }
+        finalOutput: "ordinary text without a business tool result",
+        async *[Symbol.asyncIterator]() {}
       };
     });
 
-    await expect(resume(store, config)).rejects.toThrow("motion decision stalled");
-
-    expect(runnerControl.run).toHaveBeenCalledTimes(4);
-    expect((await store.readHumanoidCheckpoint()).status).toBe("interrupted");
-    for (const agentId of sessions.keys()) {
-      expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual([
-        { role: "user", content: `baseline:${agentId}` }
-      ]);
-    }
-    const recoveries = (await store.readJournal("provider")).filter((entry) => (
-      isRecord(entry) && entry.status === "model_decision_recovery"
-    ));
-    expect(recoveries).toHaveLength(3);
-    expect(recoveries).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        session_history_preserved: true,
-        prompt_cache_prefix_preserved: true,
-        recovery_baseline: "cycle_attempt_prefix"
-      })
-    ]));
-  }, 30_000);
-
-  it("retries a completed coordinator response that contains no formal decision", async () => {
-    const store = await createCheckpointedRun();
-    const config = provider();
-    await store.writeAgentManifest(createManifest(config));
-    runnerControl.run.mockImplementation(async () => ({
-      state: { toString: () => "completed-response-without-decision" },
-      completed: Promise.resolve(),
-      finalOutput: "model text without a verified tool result",
-      async *[Symbol.asyncIterator]() {}
-    }));
-
     await expect(resume(store, config)).rejects.toThrow(
-      "did not return the cycle completion tool result"
+      "Humanoid coordinator did not return a formal tool result"
     );
 
     expect(runnerControl.run).toHaveBeenCalledTimes(4);
-    const recoveries = (await store.readJournal("provider")).filter((entry) => (
-      isRecord(entry) && entry.status === "model_decision_recovery"
+    expect(String(inputs[0])).toContain("继续下一次人形自主闭环");
+    for (const input of inputs.slice(1)) {
+      expect(String(input)).toContain("上一次模型分支没有产生 Harness 可验收的正式工具决策");
+    }
+    const followUps = (await store.readJournal("provider")).filter((entry) => (
+      isRecord(entry) && entry.status === "model_decision_follow_up"
     ));
-    expect(recoveries).toEqual([1, 2, 3].map((recoveryAttempt) => (
-      expect.objectContaining({
-        agent_id: HUMANOID_AGENT_IDS.coordinator,
-        recovery_attempt: recoveryAttempt,
-        automatic_actuation: false
-      })
-    )));
+    expect(followUps).toEqual([1, 2, 3].map((attempt) => expect.objectContaining({
+      agent_id: HUMANOID_AGENT_IDS.coordinator,
+      follow_up_attempt: attempt,
+      invalid_response_retained: true,
+      session_history_preserved: true,
+      continuation: "same_agent_model_and_session",
+      automatic_actuation: false
+    })));
+    expect((await missionSession(
+      store,
+      manifest.epoch_id,
+      HUMANOID_AGENT_IDS.coordinator
+    ).getItems()).map((item) => item.content)).toEqual([
+      "durable-prefix",
+      "prose-only-response:1",
+      "prose-only-response:2",
+      "prose-only-response:3",
+      "prose-only-response:4"
+    ]);
   }, 30_000);
+
+  it("routes a specialist stall back through the original coordinator without a repair Agent", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    const inspectionComplete = new Error("same-session follow-up inspected");
+    let firstAgent: unknown;
+    let firstSession: FileSession | undefined;
+    runnerControl.run.mockImplementation(async (
+      agent,
+      runInput,
+      options: { session?: FileSession; maxTurns?: number | null }
+    ) => {
+      const attempt = runnerControl.run.mock.calls.length;
+      if (attempt === 1) {
+        firstAgent = agent;
+        firstSession = options.session;
+        return {
+          state: { toString: () => "specialist-stall-state" },
+          completed: Promise.resolve(),
+          finalOutput: undefined,
+          async *[Symbol.asyncIterator]() {
+            throw new ModelDecisionStallError(
+              HUMANOID_AGENT_IDS.motion,
+              "motion returned no terminal tool receipt"
+            );
+          }
+        };
+      }
+      expect(agent).toBe(firstAgent);
+      expect(options.session).toBe(firstSession);
+      expect(options.maxTurns).toBeNull();
+      expect(String(runInput)).toContain("上一次模型分支没有产生 Harness 可验收的正式工具决策");
+      throw inspectionComplete;
+    });
+
+    await expect(resume(store, config)).rejects.toBe(inspectionComplete);
+    expect(runnerControl.run).toHaveBeenCalledTimes(2);
+    const followUps = (await store.readJournal("provider")).filter((entry) => (
+      isRecord(entry) && entry.status === "model_decision_follow_up"
+    ));
+    expect(followUps).toEqual([
+      expect.objectContaining({
+        agent_id: HUMANOID_AGENT_IDS.motion,
+        follow_up_attempt: 1,
+        continuation: "same_agent_model_and_session"
+      })
+    ]);
+  }, 30_000);
+
+  it("scopes decision follow-ups to one authoritative progress state", () => {
+    const first = nextModelDecisionFollowUpState(undefined, "authority-a");
+    const second = nextModelDecisionFollowUpState(first ?? undefined, "authority-a");
+    const third = nextModelDecisionFollowUpState(second ?? undefined, "authority-a");
+    expect(first).toEqual({ authorityFingerprint: "authority-a", attempt: 1 });
+    expect(second).toEqual({ authorityFingerprint: "authority-a", attempt: 2 });
+    expect(third).toEqual({ authorityFingerprint: "authority-a", attempt: 3 });
+    expect(nextModelDecisionFollowUpState(
+      third ?? undefined,
+      "authority-a"
+    )).toBeNull();
+    expect(nextModelDecisionFollowUpState(
+      third ?? undefined,
+      "authority-b"
+    )).toEqual({ authorityFingerprint: "authority-b", attempt: 1 });
+  });
 
   it("restores Sessions to the last persisted RunState before retrying", async () => {
     const store = await createCheckpointedRun();

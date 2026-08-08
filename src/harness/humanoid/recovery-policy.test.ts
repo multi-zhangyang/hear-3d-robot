@@ -29,7 +29,13 @@ const binding = {
   target_position: { x: 1, y: 1, z: 1 },
   target_articulation: null,
   eligible_interaction_points: [],
-  eligible_interaction_point_ids: ["handle"]
+  eligible_interaction_point_ids: ["handle"],
+  learned_policy_required_capabilities: [
+    "joint_reference_tracking",
+    "contact_rich_manipulation"
+  ],
+  learned_policy_missing_capabilities: ["contact_rich_manipulation"],
+  control_mode: "reference_control_fallback"
 } as const satisfies ActiveHumanoidSkillBinding;
 
 describe("humanoid recovery policy", () => {

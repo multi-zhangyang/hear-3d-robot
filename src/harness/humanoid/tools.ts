@@ -17,6 +17,7 @@ import {
 import {
   createToolInputRecovery,
   invalidToolInputResult,
+  recoverInvalidToolInputOutput
 } from "../tool-input-recovery.js";
 import type {
   HumanoidActionInvoker,
@@ -121,13 +122,19 @@ export interface HumanoidEmbodiedRecallInvoker {
 export function createHumanoidActionTools(
   runtime: HumanoidActionInvoker,
   agentId: string,
-  allowedActions: readonly HumanoidActionName[] = humanoidActionNames()
+  allowedActions: readonly HumanoidActionName[] = humanoidActionNames(),
+  options: { availability?: "dynamic" | "stable" } = {}
 ): Tool[] {
   const unique = new Set(allowedActions);
   if (unique.size !== allowedActions.length) {
     throw new Error(`Duplicate humanoid action grant for ${agentId}`);
   }
-  return allowedActions.map((name) => humanoidActionTool(runtime, agentId, name));
+  return allowedActions.map((name) => humanoidActionTool(
+    runtime,
+    agentId,
+    name,
+    options.availability ?? "dynamic"
+  ));
 }
 
 export function createHumanoidEmbodiedRecallTool(
@@ -166,7 +173,8 @@ export function createHumanoidEmbodiedRecallTool(
 function humanoidActionTool(
   runtime: HumanoidActionInvoker,
   agentId: string,
-  name: HumanoidActionName
+  name: HumanoidActionName,
+  availability: "dynamic" | "stable"
 ): FunctionTool<unknown, z.ZodObject, string> {
   const parameters: z.ZodObject = HumanoidActionInputs[name];
   const inputRecovery = createToolInputRecovery();
@@ -175,7 +183,8 @@ function humanoidActionTool(
     description: HumanoidActionDescriptions[name],
     parameters,
     strict: true,
-    isEnabled: () => runtime.isActionAvailable?.(name, agentId) ?? true,
+    isEnabled: () => availability === "stable"
+      || (runtime.isActionAvailable?.(name, agentId) ?? true),
     timeoutBehavior: "raise_exception",
     errorFunction: (_context, error) => invalidToolInputResult(error, name),
     execute: async (input, _context, details) => {
@@ -209,9 +218,14 @@ function humanoidActionTool(
   }
   const invoke = actionTool.invoke;
   actionTool.invoke = async (context, input, details) => {
-    const rejection = inputRecovery.preflight(input, parameters, name);
-    if (rejection !== undefined) return rejection;
-    return invoke(context, input, details);
+    const output = await invoke(context, input, details);
+    return recoverInvalidToolInputOutput(
+      output,
+      input,
+      parameters,
+      name,
+      inputRecovery
+    );
   };
   return actionTool;
 }

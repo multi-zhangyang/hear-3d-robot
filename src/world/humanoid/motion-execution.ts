@@ -188,6 +188,13 @@ export class HumanoidMotionExecution {
       carryTaskSpaceTargets: this.#carryTaskSpaceTargets,
       taskId: this.#stored.option?.contract.option_id
         ?? `motion-plan:${this.#stored.plan.id}`,
+      taskGoal: this.#stored.option
+        ? {
+            protocol: "humanoid-controller-motion-goal-v1",
+            predicates: structuredClone(this.#stored.option.contract.predicates),
+            stableSteps: this.#stored.option.contract.stable_steps
+          }
+        : null,
       ...(this.#stationKeepingAnchor
         ? {
             stationKeepingAnchor: this.#stationKeepingAnchor,

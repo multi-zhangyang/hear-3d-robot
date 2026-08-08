@@ -98,6 +98,16 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 控制器协议同时提供可声明的策略观察特征与逐控制步任务命令。训练策略可按自身编码消费根运动、手部状态、末端状态、MuJoCo 接触、对象与关节状态，以及当前任务空间目标和抓取约束；YAHMP 仍只读取原有本体状态与命令历史。语义 Skill 不会被展开成模型供应商或训练框架专用格式，因此本地 ONNX、远程策略服务和后续训练产物可以共用同一控制器边界。
 
+统一 Skill 合约逐阶段声明完成学习式执行所需的策略能力，实时目录会分别公开当前环境可用性与已训练能力覆盖。未被当前策略覆盖的阶段会明确标记为参考控制回退，不能被描述为已经训练完成。控制器收到的任务命令同时包含能力要求、任务空间目标、抓取约束和可观测物理终止谓词，训练侧不需要读取 Agent 提示词或依赖模型供应商格式。
+
+仓库提供基于 [mjlab](https://github.com/mujocolab/mjlab) 与 RSL-RL 的 G1 速度策略训练入口。训练直接使用 mjlab 的正式 `Mjlab-Velocity-Flat-Unitree-G1` 环境和 MuJoCo Warp，不在仓库内另写一套强化学习算法。已登录 Colab CLI 后可启动 GPU 训练：
+
+```sh
+pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
+```
+
+命令会创建独立 Colab 会话，训练真实 PPO checkpoint，由 mjlab 导出带控制元数据的 ONNX，并在 GPU MuJoCo 环境中执行无界面策略评估。checkpoint、ONNX、环境配置、评估指标和 SHA-256 报告下载到 `artifacts/training/`，结束或失败后都会释放会话。GPU 型号、并行环境数和迭代数均可显式调整；训练或导出失败会直接返回非零状态，不生成替代策略。
+
 程序化场景生成开阔区域、方块障碍、可动物体和目标区域。头部视场持续更新 0.5 米空间信念网格，模型从未知区域边界选择探索目标。Recast 根据当前静态与动态几何生成导航路径，每段路线都先在当前物理状态副本中完整执行；执行中出现新的几何阻塞时，执行监控层保持原 Skill 目标并从真实终态重新规划，最多进行两次有界尝试。跌倒、物体滑脱或语义前提失效不会被低层重规划掩盖，而是返回模型选择恢复 Skill。
 
 可动物体的抓取不是吸附或坐标绑定。系统从当前掌指接触面、接触力、对向接触、离开支撑面的高度、手物相对位姿稳定性和连续抬升帧建立抓取证据；只有通过证据的手物关系才能进入携带状态。持物导航逐帧验证抓取延续和未授权碰撞，放置动作必须由模型产生张手与撤手运动，并同时满足物体进入目标区域、手部脱离和非人形支撑面稳定承托。
@@ -189,7 +199,7 @@ AI_STREAM_EVENT_IDLE_TIMEOUT_MS=300000
 
 AI_TEMPERATURE=0.2
 AI_REASONING_EFFORT=
-AI_TOOL_CHOICE=required
+AI_TOOL_CHOICE=auto
 AI_MAX_OUTPUT_TOKENS=
 AI_CONTEXT_WINDOW_TOKENS=262144
 AI_COMPACT_TRIGGER_TOKENS=
@@ -210,7 +220,7 @@ HEAR_RUNS_DIR=./runs
 | `openai_responses` | OpenAI Responses API |
 | `anthropic_messages` | Anthropic Messages API |
 
-`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required`、`auto` 和 `none`，默认要求各层级节点调用其授权工具；兼容端点需要自行决定工具选择方式时可设为 `auto`。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时固定取各智能体实际上下文窗口的 `85%`；角色覆盖自己的窗口后也会独立重算，不继承其他模型的低阈值。
+`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required`、`auto` 和 `none`，默认使用兼容思考模式的 `auto`。Harness 在业务节点没有产生正式工具结果时，会保留同一个 Agent、模型门面和 Session，在原会话继续下一轮决策；不会关闭思考、替模型选择动作或切换成供应商专用协议。端点明确支持强制工具选择时也可以设为 `required`。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时固定取各智能体实际上下文窗口的 `85%`；角色覆盖自己的窗口后也会独立重算，不继承其他模型的低阈值。
 
 `AI_REQUEST_TIMEOUT_MS` 默认是 `300000`，表示 HTTP 建连或相邻响应数据之间允许的最长静默时间。`AI_STREAM_EVENT_IDLE_TIMEOUT_MS` 默认同为 `300000`，约束相邻 Agents SDK 模型事件之间的静默时间；只有真实模型事件会续期。两者均可按端点能力在 5 秒至 10 分钟之间调整，任务总时限、人工停止和进程恢复仍独立生效。
 
@@ -297,14 +307,14 @@ pnpm test
 pnpm check
 pnpm test:browser
 pnpm test:live:mission
-pnpm test:live:autonomy
+pnpm test:live:continuous
 pnpm test:live:manipulation
 pnpm test:live:endurance
 ```
 
 `pnpm check` 包含无用代码扫描、服务端和前端类型检查、单元与集成测试、生产构建及生产启动检查。浏览器测试在桌面与移动视口中验证 G1 网格加载、实时界面、三个相机视角、延迟加载面板和真实 WebGL/WebGPU 画布。
 
-真实模型验收使用正常环境配置，不包含在离线 CI 中。有限任务验收验证模型决策、物理执行、Goal 证据和具身记忆的完整因果链；持续自主验收从同一场景与世界种子运行多次，并分别验证模型响应、规划参数和实际物理轨迹的实质差异；配置具备接触操作能力的控制器后，物体交互验收要求真实抓取、持物导航、主动释放和稳放全部成立；耐久验收覆盖多轮上下文压缩、进程中断、恢复和后续 Goal。
+真实模型检查使用正常环境配置，不包含在离线 CI 中。有限任务检查验证模型决策、物理执行、Goal 状态和具身记忆的完整因果链；持续运行检查直接启动正式 `continuous` 内核，在配置的观察时间内不注入动作、不设置 Cycle 或 Goal 配额，也不把运行次数当作自主性结论；配置具备接触操作能力的控制器后，物体交互检查要求真实抓取、持物导航、主动释放和稳放全部成立；耐久检查通过真实进程中断与恢复确认同一运行可以继续。
 
 ## 项目结构
 
@@ -315,6 +325,7 @@ src/runtime/           任务生命周期、上下文压缩与目标检查
 src/model/             模型协议与 Agents SDK 模型适配
 src/persistence/       检查点、追加式日志与 Session
 src/server/            Operator API、SSE 与运行管理
+training/              mjlab G1 GPU 训练、ONNX 导出与物理评估
 web/src/humanoid/      G1 场景、相机和人形实时工作区
 web/src/flow/          层级流、行动历程与输出视图
 tests/browser/         桌面端和移动端浏览器验收

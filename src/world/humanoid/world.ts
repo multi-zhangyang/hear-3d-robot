@@ -1433,7 +1433,8 @@ export class HumanoidWorld {
   async #validateNavigationIntent(
     target: Vec3,
     requestedArrivalHeading: HumanoidNavigationArrivalHeading | null,
-    context?: NavigationPlanningContext
+    context?: NavigationPlanningContext,
+    acceptedPositionToleranceMeters: number | null = null
   ): Promise<NavigationIntentValidation> {
     const source = context ?? this.#captureNavigationPlanningContext();
     const start = { ...source.start };
@@ -1484,7 +1485,8 @@ export class HumanoidWorld {
           source.worldRevision,
           source.carriedObjectBindings,
           source.carriedObjectTaskSpaceTargets,
-          arrivalHeading
+          arrivalHeading,
+          acceptedPositionToleranceMeters
         )
       );
     };
@@ -1576,7 +1578,8 @@ export class HumanoidWorld {
 
   async planNavigation(
     target: Vec3,
-    requestedArrivalHeading: HumanoidNavigationArrivalHeading | null = null
+    requestedArrivalHeading: HumanoidNavigationArrivalHeading | null = null,
+    acceptedPositionToleranceMeters: number | null = null
   ): Promise<NavigationPlanReceipt> {
     const context = await this.#authority.capture(() => {
       return this.#captureNavigationPlanningContext();
@@ -1585,12 +1588,14 @@ export class HumanoidWorld {
     const expiresRevision = this.#planExpiryRevision(createdRevision);
     const intentSha256 = humanoidNavigationIntentSha256(
       target,
-      requestedArrivalHeading
+      requestedArrivalHeading,
+      acceptedPositionToleranceMeters
     );
     const validation = await this.#validateNavigationIntent(
       target,
       requestedArrivalHeading,
-      context
+      context,
+      acceptedPositionToleranceMeters
     );
     if (!validation.accepted || !validation.plan) {
       return {
@@ -1605,6 +1610,7 @@ export class HumanoidWorld {
           ? structuredClone(requestedArrivalHeading)
           : null,
         arrivalHeading: null,
+        acceptedPositionToleranceMeters,
         chunkTarget: {
           ...(validation.plan?.resolvedTarget
             ?? validation.projectedTarget
@@ -1643,6 +1649,7 @@ export class HumanoidWorld {
         arrivalHeading: validation.arrivalHeading
           ? structuredClone(validation.arrivalHeading)
           : null,
+        acceptedPositionToleranceMeters,
         releaseJointTracking: validation.releaseJointTracking,
         createdRevision,
         validatedRevision: createdRevision,
@@ -1693,6 +1700,7 @@ export class HumanoidWorld {
       arrivalHeading: validation.arrivalHeading
         ? structuredClone(validation.arrivalHeading)
         : null,
+      acceptedPositionToleranceMeters,
       waypoints: plan.waypoints.map((point) => ({ ...point })),
       distance: plan.distance,
       remainingDistance: validation.remainingDistance,
@@ -1720,7 +1728,8 @@ export class HumanoidWorld {
     if (captured.terminalReceipt) return captured.terminalReceipt;
     if (stored.intentSha256 !== humanoidNavigationIntentSha256(
       stored.requestedTarget,
-      stored.requestedArrivalHeading
+      stored.requestedArrivalHeading,
+      stored.acceptedPositionToleranceMeters
     )) {
       throw new Error("Humanoid navigation intent changed after model planning");
     }
@@ -1784,7 +1793,8 @@ export class HumanoidWorld {
       const validation = await this.#validateNavigationIntent(
         stored.requestedTarget,
         stored.requestedArrivalHeading,
-        captured.context
+        captured.context,
+        stored.acceptedPositionToleranceMeters
       );
       const nextRevalidationCount = stored.revalidationCount + 1;
       validationRevision = captured.context.worldRevision;
@@ -1906,7 +1916,8 @@ export class HumanoidWorld {
               graspRegistry: this.#graspRegistry
             }),
             carryTaskSpaceTargets: stored.carriedObjectTaskSpaceTargets,
-            arrivalHeading: stored.arrivalHeading
+            arrivalHeading: stored.arrivalHeading,
+            acceptedPositionToleranceMeters: stored.acceptedPositionToleranceMeters
           });
           this.#navigationState.status = "executing";
         },
@@ -1964,7 +1975,8 @@ export class HumanoidWorld {
             const replanned = await this.#validateNavigationIntent(
               stored.requestedTarget,
               stored.requestedArrivalHeading,
-              context
+              context,
+              stored.acceptedPositionToleranceMeters
             );
             const attempt = (stored.progress.online_replan_count ?? 0) + 1;
             onlineReplans.push({
@@ -2020,7 +2032,8 @@ export class HumanoidWorld {
                   graspRegistry: this.#graspRegistry
                 }),
                 carryTaskSpaceTargets: stored.carriedObjectTaskSpaceTargets,
-                arrivalHeading: stored.arrivalHeading
+                arrivalHeading: stored.arrivalHeading,
+                acceptedPositionToleranceMeters: stored.acceptedPositionToleranceMeters
               });
               this.#navigationState = {
                 planId,

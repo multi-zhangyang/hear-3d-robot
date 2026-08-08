@@ -29,8 +29,57 @@ describe("Goal retirement recovery evidence", () => {
       evidenceRef: "action:plan-grasp-1",
       transactionId: "plan-grasp-1",
       code: "manipulation_base_placement_required",
+      receiptCode: "manipulation_base_placement_required",
+      recovery: "1 IK-validated base placement(s) remain",
       reachableBasePlacementCount: 1
     });
+  });
+
+  it("does not let a zero-frame plan revalidation failure retire the Goal", () => {
+    const artifact = createActionGoalEvidence({
+      transactionId: "execute-route-1",
+      worldFrame: 52,
+      worldRevision: 52,
+      receipt: {
+        transactionId: "execute-route-1",
+        action: "execute_humanoid_skill",
+        accepted: false,
+        code: "plan_revalidation_failed",
+        frameCount: 0,
+        worldAfterRevision: 52,
+        detail: {
+          result: {
+            reason: "navigation_failed_to_settle"
+          }
+        }
+      }
+    });
+
+    expect(recoverableBlockedGoalEvidence([artifact])).toEqual({
+      evidenceRef: "action:execute-route-1",
+      transactionId: "execute-route-1",
+      code: "planning_attempt_recoverable",
+      receiptCode: "plan_revalidation_failed",
+      recovery: "the receipt rejected one zero-frame planning attempt, not the active Goal"
+    });
+  });
+
+  it("keeps a failed physical execution eligible as Goal retirement evidence", () => {
+    const artifact = createActionGoalEvidence({
+      transactionId: "execute-route-2",
+      worldFrame: 53,
+      worldRevision: 53,
+      receipt: {
+        transactionId: "execute-route-2",
+        action: "execute_humanoid_navigation",
+        accepted: false,
+        code: "physical_rejection",
+        frameCount: 20,
+        worldAfterRevision: 53
+      }
+    });
+
+    expect(recoverableBlockedGoalEvidence([artifact])).toBeNull();
   });
 
   it("does not reinterpret an exhausted rejection as a recovery path", () => {

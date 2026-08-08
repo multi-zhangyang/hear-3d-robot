@@ -63,6 +63,31 @@ describe("人形身体通道", () => {
     expect(html).toContain("压缩线 8000");
   });
 
+  it("成功终态不再显示仍在选择 Goal", () => {
+    const world = worldSnapshot();
+    const frameBuffer = new HumanoidFrameBuffer();
+    frameBuffer.reset(world);
+    const details = runDetails(world);
+    details.checkpoint.version = 6;
+    details.checkpoint.status = "succeeded";
+    details.checkpoint.goal_dag = {
+      status: "awaiting_model_selection",
+      candidates: {
+        first: { status: "proposed" }
+      }
+    } as unknown as NonNullable<HumanoidRunDetails["checkpoint"]["goal_dag"]>;
+
+    const html = renderToStaticMarkup(createElement(HumanoidMissionWorkspace, {
+      details,
+      frameBuffer,
+      streamState: "inactive"
+    }));
+
+    expect(html).toContain("任务目标已完成");
+    expect(html).toContain("已完成");
+    expect(html).not.toContain("等待目标管理智能体选择");
+  });
+
   it("只显示当前物理帧的真实抓取与保持进度", () => {
     const world = worldSnapshot();
     world.grasp.assessments = [

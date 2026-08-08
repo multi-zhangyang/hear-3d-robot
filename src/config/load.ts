@@ -154,7 +154,7 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
     ),
     temperature: numberFromEnv(env.AI_TEMPERATURE, 0.2),
     reasoningEffort: reasoningEffortFromEnv(env.AI_REASONING_EFFORT),
-    toolChoice: toolChoiceFromEnv(env.AI_TOOL_CHOICE, "required"),
+    toolChoice: toolChoiceFromEnv(env.AI_TOOL_CHOICE, "auto"),
     maxOutputTokens,
     contextWindowTokens,
     compactTriggerTokens: numberFromEnv(
@@ -282,7 +282,7 @@ function loadAgentModelConfig(
     ),
     toolChoice: toolChoiceFromEnv(
       env[`${prefix}TOOL_CHOICE`],
-      inherited.toolChoice ?? "required"
+      inherited.toolChoice ?? "auto"
     ),
     maxOutputTokens,
     contextWindowTokens,

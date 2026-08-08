@@ -425,8 +425,11 @@ export interface HumanoidEmbodiedEpisode {
     memory_id: string;
   };
   transaction_id: string;
-  action: "execute_whole_body_motion" | "execute_humanoid_navigation";
-  planning_action?: "plan_whole_body_motion"
+  action: "execute_humanoid_skill"
+    | "execute_whole_body_motion"
+    | "execute_humanoid_navigation";
+  planning_action?: "plan_humanoid_skill"
+    | "plan_whole_body_motion"
     | "plan_whole_body_motion_candidates"
     | "plan_humanoid_navigation";
   candidate_count?: number;
@@ -489,9 +492,11 @@ interface HumanoidEmbodiedExperience {
   transaction_id: string;
   cycle: AutonomousCycleRef;
   action: "execute_whole_body_motion"
+    | "execute_humanoid_skill"
     | "execute_humanoid_navigation"
     | "remove_world_block";
-  planning_action?: "plan_whole_body_motion"
+  planning_action?: "plan_humanoid_skill"
+    | "plan_whole_body_motion"
     | "plan_whole_body_motion_candidates"
     | "plan_humanoid_navigation";
   accepted: boolean;
@@ -517,6 +522,10 @@ interface HumanoidExperienceOutcomeCounts {
 
 type HumanoidActionName =
   | "observe_humanoid"
+  | "submit_humanoid_skill_plan"
+  | "begin_humanoid_skill"
+  | "plan_humanoid_skill"
+  | "execute_humanoid_skill"
   | "plan_whole_body_motion"
   | "plan_whole_body_motion_candidates"
   | "execute_whole_body_motion"

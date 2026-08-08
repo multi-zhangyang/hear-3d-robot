@@ -207,6 +207,7 @@ export interface NavigationPlanReceipt {
   chunkTarget: Vec3;
   requestedArrivalHeading: HumanoidNavigationArrivalHeading | null;
   arrivalHeading: HumanoidNavigationArrivalHeading | null;
+  acceptedPositionToleranceMeters: number | null;
   waypoints: Vec3[];
   distance: number;
   remainingDistance: number;

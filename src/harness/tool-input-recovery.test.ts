@@ -3,7 +3,8 @@ import { z } from "zod";
 import {
   createToolInputRecovery,
   invalidToolInputResult,
-  preflightAgentToolInput
+  preflightAgentToolInput,
+  recoverInvalidToolInputOutput
 } from "./tool-input-recovery.js";
 
 describe("invalid tool input recovery", () => {
@@ -111,6 +112,41 @@ describe("invalid tool input recovery", () => {
         message: "Duplicate contact"
       }
     ]);
+  });
+
+  it("recovers redacted SDK validation details without discarding result metadata", () => {
+    const output = recoverInvalidToolInputOutput(
+      JSON.stringify({
+        accepted: false,
+        code: "invalid_tool_input",
+        tool: "recall_goal_history",
+        validation_issues: [],
+        historical_only: true
+      }),
+      JSON.stringify({ limit: 0 }),
+      z.object({ limit: z.number().int().positive() }).strict(),
+      "recall_goal_history",
+      createToolInputRecovery()
+    );
+
+    expect(JSON.parse(output)).toMatchObject({
+      accepted: false,
+      code: "invalid_tool_input",
+      historical_only: true,
+      validation_issues: [{ path: "limit", code: "too_small" }]
+    });
+  });
+
+  it("does not preflight an input that the SDK accepted", () => {
+    const output = recoverInvalidToolInputOutput(
+      "accepted-output",
+      JSON.stringify({ optional_label: null }),
+      z.object({ optional_label: z.string().optional() }).strict(),
+      "strict_tool",
+      createToolInputRecovery()
+    );
+
+    expect(output).toBe("accepted-output");
   });
 
   it("identifies a repeated invalid field without repairing the model input", () => {

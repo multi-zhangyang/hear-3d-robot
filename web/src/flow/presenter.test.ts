@@ -2,6 +2,52 @@ import { describe, expect, it } from "vitest";
 import { presentAction, presentEmbodiedEpisode, presentFramework } from "./presenter";
 
 describe("agent timeline presenter", () => {
+  it("presents the semantic Skill pipeline without unknown-action placeholders", () => {
+    const planned = presentAction({
+      transactionId: "skill-route",
+      agentId: "humanoid-motion-reference",
+      action: "plan_humanoid_skill",
+      input: { skill_transaction_id: "bound-skill" },
+      fingerprint: "fingerprint",
+      accepted: true,
+      code: "autonomous_skill_route_validated",
+      worldBeforeRevision: 20,
+      worldAfterRevision: 20,
+      frameCount: 0,
+      channels: [],
+      detail: {},
+      committedAt: "2026-08-08T00:00:00.000Z"
+    });
+    const executed = presentAction({
+      transactionId: "skill-execution",
+      agentId: "humanoid-executor",
+      action: "execute_humanoid_skill",
+      input: { planning_transaction_id: "skill-route" },
+      fingerprint: "fingerprint",
+      accepted: true,
+      code: "navigation_completed",
+      worldBeforeRevision: 20,
+      worldAfterRevision: 534,
+      frameCount: 514,
+      channels: ["locomotion"],
+      detail: {},
+      committedAt: "2026-08-08T00:00:01.000Z"
+    });
+
+    expect(planned).toMatchObject({
+      title: "验证技能路线",
+      detail: "技能路线已完成导航、全身控制与 MuJoCo 物理预演。",
+      meta: "技能路线已通过物理预演",
+      category: "plan"
+    });
+    expect(executed).toMatchObject({
+      title: "执行自主技能",
+      detail: "机器人已执行模型选择并通过预演的技能路线。",
+      meta: "514 个物理帧",
+      category: "move"
+    });
+  });
+
   it("shows the real candidate count and selected physical rank", () => {
     const presented = presentAction({
       transactionId: "candidate-plan",
@@ -108,6 +154,32 @@ describe("agent timeline presenter", () => {
     expect(presentFramework([entry])[0]?.id).toBe("message-framework-event-1");
     expect(presentFramework([{ ignored: true }, entry])[0]?.id)
       .toBe("message-framework-event-1");
+  });
+
+  it("turns internal lifecycle assignments into a concise status message", () => {
+    const moments = presentFramework([{
+      runtime_event_id: "framework-internal-state",
+      at: "2026-08-08T00:00:00.000Z",
+      event: {
+        type: "run_item_stream_event",
+        name: "message_output_created",
+        item: {
+          rawItem: {
+            content: [{
+              type: "output_text",
+              text: "当前状态 coordinator_phase=complete_cycle，cycle_completion.status=ready。"
+            }]
+          }
+        }
+      }
+    }]);
+
+    expect(moments).toEqual([
+      expect.objectContaining({
+        title: "模型输出",
+        detail: "当前物理执行、执行后感知与目标验收证据已经齐备。"
+      })
+    ]);
   });
 
   it("presents model messages, tool results, usage, and active-agent transitions", () => {

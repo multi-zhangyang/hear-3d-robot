@@ -6,11 +6,11 @@ on:
       suite:
         description: Real-model verification suite
         required: true
-        default: autonomy
+        default: continuous
         type: choice
         options:
           - mission
-          - autonomy
+          - continuous
           - manipulation
           - endurance
           - all
@@ -32,11 +32,6 @@ on:
         description: Per-run model and physics verification timeout
         required: true
         default: "30"
-        type: string
-      run_count:
-        description: Repeated same-world runs used to verify autonomous diversity
-        required: true
-        default: "3"
         type: string
 
 permissions:
@@ -64,8 +59,6 @@ jobs:
       HEAR_LIVE_MANIPULATION_SCENARIO: ${{ inputs.manipulation_scenario }}
       HEAR_LIVE_SEED: ${{ inputs.seed }}
       HEAR_LIVE_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
-      HEAR_LIVE_RUN_COUNT: ${{ inputs.run_count }}
-      HEAR_LIVE_SEED_STRATEGY: same
     steps:
       - uses: actions/checkout@v7
 
@@ -89,8 +82,8 @@ jobs:
             mission)
               HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/mission.json" pnpm run test:live:mission
               ;;
-            autonomy)
-              HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/autonomy.json" pnpm run test:live:autonomy
+            continuous)
+              HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/continuous.json" pnpm run test:live:continuous
               ;;
             manipulation)
               HEAR_LIVE_SCENARIO="$HEAR_LIVE_MANIPULATION_SCENARIO" HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/manipulation.json" pnpm run test:live:manipulation
@@ -100,7 +93,7 @@ jobs:
               ;;
             all)
               HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/mission.json" pnpm run test:live:mission
-              HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/autonomy.json" pnpm run test:live:autonomy
+              HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/continuous.json" pnpm run test:live:continuous
               HEAR_LIVE_SCENARIO="$HEAR_LIVE_MANIPULATION_SCENARIO" HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/manipulation.json" pnpm run test:live:manipulation
               HEAR_LIVE_REPORT="$HEAR_LIVE_REPORT_DIR/endurance.json" pnpm run test:live:endurance
               ;;

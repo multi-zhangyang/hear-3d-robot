@@ -53,6 +53,16 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
   const activeChannels = movingHumanoidChannels(frame);
   const latest = props.details.actions.at(-1);
   const goal = activeCheckpointGoal(checkpoint);
+  const inactiveGoalStatus = checkpoint.status === "succeeded"
+    ? "已完成"
+    : checkpoint.status === "failed"
+      ? "已结束"
+      : "选择中";
+  const inactiveGoalDetail = checkpoint.status === "succeeded"
+    ? "任务目标已完成"
+    : checkpoint.status === "failed"
+      ? "运行已结束"
+      : "等待目标管理智能体选择";
   const passed = checkpoint.checker?.checks.filter((check) => check.passed).length ?? 0;
   const total = goal?.predicates.length ?? 0;
   const context = checkpoint.context_memory;
@@ -153,7 +163,7 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
       <section className="humanoid-goal-hud game-card" aria-label="目标与长期记忆">
         <div className="humanoid-goal-title">
           <span>{checkpoint.version === 6 ? "Goal Epoch" : "目标"}</span>
-          <b>{goal ? `${passed}/${total}` : "选择中"}</b>
+          <b>{goal ? `${passed}/${total}` : inactiveGoalStatus}</b>
         </div>
         <div className="humanoid-goal-list">
           {goal ? goal.predicates.map((predicate, index) => {
@@ -183,7 +193,7 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
           }) : (
             <span className="humanoid-goal-awaiting">
               <i />
-              <b>等待目标管理智能体选择</b>
+              <b>{inactiveGoalDetail}</b>
             </span>
           )}
         </div>

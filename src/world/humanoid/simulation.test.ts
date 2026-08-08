@@ -418,6 +418,11 @@ describe("HumanoidSimulation", () => {
           protocol: "humanoid-controller-task-v1",
           taskId: "skill:grasp:contact",
           source: "motion_option",
+          requestedCapabilities: [
+            "joint_reference_tracking",
+            "contact_rich_manipulation"
+          ],
+          goal: null,
           endEffectors: [{
             body: "right_wrist_yaw_link",
             frame: "world",
@@ -445,6 +450,11 @@ describe("HumanoidSimulation", () => {
       ]);
       expect(controller.lastOptions?.taskCommand).toMatchObject({
         taskId: "skill:grasp:contact",
+        requestedCapabilities: [
+          "joint_reference_tracking",
+          "contact_rich_manipulation"
+        ],
+        goal: null,
         grasps: [{ objectId: "workpiece", hand: "right" }]
       });
     } finally {

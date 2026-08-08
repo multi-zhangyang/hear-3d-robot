@@ -57,6 +57,111 @@ afterEach(async () => {
 });
 
 describe("HumanoidRunRuntime", () => {
+  it("keeps a model-selected exploration Goal active after the bootstrap Goal in continuous mode", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-continuous-goal-authority-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "完成初始目标后继续自主探索",
+      scenarioId: "humanoid-continuous-goal-authority-test",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1",
+      runMode: "continuous"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    let runtime: HumanoidRunRuntime | undefined;
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      const explorationGoal = GoalSchema.parse({
+        summary: "探索新的物理位置",
+        predicates: [{
+          type: "robot_at",
+          target: { x: 6, y: 0, z: 6 },
+          tolerance: 0.3
+        }]
+      });
+      await activateGoal(runtime, explorationGoal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+
+      expect(runtime.coordinatorPhase()).toBe("observe_or_plan");
+      expect(runtime.goalRetirementDelegationAvailable()).toBe(false);
+      expect(runtime.checkpoint.goal_dag.status).toBe("active");
+      expect(runtime.checkpoint.checker?.success).toBe(false);
+    } finally {
+      await runtime?.stopContinuousPhysics();
+      await world.dispose();
+    }
+  }, 30_000);
+
+  it("completes a newly selected Goal that the current physical state already satisfies", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-satisfied-goal-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "验证已经由真实物理状态满足的目标",
+      scenarioId: "humanoid-satisfied-goal-test",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1",
+      runMode: "mission"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    let runtime: HumanoidRunRuntime | undefined;
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      await activateGoal(runtime, scenario.default_goal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+
+      expect(runtime.coordinatorPhase()).toBe("complete_satisfied_goal");
+      expect(runtime.validateSatisfiedGoal()).toMatchObject({
+        physical_execution_required: false,
+        checker: { success: true }
+      });
+      await expect(runtime.completeSatisfiedGoal(JSON.stringify({
+        status: "satisfied_goal_completed",
+        summary: "当前 MuJoCo 状态已经满足选中的目标"
+      }))).resolves.toBe(true);
+
+      const checkpoint = runtime.checkpoint;
+      expect(checkpoint.status).toBe("succeeded");
+      expect(checkpoint.cycle_index).toBe(1);
+      expect(checkpoint.active_cycle).toBeNull();
+      expect(checkpoint.goal_dag.status).toBe("awaiting_model_selection");
+      expect(checkpoint.goal_dag.epochs.at(-1)?.status).toBe("completed");
+      expect(checkpoint.committed_actions).toEqual({});
+      expect(await store.readJournal("episodes")).toEqual([]);
+      expect(await store.readJournal("checker")).toEqual([
+        expect.objectContaining({ success: true })
+      ]);
+    } finally {
+      await runtime?.stopContinuousPhysics();
+      await world.dispose();
+    }
+  }, 30_000);
+
   it("restores pending Skill authority and advances its DAG after restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-skill-restart-"));
     temporaryDirectories.push(root);

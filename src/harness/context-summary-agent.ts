@@ -252,8 +252,8 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
       } catch (error) {
         request.signal?.throwIfAborted();
         lastFailure = (
-          attemptValidationFailure
-          ?? attemptResponseFailure
+          attemptResponseFailure
+          ?? attemptValidationFailure
           ?? errorMessage(error)
         ).slice(0, 600);
         await this.#onAttemptFailure?.({ attempt, failure: lastFailure });

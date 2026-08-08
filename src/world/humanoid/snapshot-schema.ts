@@ -13,9 +13,11 @@ import {
 import { HumanoidPhysicalSafetyEvidenceSchema } from "./physical-safety.js";
 import { HumanoidWorldGraspStateSchema } from "./grasp-world-state.js";
 import {
-  HUMANOID_LEARNED_POLICY_CAPABILITIES,
   HUMANOID_POLICY_OBSERVATION_FEATURES
 } from "./whole-body-controller.js";
+import {
+  HUMANOID_LEARNED_POLICY_CAPABILITIES
+} from "../../domain/humanoid-policy.js";
 
 const LinkSchema = z.object({
   position: Vec3Schema,

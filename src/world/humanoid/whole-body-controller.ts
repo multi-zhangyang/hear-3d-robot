@@ -1,4 +1,10 @@
 import type { JsonValue, Quaternion, Vec3 } from "../../domain/schema.js";
+import type {
+  HumanoidLearnedPolicyCapability
+} from "../../domain/humanoid-policy.js";
+import type {
+  HumanoidMotionOptionPredicate
+} from "./motion-option-contract.js";
 import type { HumanoidReference } from "./reference.js";
 
 export const HUMANOID_POLICY_OBSERVATION_FEATURES = [
@@ -63,6 +69,8 @@ export interface HumanoidControllerTaskCommand {
   protocol: "humanoid-controller-task-v1";
   taskId: string;
   source: "motion_option" | "carry_navigation";
+  requestedCapabilities: HumanoidLearnedPolicyCapability[];
+  goal: HumanoidControllerTaskGoal | null;
   endEffectors: ReadonlyArray<{
     body: string;
     frame: "world" | "pelvis" | "torso";
@@ -79,6 +87,27 @@ export interface HumanoidControllerTaskCommand {
   }>;
 }
 
+export type HumanoidControllerTaskGoal =
+  | {
+      protocol: "humanoid-controller-motion-goal-v1";
+      predicates: HumanoidMotionOptionPredicate[];
+      stableSteps: number;
+    }
+  | {
+      protocol: "humanoid-controller-navigation-goal-v1";
+      target: Vec3;
+      positionTolerance: number;
+      heading: null | {
+        type: "face_point";
+        target: Vec3;
+        toleranceRadians: number;
+      } | {
+        type: "yaw";
+        yawRadians: number;
+        toleranceRadians: number;
+      };
+    };
+
 export interface HumanoidPolicyState {
   jointPositions: ArrayLike<number>;
   jointVelocities: ArrayLike<number>;
@@ -86,17 +115,6 @@ export interface HumanoidPolicyState {
   rootAngularVelocity: readonly [x: number, y: number, z: number];
   environment?: HumanoidPolicyEnvironmentState | undefined;
 }
-
-export const HUMANOID_LEARNED_POLICY_CAPABILITIES = [
-  "balance",
-  "locomotion",
-  "joint_reference_tracking",
-  "contact_rich_manipulation",
-  "bimanual_manipulation"
-] as const;
-
-type HumanoidLearnedPolicyCapability =
-  typeof HUMANOID_LEARNED_POLICY_CAPABILITIES[number];
 
 interface HumanoidLearnedPolicyDescriptor {
   protocol: "humanoid-learned-policy-v1";

@@ -32,7 +32,7 @@ describe("provider context budget", () => {
     });
 
     expect(config.contextWindowTokens).toBe(262_144);
-    expect(config.toolChoice).toBe("required");
+    expect(config.toolChoice).toBe("auto");
     expect(config.requestTimeoutMs).toBe(300_000);
     expect(config.streamEventIdleTimeoutMs).toBe(300_000);
     expect(config.compactTriggerTokens).toBe(Math.floor(262_144 * 0.85));

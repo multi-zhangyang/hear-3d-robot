@@ -217,6 +217,30 @@ describe("authoritative model progress guard", () => {
     expect(recordModelCallStarted).toHaveBeenCalledTimes(6);
   });
 
+  it("accepts SDK structured output as a formal model decision", async () => {
+    const runtime: ModelTelemetryRuntime = {
+      rootAgentId: "humanoid-coordinator",
+      activeNode: () => ({}) as never,
+      recordModelCallStarted: async () => undefined
+    };
+    const model = {
+      getResponse: async () => textResponse(
+        '{"tool_name":"delegate_motion_reference","arguments_json":"{}"}'
+      ),
+      getStreamedResponse: async function* () {
+        throw new Error("streaming is outside this test");
+      }
+    } as unknown as Model;
+    const wrapped = withModelTelemetry(model, runtime, runtime.rootAgentId);
+
+    for (let index = 0; index < 5; index += 1) {
+      await expect(wrapped.getResponse({
+        input: [],
+        outputType: { type: "json_schema", name: "decision", schema: {} }
+      } as never)).resolves.toBeDefined();
+    }
+  });
+
   it("does not count transport-retried delegation decisions as one semantic stall", async () => {
     const snapshot = progressSnapshot();
     let recoveryEpoch = 0;
@@ -626,5 +650,18 @@ function functionCallResponse(): ModelResponse {
       totalTokens: 2
     },
     responseId: "response-read-only"
+  } as unknown as ModelResponse;
+}
+
+function textResponse(text: string): ModelResponse {
+  return {
+    output: [{ type: "message", role: "assistant", content: text }],
+    usage: {
+      requests: 1,
+      inputTokens: 1,
+      outputTokens: 1,
+      totalTokens: 2
+    },
+    responseId: "response-structured"
   } as unknown as ModelResponse;
 }

@@ -1,7 +1,11 @@
 import { z } from "zod";
 import { Vec3Schema } from "./schema.js";
+import type {
+  HumanoidLearnedPolicyCapability
+} from "./humanoid-policy.js";
 
 export const HUMANOID_SKILL_IDS = [
+  "navigate_to_zone",
   "explore",
   "break_block",
   "approach",
@@ -65,6 +69,10 @@ const PlacementDestinationSchema = z.discriminatedUnion("type", [
 ]);
 
 export const HumanoidSkillInvocationSchema = z.discriminatedUnion("skill", [
+  z.object({
+    skill: z.literal("navigate_to_zone"),
+    zone_id: ObjectIdSchema
+  }).strict(),
   z.object({
     skill: z.literal("explore"),
     frontier_id: z.string().regex(/^frontier:\d+:\d+$/),
@@ -208,6 +216,22 @@ export const HumanoidSkillInvocationSchema = z.discriminatedUnion("skill", [
 
 export type HumanoidSkillInvocation = z.infer<typeof HumanoidSkillInvocationSchema>;
 
+export function humanoidSkillPhaseLearnedPolicyCapabilities(
+  invocation: HumanoidSkillInvocation,
+  phase: string
+): HumanoidLearnedPolicyCapability[] {
+  const process = HUMANOID_SKILL_CONTRACTS[invocation.skill].process.find(
+    (entry) => entry.phase === phase
+  );
+  if (!process) return [];
+  const capabilities = [...process.learned_policy_capabilities];
+  if ((invocation.skill === "carry" || invocation.skill === "place")
+    && invocation.hands === "both") {
+    capabilities.push("bimanual_manipulation");
+  }
+  return [...new Set(capabilities)];
+}
+
 export const BeginHumanoidSkillSchema = z.object({
   skill_plan_transaction_id: z.string().trim().min(1).nullable().default(null),
   skill_node_id: z.string().trim().min(1).nullable().default(null),
@@ -241,9 +265,11 @@ export interface HumanoidSkillContract {
   parameters: string[];
   required_affordances: string[];
   preconditions: string[];
+  prerequisite_skill_groups: HumanoidSkillId[][];
   process: Array<{
     phase: string;
     authority: "sensor" | "navigation" | "whole_body" | "grasp" | "checker";
+    learned_policy_capabilities: HumanoidLearnedPolicyCapability[];
   }>;
   success_conditions: string[];
   failure_reasons: HumanoidSkillFailureCode[];
@@ -261,6 +287,11 @@ export const HUMANOID_SKILL_CONTRACTS: Readonly<Record<
   HumanoidSkillId,
   HumanoidSkillContract
 >> = Object.freeze({
+  navigate_to_zone: contract("navigate_to_zone", ["zone_id"], [],
+    ["zone exists in the current observation", "route into the zone is physically reachable"],
+    [["observe", "sensor"], ["enter_zone", "navigation"], ["verify_zone_membership", "checker"]],
+    ["robot enters the selected zone while remaining upright"],
+    ["path_blocked", "unreachable"], ["navigate_to_zone", "explore", "retreat"]),
   explore: contract("explore", ["frontier_id", "strategy", "maximum_travel_m"], [],
     ["frontier exists in the current spatial belief", "route is physically reachable"],
     [["observe", "sensor"], ["route_to_frontier", "navigation"], ["survey", "sensor"], ["verify_information_gain", "checker"]],
@@ -373,9 +404,65 @@ function contract(
     parameters,
     required_affordances: requiredAffordances,
     preconditions,
-    process: process.map(([phase, authority]) => ({ phase, authority })),
+    prerequisite_skill_groups: prerequisiteSkillGroups(id),
+    process: process.map(([phase, authority]) => ({
+      phase,
+      authority,
+      learned_policy_capabilities: learnedPolicyCapabilities(id, phase, authority)
+    })),
     success_conditions: successConditions,
     failure_reasons: [...new Set([...COMMON_FAILURES, ...failures])],
     recovery_entry: recovery
   };
+}
+
+function prerequisiteSkillGroups(skill: HumanoidSkillId): HumanoidSkillId[][] {
+  if (skill === "reach") return [["approach"]];
+  if (skill === "grasp") return [["reach"], ["approach"]];
+  if (skill === "lift") return [["grasp", "regrasp", "bimanual_support"]];
+  if (skill === "carry" || skill === "bimanual_carry") {
+    return [["lift", "grasp", "regrasp", "bimanual_support"]];
+  }
+  if (skill === "place") {
+    return [["carry", "bimanual_carry", "lift", "grasp", "regrasp"]];
+  }
+  if (["push", "pull", "press", "open", "close", "turn"].includes(skill)) {
+    return [["reach"], ["approach"]];
+  }
+  return [];
+}
+
+function learnedPolicyCapabilities(
+  skill: HumanoidSkillId,
+  phase: string,
+  authority: HumanoidSkillContract["process"][number]["authority"]
+): HumanoidLearnedPolicyCapability[] {
+  if (authority === "sensor" || authority === "checker") return [];
+  if (authority === "navigation") {
+    return skill === "carry" || skill === "bimanual_carry"
+      ? ["locomotion", "contact_rich_manipulation"]
+      : ["locomotion"];
+  }
+  if (skill === "stabilize") return ["balance"];
+  if (skill === "regrasp" || skill === "bimanual_support"
+    || skill === "bimanual_carry") {
+    return ["joint_reference_tracking", "contact_rich_manipulation", "bimanual_manipulation"];
+  }
+  if (authority === "grasp" || [
+    "break_block",
+    "lift",
+    "place",
+    "push",
+    "pull",
+    "press",
+    "open",
+    "close",
+    "turn"
+  ].includes(skill)) {
+    return ["joint_reference_tracking", "contact_rich_manipulation"];
+  }
+  if (phase === "solve_whole_body_reach") {
+    return ["balance", "joint_reference_tracking"];
+  }
+  return ["joint_reference_tracking"];
 }

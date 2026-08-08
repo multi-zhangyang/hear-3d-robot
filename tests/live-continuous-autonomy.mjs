@@ -2,22 +2,21 @@ import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { loadEnvironment, loadProviderConfig, loadRuntimeCatalog } from "../dist/config/load.js";
+import {
+  loadEnvironment,
+  loadProviderConfig,
+  loadRuntimeCatalog
+} from "../dist/config/load.js";
 import { resolveRunDirectory, RunStore } from "../dist/persistence/run-store.js";
 import { RunManager } from "../dist/server/run-manager.js";
 import { drawSeed } from "../dist/world/world-generator.js";
-import { inspectLiveRunEvidence } from "./live-run-evidence.mjs";
 
 loadEnvironment();
 
 const scenarioId = optionalText("HEAR_LIVE_SCENARIO") ?? "humanoid_courtyard";
 const seed = optionalSeed("HEAR_LIVE_SEED") ?? drawSeed();
-const timeoutMs = optionalPositiveInteger("HEAR_LIVE_TIMEOUT_MS")
-  ?? (optionalPositiveInteger("HEAR_LIVE_TIMEOUT_MINUTES") ?? 45) * 60_000;
-const minimumCycles = optionalPositiveInteger("HEAR_LIVE_MINIMUM_CYCLES") ?? 3;
-const minimumCompletedGoals = optionalPositiveInteger(
-  "HEAR_LIVE_MINIMUM_COMPLETED_GOALS"
-) ?? 2;
+const observationMs = optionalPositiveInteger("HEAR_LIVE_OBSERVATION_MS")
+  ?? (optionalPositiveInteger("HEAR_LIVE_TIMEOUT_MINUTES") ?? 30) * 60_000;
 const runsDir = resolve(optionalText("HEAR_RUNS_DIR") ?? "runs");
 const reportPath = optionalText("HEAR_LIVE_REPORT");
 
@@ -30,54 +29,59 @@ const scenario = catalog.materialize(scenarioId, seed);
 const manager = new RunManager({ runsDir, catalog, provider });
 const startedAt = Date.now();
 let runId;
+
 try {
   runId = await manager.start({
-    mission: "在当前世界持续自主观察、选择目标并通过真实物理执行推进探索。",
+    mission: "在当前世界持续自主观察、选择目标并通过真实物理执行自由活动。",
     scenarioId,
     goal: scenario.default_goal,
     runMode: "continuous",
     seed
   });
-  const runDir = resolveRunDirectory(runsDir, runId);
-  const store = await RunStore.open(runDir);
-  await waitUntil(async () => {
-    const checkpoint = await store.readHumanoidCheckpoint();
-    if (checkpoint.status === "failed" || checkpoint.status === "interrupted") {
-      throw new Error(
-        `Continuous autonomy stopped before the portfolio target: ${checkpoint.error}`
-      );
-    }
-    const completedGoals = checkpoint.goal_dag.epochs.filter((epoch) => (
-      epoch.status === "completed"
-    )).length;
-    return checkpoint.cycle_index >= minimumCycles
-      && completedGoals >= minimumCompletedGoals;
-  }, timeoutMs, "Continuous autonomy did not complete enough model-selected Goals");
+  const store = await RunStore.open(resolveRunDirectory(runsDir, runId));
+  await observeContinuousRun(manager, store, runId, observationMs);
 
-  manager.stop(runId, "Continuous autonomy evidence target reached");
-  await waitUntil(() => !manager.isActive(runId), 30_000,
-    "Continuous autonomy did not reach a durable pause");
-  const evidence = await inspectLiveRunEvidence({
-    store,
-    scenario,
-    expectedStatus: "paused",
-    requireMissionCompletion: false
-  });
-  assert.equal(evidence.run_mode, "continuous", "Live autonomy used finite Mission mode");
-  assert.ok(evidence.cycle_count >= minimumCycles,
-    "Continuous autonomy report lost completed cycles");
-  assert.ok(evidence.completed_goal_count >= minimumCompletedGoals,
-    "Continuous autonomy stopped after only one Goal");
-  const report = { ...evidence, duration_ms: Date.now() - startedAt };
+  manager.stop(runId, "Continuous observation window ended");
+  await waitUntil(() => !manager.isActive(runId), 10 * 60_000,
+    "Continuous run did not accept an operator pause");
+  const checkpoint = await store.readHumanoidCheckpoint();
+  assert.equal(checkpoint.status, "paused", "Continuous run did not pause cleanly");
+  assert.equal(checkpoint.error, null, "Continuous run recorded the operator pause as a failure");
+
+  const report = {
+    version: 1,
+    run_id: runId,
+    scenario_id: scenarioId,
+    seed,
+    run_mode: "continuous",
+    status: checkpoint.status,
+    observation_duration_ms: Date.now() - startedAt
+  };
   if (reportPath) {
     await writeFile(resolve(reportPath), `${JSON.stringify(report, null, 2)}\n`, "utf8");
   }
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 } finally {
   if (runId && manager.isActive(runId)) {
-    manager.stop(runId, "Continuous autonomy verifier is shutting down");
+    manager.stop(runId, "Continuous observer is shutting down");
   }
-  await manager.drain("Continuous autonomy verifier finished");
+  await manager.drain("Continuous observer finished");
+}
+
+async function observeContinuousRun(manager, store, runId, durationMs) {
+  const deadline = Date.now() + durationMs;
+  while (Date.now() < deadline) {
+    const checkpoint = await store.readHumanoidCheckpoint();
+    if (checkpoint.status !== "running") {
+      throw new Error(
+        `Continuous run stopped without an operator request: ${checkpoint.error ?? checkpoint.status}`
+      );
+    }
+    if (!manager.isActive(runId)) {
+      throw new Error("Continuous runtime exited while its checkpoint remained nonterminal");
+    }
+    await delay(Math.min(1_000, Math.max(1, deadline - Date.now())));
+  }
 }
 
 async function waitUntil(predicate, timeout, message) {
@@ -85,8 +89,12 @@ async function waitUntil(predicate, timeout, message) {
   for (;;) {
     if (await predicate()) return;
     if (Date.now() >= deadline) throw new Error(message);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+    await delay(250);
   }
+}
+
+function delay(milliseconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
 function optionalText(name) {

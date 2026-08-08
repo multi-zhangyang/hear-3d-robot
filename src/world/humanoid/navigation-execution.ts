@@ -158,6 +158,7 @@ export class HumanoidNavigationExecution {
   readonly #graspTargets: readonly G1ContactAwareGraspTarget[];
   readonly #carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
   readonly #arrivalHeading: HumanoidNavigationArrivalHeading | null;
+  readonly #requestedPositionToleranceMeters: number | null;
   readonly #onlineReplanCount: number;
   #reference: HumanoidReference;
   #final: HumanoidSimulationSnapshot;
@@ -178,6 +179,7 @@ export class HumanoidNavigationExecution {
     graspTargets?: readonly G1ContactAwareGraspTarget[];
     carryTaskSpaceTargets?: readonly HumanoidCarryTaskSpaceTarget[];
     arrivalHeading?: HumanoidNavigationArrivalHeading | null;
+    acceptedPositionToleranceMeters?: number | null;
   }) {
     this.#plan = structuredClone(input.plan);
     this.#reference = input.reference;
@@ -195,6 +197,10 @@ export class HumanoidNavigationExecution {
       || input.arrivalHeading === undefined
       ? null
       : HumanoidNavigationArrivalHeadingSchema.parse(input.arrivalHeading);
+    this.#requestedPositionToleranceMeters = input.acceptedPositionToleranceMeters === null
+      || input.acceptedPositionToleranceMeters === undefined
+      ? null
+      : navigationPositionTolerance(input.acceptedPositionToleranceMeters);
     this.#onlineReplanCount = progress?.online_replan_count ?? 0;
     const controller = input.simulation.controllerDescriptor();
     const controlStepSeconds = controller.controlStepSeconds;
@@ -377,9 +383,9 @@ export class HumanoidNavigationExecution {
       const dx = waypoint.x - this.#final.rootPosition.x;
       const dz = waypoint.z - this.#final.rootPosition.z;
       const distance = Math.hypot(dx, dz);
-      if (distance <= NAVIGATION_WAYPOINT_TOLERANCE_METERS
-        && (this.#waypointIndex < this.#plan.waypoints.length - 1
-          || this.#finalWaypointSatisfied())) {
+      if (this.#waypointIndex < this.#plan.waypoints.length - 1
+        ? distance <= NAVIGATION_WAYPOINT_TOLERANCE_METERS
+        : this.#finalWaypointSatisfied()) {
         this.#waypointIndex += 1;
         continue;
       }
@@ -534,6 +540,10 @@ export class HumanoidNavigationExecution {
     const dx = target.x - this.#final.rootPosition.x;
     const dz = target.z - this.#final.rootPosition.z;
     const distance = Math.hypot(dx, dz);
+    if (this.#requestedPositionToleranceMeters !== null
+      && distance <= this.#finalAcceptedPositionTolerance()) {
+      return [0, 0];
+    }
     const yaw = yawFromQuaternion(this.#final.rootRotation);
     let forward = (dx * Math.sin(yaw) + dz * Math.cos(yaw)) * 1.4;
     let lateral = (dx * Math.cos(yaw) - dz * Math.sin(yaw)) * 0.8;
@@ -669,6 +679,31 @@ export class HumanoidNavigationExecution {
               protocol: "humanoid-controller-task-v1" as const,
               taskId: "carry-navigation",
               source: "carry_navigation" as const,
+              requestedCapabilities: [
+                "locomotion" as const,
+                "contact_rich_manipulation" as const,
+                ...(new Set(this.#graspTargets.map(({ hand }) => hand)).size > 1
+                  ? ["bimanual_manipulation" as const]
+                  : [])
+              ],
+              goal: {
+                protocol: "humanoid-controller-navigation-goal-v1" as const,
+                target: { ...this.#plan.waypoints.at(-1)! },
+                positionTolerance: this.#finalAcceptedPositionTolerance(),
+                heading: this.#arrivalHeading?.type === "face_point"
+                  ? {
+                      type: "face_point" as const,
+                      target: { ...this.#arrivalHeading.target },
+                      toleranceRadians: this.#arrivalHeading.tolerance_radians
+                    }
+                  : this.#arrivalHeading?.type === "yaw"
+                    ? {
+                        type: "yaw" as const,
+                        yawRadians: this.#arrivalHeading.yaw_radians,
+                        toleranceRadians: this.#arrivalHeading.tolerance_radians
+                      }
+                    : null
+              },
               endEffectors: this.#carryTaskSpaceTargets.map((target) => ({
                 body: target.body,
                 frame: target.frame,
@@ -833,6 +868,9 @@ export class HumanoidNavigationExecution {
   }
 
   #boundedFinalPositionTolerance(baseTolerance: number): number {
+    if (this.#requestedPositionToleranceMeters !== null) {
+      return baseTolerance;
+    }
     const target = this.#plan.waypoints.at(-1)!;
     const initialDistance = Math.hypot(
       target.x - this.#startRootPosition.x,
@@ -883,9 +921,13 @@ export class HumanoidNavigationExecution {
   }
 
   #baseFinalPositionTolerance(): number {
-    return this.#carrying
+    const physicalMinimum = this.#carrying
       ? CARRY_NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS
       : NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS;
+    return Math.max(
+      physicalMinimum,
+      this.#requestedPositionToleranceMeters ?? physicalMinimum
+    );
   }
 
   #finalAcceptedPositionTolerance(): number {
@@ -923,7 +965,8 @@ export async function previewHumanoidNavigation(
   startWorldRevision: number,
   carriedObjectBindings: HumanoidCarriedObjectBindingSet,
   carriedObjectTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[],
-  arrivalHeading: HumanoidNavigationArrivalHeading | null = null
+  arrivalHeading: HumanoidNavigationArrivalHeading | null = null,
+  acceptedPositionToleranceMeters: number | null = null
 ): Promise<ReturnType<HumanoidNavigationExecution["result"]>> {
   if (graspRegistry.lastFrame !== startFrame) {
     throw new Error("Humanoid navigation preview grasp registry is not frame-aligned");
@@ -940,7 +983,8 @@ export async function previewHumanoidNavigation(
       graspRegistry
     }),
     carryTaskSpaceTargets: carriedObjectTaskSpaceTargets,
-    arrivalHeading
+    arrivalHeading,
+    acceptedPositionToleranceMeters
   });
   let frame = startFrame;
   let worldRevision = startWorldRevision;
@@ -1064,6 +1108,13 @@ function approach(current: number, target: number, maximumDelta: number): number
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
+}
+
+function navigationPositionTolerance(value: number): number {
+  if (!Number.isFinite(value) || value <= 0 || value > 1) {
+    throw new Error("Navigation position tolerance must be within (0, 1] meters");
+  }
+  return value;
 }
 
 function point(value: Vec3): string {

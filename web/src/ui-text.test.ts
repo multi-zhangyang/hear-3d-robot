@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  actionLabel,
   agentNameLabel,
   bodyChannelLabel,
   entityLabel,
@@ -37,6 +38,12 @@ describe("中文界面文案", () => {
     expect(resultCodeLabel("whole_body_plan_validated")).toBe("全身动作已通过物理预演");
     expect(resultCodeLabel("planning_receipt_missing")).toBe("缺少规划回执");
     expect(resultCodeLabel("required_contact_missing")).toBe("动作缺少要求的物理接触");
+    expect(actionLabel("execute_humanoid_skill")).toBe("执行自主技能");
+    expect(actionLabel("submit_coordinator_decision")).toBe("提交协调决策");
+    expect(resultCodeLabel("autonomous_skill_route_validated"))
+      .toBe("技能路线已通过物理预演");
+    expect(resultCodeLabel("plan_revalidation_failed"))
+      .toBe("执行前物理复验未通过");
     expect(resultCodeLabel("future_runtime_code")).toBe("未识别的运行回执");
   });
 
