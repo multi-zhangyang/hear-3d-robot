@@ -620,14 +620,28 @@ describe("humanoid whole-body motion", () => {
       const rightHandTrackingIndexes = new Set(
         humanoidEndEffectorTrackingJointIndexes("right_wrist_yaw_link")
       );
+      const wholeBodyReachIndexes = new Set(
+        humanoidEndEffectorJointIndexes(
+          "right_wrist_yaw_link",
+          "whole_body_reach"
+        )
+      );
       expect(rightArmIndexes.size).toBe(6);
       expect(rightHandTrackingIndexes.size).toBe(6);
+      expect(wholeBodyReachIndexes.size).toBe(9);
       expect([...rightArmIndexes].every((index) => rightHandTrackingIndexes.has(index))).toBe(true);
       expect([
         "waist_yaw_joint",
         "waist_roll_joint",
         "waist_pitch_joint"
       ].every((joint) => !rightHandTrackingIndexes.has(
+        HUMANOID_JOINT_INDEX.get(joint)!
+      ))).toBe(true);
+      expect([
+        "waist_yaw_joint",
+        "waist_roll_joint",
+        "waist_pitch_joint"
+      ].every((joint) => wholeBodyReachIndexes.has(
         HUMANOID_JOINT_INDEX.get(joint)!
       ))).toBe(true);
       const middle = hydrateHumanoidReference(frames[Math.floor(frames.length / 2)]!.reference);
@@ -799,7 +813,7 @@ describe("humanoid whole-body motion", () => {
       ]).toBe(1);
 
       for (const frame of prepared.artifact!.frames) {
-        await simulation.step(hydrateHumanoidReference(frame.reference));
+        await applyHumanoidMotionArtifactFrame(simulation, frame);
       }
       const after = simulation.snapshot();
       const achievedOrientation = normalizeQuaternion(multiplyQuaternion(

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { JsonValue } from "../../domain/schema.js";
-import { HUMANOID_JOINT_INDEX, HUMANOID_JOINT_NAMES } from "./model.js";
+import {
+  HUMANOID_JOINT_INDEX,
+  HUMANOID_JOINT_NAMES,
+  YAHMP_POLICY
+} from "./model.js";
 import {
   inverseQuaternion,
   multiplyQuaternion,
@@ -58,7 +62,20 @@ describe("HumanoidSimulation", () => {
         controlStepSeconds: 0.02,
         physicsStepSeconds: 0.005,
         commandResponseHorizonSeconds: 0.2,
-        minimumEffectivePlanarSpeedMetersPerSecond: 0.15
+        minimumEffectivePlanarSpeedMetersPerSecond: 0.15,
+        learnedPolicy: {
+          protocol: "humanoid-learned-policy-v1",
+          runtime: "onnx",
+          observationSpace: {
+            protocol: "g1-yahmp-reference-history-v1",
+            size: YAHMP_POLICY.observationSize
+          },
+          actionSpace: {
+            protocol: "g1-joint-position-residual-v1",
+            size: HUMANOID_JOINT_NAMES.length
+          },
+          capabilities: ["balance", "locomotion", "joint_reference_tracking"]
+        }
       });
       expect(simulation.captureState().controller).toMatchObject({
         version: 1,

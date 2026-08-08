@@ -33,7 +33,7 @@ const binding = {
 } as const satisfies ActiveHumanoidSkillBinding;
 
 describe("humanoid recovery policy", () => {
-  it("offers contract recovery entries without selecting or actuating one", () => {
+  it("prioritizes failure-aware recovery without selecting or actuating one", () => {
     const policy = createHumanoidRecoveryPolicy({
       executionTransactionId: "execution-1",
       planningTransactionId: "planning-1",
@@ -43,7 +43,7 @@ describe("humanoid recovery policy", () => {
     });
     expect(policy).toMatchObject({
       failure_reason: "articulation_stalled",
-      candidate_skills: ["regrasp", "approach", "stabilize"],
+      candidate_skills: ["regrasp", "approach", "stabilize", "pull", "push", "retreat"],
       requires_model_selection: true,
       automatic_actuation: false
     });

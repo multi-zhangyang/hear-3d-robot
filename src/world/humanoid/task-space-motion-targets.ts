@@ -6,11 +6,25 @@ import {
 } from "./reference.js";
 import type {
   HumanoidEndEffectorTarget,
+  HumanoidPlanningRootPose,
   HumanoidSimulation
 } from "./simulation.js";
 
 export function taskSpaceReference(
   simulation: HumanoidSimulation,
+  baseline: HumanoidReference,
+  keyframe: HumanoidMotionKeyframe,
+  planningRootPose?: HumanoidPlanningRootPose
+): HumanoidReference {
+  const rooted = taskSpaceRootReference(baseline, keyframe);
+  return simulation.solveEndEffectorTargets(
+    rooted,
+    taskSpaceTargets(keyframe),
+    planningRootPose ? { planningRootPose } : {}
+  ).reference;
+}
+
+export function taskSpaceRootReference(
   baseline: HumanoidReference,
   keyframe: HumanoidMotionKeyframe
 ): HumanoidReference {
@@ -33,8 +47,7 @@ export function taskSpaceReference(
       ? { joints: { waist_yaw_joint: keyframe.torso_yaw } }
       : {})
   };
-  const rooted = targetReference(baseline, rootTarget);
-  return simulation.solveEndEffectorTargets(rooted, taskSpaceTargets(keyframe)).reference;
+  return targetReference(baseline, rootTarget);
 }
 
 export function taskSpaceTargets(
@@ -46,6 +59,12 @@ export function taskSpaceTargets(
       position: keyframe.left_hand.position,
       frame: keyframe.left_hand.frame,
       tolerance: keyframe.left_hand.tolerance_m,
+      ...(keyframe.left_hand.kinematic_scope
+        ? { kinematicScope: keyframe.left_hand.kinematic_scope }
+        : {}),
+      ...(keyframe.left_hand.servo_mode
+        ? { servoMode: keyframe.left_hand.servo_mode }
+        : {}),
       ...(keyframe.left_hand.orientation !== undefined
         && keyframe.left_hand.orientation_tolerance_rad !== undefined
         ? {
@@ -59,6 +78,12 @@ export function taskSpaceTargets(
       position: keyframe.right_hand.position,
       frame: keyframe.right_hand.frame,
       tolerance: keyframe.right_hand.tolerance_m,
+      ...(keyframe.right_hand.kinematic_scope
+        ? { kinematicScope: keyframe.right_hand.kinematic_scope }
+        : {}),
+      ...(keyframe.right_hand.servo_mode
+        ? { servoMode: keyframe.right_hand.servo_mode }
+        : {}),
       ...(keyframe.right_hand.orientation !== undefined
         && keyframe.right_hand.orientation_tolerance_rad !== undefined
         ? {

@@ -162,11 +162,23 @@ scenarios:
       bounds: { width: 20, depth: 18 }
       visibility_radius: 9
       robot: { x: 7, z: 2.8, yaw: 0 }
-      obstacles:
-        - id: side-workbench
-          center: { x: 13.5, y: 0.55, z: 10.5 }
-          size: { x: 3.2, y: 1.1, z: 1.2 }
+      obstacles: []
       objects:
+        - id: side-workbench
+          kind: workbench
+          color: "#59625d"
+          position: { x: 13.5, y: 0.55, z: 10.5 }
+          size: { x: 3.2, y: 1.1, z: 1.2 }
+          portable: false
+          capability:
+            shape: box
+            mass_kg: 32
+            affordances: [support_surface]
+            interaction_points: []
+            support_surface:
+              local_center: { x: 0, y: 0.55, z: 0 }
+              size: { x: 3.2, y: 0, z: 1.2 }
+              normal: { x: 0, y: 1, z: 0 }
         - id: cabinet-frame
           kind: cabinet
           color: "#59645d"
@@ -196,7 +208,7 @@ scenarios:
             interaction_points:
               - id: cabinet-door-handle
                 kind: pull
-                local_position: { x: 0.56, y: 0, z: -0.045 }
+                local_position: { x: 0.56, y: 0, z: -0.105 }
                 approach_direction: { x: 0, y: 0, z: 1 }
                 compatible_hands: either
                 clearance_m: 0.08
@@ -241,6 +253,172 @@ scenarios:
               interior_size: { x: 0.9, y: 0.64, z: 0.9 }
               opening_direction: { x: 0, y: 1, z: 0 }
               wall_thickness_m: 0.045
+        - id: workbench-drawer
+          kind: drawer
+          color: "#71634f"
+          position: { x: 13.5, y: 0.72, z: 9.86 }
+          size: { x: 1.15, y: 0.3, z: 0.5 }
+          portable: false
+          capability:
+            shape: box
+            mass_kg: 5
+            affordances: []
+            interaction_points:
+              - id: drawer-handle
+                kind: pull
+                local_position: { x: 0, y: 0, z: -0.285 }
+                approach_direction: { x: 0, y: 0, z: 1 }
+                compatible_hands: either
+                clearance_m: 0.075
+            articulation:
+              joint_id: workbench-drawer-slide
+              parent_object_id: side-workbench
+              type: slide
+              semantic: drawer
+              axis: { x: 0, y: 0, z: -1 }
+              anchor_world: { x: 13.5, y: 0.72, z: 9.86 }
+              range: { minimum: 0, maximum: 0.58 }
+              initial_position: 0
+              closed_position: 0
+              open_position: 0.52
+              damping: 1.2
+              friction_loss: 0.16
+        - id: workbench-button
+          kind: button
+          color: "#d45f4c"
+          position: { x: 12.85, y: 1.14, z: 10.2 }
+          size: { x: 0.1, y: 0.06, z: 0.1 }
+          portable: false
+          capability:
+            shape: cylinder
+            mass_kg: 0.12
+            affordances: []
+            interaction_points:
+              - id: button-face
+                kind: press
+                local_position: { x: 0, y: 0.035, z: 0 }
+                approach_direction: { x: 0, y: -1, z: 0 }
+                compatible_hands: either
+                clearance_m: 0.035
+            articulation:
+              joint_id: workbench-button-slide
+              parent_object_id: side-workbench
+              type: slide
+              semantic: button
+              axis: { x: 0, y: -1, z: 0 }
+              anchor_world: { x: 12.85, y: 1.14, z: 10.2 }
+              range: { minimum: 0, maximum: 0.045 }
+              initial_position: 0
+              closed_position: 0
+              open_position: 0.04
+              damping: 0.35
+              friction_loss: 0.025
+        - id: workbench-switch
+          kind: switch
+          color: "#d8b35b"
+          position: { x: 13.25, y: 1.16, z: 10.15 }
+          size: { x: 0.08, y: 0.16, z: 0.08 }
+          portable: false
+          capability:
+            shape: box
+            mass_kg: 0.18
+            affordances: []
+            interaction_points:
+              - id: switch-tip
+                kind: press
+                local_position: { x: 0, y: 0.075, z: 0 }
+                approach_direction: { x: 0, y: -1, z: 0 }
+                compatible_hands: either
+                clearance_m: 0.04
+            articulation:
+              joint_id: workbench-switch-hinge
+              parent_object_id: side-workbench
+              type: hinge
+              semantic: switch
+              axis: { x: 1, y: 0, z: 0 }
+              anchor_world: { x: 13.25, y: 1.09, z: 10.15 }
+              range: { minimum: -0.4, maximum: 0.4 }
+              initial_position: -0.32
+              closed_position: -0.32
+              open_position: 0.32
+              damping: 0.28
+              friction_loss: 0.02
+        - id: workbench-valve
+          kind: valve
+          color: "#548b98"
+          position: { x: 14.25, y: 0.72, z: 9.86 }
+          size: { x: 0.3, y: 0.3, z: 0.08 }
+          portable: false
+          capability:
+            shape: box
+            mass_kg: 0.8
+            affordances: []
+            interaction_points:
+              - id: valve-rim
+                kind: turn
+                local_position: { x: 0.13, y: 0, z: -0.055 }
+                approach_direction: { x: 0, y: 0, z: 1 }
+                compatible_hands: either
+                clearance_m: 0.055
+            articulation:
+              joint_id: workbench-valve-hinge
+              parent_object_id: side-workbench
+              type: hinge
+              semantic: valve
+              axis: { x: 0, y: 0, z: 1 }
+              anchor_world: { x: 14.25, y: 0.72, z: 9.86 }
+              range: { minimum: -3.14159, maximum: 3.14159 }
+              initial_position: 0
+              closed_position: 0
+              open_position: 1.5708
+              damping: 0.45
+              friction_loss: 0.05
+        - id: workbench-tool
+          kind: tool
+          color: "#b9bdc1"
+          position: { x: 13.7, y: 1.19, z: 10.45 }
+          size: { x: 0.42, y: 0.1, z: 0.08 }
+          portable: true
+          capability:
+            shape: capsule
+            mass_kg: 0.55
+            affordances: []
+            interaction_points: []
+        - id: material-cart
+          kind: cart
+          color: "#4f7187"
+          position: { x: 16, y: 0.42, z: 7.5 }
+          size: { x: 1.1, y: 0.84, z: 0.72 }
+          portable: true
+          capability:
+            shape: box
+            mass_kg: 15
+            friction: { sliding: 0.55, torsional: 0.02, rolling: 0.012 }
+            affordances: [movable, pushable, pullable]
+            interaction_points:
+              - id: cart-handle
+                kind: push
+                local_position: { x: 0, y: 0.3, z: -0.4 }
+                approach_direction: { x: 0, y: 0, z: 1 }
+                compatible_hands: both
+                clearance_m: 0.09
+        - id: tool-slot
+          kind: tool_rack
+          color: "#5d675e"
+          position: { x: 12.4, y: 1.22, z: 10.45 }
+          size: { x: 0.55, y: 0.18, z: 0.22 }
+          portable: false
+          capability:
+            shape: box
+            mass_kg: 2.5
+            affordances: [insertable]
+            interaction_points:
+              - id: tool-slot-entry
+                kind: insert
+                local_position: { x: 0, y: 0, z: -0.13 }
+                approach_direction: { x: 0, y: 0, z: 1 }
+                compatible_hands: either
+                clearance_m: 0.06
       zones: []
       default_goal:
         summary: 将柜内工件取出并放入目标容器，最后关闭柜门。

@@ -94,7 +94,7 @@ function skillTargetCompatible(
   skill: HumanoidSkillId,
   object: HumanoidObjectWorldModelEntry
 ): boolean {
-  if (skill === "open" || skill === "close" || skill === "press") {
+  if (skill === "open" || skill === "close" || skill === "press" || skill === "turn") {
     return object.articulation !== null;
   }
   if (skill === "approach" || skill === "reach") return true;
@@ -116,6 +116,6 @@ function destinationIds(
 function skillNeedsObject(skill: HumanoidSkillId): boolean {
   return [
     "approach", "reach", "grasp", "lift", "carry", "place", "push", "pull",
-    "press", "open", "close", "regrasp", "bimanual_support", "bimanual_carry"
+    "press", "open", "close", "turn", "regrasp", "bimanual_support", "bimanual_carry"
   ].includes(skill);
 }

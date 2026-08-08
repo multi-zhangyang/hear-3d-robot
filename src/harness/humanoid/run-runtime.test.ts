@@ -116,7 +116,8 @@ describe("HumanoidRunRuntime", () => {
         version: 1,
         skill_plans: [{
           transaction_id: "restart-retreat-skill-plan",
-          completed_node_ids: []
+          completed_node_ids: [],
+          completed_phases_by_node: {}
         }],
         active_skills: [{ transaction_id: skillTransactionId }],
         planning_skill_bindings: [{
@@ -183,7 +184,10 @@ describe("HumanoidRunRuntime", () => {
         latest_physical_execution_revision: executed.worldAfterRevision,
         skill_plans: [{
           transaction_id: "restart-retreat-skill-plan",
-          completed_node_ids: ["restart-retreat-skill-node"]
+          completed_node_ids: ["restart-retreat-skill-node"],
+          completed_phases_by_node: {
+            "restart-retreat-skill-node": ["route"]
+          }
         }],
         active_skill_plan_transactions: {
           [HUMANOID_AGENT_IDS.motion]: "restart-retreat-skill-plan"

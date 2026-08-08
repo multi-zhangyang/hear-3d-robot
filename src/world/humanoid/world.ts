@@ -165,6 +165,9 @@ import {
   type HumanoidSpatialBeliefMapCheckpoint
 } from "./spatial-belief-map.js";
 import { onlineNavigationReplanDecision } from "./online-navigation-replanner.js";
+import type {
+  HumanoidWholeBodyControllerFactory
+} from "./whole-body-controller.js";
 
 export interface WholeBodyMotionPlanningOptions {
   retainTerminalJointTracking?: boolean;
@@ -252,6 +255,7 @@ export class HumanoidWorld {
   #spatialBelief: HumanoidSpatialBeliefMap;
   readonly #graspRegistry: HumanoidGraspRegistry;
   readonly #motionGenerator: HumanoidMotionGenerator;
+  readonly #controllerFactory: HumanoidWholeBodyControllerFactory | undefined;
   readonly #planIntentLeaseSeconds: number;
   readonly #motions = new Map<string, StoredHumanoidMotionPlan>();
   readonly #routes = new Map<string, StoredHumanoidNavigationPlan>();
@@ -295,7 +299,8 @@ export class HumanoidWorld {
         activeScenario,
         checkpoint
           ? [checkpointRootAnchor(checkpoint)]
-          : undefined
+          : undefined,
+        options.controllerFactory
       );
       motionGenerator = options.motionGeneratorFactory
         ? await options.motionGeneratorFactory()
@@ -307,6 +312,7 @@ export class HumanoidWorld {
         resources.navigation,
         resources.physicalRegion,
         motionGenerator,
+        options.controllerFactory,
         options.planIntentLeaseSeconds
           ?? DEFAULT_HUMANOID_PLAN_INTENT_LEASE_SECONDS,
         checkpoint?.objectMemory,
@@ -333,6 +339,7 @@ export class HumanoidWorld {
     navigation: HumanoidNavigationPlanner,
     physicalRegion: HumanoidPhysicalRegion,
     motionGenerator: HumanoidMotionGenerator,
+    controllerFactory: HumanoidWholeBodyControllerFactory | undefined,
     planIntentLeaseSeconds: number,
     objectMemoryCheckpoint?: HumanoidObjectMemoryCheckpoint,
     graspRegistryCheckpoint?: HumanoidGraspRegistryCheckpoint,
@@ -344,6 +351,7 @@ export class HumanoidWorld {
     this.#navigation = navigation;
     this.#physicalRegion = physicalRegion;
     this.#motionGenerator = motionGenerator;
+    this.#controllerFactory = controllerFactory;
     this.#planIntentLeaseSeconds = planIntentLeaseSeconds;
     this.#objectMemory = new HumanoidObjectMemory(scenario, objectMemoryCheckpoint);
     this.#spatialBelief = new HumanoidSpatialBeliefMap(
@@ -455,7 +463,8 @@ export class HumanoidWorld {
         reference: this.#reference,
         robot: this.#simulation.snapshot(),
         objectTokens: observation.objectTokens,
-        handSurfaces: observation.handSurfaces
+        handSurfaces: observation.handSurfaces,
+        interactionTargets: manipulationInteractionTargets(observation)
       })
     );
     if (this.#worldRevision !== observation.worldRevision) {
@@ -563,7 +572,8 @@ export class HumanoidWorld {
     const nextResources = analysis.requiresResourceRebuild
       ? await createHumanoidWorldResources(
           analysis.scenario,
-          captured.physicalAnchors
+          captured.physicalAnchors,
+          this.#controllerFactory
         )
       : undefined;
     let resourcesInstalled = false;
@@ -1029,6 +1039,11 @@ export class HumanoidWorld {
           execution = new HumanoidMotionExecution({
             stored,
             reference: this.#reference,
+            stationKeepingAnchor: captureHumanoidStationKeepingAnchor(
+              this.#simulation.snapshot(),
+              this.#frame,
+              this.#worldRevision
+            ),
             graspTargets: mergeG1ContactAwareGraspTargets(
               contactAwareG1GraspTargetsForBindings({
                 bindings: stored.carriedObjectBindings.bindings,
@@ -2746,6 +2761,55 @@ export class HumanoidWorld {
       detail
     };
   }
+}
+
+function manipulationInteractionTargets(
+  observation: HumanoidWorldObservation
+): Array<{
+  objectId: string;
+  interactionPointId: string;
+  worldPosition: Vec3;
+  approachDirection?: Vec3;
+  preferredGraspAxis?: Vec3;
+  clearanceMeters?: number;
+}> {
+  const wrists = [
+    observation.robot.links.left_wrist_yaw_link.position,
+    observation.robot.links.right_wrist_yaw_link.position
+  ];
+  return observation.interaction.object_world_model.objects.flatMap((object) => {
+    if (object.status !== "visible"
+      || object.role !== "manipulable" && object.articulation === null) {
+      return [];
+    }
+    return object.interaction_points
+      .filter(({ kind }) => [
+        "grasp", "push", "pull", "press", "turn"
+      ].includes(kind))
+      .sort((left, right) => minimumPointDistance(left.world_position, wrists)
+        - minimumPointDistance(right.world_position, wrists))
+      .slice(0, 2)
+      .map((point) => ({
+        objectId: object.id,
+        interactionPointId: point.id,
+        worldPosition: { ...point.world_position },
+        ...(point.approach_direction_world
+          ? { approachDirection: { ...point.approach_direction_world } }
+          : {}),
+        ...(object.articulation?.axis_world
+          ? { preferredGraspAxis: { ...object.articulation.axis_world } }
+          : {}),
+        clearanceMeters: point.clearance_m
+      }));
+  });
+}
+
+function minimumPointDistance(point: Vec3, references: readonly Vec3[]): number {
+  return Math.min(...references.map((reference) => Math.hypot(
+    point.x - reference.x,
+    point.y - reference.y,
+    point.z - reference.z
+  )));
 }
 
 function checkpointRootAnchor(

@@ -23,11 +23,19 @@ import {
   type G1HandJointName
 } from "./morphology.js";
 import type { HumanoidSimulationSnapshot } from "./simulation.js";
+import type { HumanoidTaskSpaceServoTarget } from "./task-space-servo.js";
 
 export interface G1ContactAwareGraspTarget {
   objectId: string;
   hand: "left" | "right";
   minimumNormalForceN: number;
+  acquisitionNormalForceN?: number;
+  minimumDistinctContactSurfaces?: number;
+  holdOnAcquisition?: boolean;
+  contactRegion?: {
+    centerWorld: Vec3;
+    maximumDistanceM: number;
+  };
   maximumRelativeTranslationDriftM?: number;
   maximumRelativeRotationDriftRad?: number;
   referenceRelativePose?: {
@@ -50,6 +58,37 @@ export interface G1ContactAwareGraspServoEvidence {
 export interface G1ContactAwareGraspServoResult {
   jointTargets: Record<G1HandJointName, number>;
   evidence: G1ContactAwareGraspServoEvidence;
+}
+
+export interface G1GraspAcquisitionContactEvidence {
+  contactEstablished: boolean;
+  acquired: boolean;
+  distinctContactSurfaces: number;
+  maximumNormalForceN: number;
+}
+
+export function g1GraspAcquisitionContactEvidence(input: {
+  snapshot: HumanoidSimulationSnapshot;
+  target: G1ContactAwareGraspTarget;
+}): G1GraspAcquisitionContactEvidence {
+  const threshold = input.target.acquisitionNormalForceN
+    ?? input.target.minimumNormalForceN;
+  const surfaces = new Set<string>();
+  let maximumNormalForceN = 0;
+  for (const contact of g1HandObjectContactsForTarget(
+    input.snapshot,
+    input.target
+  )) {
+    if (contact.hand !== input.target.hand) continue;
+    maximumNormalForceN = Math.max(maximumNormalForceN, contact.normalForce);
+    if (contact.normalForce >= threshold) surfaces.add(contact.handLink);
+  }
+  return {
+    contactEstablished: surfaces.size > 0,
+    acquired: surfaces.size >= (input.target.minimumDistinctContactSurfaces ?? 1),
+    distinctContactSurfaces: surfaces.size,
+    maximumNormalForceN
+  };
 }
 
 export function g1CarriedGraspRequiresNoslip(input: {
@@ -100,6 +139,67 @@ const TRANSLATION_REGULATION_FULL_AUTHORITY_METERS = 0.012;
 const MAXIMUM_TRANSLATION_PRELOAD_STEP_RAD = 0.002;
 const RELATIVE_ANGULAR_VELOCITY_DAMPING_SECONDS = 0.04;
 const RELATIVE_LINEAR_VELOCITY_DAMPING_SECONDS = 0.02;
+const WRIST_ADMITTANCE_METERS_PER_EXCESS_NEWTON = 0.00005;
+const MAXIMUM_WRIST_ADMITTANCE_METERS = 0.004;
+
+export function contactAwareG1WristAdmittanceTargets(input: {
+  snapshot: HumanoidSimulationSnapshot;
+  taskSpaceTargets: readonly HumanoidTaskSpaceServoTarget[];
+  graspTargets: readonly G1ContactAwareGraspTarget[];
+}): HumanoidTaskSpaceServoTarget[] {
+  const targets = validateTargets(input.graspTargets);
+  return input.taskSpaceTargets.map((taskTarget) => {
+    const hand = taskTarget.body === "left_wrist_yaw_link"
+      ? "left" as const
+      : taskTarget.body === "right_wrist_yaw_link"
+        ? "right" as const
+        : null;
+    const grasp = hand ? targets.find((target) => target.hand === hand) : undefined;
+    if (!grasp || grasp.referenceRelativePose || taskTarget.frame !== "world") {
+      return structuredClone(taskTarget);
+    }
+    const acquisition = g1GraspAcquisitionContactEvidence({
+      snapshot: input.snapshot,
+      target: grasp
+    });
+    const overload = g1HandObjectContactsForTarget(
+      input.snapshot,
+      grasp
+    ).filter((contact) => (
+      contact.hand === hand && contact.normalFromHand !== null
+    )).reduce((sum, contact) => {
+      const excess = Math.max(
+        0,
+        contact.normalForce - grasp.minimumNormalForceN * 1.5
+      );
+      return {
+        x: sum.x - contact.normalFromHand!.x * excess,
+        y: sum.y - contact.normalFromHand!.y * excess,
+        z: sum.z - contact.normalFromHand!.z * excess
+      };
+    }, { x: 0, y: 0, z: 0 });
+    const requested = {
+      x: overload.x * WRIST_ADMITTANCE_METERS_PER_EXCESS_NEWTON,
+      y: overload.y * WRIST_ADMITTANCE_METERS_PER_EXCESS_NEWTON,
+      z: overload.z * WRIST_ADMITTANCE_METERS_PER_EXCESS_NEWTON
+    };
+    const magnitude = Math.hypot(requested.x, requested.y, requested.z);
+    const ratio = magnitude > MAXIMUM_WRIST_ADMITTANCE_METERS
+      ? MAXIMUM_WRIST_ADMITTANCE_METERS / magnitude
+      : 1;
+    const contactHold = grasp.holdOnAcquisition && acquisition.contactEstablished
+      ? input.snapshot.links[taskTarget.body].position
+      : taskTarget.position;
+    return {
+      ...structuredClone(taskTarget),
+      position: {
+        x: contactHold.x + requested.x * ratio,
+        y: contactHold.y + requested.y * ratio,
+        z: contactHold.z + requested.z * ratio
+      }
+    };
+  });
+}
 
 export function contactAwareG1GraspTargets(input: {
   command: G1HandArtifactCommand;
@@ -121,9 +221,9 @@ export function contactAwareG1GraspJointTargets(input: {
   const targets = validateTargets(input.targets);
   const forceByDigit = new Map<string, number>();
   for (const target of targets) {
-    for (const contact of g1HandObjectContacts(
-      input.snapshot.contacts,
-      target.objectId
+    for (const contact of g1HandObjectContactsForTarget(
+      input.snapshot,
+      target
     )) {
       if (contact.hand !== target.hand) continue;
       const digit = handDigit(contact.handLink);
@@ -327,10 +427,7 @@ function carriedPoseRegulation(
       normalSum: Vec3;
       weightSum: number;
     }>();
-    for (const contact of g1HandObjectContacts(
-      snapshot.contacts,
-      target.objectId
-    )) {
+    for (const contact of g1HandObjectContactsForTarget(snapshot, target)) {
       if (contact.hand !== target.hand
         || !contact.normalFromHand
         || contact.normalForce <= 1e-9
@@ -472,7 +569,36 @@ export function contactAwareG1GraspTargetsForOption(input: {
   graspContract: HumanoidGraspContract;
 }): G1ContactAwareGraspTarget[] {
   const contractSha256 = humanoidGraspContractSha256(input.graspContract);
+  const displacesTarget = input.option.predicates.some((predicate) => (
+    predicate.type === "articulation_displaced"
+      || predicate.type === "object_displaced"
+      || predicate.type === "object_near_point"
+  ));
   return input.option.predicates.flatMap((predicate) => {
+    if (predicate.type === "hand_contact_object_any"
+      || predicate.type === "hand_contact_object_region") {
+      return [{
+        objectId: predicate.object_id,
+        hand: predicate.hand,
+        minimumNormalForceN: Math.max(
+          predicate.minimum_normal_force,
+          input.graspContract.minimum_contact_normal_force_n
+        ),
+        acquisitionNormalForceN: predicate.minimum_normal_force,
+        minimumDistinctContactSurfaces:
+          predicate.minimum_distinct_surfaces ?? 1,
+        holdOnAcquisition:
+          (predicate.minimum_distinct_surfaces ?? 1) > 1 && !displacesTarget,
+        ...(predicate.type === "hand_contact_object_region"
+          ? {
+              contactRegion: {
+                centerWorld: { ...predicate.center_world },
+                maximumDistanceM: predicate.maximum_distance_m
+              }
+            }
+          : {})
+      }];
+    }
     if (predicate.type !== "grasp_verified") return [];
     if (predicate.grasp_contract_sha256 !== contractSha256) {
       throw new Error("Contact-aware grasp option contract does not match authority");
@@ -493,6 +619,12 @@ export function mergeG1ContactAwareGraspTargets(
     const previous = targets.get(target.hand);
     if (previous && (previous.objectId !== target.objectId
       || previous.minimumNormalForceN !== target.minimumNormalForceN
+      || previous.acquisitionNormalForceN !== target.acquisitionNormalForceN
+      || previous.minimumDistinctContactSurfaces
+        !== target.minimumDistinctContactSurfaces
+      || previous.holdOnAcquisition !== target.holdOnAcquisition
+      || JSON.stringify(previous.contactRegion)
+        !== JSON.stringify(target.contactRegion)
       || (previous.referenceRelativePose && target.referenceRelativePose
         && JSON.stringify(previous.referenceRelativePose)
           !== JSON.stringify(target.referenceRelativePose)))) {
@@ -527,6 +659,29 @@ function validateTargets(
       || target.minimumNormalForceN <= 0) {
       throw new Error("Contact-aware grasp force threshold must be positive");
     }
+    if (target.acquisitionNormalForceN !== undefined
+      && (!Number.isFinite(target.acquisitionNormalForceN)
+        || target.acquisitionNormalForceN <= 0)) {
+      throw new Error("Contact-aware grasp acquisition force must be positive");
+    }
+    if (target.minimumDistinctContactSurfaces !== undefined
+      && (!Number.isInteger(target.minimumDistinctContactSurfaces)
+        || target.minimumDistinctContactSurfaces < 1
+        || target.minimumDistinctContactSurfaces > 8)) {
+      throw new Error("Contact-aware grasp surface count must be between 1 and 8");
+    }
+    if (target.holdOnAcquisition !== undefined
+      && typeof target.holdOnAcquisition !== "boolean") {
+      throw new Error("Contact-aware grasp acquisition hold must be boolean");
+    }
+    if (target.contactRegion && (![
+      target.contactRegion.centerWorld.x,
+      target.contactRegion.centerWorld.y,
+      target.contactRegion.centerWorld.z,
+      target.contactRegion.maximumDistanceM
+    ].every(Number.isFinite) || target.contactRegion.maximumDistanceM <= 0)) {
+      throw new Error("Contact-aware grasp region must be finite and positive");
+    }
     if ((target.maximumRelativeTranslationDriftM !== undefined
       && (!Number.isFinite(target.maximumRelativeTranslationDriftM)
         || target.maximumRelativeTranslationDriftM <= 0))
@@ -555,11 +710,31 @@ function validateTargets(
     return {
       ...target,
       objectId: target.objectId.trim(),
+      ...(target.contactRegion
+        ? {
+            contactRegion: {
+              centerWorld: { ...target.contactRegion.centerWorld },
+              maximumDistanceM: target.contactRegion.maximumDistanceM
+            }
+          }
+        : {}),
       ...(referenceRelativePose
         ? { referenceRelativePose: structuredClone(referenceRelativePose) }
         : {})
     };
   });
+}
+
+export function g1HandObjectContactsForTarget(
+  snapshot: HumanoidSimulationSnapshot,
+  target: G1ContactAwareGraspTarget
+): ReturnType<typeof g1HandObjectContacts> {
+  const contacts = g1HandObjectContacts(snapshot.contacts, target.objectId);
+  if (!target.contactRegion) return contacts;
+  return contacts.filter((contact) => vectorLength(subtract(
+    contact.position,
+    target.contactRegion!.centerWorld
+  )) <= target.contactRegion!.maximumDistanceM);
 }
 
 function handDigit(surface: string): string {

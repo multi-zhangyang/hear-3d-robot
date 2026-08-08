@@ -13,6 +13,14 @@ export const HUMANOID_END_EFFECTOR_BODIES = [
 export type HumanoidEndEffectorBody =
   typeof HUMANOID_END_EFFECTOR_BODIES[number];
 
+export const HUMANOID_TASK_SPACE_KINEMATIC_SCOPES = [
+  "arm_only",
+  "whole_body_reach"
+] as const;
+
+export type HumanoidTaskSpaceKinematicScope =
+  typeof HUMANOID_TASK_SPACE_KINEMATIC_SCOPES[number];
+
 const HUMANOID_END_EFFECTOR_JOINT_CHAINS: Readonly<Record<
   HumanoidEndEffectorBody,
   readonly HumanoidJointName[]
@@ -49,6 +57,12 @@ const HUMANOID_END_EFFECTOR_JOINT_CHAINS: Readonly<Record<
   ]
 };
 
+const HUMANOID_WHOLE_BODY_REACH_JOINTS = [
+  "waist_yaw_joint",
+  "waist_roll_joint",
+  "waist_pitch_joint"
+] as const satisfies readonly HumanoidJointName[];
+
 const HUMANOID_END_EFFECTOR_ORIENTATION_JOINTS: Readonly<Record<
   HumanoidEndEffectorBody,
   HumanoidJointName
@@ -60,28 +74,41 @@ const HUMANOID_END_EFFECTOR_ORIENTATION_JOINTS: Readonly<Record<
 };
 
 export function humanoidEndEffectorJointIndexes(
-  body: HumanoidEndEffectorBody
+  body: HumanoidEndEffectorBody,
+  scope: HumanoidTaskSpaceKinematicScope = "arm_only"
 ): number[] {
-  return humanoidJointIndexes(HUMANOID_END_EFFECTOR_JOINT_CHAINS[body]);
+  return humanoidJointIndexes(jointChain(body, scope));
 }
 
 export function humanoidEndEffectorPoseJointIndexes(
-  body: HumanoidEndEffectorBody
+  body: HumanoidEndEffectorBody,
+  scope: HumanoidTaskSpaceKinematicScope = "arm_only"
 ): number[] {
   return humanoidJointIndexes([
-    ...HUMANOID_END_EFFECTOR_JOINT_CHAINS[body],
+    ...jointChain(body, scope),
     HUMANOID_END_EFFECTOR_ORIENTATION_JOINTS[body]
   ]);
 }
 
 export function humanoidEndEffectorTrackingJointIndexes(
   body: HumanoidEndEffectorBody,
-  trackOrientation = false
+  trackOrientation = false,
+  scope: HumanoidTaskSpaceKinematicScope = "arm_only"
 ): number[] {
   return humanoidJointIndexes([
-    ...HUMANOID_END_EFFECTOR_JOINT_CHAINS[body],
+    ...jointChain(body, scope),
     ...(trackOrientation ? [HUMANOID_END_EFFECTOR_ORIENTATION_JOINTS[body]] : [])
   ]);
+}
+
+function jointChain(
+  body: HumanoidEndEffectorBody,
+  scope: HumanoidTaskSpaceKinematicScope
+): readonly HumanoidJointName[] {
+  const limb = HUMANOID_END_EFFECTOR_JOINT_CHAINS[body];
+  return scope === "whole_body_reach" && body.endsWith("wrist_yaw_link")
+    ? [...HUMANOID_WHOLE_BODY_REACH_JOINTS, ...limb]
+    : limb;
 }
 
 function humanoidJointIndexes(joints: readonly HumanoidJointName[]): number[] {

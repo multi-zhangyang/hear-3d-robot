@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   advanceHumanoidSkillPlan,
   authorizeHumanoidSkillPlanNode,
+  compileHumanoidSkillDependencies,
   registerHumanoidSkillPlan
 } from "./skill-plan.js";
 import type { ActiveHumanoidSkillBinding } from "./skill-binding.js";
@@ -37,6 +38,64 @@ const proposal = {
 };
 
 describe("registered humanoid Skill DAG", () => {
+  it("adds dependencies between compatible model-proposed manipulation nodes", () => {
+    const compiled = compileHumanoidSkillDependencies({
+      objective: "取起物体",
+      selected_strategy_id: "direct",
+      strategies: [{
+        strategy_id: "direct",
+        rationale: "使用实时交互点",
+        nodes: [{
+          node_id: "approach",
+          invocation: {
+            skill: "approach",
+            object_id: "part",
+            interaction_point_id: "grasp",
+            standoff_m: 0.4
+          },
+          depends_on_node_ids: []
+        }, {
+          node_id: "reach",
+          invocation: {
+            skill: "reach",
+            object_id: "part",
+            interaction_point_id: "grasp",
+            hand: "right",
+            tolerance_m: 0.05
+          },
+          depends_on_node_ids: []
+        }, {
+          node_id: "grasp",
+          invocation: {
+            skill: "grasp",
+            object_id: "part",
+            interaction_point_id: "grasp",
+            hand: "right"
+          },
+          depends_on_node_ids: []
+        }, {
+          node_id: "lift",
+          invocation: {
+            skill: "lift",
+            object_id: "part",
+            hand: "right",
+            clearance_m: 0.2
+          },
+          depends_on_node_ids: []
+        }]
+      }]
+    });
+    expect(compiled.strategies[0]!.nodes.map((node) => ({
+      id: node.node_id,
+      dependencies: node.depends_on_node_ids
+    }))).toEqual([
+      { id: "approach", dependencies: [] },
+      { id: "reach", dependencies: ["approach"] },
+      { id: "grasp", dependencies: ["approach", "reach"] },
+      { id: "lift", dependencies: ["grasp"] }
+    ]);
+  });
+
   it("authorizes only exact nodes with completed dependencies and advances on terminal phases", () => {
     const registered = registerHumanoidSkillPlan({
       transactionId: "skill-plan-1",
@@ -50,6 +109,7 @@ describe("registered humanoid Skill DAG", () => {
       planTransactionId: "skill-plan-1",
       nodeId: "open",
       invocation: proposal.strategies[0]!.nodes[1]!.invocation,
+      phase: "reach_handle",
       agentId: "motion",
       currentWorldRevision: 5
     })).toMatchObject({
@@ -92,6 +152,7 @@ describe("registered humanoid Skill DAG", () => {
       planTransactionId: "skill-plan-1",
       nodeId: "open",
       invocation: proposal.strategies[0]!.nodes[1]!.invocation,
+      phase: "reach_handle",
       agentId: "motion",
       currentWorldRevision: 6
     })).toMatchObject({ accepted: true, node: { node_id: "open" } });
@@ -114,23 +175,78 @@ describe("registered humanoid Skill DAG", () => {
     });
     expect(reached).toMatchObject({
       world_revision: 7,
-      completed_node_ids: ["approach"]
+      completed_node_ids: ["approach"],
+      completed_phases_by_node: {
+        approach: ["route"],
+        open: ["reach_handle"]
+      }
     });
+
+    expect(authorizeHumanoidSkillPlanNode({
+      plan: reached!,
+      planTransactionId: "skill-plan-1",
+      nodeId: "open",
+      invocation: openNode.invocation,
+      phase: "actuate_joint",
+      agentId: "motion",
+      currentWorldRevision: 7
+    })).toMatchObject({
+      accepted: false,
+      code: "skill_plan_phase_out_of_order",
+      detail: {
+        requested_phase: "actuate_joint",
+        expected_phase: "establish_grasp",
+        completed_phases: ["reach_handle"]
+      }
+    });
+
+    const establishGrasp = {
+      ...reachHandle,
+      transaction_id: "skill-3",
+      phase: "establish_grasp",
+      phase_authority: "grasp",
+      observed_world_revision: 7
+    } as const satisfies ActiveHumanoidSkillBinding;
+    const grasped = advanceHumanoidSkillPlan({
+      plan: reached!,
+      binding: establishGrasp,
+      worldRevision: 8,
+      executionSucceeded: true
+    });
+    expect(grasped).toMatchObject({
+      world_revision: 8,
+      completed_node_ids: ["approach"],
+      completed_phases_by_node: {
+        open: ["reach_handle", "establish_grasp"]
+      }
+    });
+    expect(authorizeHumanoidSkillPlanNode({
+      plan: grasped!,
+      planTransactionId: "skill-plan-1",
+      nodeId: "open",
+      invocation: openNode.invocation,
+      phase: "actuate_joint",
+      agentId: "motion",
+      currentWorldRevision: 8
+    })).toMatchObject({ accepted: true, node: { node_id: "open" } });
 
     const actuateJoint = {
       ...reachHandle,
-      transaction_id: "skill-3",
+      transaction_id: "skill-4",
       phase: "actuate_joint",
-      observed_world_revision: 7
+      observed_world_revision: 8
     } as const satisfies ActiveHumanoidSkillBinding;
     expect(advanceHumanoidSkillPlan({
-      plan: reached!,
+      plan: grasped!,
       binding: actuateJoint,
-      worldRevision: 8,
+      worldRevision: 9,
       executionSucceeded: true
     })).toMatchObject({
-      world_revision: 8,
-      completed_node_ids: ["approach", "open"]
+      world_revision: 9,
+      completed_node_ids: ["approach", "open"],
+      completed_phases_by_node: {
+        open: ["reach_handle", "establish_grasp", "actuate_joint"]
+      }
     });
   });
 });

@@ -14,18 +14,29 @@ export interface HumanoidObjectWorldModelEntry {
   kind: string;
   role: "manipulable" | "fixture";
   status: "visible" | "remembered";
-  authority: "mujoco_exact" | "sensor_history";
+  authority: "sensor_observation" | "sensor_history";
   pose: HumanoidObjectToken["pose"];
   size: Vec3;
   shape: "box" | "sphere" | "cylinder" | "capsule";
   physical: {
-    mass_kg: number;
+    mass_kg: number | null;
     friction: {
-      sliding: number;
-      torsional: number;
-      rolling: number;
+      sliding: number | null;
+      torsional: number | null;
+      rolling: number | null;
     };
     mobility: "fixed" | "free" | "articulated";
+  };
+  belief: {
+    observation_age_frames: number;
+    pose_confidence: number;
+    size: VectorBelief;
+    mass_kg: ScalarBelief;
+    friction: {
+      sliding: ScalarBelief;
+      torsional: ScalarBelief;
+      rolling: ScalarBelief;
+    };
   };
   affordances: string[];
   interaction_points: Array<{
@@ -60,6 +71,22 @@ export interface HumanoidObjectWorldModelEntry {
     connected_to: string[];
   };
   current_contact_count: number;
+}
+
+interface ScalarBelief {
+  estimate: number | null;
+  minimum: number;
+  maximum: number;
+  confidence: number;
+  source: "visual_geometry" | "interaction_evidence" | "memory_decay" | "unobserved";
+}
+
+interface VectorBelief {
+  estimate: Vec3;
+  minimum: Vec3;
+  maximum: Vec3;
+  confidence: number;
+  source: "visual_geometry" | "memory_decay";
 }
 
 export interface HumanoidObjectWorldModel {
@@ -135,15 +162,22 @@ export function createHumanoidObjectWorldModel(input: {
         kind: descriptor.kind,
         role: token.role,
         status: token.status,
-        authority: token.authority,
+        authority: token.status === "visible"
+          ? "sensor_observation" : "sensor_history",
         pose: structuredClone(pose),
         size: { ...descriptor.size },
         shape: capability.shape,
         physical: {
-          mass_kg: capability.massKg,
-          friction: { ...capability.friction },
+          mass_kg: null,
+          friction: { sliding: null, torsional: null, rolling: null },
           mobility: capability.mobility
         },
+        belief: objectPhysicalBelief({
+          frame: input.frame,
+          token,
+          size: descriptor.size,
+          mobility: capability.mobility
+        }),
         affordances: [...capability.affordances],
         interaction_points: capability.interactionPoints.map((point) => ({
           id: point.id,
@@ -182,6 +216,53 @@ export function createHumanoidObjectWorldModel(input: {
     world_revision: input.worldRevision,
     objects
   };
+}
+
+function objectPhysicalBelief(input: {
+  frame: number;
+  token: HumanoidObjectToken;
+  size: Vec3;
+  mobility: HumanoidObjectWorldModelEntry["physical"]["mobility"];
+}): HumanoidObjectWorldModelEntry["belief"] {
+  const age = Math.max(0, input.frame - input.token.observedFrame);
+  const visible = input.token.status === "visible";
+  const relativeSizeUncertainty = visible ? 0.04 : Math.min(0.35, 0.12 + age * 0.002);
+  const sizeBelief: VectorBelief = {
+    estimate: { ...input.size },
+    minimum: scaleComponents(input.size, 1 - relativeSizeUncertainty),
+    maximum: scaleComponents(input.size, 1 + relativeSizeUncertainty),
+    confidence: visible ? 0.82 : Math.max(0.12, 0.55 - age * 0.006),
+    source: visible ? "visual_geometry" : "memory_decay"
+  };
+  const volume = input.size.x * input.size.y * input.size.z;
+  const massMaximum = input.mobility === "fixed"
+    ? Math.max(20, volume * 4_000)
+    : Math.max(2, volume * 3_000);
+  const unknown = (
+    minimum: number,
+    maximum: number
+  ): ScalarBelief => ({
+    estimate: null,
+    minimum,
+    maximum,
+    confidence: 0,
+    source: "unobserved"
+  });
+  return {
+    observation_age_frames: age,
+    pose_confidence: visible ? 0.94 : Math.max(0.1, 0.62 - age * 0.008),
+    size: sizeBelief,
+    mass_kg: unknown(0.02, massMaximum),
+    friction: {
+      sliding: unknown(0.05, 1.5),
+      torsional: unknown(0, 0.12),
+      rolling: unknown(0, 0.08)
+    }
+  };
+}
+
+function scaleComponents(value: Vec3, amount: number): Vec3 {
+  return { x: value.x * amount, y: value.y * amount, z: value.z * amount };
 }
 
 function articulationState(

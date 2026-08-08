@@ -7,7 +7,7 @@ import { HumanoidSimulation } from "./simulation.js";
 import type { HumanoidWorldSnapshot } from "./world.js";
 
 describe("authored cabinet task", () => {
-  it("loads a physical cabinet, hinged door, free workpiece and receiving container", async () => {
+  it("loads the integrated articulated cabinet and workcell", async () => {
     const catalog = await loadRuntimeCatalog();
     const scenario = catalog.materialize("humanoid_cabinet", 9);
     const simulation = await HumanoidSimulation.create(humanoidEnvironment(scenario));
@@ -17,13 +17,33 @@ describe("authored cabinet task", () => {
         "cabinet-door",
         "cabinet-frame",
         "cabinet-workpiece",
-        "destination-bin"
+        "destination-bin",
+        "material-cart",
+        "side-workbench",
+        "tool-slot",
+        "workbench-button",
+        "workbench-drawer",
+        "workbench-switch",
+        "workbench-tool",
+        "workbench-valve"
       ]);
       expect(robot.objects["cabinet-door"]?.articulation).toMatchObject({
         type: "hinge",
         position: 0
       });
       expect(robot.objects["cabinet-workpiece"]?.articulation).toBeUndefined();
+      expect(robot.objects["workbench-drawer"]?.articulation).toMatchObject({
+        type: "slide",
+        position: 0
+      });
+      expect(robot.objects["workbench-button"]?.articulation).toMatchObject({
+        type: "slide",
+        position: 0
+      });
+      expect(robot.objects["workbench-valve"]?.articulation).toMatchObject({
+        type: "hinge",
+        position: 0
+      });
 
       const checker = checkHumanoidGoal(
         scenario.default_goal,

@@ -39,7 +39,7 @@ describe("humanoid object capabilities", () => {
       .toBe(true);
   });
 
-  it("derives articulated affordances from joint semantics", () => {
+  it("derives articulated affordances from structure and interaction points", () => {
     const scenario = scenarioWith({
       id: "panel",
       kind: "panel",
@@ -62,7 +62,7 @@ describe("humanoid object capabilities", () => {
         articulation: {
           joint_id: "panel-hinge",
           type: "hinge",
-          semantic: "cabinet_door",
+          semantic: "custom_panel_joint",
           axis: { x: 0, y: 1, z: 0 },
           anchor_world: { x: 1.6, y: 1, z: 2 },
           range: { minimum: 0, maximum: 1.6 },
@@ -80,9 +80,9 @@ describe("humanoid object capabilities", () => {
     expect(capability.affordances).toEqual(expect.arrayContaining([
       "openable",
       "closeable",
-      "pullable",
-      "pushable"
+      "pullable"
     ]));
+    expect(capability.affordances).not.toContain("pushable");
     expect(capability.interactionPoints).toEqual([
       expect.objectContaining({ id: "handle", kind: "pull", source: "authored" })
     ]);

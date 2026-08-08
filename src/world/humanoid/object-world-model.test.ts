@@ -126,7 +126,12 @@ describe("object-centered humanoid world model", () => {
     const door = world.objects.find(({ id }) => id === "door")!;
     expect(parcel).toMatchObject({
       shape: "sphere",
-      physical: { mass_kg: 0.6, mobility: "free" },
+      authority: "sensor_observation",
+      physical: { mass_kg: null, mobility: "free" },
+      belief: {
+        size: { confidence: 0.82, source: "visual_geometry" },
+        mass_kg: { estimate: null, confidence: 0, source: "unobserved" }
+      },
       relations: { contained_by: ["bin"] }
     });
     expect(parcel.affordances).toEqual(expect.arrayContaining(["graspable", "movable"]));

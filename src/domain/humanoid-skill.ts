@@ -15,6 +15,7 @@ export const HUMANOID_SKILL_IDS = [
   "press",
   "open",
   "close",
+  "turn",
   "regrasp",
   "bimanual_support",
   "bimanual_carry",
@@ -80,6 +81,7 @@ export const HumanoidSkillInvocationSchema = z.discriminatedUnion("skill", [
   z.object({
     skill: z.literal("approach"),
     ...ObjectPointParameters,
+    hand: HandSchema.nullable().optional(),
     standoff_m: z.number().finite().min(0.15).max(1.5)
   }).strict(),
   z.object({
@@ -146,6 +148,14 @@ export const HumanoidSkillInvocationSchema = z.discriminatedUnion("skill", [
     joint_id: ObjectIdSchema,
     hand: HandSchema,
     maximum_open_fraction: z.number().finite().min(0).max(0.5)
+  }).strict(),
+  z.object({
+    skill: z.literal("turn"),
+    ...ObjectPointParameters,
+    joint_id: ObjectIdSchema,
+    hand: HandSchema,
+    direction: z.enum(["increasing", "decreasing"]),
+    rotation_radians: z.number().finite().positive().max(Math.PI * 2)
   }).strict(),
   z.object({
     skill: z.literal("regrasp"),
@@ -248,7 +258,7 @@ export const HUMANOID_SKILL_CONTRACTS: Readonly<Record<
     [["observe", "sensor"], ["approach", "navigation"], ["contact", "whole_body"], ["verify_contact", "checker"]],
     ["selected hand sustains removal-authorizing contact with the selected block"],
     ["path_blocked", "contact_missing", "unreachable"], ["approach", "stabilize", "retreat"]),
-  approach: contract("approach", ["object_id", "interaction_point_id", "standoff_m"], [],
+  approach: contract("approach", ["object_id", "interaction_point_id", "hand", "standoff_m"], [],
     ["target observable", "reachable base placement exists"],
     [["observe", "sensor"], ["route", "navigation"], ["verify_standoff", "checker"]],
     ["base reaches a collision-free manipulation stance"],
@@ -295,14 +305,19 @@ export const HUMANOID_SKILL_CONTRACTS: Readonly<Record<
     ["contact_missing", "articulation_stalled"], ["approach", "reach"]),
   open: contract("open", ["object_id", "interaction_point_id", "joint_id", "hand", "minimum_open_fraction"], ["openable"],
     ["joint and handle observable", "joint not already open"],
-    [["observe", "sensor"], ["reach_handle", "whole_body"], ["actuate_joint", "whole_body"], ["verify_open", "checker"]],
+    [["observe", "sensor"], ["reach_handle", "whole_body"], ["establish_grasp", "grasp"], ["actuate_joint", "whole_body"], ["verify_open", "checker"]],
     ["joint open fraction reaches requested threshold"],
     ["articulation_stalled", "contact_missing"], ["regrasp", "approach", "stabilize"]),
   close: contract("close", ["object_id", "interaction_point_id", "joint_id", "hand", "maximum_open_fraction"], ["closeable"],
     ["joint and interaction point observable", "joint not already closed"],
-    [["observe", "sensor"], ["reach_interaction", "whole_body"], ["actuate_joint", "whole_body"], ["verify_closed", "checker"]],
+    [["observe", "sensor"], ["reach_interaction", "whole_body"], ["establish_grasp", "grasp"], ["actuate_joint", "whole_body"], ["verify_closed", "checker"]],
     ["joint open fraction falls below requested threshold"],
     ["articulation_stalled", "contact_missing"], ["approach", "stabilize"]),
+  turn: contract("turn", ["object_id", "interaction_point_id", "joint_id", "hand", "direction", "rotation_radians"], ["rotatable"],
+    ["joint and turn point observable", "requested rotation is inside the joint range"],
+    [["observe", "sensor"], ["reach_turn_point", "whole_body"], ["establish_grasp", "grasp"], ["actuate_joint", "whole_body"], ["verify_rotation", "checker"]],
+    ["joint moves through the requested physical rotation"],
+    ["articulation_stalled", "contact_missing"], ["regrasp", "approach", "stabilize"]),
   regrasp: contract("regrasp", ["object_id", "from_hand", "to_hand", "excluded_interaction_point_ids"], ["graspable"],
     ["object observable or physically carried", "alternative grasp point exists"],
     [["observe", "sensor"], ["select_alternative_point", "checker"], ["support_object", "whole_body"], ["transfer_grasp", "grasp"], ["verify_grasp", "checker"]],

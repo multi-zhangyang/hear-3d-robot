@@ -11,6 +11,10 @@ import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import type { HumanoidWorldObservation } from "../../world/humanoid/world.js";
 import type { HumanoidObjectWorldModelEntry } from "../../world/humanoid/object-world-model.js";
 import type { HumanoidSolidToken } from "../../world/humanoid/solid-observation.js";
+import {
+  humanoidArticulationGoal,
+  type HumanoidArticulationGoal
+} from "./articulation-control.js";
 
 export type SkillPlanningAction =
   | "plan_humanoid_skill"
@@ -139,6 +143,7 @@ export function bindHumanoidSkill(input: {
   agentId: string;
   request: BeginHumanoidSkill;
   observation: HumanoidWorldObservation;
+  articulationGoal?: HumanoidArticulationGoal;
 }): HumanoidSkillBindingResult {
   const request = BeginHumanoidSkillSchema.parse(input.request);
   const invocation = request.invocation;
@@ -237,7 +242,13 @@ export function bindHumanoidSkill(input: {
   }
   const interaction = validateInteractionPoints(invocation, target);
   if (!interaction.accepted) return interaction;
-  const semantic = validateSkillSemantics(invocation, target, objects, input.observation);
+  const semantic = validateSkillSemantics(
+    invocation,
+    target,
+    objects,
+    input.observation,
+    input.articulationGoal
+  );
   if (semantic) return semantic;
   const planningAction: SkillPlanningAction = "plan_humanoid_skill";
   return {
@@ -374,9 +385,11 @@ function validateSkillSemantics(
   invocation: HumanoidSkillInvocation,
   target: HumanoidObjectWorldModelEntry | undefined,
   objects: ReadonlyMap<string, HumanoidObjectWorldModelEntry>,
-  observation: HumanoidWorldObservation
+  observation: HumanoidWorldObservation,
+  continuationGoal?: HumanoidArticulationGoal
 ): ReturnType<typeof rejection> | null {
-  if ((invocation.skill === "open" || invocation.skill === "close")) {
+  if (invocation.skill === "open" || invocation.skill === "close"
+    || invocation.skill === "turn") {
     if (!target?.articulation
       || target.articulation.joint_id !== invocation.joint_id
       || target.articulation.position === null) {
@@ -386,6 +399,54 @@ function validateSkillSemantics(
         joint_id: invocation.joint_id,
         observed_joint_id: target?.articulation?.joint_id ?? null
       });
+    }
+    if (continuationGoal && continuationGoal.joint_id !== invocation.joint_id) {
+      return rejection("skill_precondition_failed", {
+        skill: invocation.skill,
+        object_id: target.id,
+        joint_id: invocation.joint_id,
+        reason: "continued articulation goal does not match the selected joint"
+      });
+    }
+    if (invocation.skill === "turn") {
+      if (target.articulation.type !== "hinge") {
+        return rejection("skill_precondition_failed", {
+          skill: invocation.skill,
+          object_id: target.id,
+          joint_id: invocation.joint_id,
+          reason: "turn requires a rotational articulation"
+        });
+      }
+      let goal: HumanoidArticulationGoal;
+      try {
+        goal = continuationGoal ?? humanoidArticulationGoal({
+          invocation,
+          articulation: target.articulation
+        });
+      } catch (error) {
+        return rejection("skill_precondition_failed", {
+          skill: invocation.skill,
+          object_id: target.id,
+          joint_id: invocation.joint_id,
+          reason: error instanceof Error ? error.message : String(error),
+          current_position: target.articulation.position,
+          requested_target_position: continuationGoal?.target_position ?? null,
+          observed_range: target.articulation.range
+        });
+      }
+      const remainingDirection = goal.target_position > target.articulation.position
+        ? "increasing" : "decreasing";
+      if (remainingDirection !== invocation.direction) {
+        return rejection("skill_precondition_failed", {
+          skill: invocation.skill,
+          object_id: target.id,
+          joint_id: invocation.joint_id,
+          reason: "continued articulation goal has already been reached or crossed",
+          current_position: target.articulation.position,
+          requested_target_position: goal.target_position
+        });
+      }
+      return null;
     }
     const fraction = target.articulation.open_fraction;
     if (fraction !== null && (invocation.skill === "open"
@@ -557,6 +618,37 @@ function validateMotionOutcome(
       });
     }
   }
+  if (invocation.skill === "turn" && phase === "actuate_joint") {
+    const articulation = binding.target_articulation;
+    const predicate = predicates.find((candidate) => (
+      candidate?.type === "articulation_displaced"
+        && candidate.object_id === invocation.object_id
+        && candidate.joint_id === invocation.joint_id
+    ));
+    const originPosition = number(predicate?.origin_position);
+    const minimumDelta = number(predicate?.minimum_delta);
+    const matched = articulation?.position !== null
+      && articulation?.position !== undefined
+      && predicate?.direction === invocation.direction
+      && originPosition !== null
+      && Math.abs(originPosition - articulation.position) <= 1e-6
+      && minimumDelta !== null
+      && minimumDelta >= invocation.rotation_radians;
+    if (!matched) {
+      return rejection("skill_terminal_contract_mismatch", {
+        skill: invocation.skill,
+        phase,
+        required_predicate: {
+          type: "articulation_displaced",
+          object_id: invocation.object_id,
+          joint_id: invocation.joint_id,
+          origin_position: articulation?.position ?? null,
+          direction: invocation.direction,
+          minimum_delta: invocation.rotation_radians
+        }
+      });
+    }
+  }
   if ((invocation.skill === "push" || invocation.skill === "pull")
     && phase === "apply_force") {
     const mismatch = binding.target_articulation
@@ -671,6 +763,8 @@ function validateMotionOutcome(
     || phase === "solve_whole_body_reach" || phase === "establish_contact")
     && objectId
     && !has("hand_contact_object", objectId)
+    && !has("hand_contact_object_any", objectId)
+    && !has("hand_contact_object_region", objectId)
     && !has("body_contact_object", objectId)
     && !has("end_effector_near_point")) {
     return rejection("skill_terminal_contract_mismatch", {
@@ -678,6 +772,8 @@ function validateMotionOutcome(
       phase,
       required_predicates: [
         "hand_contact_object",
+        "hand_contact_object_any",
+        "hand_contact_object_region",
         "body_contact_object",
         "end_effector_near_point"
       ]
@@ -862,19 +958,20 @@ function interactionPointKinds(skill: HumanoidSkillInvocation["skill"]): string[
   if (skill === "push") return ["push", "grasp"];
   if (skill === "pull" || skill === "open") return ["pull", "grasp", "turn"];
   if (skill === "close") return ["push", "pull", "grasp", "turn"];
+  if (skill === "turn") return ["turn", "grasp"];
   if (skill === "press") return ["press"];
   return [];
 }
 
 function skillNeedsInteractionPoint(skill: HumanoidSkillInvocation["skill"]): boolean {
   return [
-    "reach", "grasp", "push", "pull", "press", "open", "close",
+    "reach", "grasp", "push", "pull", "press", "open", "close", "turn",
     "bimanual_support"
   ].includes(skill);
 }
 
 function invocationHand(invocation: HumanoidSkillInvocation): "left" | "right" | null {
-  if ("hand" in invocation) return invocation.hand;
+  if ("hand" in invocation) return invocation.hand ?? null;
   return null;
 }
 

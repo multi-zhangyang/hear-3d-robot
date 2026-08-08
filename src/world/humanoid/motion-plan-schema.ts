@@ -13,6 +13,7 @@ import {
 } from "./morphology.js";
 import { G1HandCoordinationSchema } from "./hand-coordination.js";
 import { HumanoidMotionOptionContractSchema } from "./motion-option.js";
+import { HUMANOID_TASK_SPACE_KINEMATIC_SCOPES } from "./task-space-targets.js";
 
 const HumanoidRootVelocitySchema = z.object({
   forward_mps: z.number().finite().describe("身体局部前向速度，单位米每秒"),
@@ -24,6 +25,12 @@ const HumanoidEndEffectorTargetSchema = z.object({
   frame: z.enum(["world", "pelvis"]),
   tolerance_m: z.number().finite().min(0.01).max(0.12)
     .describe("真实物理跟踪的位置容差，单位米"),
+  kinematic_scope: z.enum(HUMANOID_TASK_SPACE_KINEMATIC_SCOPES)
+    .describe("arm_only 保持躯干稳定；whole_body_reach 允许受正则约束的腰部冗余伸手")
+    .optional(),
+  servo_mode: z.enum(["precision", "task_tolerance"])
+    .describe("precision 使用生成级精度；task_tolerance 使用任务声明的物理容差")
+    .optional(),
   orientation: QuaternionSchema
     .describe("可选末端朝向；与 position 使用相同坐标系")
     .optional(),
@@ -180,6 +187,14 @@ export const HumanoidMotionPlanSchema = z.object({
 
 export type HumanoidMotionPlan = z.infer<typeof HumanoidMotionPlanSchema>;
 
+export function humanoidMotionPlanHasPlanarRootMotion(
+  plan: Pick<HumanoidMotionPlan, "keyframes">
+): boolean {
+  return plan.keyframes.some((keyframe) => (
+    keyframe.root_velocity != null || keyframe.root_yaw_velocity != null
+  ));
+}
+
 function duplicateHumanoidMotionCandidateIndexes(
   candidates: readonly HumanoidMotionPlan[]
 ): Array<{ candidateIndex: number; originalIndex: number }> {
@@ -202,7 +217,7 @@ export const HumanoidMotionCandidateBatchSchema = z.object({
     .describe("所有候选共同服务的当前自主目标"),
   termination: HumanoidMotionOptionContractSchema
     .describe("所有候选必须共同达成的可观测物理结果；时长只是最多八秒的执行上界"),
-  candidates: z.array(HumanoidMotionPlanSchema).min(1).max(3)
+  candidates: z.array(HumanoidMotionPlanSchema).min(1).max(4)
     .describe("按模型偏好排序的 1 至 3 个连续全身动作候选；每个候选都会从同一物理状态完整预演")
 }).strict().superRefine((batch, context) => {
   const ids = batch.candidates.map((candidate) => candidate.id);
@@ -225,6 +240,8 @@ export const HumanoidMotionCandidateBatchSchema = z.object({
   const contactPredicates = batch.termination.predicates.filter((predicate) => (
     predicate.type === "body_contact_object"
       || predicate.type === "hand_contact_object"
+      || predicate.type === "hand_contact_object_any"
+      || predicate.type === "hand_contact_object_region"
       || predicate.type === "body_contact_solid"
       || predicate.type === "hand_contact_solid"
   ));
@@ -240,9 +257,15 @@ export const HumanoidMotionCandidateBatchSchema = z.object({
       });
     }
     for (const predicate of contactPredicates) {
-      const authorized = candidate.contact_constraints?.some((constraint) => (
-        contactPredicateAuthorized(predicate, constraint)
-      ));
+      const authorizedCount = new Set(candidate.contact_constraints?.flatMap(
+        (constraint) => contactPredicateAuthorized(predicate, constraint)
+          ? [contactKey(constraint)] : []
+      ) ?? []).size;
+      const requiredCount = predicate.type === "hand_contact_object_any"
+        || predicate.type === "hand_contact_object_region"
+        ? predicate.minimum_distinct_surfaces ?? 1
+        : 1;
+      const authorized = authorizedCount >= requiredCount;
       if (!authorized) {
         context.addIssue({
           code: "custom",
@@ -270,7 +293,8 @@ export const HumanoidMotionCandidateBatchSchema = z.object({
 
 function missingContactAuthorizationMessage(
   predicate: Extract<HumanoidMotionCandidateBatch["termination"]["predicates"][number], {
-    type: "body_contact_object" | "hand_contact_object"
+    type: "body_contact_object" | "hand_contact_object" | "hand_contact_object_any"
+      | "hand_contact_object_region"
       | "body_contact_solid" | "hand_contact_solid";
   }>
 ): string {
@@ -278,10 +302,14 @@ function missingContactAuthorizationMessage(
     ? `type=body_object body=${predicate.body} object_id=${predicate.object_id}`
     : predicate.type === "hand_contact_object"
       ? `type=hand_object hand_surface=${predicate.hand_surface} object_id=${predicate.object_id}`
+      : predicate.type === "hand_contact_object_any"
+        ? `type=hand_object_any hand=${predicate.hand} object_id=${predicate.object_id}`
+      : predicate.type === "hand_contact_object_region"
+        ? `type=hand_object_region hand=${predicate.hand} object_id=${predicate.object_id}`
       : predicate.type === "body_contact_solid"
         ? `type=body_solid body=${predicate.body} solid_id=${predicate.solid_id}`
         : `type=hand_solid hand_surface=${predicate.hand_surface} solid_id=${predicate.solid_id}`;
-  return `Every candidate shares the termination predicates and must include the exact required contact: ${contact} required=true`;
+  return `Every candidate shares the termination predicates and must authorize the required contact: ${contact}`;
 }
 
 export interface HumanoidGraspContactAuthorizationFailure {
@@ -381,6 +409,10 @@ function canonicalTaskSpaceTarget(
     position: target.position,
     frame: target.frame,
     tolerance_m: target.tolerance_m,
+    ...(target.kinematic_scope
+      ? { kinematic_scope: target.kinematic_scope }
+      : {}),
+    ...(target.servo_mode ? { servo_mode: target.servo_mode } : {}),
     ...(target.orientation !== undefined
       && target.orientation_tolerance_rad !== undefined
       ? {
@@ -420,11 +452,19 @@ function contactKey(constraint: HumanoidContactConstraint): string {
 
 function contactPredicateAuthorized(
   predicate: Extract<HumanoidMotionCandidateBatch["termination"]["predicates"][number], {
-    type: "body_contact_object" | "hand_contact_object"
+    type: "body_contact_object" | "hand_contact_object" | "hand_contact_object_any"
+      | "hand_contact_object_region"
       | "body_contact_solid" | "hand_contact_solid";
   }>,
   constraint: HumanoidContactConstraint
 ): boolean {
+  if (predicate.type === "hand_contact_object_any"
+    || predicate.type === "hand_contact_object_region") {
+    return "hand_surface" in constraint
+      && "object_id" in constraint
+      && constraint.hand_surface.startsWith(`${predicate.hand}_`)
+      && constraint.object_id === predicate.object_id;
+  }
   if (!constraint.required) return false;
   if (predicate.type === "body_contact_object") {
     return "body" in constraint

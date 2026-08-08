@@ -16,6 +16,7 @@ import type {
   HumanoidGraspContract
 } from "./grasp-tracker.js";
 import { humanoidGraspContractSha256 } from "./grasp-tracker.js";
+import { resolveG1HandCoordination } from "./hand-coordination.js";
 
 const robot: HumanoidMotionOptionRobotSnapshot = {
   rootPosition: { x: 1, y: 0.8, z: 2 },
@@ -999,6 +1000,184 @@ describe("humanoid motion option detector", () => {
         reason: "object_not_observable"
       }]
     });
+  });
+
+  it("requires the declared number of force-qualified hand surfaces", () => {
+    const clusterContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "stable-articulation-grasp",
+      stable_steps: 4,
+      predicates: [{
+        type: "hand_contact_object_any",
+        hand: "right",
+        object_id: "crate",
+        minimum_normal_force: 5,
+        minimum_distinct_surfaces: 2
+      }]
+    });
+    const contact = (
+      handLink: "right_hand_thumb_2_link" | "right_hand_index_1_link",
+      normalForce: number
+    ) => ({
+      normalForce,
+      firstBody: null,
+      secondBody: null,
+      firstObject: null,
+      secondObject: "crate",
+      firstHandLink: handLink,
+      secondHandLink: null
+    });
+    const detect = (contacts: HumanoidMotionOptionRobotSnapshot["contacts"]) => (
+      detectHumanoidMotionOption(clusterContract, {
+        snapshot: { ...robot, contacts },
+        observableObjects: [observableCrate],
+        zones: []
+      })
+    );
+
+    expect(detect([
+      contact("right_hand_thumb_2_link", 12),
+      contact("right_hand_index_1_link", 4)
+    ])).toMatchObject({
+      status: "unsatisfied",
+      evidence: [{
+        distinctContactSurfaces: 1,
+        minimumDistinctContactSurfaces: 2
+      }]
+    });
+    expect(detect([
+      contact("right_hand_thumb_2_link", 12),
+      contact("right_hand_index_1_link", 7)
+    ])).toMatchObject({
+      status: "satisfied",
+      evidence: [{
+        maximumNormalForce: 12,
+        distinctContactSurfaces: 2,
+        minimumDistinctContactSurfaces: 2
+      }]
+    });
+  });
+
+  it("accepts only force-qualified hand contacts inside the live interaction region", () => {
+    const regionContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "contact-cabinet-handle-region",
+      stable_steps: 4,
+      predicates: [{
+        type: "hand_contact_object_region",
+        hand: "right",
+        object_id: "crate",
+        center_world: { x: 1, y: 1, z: 1 },
+        maximum_distance_m: 0.08,
+        minimum_normal_force: 5,
+        minimum_distinct_surfaces: 2
+      }]
+    });
+    const contact = (
+      handLink: "right_hand_thumb_2_link" | "right_hand_index_1_link",
+      position: { x: number; y: number; z: number }
+    ) => ({
+      position,
+      normalForce: 12,
+      firstBody: null,
+      secondBody: null,
+      firstObject: null,
+      secondObject: "crate",
+      firstHandLink: handLink,
+      secondHandLink: null
+    });
+    const detect = (contacts: HumanoidMotionOptionRobotSnapshot["contacts"]) => (
+      detectHumanoidMotionOption(regionContract, {
+        snapshot: { ...robot, contacts },
+        observableObjects: [observableCrate],
+        zones: []
+      })
+    );
+
+    const outsideRegion = detect([
+      contact("right_hand_thumb_2_link", { x: 1, y: 0.62, z: 1 }),
+      contact("right_hand_index_1_link", { x: 1.01, y: 0.64, z: 1 })
+    ]);
+    expect(outsideRegion).toMatchObject({
+      status: "unsatisfied",
+      evidence: [{
+        type: "hand_contact_object_region",
+        maximumNormalForce: 0,
+        distinctContactSurfaces: 0,
+        maximumDistanceMeters: 0.08
+      }]
+    });
+    expect(outsideRegion.evidence[0]?.type === "hand_contact_object_region"
+      ? outsideRegion.evidence[0].closestContactDistanceMeters
+      : null).toBeCloseTo(0.36, 2);
+    expect(detect([
+      contact("right_hand_thumb_2_link", { x: 1, y: 1.03, z: 1 }),
+      contact("right_hand_index_1_link", { x: 1.01, y: 1.04, z: 1 })
+    ])).toMatchObject({
+      status: "satisfied",
+      evidence: [{
+        type: "hand_contact_object_region",
+        maximumNormalForce: 12,
+        distinctContactSurfaces: 2,
+        minimumDistinctContactSurfaces: 2
+      }]
+    });
+  });
+
+  it("measures physical hand-coordination displacement from the phase origin", () => {
+    const coordination = {
+      left: {
+        thumb_opposition: 0,
+        thumb_curl: 0,
+        index_curl: 0,
+        middle_curl: 0
+      },
+      right: {
+        thumb_opposition: 0.5,
+        thumb_curl: 0.4,
+        index_curl: 0.45,
+        middle_curl: 0.5
+      }
+    };
+    const jointPositions = resolveG1HandCoordination(coordination);
+    const contract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "close-hand-from-observed-origin",
+      stable_steps: 2,
+      predicates: [{
+        type: "hand_coordination_displaced",
+        hand: "right",
+        origin: {
+          thumb_opposition: 0,
+          thumb_curl: 0,
+          index_curl: 0,
+          middle_curl: 0
+        },
+        minimum_distance: 0.5
+      }]
+    });
+    const detection = detectHumanoidMotionOption(contract, {
+      snapshot: {
+        ...robot,
+        hands: {
+          joints: Object.fromEntries(Object.entries(jointPositions).map(
+            ([joint, position]) => [joint, { position }]
+          ))
+        }
+      },
+      observableObjects: [],
+      zones: []
+    });
+
+    expect(detection).toMatchObject({
+      status: "satisfied",
+      evidence: [{
+        type: "hand_coordination_displaced",
+        hand: "right",
+        actual: coordination.right,
+        minimumDistance: 0.5
+      }]
+    });
+    expect(detection.evidence[0]?.type === "hand_coordination_displaced"
+      ? detection.evidence[0].distance
+      : 0).toBeCloseTo(Math.hypot(0.5, 0.4, 0.45, 0.5), 12);
   });
 
   it("never uses hidden snapshot objects or contacts as observable success", () => {

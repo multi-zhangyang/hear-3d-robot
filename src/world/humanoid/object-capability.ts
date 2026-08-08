@@ -54,13 +54,6 @@ export function humanoidObjectCapability(
     ? "articulated" as const
     : object.portable ? "free" as const : "fixed" as const;
   const affordances = new Set<ObjectAffordance>(configured?.affordances ?? []);
-  deriveAffordances({
-    affordances,
-    mobility,
-    massKg,
-    maximumExtent: Math.max(object.size.x, object.size.y, object.size.z),
-    capability: configured
-  });
   const authored = (configured?.interaction_points ?? []).map((point) => ({
     id: point.id,
     kind: point.kind,
@@ -72,6 +65,16 @@ export function humanoidObjectCapability(
     clearanceMeters: point.clearance_m,
     source: "authored" as const
   }));
+  deriveAffordances({
+    affordances,
+    mobility,
+    massKg,
+    maximumExtent: Math.max(object.size.x, object.size.y, object.size.z),
+    articulated: configured?.articulation !== undefined,
+    interactionPointKinds: new Set(authored.map(({ kind }) => kind)),
+    container: configured?.container !== undefined,
+    supportSurface: configured?.support_surface !== undefined
+  });
   const generated = authored.some((point) => point.kind === "grasp")
     || !affordances.has("graspable")
     ? []
@@ -102,7 +105,10 @@ function deriveAffordances(input: {
   mobility: HumanoidObjectCapabilityDescriptor["mobility"];
   massKg: number;
   maximumExtent: number;
-  capability: ScenarioObjectCapability | undefined;
+  articulated: boolean;
+  interactionPointKinds: ReadonlySet<HumanoidObjectInteractionPoint["kind"]>;
+  container: boolean;
+  supportSurface: boolean;
 }): void {
   if (input.mobility === "free") {
     input.affordances.add("movable");
@@ -112,19 +118,32 @@ function deriveAffordances(input: {
       input.affordances.add("graspable");
     }
   }
-  const semantic = input.capability?.articulation?.semantic;
-  if (semantic === "door" || semantic === "drawer" || semantic === "cabinet_door") {
-    input.affordances.add("openable");
-    input.affordances.add("closeable");
-    input.affordances.add("pullable");
+  if (input.interactionPointKinds.has("grasp")) {
+    input.affordances.add("graspable");
+  }
+  if (input.interactionPointKinds.has("push")) {
     input.affordances.add("pushable");
-  } else if (semantic === "button" || semantic === "switch") {
+  }
+  if (input.interactionPointKinds.has("pull")) {
+    input.affordances.add("pullable");
+  }
+  if (input.interactionPointKinds.has("press")) {
     input.affordances.add("pressable");
-  } else if (semantic === "valve" || semantic === "knob") {
+  }
+  if (input.interactionPointKinds.has("turn")) {
     input.affordances.add("rotatable");
   }
-  if (input.capability?.container) input.affordances.add("container");
-  if (input.capability?.support_surface) input.affordances.add("support_surface");
+  if (input.interactionPointKinds.has("insert")) {
+    input.affordances.add("insertable");
+  }
+  if (input.articulated && (input.interactionPointKinds.has("grasp")
+    || input.interactionPointKinds.has("push")
+    || input.interactionPointKinds.has("pull"))) {
+    input.affordances.add("openable");
+    input.affordances.add("closeable");
+  }
+  if (input.container) input.affordances.add("container");
+  if (input.supportSurface) input.affordances.add("support_surface");
 }
 
 function geometryGraspPoints(

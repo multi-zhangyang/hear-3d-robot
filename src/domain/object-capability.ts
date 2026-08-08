@@ -51,15 +51,7 @@ const ObjectArticulationSchema = z.object({
   joint_id: z.string().trim().min(1),
   parent_object_id: z.string().trim().min(1).optional(),
   type: z.enum(["hinge", "slide"]),
-  semantic: z.enum([
-    "door",
-    "drawer",
-    "cabinet_door",
-    "button",
-    "switch",
-    "valve",
-    "knob"
-  ]),
+  semantic: z.string().trim().min(1).max(64),
   axis: UnitVector3Schema,
   anchor_world: Vector3Schema,
   range: z.object({

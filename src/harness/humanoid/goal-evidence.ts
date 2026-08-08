@@ -84,7 +84,7 @@ const WorldObjectAffordanceDescriptorSchema = z.object({
 const WorldObjectAffordanceDescriptorV4Schema =
   WorldObjectAffordanceDescriptorSchema.extend({
     shape: z.enum(["box", "sphere", "cylinder", "capsule"]),
-    mass_kg: z.number().finite().positive(),
+    mass_kg: z.number().finite().positive().nullable(),
     mobility: z.enum(["fixed", "free", "articulated"]),
     affordances: z.array(z.string().trim().min(1)),
     interaction_points: z.array(z.object({
@@ -403,7 +403,7 @@ export function createWorldGoalEvidence(input: {
         linear_velocity: structuredClone(token.linearVelocity),
         angular_velocity: structuredClone(token.angularVelocity),
         shape: capability.shape,
-        mass_kg: capability.massKg,
+        mass_kg: null,
         mobility: capability.mobility,
         affordances: [...capability.affordances],
         interaction_points: capability.interactionPoints.map((point) => ({

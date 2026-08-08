@@ -54,6 +54,14 @@ export function humanoidEnvironment(
         mass: capability.massKg,
         shape: capability.shape,
         friction: capability.friction,
+        interactionPoints: capability.interactionPoints
+          .filter(({ source }) => source === "authored")
+          .map((point) => ({
+            id: point.id,
+            kind: point.kind,
+            localPosition: { ...point.localPosition },
+            clearanceMeters: point.clearanceMeters
+          })),
         mobility: articulation
           ? {
               type: articulation.type,

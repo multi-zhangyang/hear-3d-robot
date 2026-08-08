@@ -198,6 +198,20 @@ export function g1HandCoordinationFromJointTargets(
   });
 }
 
+export function g1HandCoordinationFromJointPositions(
+  input: Readonly<Record<G1HandJointName, number>>
+): G1HandCoordination {
+  const clamped = Object.fromEntries(G1_HAND_JOINT_NAMES.map((joint) => {
+    const position = input[joint];
+    if (!Number.isFinite(position)) {
+      throw new Error(`G1 hand position is not finite: ${joint}`);
+    }
+    const [minimum, maximum] = G1_HAND_JOINT_LIMITS[joint];
+    return [joint, Math.max(minimum, Math.min(maximum, position))];
+  })) as Record<G1HandJointName, number>;
+  return g1HandCoordinationFromJointTargets(clamped);
+}
+
 function endpoint(
   joint: G1HandJointName,
   side: "minimum" | "maximum",

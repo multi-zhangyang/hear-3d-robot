@@ -25,13 +25,19 @@ const POLICY_PATH = fileURLToPath(
   new URL("../../../assets/humanoid/controllers/g1_yahmp.onnx", import.meta.url)
 );
 
-const EXPLICIT_TRACKING_STIFFNESS: Readonly<Record<
+const TASK_TRACKING_VELOCITY_LEAD_SECONDS = 0.08;
+const POSE_TRACKING_COMMAND_STATE_FEEDBACK = 0.65;
+const WRIST_YAW_JOINT_INDEXES = [
+  HUMANOID_JOINT_INDEX.get("left_wrist_yaw_joint")!,
+  HUMANOID_JOINT_INDEX.get("right_wrist_yaw_joint")!
+] as const;
+const TASK_TRACKING_STIFFNESS: Readonly<Record<
   "leg" | "ankle" | "waist" | "arm" | "wrist",
   number
 >> = Object.freeze({
-  leg: 100,
-  ankle: 70,
-  waist: 65,
+  leg: 80,
+  ankle: 55,
+  waist: 45,
   arm: 80,
   wrist: 40
 });
@@ -53,7 +59,20 @@ export class YahmpController implements HumanoidWholeBodyController {
     controlStepSeconds: YAHMP_POLICY.controlDt,
     physicsStepSeconds: YAHMP_POLICY.physicsDt,
     commandResponseHorizonSeconds: 0.2,
-    minimumEffectivePlanarSpeedMetersPerSecond: 0.15
+    minimumEffectivePlanarSpeedMetersPerSecond: 0.15,
+    learnedPolicy: {
+      protocol: "humanoid-learned-policy-v1",
+      runtime: "onnx",
+      observationSpace: {
+        protocol: "g1-yahmp-reference-history-v1",
+        size: YAHMP_POLICY.observationSize
+      },
+      actionSpace: {
+        protocol: "g1-joint-position-residual-v1",
+        size: HUMANOID_JOINT_NAMES.length
+      },
+      capabilities: ["balance", "locomotion", "joint_reference_tracking"]
+    }
   };
   readonly #session: ort.InferenceSession;
   #previousAction = new Float32Array(HUMANOID_JOINT_NAMES.length);
@@ -117,15 +136,21 @@ export class YahmpController implements HumanoidWholeBodyController {
     const stiffness = Float64Array.from(YAHMP_POLICY.stiffness, (value, index) => {
       const joint = HUMANOID_JOINT_NAMES[index];
       if (!joint) throw new Error(`Missing humanoid joint stiffness identity: ${index}`);
-      const target = Math.max(value, explicitTrackingStiffness(joint));
+      const target = Math.max(value, taskTrackingStiffness(joint));
       return value + (target - value) * reference.jointTrackingWeights[index]!;
     });
     return {
       kind: "joint_position_pd",
       positions: Float64Array.from(action, (value, index) => (
         reference.jointPositions[index]!
+        + reference.jointVelocities[index]!
+          * reference.jointTrackingWeights[index]!
+          * TASK_TRACKING_VELOCITY_LEAD_SECONDS
         + value * YAHMP_POLICY.actionScale[index]!
-          * (1 - reference.jointTrackingWeights[index]!)
+          * (1 - reference.jointTrackingWeights[index]!
+            * (1 - taskTrackingResidualAuthority(
+              HUMANOID_JOINT_NAMES[index]!
+            )))
       )),
       stiffness,
       damping: Float64Array.from(YAHMP_POLICY.damping, (value, index) => (
@@ -186,6 +211,9 @@ export class YahmpController implements HumanoidWholeBodyController {
       throw new Error("Humanoid policy state has an invalid joint count");
     }
     const projectedGravity = inverseRotate(state.rootQuaternion, [0, 0, -1]);
+    const commandStateFeedback = WRIST_YAW_JOINT_INDEXES.some(
+      (index) => reference.jointTrackingWeights[index]! > 0
+    ) ? POSE_TRACKING_COMMAND_STATE_FEEDBACK : 0;
     const neutralTrackedCommand = options.trackedJointPolicyCommand === "neutral";
     const policyReferencePositions = Array.from(
       reference.jointPositions,
@@ -195,6 +223,7 @@ export class YahmpController implements HumanoidWholeBodyController {
           ? YAHMP_POLICY.defaultJointPositions[index]!
           : state.jointPositions[index]!,
         reference.jointTrackingWeights[index]!
+          * (neutralTrackedCommand ? 1 : commandStateFeedback)
       )
     );
     const policyReferenceVelocities = Array.from(
@@ -203,6 +232,7 @@ export class YahmpController implements HumanoidWholeBodyController {
         value,
         neutralTrackedCommand ? 0 : state.jointVelocities[index]!,
         reference.jointTrackingWeights[index]!
+          * (neutralTrackedCommand ? 1 : commandStateFeedback)
       )
     );
     return Float32Array.from([
@@ -229,18 +259,29 @@ function mix(start: number, end: number, amount: number): number {
   return start + (end - start) * amount;
 }
 
-function explicitTrackingStiffness(joint: HumanoidJointName): number {
+function taskTrackingStiffness(joint: HumanoidJointName): number {
   const index = HUMANOID_JOINT_INDEX.get(joint);
   if (index === undefined) throw new Error(`Unknown humanoid tracking joint: ${joint}`);
-  if (joint.includes("ankle")) return EXPLICIT_TRACKING_STIFFNESS.ankle;
+  if (joint.includes("ankle")) return TASK_TRACKING_STIFFNESS.ankle;
   if (joint.startsWith("left_hip_")
     || joint.startsWith("right_hip_")
     || joint.includes("knee")) {
-    return EXPLICIT_TRACKING_STIFFNESS.leg;
+    return TASK_TRACKING_STIFFNESS.leg;
   }
-  if (joint.startsWith("waist_")) return EXPLICIT_TRACKING_STIFFNESS.waist;
-  if (joint.includes("wrist")) return EXPLICIT_TRACKING_STIFFNESS.wrist;
-  return EXPLICIT_TRACKING_STIFFNESS.arm;
+  if (joint.startsWith("waist_")) return TASK_TRACKING_STIFFNESS.waist;
+  if (joint.includes("wrist")) return TASK_TRACKING_STIFFNESS.wrist;
+  return TASK_TRACKING_STIFFNESS.arm;
+}
+
+function taskTrackingResidualAuthority(joint: HumanoidJointName): number {
+  if (joint.startsWith("left_hip_")
+    || joint.startsWith("right_hip_")
+    || joint.includes("knee")
+    || joint.includes("ankle")) {
+    return 0.65;
+  }
+  if (joint.startsWith("waist_")) return 0.35;
+  return 0;
 }
 
 function inverseRotate(

@@ -12,6 +12,7 @@ import {
 } from "./motion-generator-contract.js";
 import { HumanoidPhysicalSafetyEvidenceSchema } from "./physical-safety.js";
 import { HumanoidWorldGraspStateSchema } from "./grasp-world-state.js";
+import { HUMANOID_LEARNED_POLICY_CAPABILITIES } from "./whole-body-controller.js";
 
 const LinkSchema = z.object({
   position: Vec3Schema,
@@ -104,7 +105,20 @@ const HumanoidSimulationSnapshotSchema = z.object({
     physicsStepSeconds: z.number().finite().positive(),
     commandResponseHorizonSeconds: z.number().finite().positive().optional(),
     minimumEffectivePlanarSpeedMetersPerSecond:
-      z.number().finite().positive().optional()
+      z.number().finite().positive().optional(),
+    learnedPolicy: z.object({
+      protocol: z.literal("humanoid-learned-policy-v1"),
+      runtime: z.string().trim().min(1),
+      observationSpace: z.object({
+        protocol: z.string().trim().min(1),
+        size: z.number().int().positive()
+      }).strict(),
+      actionSpace: z.object({
+        protocol: z.string().trim().min(1),
+        size: z.number().int().positive()
+      }).strict(),
+      capabilities: z.array(z.enum(HUMANOID_LEARNED_POLICY_CAPABILITIES))
+    }).strict().optional()
   }).strict(),
   rootPosition: Vec3Schema,
   rootRotation: QuaternionSchema,

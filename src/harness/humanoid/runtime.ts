@@ -53,6 +53,10 @@ import {
   type RegisteredHumanoidSkillPlan
 } from "./skill-plan.js";
 import { planAutonomousHumanoidSkill } from "./autonomous-skill-planner.js";
+import {
+  executeHumanoidArticulationHorizon,
+  isHumanoidArticulationActuation
+} from "./articulation-horizon-executor.js";
 
 type HumanoidPlanningActionName = "plan_humanoid_skill"
   | "plan_whole_body_motion"
@@ -1020,6 +1024,10 @@ export class HumanoidActionRuntime {
       );
       this.#observationByAgent.set(invocation.agentId, observation);
       this.#activeSkillByAgent.delete(invocation.agentId);
+      const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
+      if (recovery && recovery.world_revision !== observation.worldRevision) {
+        this.#recoveryPolicyByAgent.delete(invocation.agentId);
+      }
       if (invocation.agentId === "humanoid-motion-reference") {
         const requirement = manipulationBasePlacementRequirement(observation);
         if (requirement) {
@@ -1115,6 +1123,7 @@ export class HumanoidActionRuntime {
           planTransactionId,
           nodeId: request.skill_node_id,
           invocation: request.invocation,
+          phase: request.phase,
           agentId: invocation.agentId,
           currentWorldRevision
         });
@@ -1349,7 +1358,7 @@ export class HumanoidActionRuntime {
           : {}),
         ...(this.#signal ? { signal: this.#signal } : {})
       };
-      const result = planKind === "motion"
+      const initialResult = planKind === "motion"
         ? await this.#world.executeWholeBodyMotion(
             reference.planId,
             this.#frameSink,
@@ -1360,6 +1369,28 @@ export class HumanoidActionRuntime {
             this.#frameSink,
             options
           );
+      let result: {
+        accepted: boolean;
+        code: string;
+        frames: number;
+        finalSnapshot: HumanoidWorldSnapshot;
+        terminalResultSha256?: string;
+        detail: unknown;
+      } = initialResult;
+      const skill = this.#skillByPlanningTransactionId.get(
+        input.planning_transaction_id
+      );
+      if (planKind === "motion" && result.accepted
+        && isHumanoidArticulationActuation(skill)) {
+        result = await executeHumanoidArticulationHorizon({
+          world: this.#world,
+          binding: skill,
+          initialPlanId: reference.planId,
+          initialExecution: initialResult,
+          ...(this.#frameSink ? { frameSink: this.#frameSink } : {}),
+          executionOptions: options
+        });
+      }
       if (!this.#retainPhysicalTerminals) this.#planChannels.delete(reference.planId);
       return {
         accepted: result.accepted,
@@ -1918,21 +1949,20 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
         : [assessment.object_id]
     ))
   ]);
-  const contactReferenceObjects = snapshot.objectTokens.filter((token) => (
-    token.portable
-      && token.observable
-      && embodiedObjectIds.has(token.id)
-      && token.position !== null
-  ));
+  const contactReferenceObjects = (snapshot.interaction.object_world_model?.objects ?? [])
+    .filter((object) => object.status === "visible"
+      && (object.role === "manipulable" || object.articulation !== null)
+      && embodiedObjectIds.has(object.id));
   const manipulationGeometry = exposeHandGeometry
     ? {
         objects: contactReferenceObjects.map((object) => ({
           object_id: object.id,
-          object_center_world: object.position,
+          object_center_world: object.pose.position,
           object_size: object.size,
           reachable_base_placements: snapshot.manipulationBasePlacements
             .filter((entry) => entry.objectId === object.id)
             .map((entry) => ({
+              interaction_point_id: entry.interactionPointId ?? null,
               hand_surface: entry.handSurface,
               root_world_target: entry.rootWorldTarget,
               root_translation_world: entry.rootTranslationWorld,
@@ -1947,37 +1977,12 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
             ];
             return [hand, {
               current_wrist_world: wrist.position,
-              surface_center_alignments: snapshot.handSurfaces
-                .filter((surface) => surface.hand === hand)
-                .map((surface) => {
-                  const reachability = snapshot.manipulationReachability.find((entry) => (
-                    entry.objectId === object.id
-                      && entry.handSurface === surface.handSurface
-                  ));
-                  const wristTarget = {
-                    x: object.position!.x - surface.surfaceFromWristWorld.x,
-                    y: object.position!.y - surface.surfaceFromWristWorld.y,
-                    z: object.position!.z - surface.surfaceFromWristWorld.z
-                  };
-                  const delta = {
-                    x: wristTarget.x - wrist.position.x,
-                    y: wristTarget.y - wrist.position.y,
-                    z: wristTarget.z - wrist.position.z
-                  };
-                  return {
-                    hand_surface: surface.handSurface,
-                    wrist_world_if_surface_at_object_center: wristTarget,
-                    delta_from_current_wrist_world: delta,
-                    distance_from_current_wrist_m: Math.hypot(
-                      delta.x,
-                      delta.y,
-                      delta.z
-                    ),
-                    ik_reference_reachable:
-                      reachability?.ikReferenceReachable ?? false,
-                    ik_residual_m: reachability?.ikResidualMeters ?? null
-                  };
-                })
+              interaction_alignments: modelInteractionAlignments(
+                snapshot,
+                object.id,
+                hand,
+                wrist.position
+              )
             }];
           }))
         }))
@@ -1986,6 +1991,19 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
   return {
     frame: snapshot.frame,
     world_revision: snapshot.worldRevision,
+    control_authority: {
+      physics_backend: "mujoco",
+      learned_policy: robot.controller.learnedPolicy
+        ? {
+            protocol: robot.controller.learnedPolicy.protocol,
+            runtime: robot.controller.learnedPolicy.runtime,
+            observation_space: robot.controller.learnedPolicy.observationSpace,
+            action_space: robot.controller.learnedPolicy.actionSpace,
+            capabilities: robot.controller.learnedPolicy.capabilities
+          }
+        : null,
+      motion_generator: snapshot.motionGenerator
+    },
     sensor: {
       id: "head_sensor",
       position: snapshot.sensor.position,
@@ -2118,6 +2136,63 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
   };
 }
 
+function modelInteractionAlignments(
+  snapshot: HumanoidWorldObservation,
+  objectId: string,
+  hand: "left" | "right",
+  currentWristWorld: { x: number; y: number; z: number }
+): unknown[] {
+  const selected = new Map<
+    string,
+    HumanoidWorldObservation["manipulationReachability"][number]
+  >();
+  for (const candidate of snapshot.manipulationReachability) {
+    if (candidate.objectId !== objectId
+      || !candidate.handSurface.startsWith(`${hand}_`)) continue;
+    const key = candidate.interactionPointId ?? "";
+    const current = selected.get(key);
+    if (!current || compareInteractionAlignment(candidate, current) < 0) {
+      selected.set(key, candidate);
+    }
+  }
+  return [...selected.values()]
+    .sort((left, right) => (
+      (left.interactionPointId ?? "").localeCompare(right.interactionPointId ?? "")
+    ))
+    .map((alignment) => {
+      const target = alignment.wristWorldTarget;
+      const delta = {
+        x: target.x - currentWristWorld.x,
+        y: target.y - currentWristWorld.y,
+        z: target.z - currentWristWorld.z
+      };
+      return {
+        interaction_point_id: alignment.interactionPointId ?? null,
+        hand_surface: alignment.handSurface,
+        wrist_world_target: target,
+        wrist_world_orientation: alignment.wristWorldOrientation ?? null,
+        delta_from_current_wrist_world: delta,
+        distance_from_current_wrist_m: Math.hypot(delta.x, delta.y, delta.z),
+        ik_reference_reachable: alignment.ikReferenceReachable,
+        ik_residual_m: alignment.ikResidualMeters
+      };
+    });
+}
+
+function compareInteractionAlignment(
+  left: HumanoidWorldObservation["manipulationReachability"][number],
+  right: HumanoidWorldObservation["manipulationReachability"][number]
+): number {
+  if (left.ikReferenceReachable !== right.ikReferenceReachable) {
+    return left.ikReferenceReachable ? -1 : 1;
+  }
+  const leftResidual = left.ikResidualMeters ?? Number.POSITIVE_INFINITY;
+  const rightResidual = right.ikResidualMeters ?? Number.POSITIVE_INFINITY;
+  return leftResidual !== rightResidual
+    ? leftResidual - rightResidual
+    : left.handSurface.localeCompare(right.handSurface);
+}
+
 function modelRelevantContacts(
   robot: HumanoidWorldObservation["robot"]
 ): HumanoidWorldObservation["robot"]["contacts"] {
@@ -2152,6 +2227,10 @@ function requiresHandSurfaceGeometry(
     ))) {
     return true;
   }
+  if ((snapshot.interaction.object_world_model?.objects ?? []).some((object) => (
+    object.status === "visible" && object.articulation !== null
+      && planarDistance(object.pose.position, snapshot.robot.rootPosition) <= 1.5
+  ))) return true;
   return snapshot.solidTokens.some((solid) => (
     solid.kind === "block"
       && Math.hypot(
@@ -2164,11 +2243,11 @@ function requiresHandSurfaceGeometry(
 function manipulationBasePlacementRequirement(
   observation: HumanoidWorldObservation
 ): ManipulationBasePlacementRequirement | null {
-  const objects = observation.objectTokens.flatMap((object) => {
-    if (!object.portable
-      || object.status !== "visible"
-      || !object.observable
-      || object.position === null) return [];
+  const worldModelObjects = observation.interaction.object_world_model?.objects;
+  if (!worldModelObjects) return legacyManipulationBasePlacementRequirement(observation);
+  const objects = worldModelObjects.flatMap((object) => {
+    if (object.status !== "visible"
+      || object.role !== "manipulable" && object.articulation === null) return [];
     const reachability = observation.manipulationReachability.filter((entry) => (
       entry.objectId === object.id
     ));
@@ -2181,7 +2260,7 @@ function manipulationBasePlacementRequirement(
       ? []
       : [{
           objectId: object.id,
-          objectCenterWorld: { ...object.position },
+          objectCenterWorld: { ...object.pose.position },
           placements: structuredClone(placements)
         }];
   });
@@ -2191,6 +2270,32 @@ function manipulationBasePlacementRequirement(
         observedWorldRevision: observation.worldRevision,
         objects
       };
+}
+
+function legacyManipulationBasePlacementRequirement(
+  observation: HumanoidWorldObservation
+): ManipulationBasePlacementRequirement | null {
+  const objects = observation.objectTokens.flatMap((object) => {
+    if (!object.portable || object.status !== "visible"
+      || !object.observable || object.position === null) return [];
+    const reachability = observation.manipulationReachability.filter((entry) => (
+      entry.objectId === object.id
+    ));
+    if (reachability.length === 0
+      || reachability.some((entry) => entry.ikReferenceReachable)) return [];
+    const placements = observation.manipulationBasePlacements.filter((entry) => (
+      entry.objectId === object.id
+    ));
+    return placements.length === 0 ? [] : [{
+      objectId: object.id,
+      objectCenterWorld: { ...object.position },
+      placements: structuredClone(placements)
+    }];
+  });
+  return objects.length === 0 ? null : {
+    observedWorldRevision: observation.worldRevision,
+    objects
+  };
 }
 
 function manipulationBasePlacementNavigationRejection(

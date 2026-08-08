@@ -1,4 +1,4 @@
-import type { Vec3 } from "../../domain/schema.js";
+import type { Quaternion, Vec3 } from "../../domain/schema.js";
 import { yawFromQuaternion } from "../geometry.js";
 import type { HumanoidObjectToken } from "./object-memory.js";
 import type { HumanoidReference } from "./reference.js";
@@ -13,9 +13,13 @@ import type {
   HumanoidManipulationBasePlacementObservation,
   HumanoidManipulationReachabilityObservation
 } from "./world-contract.js";
+import { solveG1PregraspPose } from "./pregrasp-pose.js";
 
 const SURFACES_WITH_BASE_PLACEMENT_PROBES_PER_HAND = 1;
 const ROOT_TRANSLATION_DISTANCES_METERS = [0.06, 0.12, 0.18] as const;
+const ARM_WORKSPACE_RADII_METERS = [0.28, 0.36, 0.44, 0.52] as const;
+const BASE_PLACEMENT_LATERAL_OFFSETS_METERS = [-0.24, -0.12, 0, 0.12, 0.24] as const;
+const HUMANOID_PLANAR_BODY_CLEARANCE_METERS = 0.18;
 
 export interface HumanoidManipulationReachabilityMap {
   alignments: HumanoidManipulationReachabilityObservation[];
@@ -29,19 +33,60 @@ export function probeHumanoidManipulationReachability(input: {
   robot: HumanoidSimulationSnapshot;
   objectTokens: readonly HumanoidObjectToken[];
   handSurfaces: readonly HumanoidHandSurfaceObservation[];
+  interactionTargets?: readonly {
+    objectId: string;
+    interactionPointId: string;
+    worldPosition: Vec3;
+    approachDirection?: Vec3;
+    preferredGraspAxis?: Vec3;
+    clearanceMeters?: number;
+  }[];
 }): HumanoidManipulationReachabilityMap {
   const visibleObjects = input.objectTokens.filter((object) => (
     object.portable
       && object.status === "visible"
       && object.observable
   ));
-  const alignments = visibleObjects.flatMap((object) => (
-    input.handSurfaces.map((surface) => probeAlignment(input, object, surface))
+  const targets: Array<{
+    objectId: string;
+    interactionPointId?: string | undefined;
+    worldPosition: Vec3;
+    approachDirection?: Vec3 | undefined;
+    preferredGraspAxis?: Vec3 | undefined;
+    clearanceMeters?: number | undefined;
+  }> = input.interactionTargets && input.interactionTargets.length > 0
+    ? input.interactionTargets.map((target) => ({
+        objectId: target.objectId,
+        interactionPointId: target.interactionPointId,
+        worldPosition: { ...target.worldPosition },
+        ...(target.approachDirection
+          ? { approachDirection: { ...target.approachDirection } }
+          : {}),
+        ...(target.preferredGraspAxis
+          ? { preferredGraspAxis: { ...target.preferredGraspAxis } }
+          : {}),
+        ...(target.clearanceMeters !== undefined
+          ? { clearanceMeters: target.clearanceMeters }
+          : {})
+      }))
+    : visibleObjects.map((object) => ({
+        objectId: object.id,
+        worldPosition: { ...object.position }
+      }));
+  const alignments = targets.flatMap((target) => (
+    input.handSurfaces.map((surface) => probeAlignment(input, target, surface))
   ));
-  const basePlacements = visibleObjects.flatMap((object) => {
-    const objectAlignments = alignments.filter((entry) => entry.objectId === object.id);
+  const basePlacements = targets.flatMap((target) => {
+    const objectAlignments = alignments.filter((entry) => (
+      entry.objectId === target.objectId
+        && entry.interactionPointId === target.interactionPointId
+    ));
     const current = objectAlignments
-      .filter((entry) => entry.ikReferenceReachable)
+      .filter((entry) => entry.ikReferenceReachable
+        && manipulationBasePreservesBodyClearance(
+          input.robot.rootPosition,
+          target
+        ))
       .map((entry) => currentRootPlacement(input.robot, entry));
     if (current.length > 0) return current;
     return basePlacementProbeAlignments(objectAlignments)
@@ -50,7 +95,12 @@ export function probeHumanoidManipulationReachability(input: {
           entry.handSurface === alignment.handSurface
         ));
         if (!surface) return [];
-        const placement = bestReachableRootPlacement(input, alignment, surface);
+        const placement = bestReachableRootPlacement(
+          input,
+          target,
+          alignment,
+          surface
+        );
         return placement ? [placement] : [];
       });
   });
@@ -74,24 +124,62 @@ export function basePlacementProbeAlignments(
 
 function probeAlignment(
   input: Parameters<typeof probeHumanoidManipulationReachability>[0],
-  object: HumanoidObjectToken,
+  target: {
+    objectId: string;
+    interactionPointId?: string | undefined;
+    worldPosition: Vec3;
+    approachDirection?: Vec3 | undefined;
+    preferredGraspAxis?: Vec3 | undefined;
+    clearanceMeters?: number | undefined;
+  },
   surface: HumanoidHandSurfaceObservation
 ): HumanoidManipulationReachabilityObservation {
-  const wristWorldTarget = subtract(object.position, surface.surfaceFromWristWorld);
+  const wrist = input.robot.links[
+    surface.hand === "left" ? "left_wrist_yaw_link" : "right_wrist_yaw_link"
+  ];
+  const pregrasp = target.approachDirection
+    ? solveG1PregraspPose({
+        hand: surface.hand,
+        wristRotation: wrist.rotation,
+        handSurfaces: input.handSurfaces,
+        interactionPoint: target.worldPosition,
+        approachDirection: target.approachDirection,
+        ...(target.preferredGraspAxis
+          ? { preferredGraspAxis: target.preferredGraspAxis }
+          : {})
+      })
+    : null;
+  const wristWorldTarget = pregrasp?.position
+    ?? subtract(target.worldPosition, surface.surfaceFromWristWorld);
   try {
-    const solution = solveWrist(input.simulation, input.reference, surface, wristWorldTarget);
+    const solution = solveWrist(
+      input.simulation,
+      input.reference,
+      surface,
+      wristWorldTarget,
+      undefined,
+      pregrasp?.rotation
+    );
     return {
-      objectId: object.id,
+      objectId: target.objectId,
+      ...(target.interactionPointId
+        ? { interactionPointId: target.interactionPointId }
+        : {}),
       handSurface: surface.handSurface,
       wristWorldTarget,
+      ...(pregrasp ? { wristWorldOrientation: pregrasp.rotation } : {}),
       ikReferenceReachable: true,
       ikResidualMeters: solution
     };
   } catch (error) {
     return {
-      objectId: object.id,
+      objectId: target.objectId,
+      ...(target.interactionPointId
+        ? { interactionPointId: target.interactionPointId }
+        : {}),
       handSurface: surface.handSurface,
       wristWorldTarget,
+      ...(pregrasp ? { wristWorldOrientation: pregrasp.rotation } : {}),
       ikReferenceReachable: false,
       ikResidualMeters: ikResidual(error)
     };
@@ -100,34 +188,84 @@ function probeAlignment(
 
 function bestReachableRootPlacement(
   input: Parameters<typeof probeHumanoidManipulationReachability>[0],
+  target: {
+    objectId: string;
+    interactionPointId?: string | undefined;
+    worldPosition: Vec3;
+    approachDirection?: Vec3 | undefined;
+    preferredGraspAxis?: Vec3 | undefined;
+    clearanceMeters?: number | undefined;
+  },
   alignment: HumanoidManipulationReachabilityObservation,
   surface: HumanoidHandSurfaceObservation
 ): HumanoidManipulationBasePlacementObservation | null {
   const wristDelta = subtract(alignment.wristWorldTarget, surface.wristWorldPosition);
   const placements: HumanoidManipulationBasePlacementObservation[] = [];
-  for (const translation of rootTranslationProbes(input.robot, wristDelta)) {
-    input.simulation.restoreState(translatedRootState(
-      input.authoritativeState,
-      translation
-    ));
+  for (const translation of humanoidManipulationRootTranslationProbes(
+    input.robot,
+    wristDelta
+  )) {
+    input.simulation.restoreState(input.authoritativeState);
+    const rootWorldTarget = add(input.robot.rootPosition, translation);
+    if (!manipulationBasePreservesBodyClearance(rootWorldTarget, target)) {
+      continue;
+    }
+    const currentYaw = yawFromQuaternion(input.robot.rootRotation);
+    const rootYawRadians = handAlignedRootYaw(
+      input.robot,
+      rootWorldTarget,
+      target.worldPosition,
+      surface
+    );
+    const wristWorldTarget = alignment.wristWorldOrientation
+      ? alignment.wristWorldTarget
+      : subtract(target.worldPosition, rotatePlanar(
+          surface.surfaceFromWristWorld,
+          rootYawRadians - currentYaw
+        ));
     try {
       const residual = solveWrist(
         input.simulation,
         input.reference,
         surface,
-        alignment.wristWorldTarget
+        wristWorldTarget,
+        {
+          position: rootWorldTarget,
+          yawRadians: rootYawRadians
+        },
+        alignment.wristWorldOrientation
       );
       placements.push({
         objectId: alignment.objectId,
+        ...(alignment.interactionPointId
+          ? { interactionPointId: alignment.interactionPointId }
+          : {}),
         handSurface: alignment.handSurface,
-        rootWorldTarget: add(input.robot.rootPosition, translation),
+        rootWorldTarget,
         rootTranslationWorld: translation,
-        rootYawRadians: yawFromQuaternion(input.robot.rootRotation),
-        wristWorldTarget: alignment.wristWorldTarget,
+        rootYawRadians,
+        wristWorldTarget,
         ikResidualMeters: residual
       });
-    } catch {
-      // The next model-visible probe remains grounded in an independent IK solve.
+      if (residual <= 0.005) return placements.at(-1)!;
+    } catch (error) {
+      const residual = ikResidual(error);
+      const orientationResidual = ikOrientationResidual(error);
+      if (residual !== null && residual <= 0.12
+        && (orientationResidual === null || orientationResidual <= 0.12)) {
+        placements.push({
+          objectId: alignment.objectId,
+          ...(alignment.interactionPointId
+            ? { interactionPointId: alignment.interactionPointId }
+            : {}),
+          handSurface: alignment.handSurface,
+          rootWorldTarget,
+          rootTranslationWorld: translation,
+          rootYawRadians,
+          wristWorldTarget,
+          ikResidualMeters: residual
+        });
+      }
     }
   }
   return placements.sort((left, right) => (
@@ -135,7 +273,72 @@ function bestReachableRootPlacement(
   ))[0] ?? null;
 }
 
-function rootTranslationProbes(
+export function manipulationBasePreservesBodyClearance(
+  rootPosition: Vec3,
+  target: {
+    worldPosition: Vec3;
+    approachDirection?: Vec3 | undefined;
+    clearanceMeters?: number | undefined;
+  }
+): boolean {
+  if (!target.approachDirection) return true;
+  const requiredStandoff = minimumHumanoidManipulationRootStandoff(target);
+  const rootToTarget = subtract(target.worldPosition, rootPosition);
+  const planarApproachLength = Math.hypot(
+    target.approachDirection.x,
+    target.approachDirection.z
+  );
+  if (planarApproachLength <= 1e-9) {
+    return Math.hypot(rootToTarget.x, rootToTarget.z) >= requiredStandoff;
+  }
+  return (
+    rootToTarget.x * target.approachDirection.x
+      + rootToTarget.z * target.approachDirection.z
+  ) / planarApproachLength >= requiredStandoff;
+}
+
+export function minimumHumanoidManipulationRootStandoff(target: {
+  clearanceMeters?: number | undefined;
+}): number {
+  return HUMANOID_PLANAR_BODY_CLEARANCE_METERS
+    + (target.clearanceMeters ?? 0);
+}
+
+function handAlignedRootYaw(
+  robot: HumanoidSimulationSnapshot,
+  rootWorldTarget: Vec3,
+  interactionPoint: Vec3,
+  surface: HumanoidHandSurfaceObservation
+): number {
+  const delta = subtract(interactionPoint, rootWorldTarget);
+  const distance = Math.hypot(delta.x, delta.z);
+  const bearing = Math.atan2(delta.x, delta.z);
+  if (distance <= 1e-6) return bearing;
+  const currentYaw = yawFromQuaternion(robot.rootRotation);
+  const currentLeft = { x: Math.cos(currentYaw), y: 0, z: -Math.sin(currentYaw) };
+  const observedWristLateral = dot(
+    subtract(surface.wristWorldPosition, robot.rootPosition),
+    currentLeft
+  );
+  const desiredLateral = clamp(
+    observedWristLateral,
+    -Math.min(0.2, distance * 0.72),
+    Math.min(0.2, distance * 0.72)
+  );
+  return bearing - Math.asin(clamp(desiredLateral / distance, -0.72, 0.72));
+}
+
+function rotatePlanar(vector: Vec3, radians: number): Vec3 {
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  return {
+    x: vector.x * cosine + vector.z * sine,
+    y: vector.y,
+    z: -vector.x * sine + vector.z * cosine
+  };
+}
+
+function humanoidManipulationRootTranslationProbes(
   robot: HumanoidSimulationSnapshot,
   wristDelta: Vec3
 ): Vec3[] {
@@ -145,18 +348,45 @@ function rootTranslationProbes(
   const lateralDirection = signedDirection(left, dot(wristDelta, left));
   const forwardDirection = signedDirection(forward, dot(wristDelta, forward));
   const diagonalDirection = normalize(add(lateralDirection, forwardDirection));
-  return ROOT_TRANSLATION_DISTANCES_METERS.flatMap((distance) => [
-    scale(lateralDirection, distance),
+  const directDirection = normalize(wristDelta);
+  const directLateral = { x: directDirection.z, y: 0, z: -directDirection.x };
+  const planarDistance = Math.hypot(wristDelta.x, wristDelta.z);
+  const adaptiveDistances = ARM_WORKSPACE_RADII_METERS
+    .map((radius) => planarDistance - radius)
+    .filter((distance) => distance > 0.18);
+  const distances = [...new Set([
+    ...ROOT_TRANSLATION_DISTANCES_METERS,
+    ...adaptiveDistances
+  ].map((distance) => Number(distance.toFixed(6))))];
+  return uniqueTranslations(distances.flatMap((distance) => [
+    ...BASE_PLACEMENT_LATERAL_OFFSETS_METERS.map((offset) => add(
+      scale(directDirection, distance),
+      scale(directLateral, offset)
+    )),
+    scale(diagonalDirection, distance),
     scale(forwardDirection, distance),
-    scale(diagonalDirection, distance)
-  ]);
+    scale(lateralDirection, distance)
+  ]));
+}
+
+function uniqueTranslations(translations: readonly Vec3[]): Vec3[] {
+  const unique = new Map(translations.map((translation) => [
+    `${translation.x.toFixed(4)}:${translation.z.toFixed(4)}`,
+    translation
+  ]));
+  return [...unique.values()];
 }
 
 function solveWrist(
   simulation: HumanoidSimulation,
   reference: HumanoidReference,
   surface: HumanoidHandSurfaceObservation,
-  wristWorldTarget: Vec3
+  wristWorldTarget: Vec3,
+  planningRootPose?: {
+    position: Vec3;
+    yawRadians: number;
+  },
+  wristWorldOrientation?: Quaternion
 ): number {
   const solution = simulation.solveEndEffectorTargets(reference, [{
     body: surface.hand === "left"
@@ -164,8 +394,15 @@ function solveWrist(
       : "right_wrist_yaw_link",
     position: wristWorldTarget,
     frame: "world",
-    tolerance: 0.02
-  }]);
+    tolerance: 0.02,
+    ...(wristWorldOrientation
+      ? {
+          orientation: wristWorldOrientation,
+          orientationTolerance: 0.08
+        }
+      : {}),
+    ...(planningRootPose ? { kinematicScope: "whole_body_reach" as const } : {})
+  }], planningRootPose ? { planningRootPose } : {});
   return solution.residuals[0]?.error ?? 0;
 }
 
@@ -175,28 +412,10 @@ function ikResidual(error: unknown): number | null {
     : null;
 }
 
-function translatedRootState(
-  state: HumanoidSimulationState,
-  translation: Vec3
-): HumanoidSimulationState {
-  const positions = state.positions.slice();
-  positions[0] = (positions[0] ?? 0) + translation.z;
-  positions[1] = (positions[1] ?? 0) + translation.x;
-  return {
-    ...state,
-    positions,
-    velocities: state.velocities.slice(),
-    controls: state.controls.slice(),
-    activations: state.activations.slice(),
-    accelerationWarmstart: state.accelerationWarmstart.slice(),
-    ...(state.requestedActuatorTorques
-      ? { requestedActuatorTorques: state.requestedActuatorTorques.slice() }
-      : {}),
-    ...(state.handCommandTargets
-      ? { handCommandTargets: state.handCommandTargets.slice() }
-      : {}),
-    controller: structuredClone(state.controller)
-  };
+function ikOrientationResidual(error: unknown): number | null {
+  return error instanceof HumanoidTaskSpaceIkError
+    ? error.residuals[0]?.orientationError ?? null
+    : null;
 }
 
 function currentRootPlacement(
@@ -205,6 +424,9 @@ function currentRootPlacement(
 ): HumanoidManipulationBasePlacementObservation {
   return {
     objectId: alignment.objectId,
+    ...(alignment.interactionPointId
+      ? { interactionPointId: alignment.interactionPointId }
+      : {}),
     handSurface: alignment.handSurface,
     rootWorldTarget: { ...robot.rootPosition },
     rootTranslationWorld: { x: 0, y: 0, z: 0 },
@@ -216,6 +438,10 @@ function currentRootPlacement(
 
 function dot(left: Vec3, right: Vec3): number {
   return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function add(left: Vec3, right: Vec3): Vec3 {

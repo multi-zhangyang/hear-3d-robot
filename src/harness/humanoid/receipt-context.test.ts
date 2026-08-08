@@ -31,9 +31,10 @@ describe("humanoid receipt context", () => {
             object_id: "assembly_rod",
             hands: {
               left: {
-                surface_center_alignments: [{
+                interaction_alignments: [{
+                  interaction_point_id: "assembly_rod:grasp:0",
                   hand_surface: "left_hand_palm_link",
-                  wrist_world_if_surface_at_object_center: {
+                  wrist_world_target: {
                     x: 4.18,
                     y: 0.72,
                     z: 4.74

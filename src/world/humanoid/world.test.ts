@@ -17,11 +17,19 @@ import {
   humanoidWorldTestScenario as scenario
 } from "./world-scenarios.test-support.js";
 import { HumanoidWorld } from "./world.js";
+import { YahmpController } from "./yahmp-controller.js";
 
 describe("HumanoidWorld", () => {
   it("rebuilds live collision and navigation resources from chunk geometry", async () => {
-    const world = await HumanoidWorld.create(scenario);
+    let controllerInstances = 0;
+    const world = await HumanoidWorld.create(scenario, undefined, {
+      controllerFactory: async () => {
+        controllerInstances += 1;
+        return YahmpController.create();
+      }
+    });
     try {
+      expect(controllerInstances).toBe(2);
       const target = { x: 1.5, y: 0, z: 2.2 };
       const plannedBefore = await world.planNavigation(target);
       expect(plannedBefore.accepted, plannedBefore.reason).toBe(true);
@@ -42,6 +50,7 @@ describe("HumanoidWorld", () => {
       );
 
       const synchronized = await world.synchronizeScenarioChunks(scenario, chunks);
+      expect(controllerInstances).toBe(4);
       expect(synchronized).toMatchObject({
         changed: true,
         chunkRevision: 1,

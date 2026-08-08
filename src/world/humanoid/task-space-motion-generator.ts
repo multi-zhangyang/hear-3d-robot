@@ -25,11 +25,16 @@ import {
   interpolateReference,
   type HumanoidReference
 } from "./reference.js";
-import type { HumanoidSimulation } from "./simulation.js";
+import {
+  type HumanoidPlanningRootPose,
+  type HumanoidSimulation
+} from "./simulation.js";
 import {
   taskSpaceReference,
+  taskSpaceRootReference,
   taskSpaceTargets
 } from "./task-space-motion-targets.js";
+import { yawFromQuaternion } from "../geometry.js";
 
 export type HumanoidBodyChannel =
   | "locomotion"
@@ -58,6 +63,11 @@ export interface HumanoidMotionGenerator {
   readonly descriptor: HumanoidMotionGeneratorDescriptor;
   generate(input: HumanoidMotionGeneratorInput): Promise<HumanoidMotionArtifact>;
   dispose(): Promise<void>;
+}
+
+interface PredictedPlanningRootState extends HumanoidPlanningRootPose {
+  worldVelocity: { x: number; z: number };
+  yawVelocity: number;
 }
 
 export class HumanoidMotionGenerationError extends Error {
@@ -118,14 +128,44 @@ async function generateTaskSpaceMotion(
     throw new Error("Humanoid motion control step must be positive");
   }
   const targets: HumanoidReference[] = [];
+  const planningRootPoses: PredictedPlanningRootState[] = [];
+  const predictsMobileTaskSpace = plan.keyframes.some((keyframe) => (
+    keyframe.left_hand?.kinematic_scope === "whole_body_reach"
+      || keyframe.right_hand?.kinematic_scope === "whole_body_reach"
+  )) && plan.keyframes.some((keyframe) => keyframe.root_velocity != null);
   let previous = input.baseline;
+  const initial = input.simulation.snapshot();
+  let planningRootPose: PredictedPlanningRootState = {
+    position: { ...initial.rootPosition },
+    yawRadians: yawFromQuaternion(initial.rootRotation),
+    worldVelocity: { x: 0, z: 0 },
+    yawVelocity: 0
+  };
+  let previousAtSeconds = 0;
   for (const keyframe of plan.keyframes) {
     try {
-      previous = taskSpaceReference(input.simulation, previous, keyframe);
+      const rooted = taskSpaceRootReference(previous, keyframe);
+      const segmentDuration = keyframe.at_seconds - previousAtSeconds;
+      planningRootPose = predictPlanningRootPose(
+        planningRootPose,
+        previous,
+        rooted,
+        segmentDuration,
+        segmentDuration
+      );
+      previous = taskSpaceReferenceWithFallbackSeed({
+        simulation: input.simulation,
+        primary: previous,
+        fallback: input.baseline,
+        keyframe,
+        ...(predictsMobileTaskSpace ? { planningRootPose } : {})
+      });
     } catch (error) {
       throw new HumanoidMotionGenerationError(keyframe.at_seconds, error);
     }
     targets.push(previous);
+    planningRootPoses.push(planningRootPose);
+    previousAtSeconds = keyframe.at_seconds;
   }
 
   const frames: Array<{
@@ -148,20 +188,29 @@ async function generateTaskSpaceMotion(
     const startKeyframe = plan.keyframes[segment - 1]!;
     const endKeyframe = plan.keyframes[segment]!;
     const duration = endKeyframe.at_seconds - startKeyframe.at_seconds;
+    const endpointTargets = taskSpaceTargets(endKeyframe);
     const interpolated = interpolateReference(
       targets[segment - 1]!,
       targets[segment]!,
       (atSeconds - startKeyframe.at_seconds) / duration,
       duration
     );
-    const endpointTargets = taskSpaceTargets(endKeyframe);
     const taskSpaceServoTargets = endpointTargets.length === 0
       ? undefined
       : Math.abs(atSeconds - endKeyframe.at_seconds) <= 1e-9
         ? endpointTargets
         : input.simulation.measureEndEffectorTargets(
             interpolated,
-            endpointTargets
+            endpointTargets,
+            predictsMobileTaskSpace ? {
+              planningRootPose: predictPlanningRootPose(
+                planningRootPoses[segment - 1]!,
+                targets[segment - 1]!,
+                targets[segment]!,
+                atSeconds - startKeyframe.at_seconds,
+                duration
+              )
+            } : {}
           );
     const handCommand = plannedHandCommandAtTime(plan.keyframes, atSeconds);
     frames.push({
@@ -187,6 +236,118 @@ async function generateTaskSpaceMotion(
       : {}),
     frames
   });
+}
+
+function taskSpaceReferenceWithFallbackSeed(input: {
+  simulation: HumanoidSimulation;
+  primary: HumanoidReference;
+  fallback: HumanoidReference;
+  keyframe: HumanoidMotionKeyframe;
+  planningRootPose?: HumanoidPlanningRootPose;
+}): HumanoidReference {
+  const solve = (seed: HumanoidReference) => taskSpaceReference(
+    input.simulation,
+    seed,
+    input.keyframe,
+    input.planningRootPose
+  );
+  try {
+    return solve(input.primary);
+  } catch (primaryError) {
+    if (input.primary === input.fallback) throw primaryError;
+    try {
+      return solve(input.fallback);
+    } catch (fallbackError) {
+      throw new AggregateError(
+        [primaryError, fallbackError],
+        `Task-space IK failed from continuous and action-start seeds: ${errorMessage(primaryError)}; ${errorMessage(fallbackError)}`
+      );
+    }
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function predictPlanningRootPose(
+  start: PredictedPlanningRootState,
+  startReference: HumanoidReference,
+  endReference: HumanoidReference,
+  elapsedSeconds: number,
+  segmentDurationSeconds: number
+): PredictedPlanningRootState {
+  if (elapsedSeconds <= 0 || segmentDurationSeconds <= 0) {
+    return {
+      position: { ...start.position },
+      yawRadians: start.yawRadians,
+      worldVelocity: { ...start.worldVelocity },
+      yawVelocity: start.yawVelocity
+    };
+  }
+  const elapsed = Math.min(elapsedSeconds, segmentDurationSeconds);
+  const steps = Math.max(1, Math.ceil(elapsed / 0.04));
+  const stepSeconds = elapsed / steps;
+  const position = { ...start.position };
+  let yaw = start.yawRadians;
+  let worldVelocity = { ...start.worldVelocity };
+  let yawVelocity = start.yawVelocity;
+  const response = 1 - Math.exp(-stepSeconds / 1.1);
+  for (let index = 0; index < steps; index += 1) {
+    const progress = (index + 0.5) * stepSeconds / segmentDurationSeconds;
+    const blend = progress * progress * (3 - 2 * progress);
+    const commandedForward = mix(
+      startReference.rootVelocity[0],
+      endReference.rootVelocity[0],
+      blend
+    );
+    const commandedLateral = mix(
+      startReference.rootVelocity[1],
+      endReference.rootVelocity[1],
+      blend
+    );
+    const commandedYawVelocity = mix(
+      startReference.rootYawVelocity,
+      endReference.rootYawVelocity,
+      blend
+    );
+    const targetLocalVelocity = effectivePolicyPlanarVelocity(
+      commandedForward,
+      commandedLateral
+    );
+    const targetWorldVelocity = {
+      x: targetLocalVelocity.forward * Math.sin(yaw)
+        + targetLocalVelocity.lateral * Math.cos(yaw),
+      z: targetLocalVelocity.forward * Math.cos(yaw)
+        - targetLocalVelocity.lateral * Math.sin(yaw)
+    };
+    worldVelocity = {
+      x: mix(worldVelocity.x, targetWorldVelocity.x, response),
+      z: mix(worldVelocity.z, targetWorldVelocity.z, response)
+    };
+    yawVelocity = mix(yawVelocity, commandedYawVelocity, response);
+    position.x += worldVelocity.x * stepSeconds;
+    position.z += worldVelocity.z * stepSeconds;
+    yaw += yawVelocity * stepSeconds;
+  }
+  return { position, yawRadians: yaw, worldVelocity, yawVelocity };
+}
+
+function effectivePolicyPlanarVelocity(
+  forward: number,
+  lateral: number
+): { forward: number; lateral: number } {
+  const speed = Math.hypot(forward, lateral);
+  if (speed <= 1e-9) return { forward: 0, lateral: 0 };
+  const effectiveSpeed = speed < 0.15
+    ? speed * 0.075
+    : Math.max(0, speed - 0.075);
+  const scale = effectiveSpeed / speed;
+  return { forward: forward * scale, lateral: lateral * scale };
+}
+
+function mix(start: number, end: number, amount: number): number {
+  return start + (end - start) * amount;
 }
 
 export function plannedHandCommandAtTime(

@@ -51,12 +51,22 @@ describe("HumanoidActionRuntime", () => {
     const runtime = new HumanoidActionRuntime(lightweight.world, {
       requireSkillBinding: true
     });
-    await runtime.invoke(
+    const observation = await runtime.invoke(
       "observe_humanoid",
       {},
       "skill-observation",
       "humanoid-motion-reference"
     );
+    expect(observation.detail).toMatchObject({
+      control_authority: {
+        physics_backend: "mujoco",
+        learned_policy: {
+          protocol: "humanoid-learned-policy-v1",
+          capabilities: ["balance", "locomotion", "joint_reference_tracking"]
+        },
+        motion_generator: { implementation: "test_task_space_generator" }
+      }
+    });
     expect(runtime.isActionAvailable(
       "begin_humanoid_skill",
       "humanoid-motion-reference"
@@ -329,6 +339,61 @@ describe("HumanoidActionRuntime", () => {
         selected_skill: "stabilize"
       }
     });
+  });
+
+  it("retires stale Recovery Policy after observing a changed world", async () => {
+    const lightweight = lightweightObservationWorld(undefined, {
+      interaction: {
+        object_world_model: { frame: 0, world_revision: 1, objects: [] },
+        skill_catalog: {
+          contract_sha256: "a".repeat(64),
+          frame: 0,
+          world_revision: 1,
+          entries: []
+        },
+        carrying: { bindings: [] },
+        manipulable_objects: []
+      }
+    }, 1);
+    const runtime = new HumanoidActionRuntime(lightweight.world, {
+      requireSkillBinding: true,
+      state: {
+        version: 1,
+        latest_physical_execution_revision: 0,
+        skill_plans: [],
+        active_skill_plan_transactions: {},
+        active_skills: [],
+        planning_skill_bindings: [],
+        recovery_policies: [{
+          agent_id: "humanoid-motion-reference",
+          policy: {
+            protocol: "humanoid-recovery-policy-v1",
+            source_execution_transaction_id: "old-execution",
+            source_planning_transaction_id: "old-plan",
+            source_skill_transaction_id: "old-skill",
+            source_skill: "grasp",
+            source_phase: "close_hand_under_contact",
+            physical_failure_code: "motion_goal_unmet",
+            failure_reason: "grasp_unstable",
+            world_revision: 0,
+            candidate_skills: ["regrasp", "reach"],
+            requires_model_selection: true,
+            automatic_actuation: false
+          }
+        }]
+      }
+    });
+
+    expect(runtime.planningToolState("humanoid-motion-reference"))
+      .toMatchObject({ recovery_policy: { world_revision: 0 } });
+    await runtime.invoke(
+      "observe_humanoid",
+      {},
+      "changed-world-recovery-observation",
+      "humanoid-motion-reference"
+    );
+    expect(runtime.planningToolState("humanoid-motion-reference"))
+      .toMatchObject({ recovery_policy: null });
   });
 
   it("renews Skill authority across stationary physics but rejects material world changes", async () => {
@@ -1462,7 +1527,8 @@ function record(value: JsonValue | undefined): Record<string, JsonValue> {
 
 function lightweightObservationWorld(
   navigationReceipt?: Awaited<ReturnType<HumanoidWorld["planNavigation"]>>,
-  observationOverride: Record<string, unknown> = {}
+  observationOverride: Record<string, unknown> = {},
+  worldRevision = 0
 ): {
   world: HumanoidWorld;
   observationCalls: () => number;
@@ -1471,7 +1537,7 @@ function lightweightObservationWorld(
   let observationCalls = 0;
   let candidatePlanningCalls = 0;
   const worldShape = {
-    snapshot: () => ({ frame: 0, worldRevision: 0 }),
+    snapshot: () => ({ frame: 0, worldRevision }),
     consumablePlanIds: () => [],
     planNavigation: async () => structuredClone(navigationReceipt ?? {
       accepted: false,
@@ -1512,7 +1578,7 @@ function lightweightObservationWorld(
       observationCalls += 1;
       return {
         frame: 0,
-        worldRevision: 0,
+        worldRevision,
         sensor: {
           position: { x: 0, y: 1, z: 0 },
           rotation: { x: 0, y: 0, z: 0, w: 1 },
@@ -1521,7 +1587,30 @@ function lightweightObservationWorld(
           verticalFieldOfView: 1
         },
         robot: {
-          controller: {},
+          controller: {
+            protocol: "humanoid-controller-v1",
+            implementation: "test_learned_controller",
+            actuation: "joint_position_pd",
+            controlStepSeconds: 0.02,
+            physicsStepSeconds: 0.005,
+            learnedPolicy: {
+              protocol: "humanoid-learned-policy-v1",
+              runtime: "onnx",
+              observationSpace: {
+                protocol: "test-observation-v1",
+                size: 12
+              },
+              actionSpace: {
+                protocol: "test-action-v1",
+                size: 4
+              },
+              capabilities: [
+                "balance",
+                "locomotion",
+                "joint_reference_tracking"
+              ]
+            }
+          },
           rootPosition: { x: 0, y: 0, z: 0 },
           rootRotation: { x: 0, y: 0, z: 0, w: 1 },
           fallen: false,
@@ -1565,6 +1654,10 @@ function lightweightObservationWorld(
         },
         interaction: {},
         navigation: {},
+        motionGenerator: {
+          protocol: "humanoid-motion-generator-v1",
+          implementation: "test_task_space_generator"
+        },
         ...structuredClone(observationOverride)
       };
     }

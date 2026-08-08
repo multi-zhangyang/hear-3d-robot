@@ -25,6 +25,7 @@ import {
   type HumanoidMotionArtifact
 } from "./motion-artifact.js";
 import { applyHumanoidMotionArtifactFrame } from "./motion-frame-application.js";
+import { captureHumanoidStationKeepingAnchor } from "./station-keeping.js";
 import {
   advanceHumanoidMotionOptionMonitor,
   createHumanoidMotionOptionMonitorState,
@@ -95,6 +96,7 @@ import {
 } from "./motion-contact-policy.js";
 
 import {
+  humanoidMotionPlanHasPlanarRootMotion,
   HumanoidMotionPlanSchema,
   type HumanoidContactConstraint,
   type HumanoidMotionPlan
@@ -374,6 +376,8 @@ function assertTaskSpaceServoArtifactFrame(
     if (!endpoint
       || target.frame !== endpoint.frame
       || target.tolerance !== endpoint.tolerance
+      || target.kinematicScope !== endpoint.kinematicScope
+      || target.servoMode !== endpoint.servoMode
       || target.orientationTolerance !== endpoint.orientationTolerance
       || (target.orientation === undefined) !== (endpoint.orientation === undefined)) {
       throw new Error("Motion artifact task-space authority exceeds its model plan");
@@ -405,6 +409,14 @@ async function validateHumanoidMotionArtifact(
 }> {
   const saved = simulation.captureState();
   const start = simulation.snapshot();
+  const stationKeepingAnchor = humanoidMotionPlanHasPlanarRootMotion(plan)
+    ? undefined
+    : captureHumanoidStationKeepingAnchor(
+        start,
+        options.worldFrame ?? 0,
+        options.worldRevision ?? 0
+      );
+  let stationKeepingCommand: [number, number] = [0, 0];
   const modelConstraints = plan.contact_constraints ?? [];
   const carriedObjectBindings = options.carriedObjectBindings
     ? HumanoidCarriedObjectBindingSetSchema.parse(options.carriedObjectBindings)
@@ -425,7 +437,10 @@ async function validateHumanoidMotionArtifact(
   const required = modelConstraints.filter((constraint) => constraint.required);
   const knownObjects = new Set(Object.keys(start.objects));
   const knownSolids = new Set(simulation.solidIds());
-  const physicalTargets = scheduledTaskSpaceTargets(plan);
+  const physicalTargets = scheduledTaskSpaceTargets(
+    plan,
+    options.motionOption !== undefined
+  );
   let nextPhysicalTargetIndex = 0;
   const failures: HumanoidMotionValidation["failures"] = [];
   const contacted = new Set<HumanoidBodyName>();
@@ -749,12 +764,17 @@ async function validateHumanoidMotionArtifact(
         }
       }
       try {
-        finalSnapshot = (
-          await applyHumanoidMotionArtifactFrame(simulation, frame, {
+        const applied = await applyHumanoidMotionArtifactFrame(simulation, frame, {
             graspTargets,
-            carryTaskSpaceTargets: carriedObjectTaskSpaceTargets
-          })
-        ).snapshot;
+            carryTaskSpaceTargets: carriedObjectTaskSpaceTargets,
+            ...(stationKeepingAnchor
+              ? { stationKeepingAnchor, stationKeepingCommand }
+              : {})
+          });
+        finalSnapshot = applied.snapshot;
+        if (stationKeepingAnchor) {
+          stationKeepingCommand = [...applied.reference.rootVelocity];
+        }
       } catch (error) {
         failures.push({
           code: "invalid_reference",
@@ -860,17 +880,6 @@ async function validateHumanoidMotionArtifact(
         failures.push({ code: "fallen", atSeconds: frame.atSeconds });
         break;
       }
-      while ((physicalTargets[nextPhysicalTargetIndex]?.atSeconds ?? Infinity)
-        <= frame.atSeconds + 1e-9) {
-        const failure = physicalTaskSpaceTargetFailure(
-          physicalTargets[nextPhysicalTargetIndex]!,
-          finalSnapshot,
-          frame.atSeconds
-        );
-        if (failure) failures.push(failure);
-        nextPhysicalTargetIndex += 1;
-      }
-      if (failures.length > 0) break;
       if (options.motionOption && optionMonitor?.phase !== "awaiting_precondition") {
         if (!optionMonitor) {
           throw new Error("Humanoid motion option monitor is missing");
@@ -926,6 +935,17 @@ async function validateHumanoidMotionArtifact(
           break;
         }
       }
+      while ((physicalTargets[nextPhysicalTargetIndex]?.atSeconds ?? Infinity)
+        <= frame.atSeconds + 1e-9) {
+        const failure = physicalTaskSpaceTargetFailure(
+          physicalTargets[nextPhysicalTargetIndex]!,
+          finalSnapshot,
+          frame.atSeconds
+        );
+        if (failure) failures.push(failure);
+        nextPhysicalTargetIndex += 1;
+      }
+      if (failures.length > 0) break;
     }
     const missingRequired = required.filter((constraint) => (
       !satisfiedRequired.has(contactKey(constraint))
@@ -1040,9 +1060,11 @@ interface ScheduledTaskSpaceTarget {
 }
 
 function scheduledTaskSpaceTargets(
-  plan: HumanoidMotionPlan
+  plan: HumanoidMotionPlan,
+  finalOnly = false
 ): ScheduledTaskSpaceTarget[] {
-  return plan.keyframes.flatMap((keyframe) => (
+  const keyframes = finalOnly ? plan.keyframes.slice(-1) : plan.keyframes;
+  return keyframes.flatMap((keyframe) => (
     taskSpaceTargets(keyframe).map((target) => ({
       atSeconds: keyframe.at_seconds,
       target

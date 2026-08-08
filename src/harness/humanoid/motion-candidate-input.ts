@@ -65,6 +65,44 @@ const HandContactObjectPredicateSchema = z.object({
     .describe("该真实掌指碰撞面与物体必须持续达到的最小法向力，单位 N")
 }).strict();
 
+const HandContactObjectAnyPredicateSchema = z.object({
+  type: z.literal("hand_contact_object_any"),
+  hand: z.enum(["left", "right"]),
+  object_id: z.string().trim().min(1),
+  minimum_normal_force: z.number().finite().positive()
+    .describe("该手任一已授权真实掌指碰撞面与物体必须持续达到的最小法向力，单位 N"),
+  minimum_distinct_surfaces: z.number().int().min(1).max(8).optional()
+    .describe("需要同时达到力阈值的不同真实掌指碰撞面数量")
+}).strict();
+
+const HandContactObjectRegionPredicateSchema = z.object({
+  type: z.literal("hand_contact_object_region"),
+  hand: z.enum(["left", "right"]),
+  object_id: z.string().trim().min(1),
+  center_world: Vec3Schema
+    .describe("当前观察中交互区域中心的世界坐标"),
+  maximum_distance_m: z.number().finite().positive().max(1)
+    .describe("接触点到交互区域中心允许的最大世界距离，单位米"),
+  minimum_normal_force: z.number().finite().positive()
+    .describe("区域内真实掌指碰撞面必须持续达到的最小法向力，单位 N"),
+  minimum_distinct_surfaces: z.number().int().min(1).max(8).optional()
+    .describe("区域内需要同时达到力阈值的不同真实掌指碰撞面数量")
+}).strict();
+
+const HandCoordinationSideSchema = z.object({
+  thumb_opposition: z.number().finite().min(0).max(1),
+  thumb_curl: z.number().finite().min(0).max(1),
+  index_curl: z.number().finite().min(0).max(1),
+  middle_curl: z.number().finite().min(0).max(1)
+}).strict();
+
+const HandCoordinationDisplacedPredicateSchema = z.object({
+  type: z.literal("hand_coordination_displaced"),
+  hand: z.enum(["left", "right"]),
+  origin: HandCoordinationSideSchema,
+  minimum_distance: z.number().finite().positive().max(2)
+}).strict();
+
 const BodyContactSolidPredicateSchema = z.object({
   type: z.literal("body_contact_solid"),
   body: z.enum(HUMANOID_BODY_NAMES),
@@ -172,6 +210,9 @@ const ModelMotionPredicateSchema = z.discriminatedUnion("type", [
   EndEffectorNearPosePredicateSchema,
   BodyContactObjectPredicateSchema,
   HandContactObjectPredicateSchema,
+  HandContactObjectAnyPredicateSchema,
+  HandContactObjectRegionPredicateSchema,
+  HandCoordinationDisplacedPredicateSchema,
   BodyContactSolidPredicateSchema,
   HandContactSolidPredicateSchema,
   ObjectNearPointPredicateSchema,
@@ -372,7 +413,7 @@ const HumanoidMotionCandidateBatchInputShapeSchema = z.object({
   skill_transaction_id: z.string().trim().min(1).nullable().default(null),
   objective: z.string().trim().min(1),
   termination: ModelMotionOptionSchema,
-  candidates: z.array(ModelMotionCandidateSchema).min(1).max(3)
+  candidates: z.array(ModelMotionCandidateSchema).min(1).max(4)
 }).strict();
 
 export const HumanoidMotionCandidateBatchInputSchema =

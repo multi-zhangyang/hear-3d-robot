@@ -8,6 +8,31 @@ export interface HumanoidPolicyState {
   rootAngularVelocity: readonly [x: number, y: number, z: number];
 }
 
+export const HUMANOID_LEARNED_POLICY_CAPABILITIES = [
+  "balance",
+  "locomotion",
+  "joint_reference_tracking",
+  "contact_rich_manipulation",
+  "bimanual_manipulation"
+] as const;
+
+type HumanoidLearnedPolicyCapability =
+  typeof HUMANOID_LEARNED_POLICY_CAPABILITIES[number];
+
+interface HumanoidLearnedPolicyDescriptor {
+  protocol: "humanoid-learned-policy-v1";
+  runtime: string;
+  observationSpace: {
+    protocol: string;
+    size: number;
+  };
+  actionSpace: {
+    protocol: string;
+    size: number;
+  };
+  capabilities: HumanoidLearnedPolicyCapability[];
+}
+
 export interface HumanoidControllerDescriptor {
   protocol: "humanoid-controller-v1";
   implementation: string;
@@ -16,6 +41,7 @@ export interface HumanoidControllerDescriptor {
   physicsStepSeconds: number;
   commandResponseHorizonSeconds?: number | undefined;
   minimumEffectivePlanarSpeedMetersPerSecond?: number | undefined;
+  learnedPolicy?: HumanoidLearnedPolicyDescriptor | undefined;
 }
 
 export interface HumanoidJointPositionCommand {
@@ -57,3 +83,6 @@ export interface HumanoidWholeBodyController {
   restoreState(state: HumanoidControllerState): void;
   dispose(): Promise<void>;
 }
+
+export type HumanoidWholeBodyControllerFactory =
+  () => Promise<HumanoidWholeBodyController>;

@@ -74,6 +74,38 @@ const HandContactObjectPredicateSchema = z.object({
   minimum_normal_force: z.number().finite().positive()
 }).strict();
 
+const HandContactObjectAnyPredicateSchema = z.object({
+  type: z.literal("hand_contact_object_any"),
+  hand: z.enum(["left", "right"]),
+  object_id: z.string().trim().min(1),
+  minimum_normal_force: z.number().finite().positive(),
+  minimum_distinct_surfaces: z.number().int().min(1).max(8).optional()
+}).strict();
+
+const HandContactObjectRegionPredicateSchema = z.object({
+  type: z.literal("hand_contact_object_region"),
+  hand: z.enum(["left", "right"]),
+  object_id: z.string().trim().min(1),
+  center_world: Vec3Schema,
+  maximum_distance_m: z.number().finite().positive().max(1),
+  minimum_normal_force: z.number().finite().positive(),
+  minimum_distinct_surfaces: z.number().int().min(1).max(8).optional()
+}).strict();
+
+const HandCoordinationSideSchema = z.object({
+  thumb_opposition: z.number().finite().min(0).max(1),
+  thumb_curl: z.number().finite().min(0).max(1),
+  index_curl: z.number().finite().min(0).max(1),
+  middle_curl: z.number().finite().min(0).max(1)
+}).strict();
+
+const HandCoordinationDisplacedPredicateSchema = z.object({
+  type: z.literal("hand_coordination_displaced"),
+  hand: z.enum(["left", "right"]),
+  origin: HandCoordinationSideSchema,
+  minimum_distance: z.number().finite().positive().max(2)
+}).strict();
+
 const BodyContactSolidPredicateSchema = z.object({
   type: z.literal("body_contact_solid"),
   body: z.enum(HUMANOID_BODY_NAMES),
@@ -180,6 +212,9 @@ const HumanoidMotionOptionPredicateSchema = z.discriminatedUnion("type", [
   EndEffectorNearPointPredicateSchema,
   BodyContactObjectPredicateSchema,
   HandContactObjectPredicateSchema,
+  HandContactObjectAnyPredicateSchema,
+  HandContactObjectRegionPredicateSchema,
+  HandCoordinationDisplacedPredicateSchema,
   BodyContactSolidPredicateSchema,
   HandContactSolidPredicateSchema,
   ObjectNearPointPredicateSchema,

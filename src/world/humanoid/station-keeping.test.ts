@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { yawFromQuaternion } from "../geometry.js";
+import { HUMANOID_JOINT_INDEX } from "./model.js";
 import {
   neutralHumanoidReference,
   targetReference
@@ -50,6 +51,67 @@ describe("humanoid station keeping", () => {
     expect(reference.rootYawVelocity).toBeCloseTo(0, 12);
   });
 
+  it("overrides inherited planar velocity when the plan has no root authority", () => {
+    const state = snapshot(2, 3, -0.4);
+    const inherited = targetReference(neutralHumanoidReference(), {
+      rootVelocity: [0.12, -0.08],
+      rootYawVelocity: 0.3
+    });
+    const reference = stationKeepingHumanoidReference(
+      inherited,
+      state,
+      captureHumanoidStationKeepingAnchor(state, 0, 0)
+    );
+
+    expect(reference.rootVelocity).toEqual([0, 0]);
+    expect(reference.rootYawVelocity).toBeCloseTo(0, 12);
+  });
+
+  it("inverts the locomotion deadzone before drift becomes large", () => {
+    const anchorState = snapshot(2, 3, 0);
+    const reference = stationKeepingHumanoidReference(
+      neutralHumanoidReference(),
+      snapshot(2, 2.97, 0),
+      captureHumanoidStationKeepingAnchor(anchorState, 0, 0)
+    );
+
+    expect(reference.rootVelocity[0]).toBeGreaterThan(0.08);
+    expect(reference.rootVelocity[0]).toBeLessThan(0.15);
+    expect(reference.rootVelocity[1]).toBe(0);
+  });
+
+  it("damps measured pelvis motion before it can cross the anchor", () => {
+    const anchorState = snapshot(2, 3, 0);
+    const moving = snapshot(2, 3.03, 0);
+    moving.links = {
+      pelvis: {
+        linearVelocity: { x: 0, y: 0, z: 0.12 }
+      }
+    } as HumanoidSimulationSnapshot["links"];
+    const reference = stationKeepingHumanoidReference(
+      neutralHumanoidReference(),
+      moving,
+      captureHumanoidStationKeepingAnchor(anchorState, 0, 0)
+    );
+
+    expect(reference.rootVelocity[0]).toBeLessThan(0);
+  });
+
+  it("slews policy commands at the controller acceleration boundary", () => {
+    const anchorState = snapshot(2, 3, 0);
+    const reference = stationKeepingHumanoidReference(
+      neutralHumanoidReference(),
+      snapshot(2, 2.8, 0),
+      captureHumanoidStationKeepingAnchor(anchorState, 0, 0),
+      {
+        previousPlanarCommand: [0, 0],
+        controlStepSeconds: 0.02
+      }
+    );
+
+    expect(reference.rootVelocity).toEqual([0.02, 0]);
+  });
+
   it("releases a tracked posture before base drift can become a runaway", () => {
     const anchorState = snapshot(2, 3, 0);
     const tracked = targetReference(neutralHumanoidReference(), {
@@ -57,12 +119,69 @@ describe("humanoid station keeping", () => {
     });
     const reference = stationKeepingHumanoidReference(
       tracked,
-      snapshot(2.11, 3, 0),
+      snapshot(2.21, 3, 0),
       captureHumanoidStationKeepingAnchor(anchorState, 0, 0)
     );
 
     expect(reference.jointTrackingWeights.every((weight) => weight === 0)).toBe(true);
     expect(reference.rootVelocity[1]).toBeLessThan(0);
+  });
+
+  it("preserves explicit lower-body authority only for a stance task", () => {
+    const state = snapshot(2, 3, 0);
+    const tracked = targetReference(neutralHumanoidReference(), {
+      joints: {
+        left_hip_pitch_joint: -0.2,
+        left_knee_joint: 0.5,
+        waist_pitch_joint: 0.1
+      }
+    });
+    const reference = stationKeepingHumanoidReference(
+      tracked,
+      state,
+      captureHumanoidStationKeepingAnchor(state, 0, 0),
+      { preserveTrackedLowerBody: true }
+    );
+
+    for (const joint of [
+      "left_hip_pitch_joint",
+      "left_knee_joint",
+      "waist_pitch_joint"
+    ] as const) {
+      expect(reference.jointTrackingWeights[
+        HUMANOID_JOINT_INDEX.get(joint)!
+      ]).toBe(1);
+    }
+  });
+
+  it("hands lower-body authority back to the balance policy at the root boundary", () => {
+    const anchorState = snapshot(2, 3, 0);
+    const tracked = targetReference(neutralHumanoidReference(), {
+      joints: {
+        left_hip_pitch_joint: -0.2,
+        left_knee_joint: 0.5,
+        right_ankle_pitch_joint: -0.25
+      }
+    });
+    const reference = stationKeepingHumanoidReference(
+      tracked,
+      snapshot(2, 3.08, 0),
+      captureHumanoidStationKeepingAnchor(anchorState, 0, 0),
+      { preserveTrackedLowerBody: true }
+    );
+
+    for (const joint of [
+      "left_hip_pitch_joint",
+      "left_knee_joint",
+      "right_ankle_pitch_joint"
+    ] as const) {
+      const index = HUMANOID_JOINT_INDEX.get(joint)!;
+      expect(reference.jointTrackingWeights[index]).toBeCloseTo(0, 12);
+      expect(reference.jointPositions[index]).toBeCloseTo(
+        neutralHumanoidReference().jointPositions[index]!,
+        12
+      );
+    }
   });
 
   it("holds a real YAHMP humanoid in place across a long MuJoCo run", async () => {

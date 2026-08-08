@@ -30,12 +30,17 @@ import type {
   HumanoidSimulationSnapshot
 } from "./simulation.js";
 import type { StoredHumanoidMotionPlan } from "./world-plan-state.js";
+import { humanoidMotionPlanHasPlanarRootMotion } from "./motion-plan-schema.js";
 import type { G1ContactAwareGraspTarget } from "./contact-aware-grasp-servo.js";
 import { humanoidCarriedObjectContactConstraints } from "./carried-object-binding.js";
 import {
   HumanoidCarryTaskSpaceTargetsSchema,
   type HumanoidCarryTaskSpaceTarget
 } from "./carry-task-space-servo.js";
+import {
+  captureHumanoidStationKeepingAnchor,
+  type HumanoidStationKeepingAnchor
+} from "./station-keeping.js";
 
 export interface HumanoidMotionExecutionStep {
   snapshot?: HumanoidSimulationSnapshot;
@@ -68,6 +73,9 @@ export class HumanoidMotionExecution {
   readonly #frameLimit: number;
   readonly #graspTargets: readonly G1ContactAwareGraspTarget[];
   readonly #carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
+  readonly #stationKeepingRequired: boolean;
+  #stationKeepingAnchor: HumanoidStationKeepingAnchor | undefined;
+  #stationKeepingCommand: [number, number] = [0, 0];
   #frames = 0;
   #reference: HumanoidReference;
   #lastOptionDetection: HumanoidMotionOptionDetection | null = null;
@@ -81,6 +89,7 @@ export class HumanoidMotionExecution {
     ) => HumanoidMotionOptionDetectorInput;
     graspTargets?: readonly G1ContactAwareGraspTarget[];
     carryTaskSpaceTargets?: readonly HumanoidCarryTaskSpaceTarget[];
+    stationKeepingAnchor?: HumanoidStationKeepingAnchor;
     commitPhysicalFrame?: (
       snapshot: HumanoidSimulationSnapshot
     ) => string | undefined;
@@ -93,6 +102,17 @@ export class HumanoidMotionExecution {
     this.#carryTaskSpaceTargets = HumanoidCarryTaskSpaceTargetsSchema.parse(
       input.carryTaskSpaceTargets ?? input.stored.carriedObjectTaskSpaceTargets ?? []
     );
+    this.#stationKeepingRequired = !humanoidMotionPlanHasPlanarRootMotion(
+      input.stored.plan
+    );
+    this.#stationKeepingAnchor = this.#stationKeepingRequired
+      && input.stationKeepingAnchor
+      ? structuredClone(input.stationKeepingAnchor)
+      : undefined;
+    if (this.#stationKeepingRequired
+      && input.stored.progress.nextFrameIndex > 0) {
+      this.#stationKeepingCommand = [...input.reference.rootVelocity];
+    }
     this.#failures = input.stored.progress.failure
       ? [validationFailure(input.stored.progress.failure)]
       : [];
@@ -148,6 +168,15 @@ export class HumanoidMotionExecution {
     }
     const index = this.#stored.progress.nextFrameIndex;
     const frame = this.#stored.artifact.frames[index]!;
+    if (this.#stationKeepingRequired
+      && !this.#stationKeepingAnchor
+      && typeof simulation.snapshot === "function") {
+      this.#stationKeepingAnchor = captureHumanoidStationKeepingAnchor(
+        simulation.snapshot(),
+        0,
+        0
+      );
+    }
     if (this.#stored.option?.monitor.phase === "awaiting_precondition"
       && !this.#acceptPrecondition(index, simulation.snapshot())) {
       this.#finish();
@@ -156,11 +185,20 @@ export class HumanoidMotionExecution {
 
     const applied = await applyHumanoidMotionArtifactFrame(simulation, frame, {
       graspTargets: this.#graspTargets,
-      carryTaskSpaceTargets: this.#carryTaskSpaceTargets
+      carryTaskSpaceTargets: this.#carryTaskSpaceTargets,
+      ...(this.#stationKeepingAnchor
+        ? {
+            stationKeepingAnchor: this.#stationKeepingAnchor,
+            stationKeepingCommand: this.#stationKeepingCommand
+          }
+        : {})
     });
     const { reference, snapshot } = applied;
     this.#frames += 1;
     this.#reference = reference;
+    if (this.#stationKeepingAnchor) {
+      this.#stationKeepingCommand = [...reference.rootVelocity];
+    }
     this.#stored.progress.physicalSafety = accumulateHumanoidPhysicalSafetyFrame(
       this.#stored.progress.physicalSafety ?? createHumanoidPhysicalSafetyAccumulator(),
       index + 1,

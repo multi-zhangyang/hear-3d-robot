@@ -24,6 +24,12 @@ export interface HumanoidSceneObject extends HumanoidSceneSolid {
     torsional: number;
     rolling: number;
   } | undefined;
+  interactionPoints?: Array<{
+    id: string;
+    kind: "grasp" | "push" | "pull" | "press" | "turn" | "insert" | "support";
+    localPosition: { x: number; y: number; z: number };
+    clearanceMeters: number;
+  }> | undefined;
   mobility?:
     | { type: "fixed" }
     | { type: "free" }
@@ -52,6 +58,7 @@ export interface ResolvedHumanoidSceneObject extends HumanoidSceneSolid {
     torsional: number;
     rolling: number;
   };
+  interactionPoints: NonNullable<HumanoidSceneObject["interactionPoints"]>;
   mobility: NonNullable<HumanoidSceneObject["mobility"]>;
   container?: NonNullable<HumanoidSceneObject["container"]> | undefined;
 }
@@ -68,6 +75,7 @@ export function resolveHumanoidSceneObject(
     friction: object.friction
       ? { ...object.friction }
       : { sliding: 0.8, torsional: 0.01, rolling: 0.001 },
+    interactionPoints: structuredClone(object.interactionPoints ?? []),
     mobility: object.mobility ? structuredClone(object.mobility) : { type: "free" },
     ...(object.container ? { container: structuredClone(object.container) } : {})
   };
@@ -164,8 +172,13 @@ function sceneXml(
     const geometry = object.container
       ? containerGeometriesXml(object, index)
       : sceneObjectGeometryXml(object, index, geometryOffset);
+    const interactionGeometry = interactionPointGeometriesXml(
+      object,
+      index,
+      geometryOffset
+    );
     return `    <body name="world-object-${index}" pos="${numbers(worldVector(bodyPosition))}">
-${joint}${geometry}
+${joint}${geometry}${interactionGeometry ? `\n${interactionGeometry}` : ""}
     </body>`;
   }).join("\n");
   return `<mujoco model="g1_43dof world">
@@ -186,6 +199,37 @@ ${geoms}
 ${objectBodies}
   </worldbody>
 </mujoco>`;
+}
+
+function interactionPointGeometriesXml(
+  object: ResolvedHumanoidSceneObject,
+  objectIndex: number,
+  geometryOffset: HumanoidSceneSolid["center"]
+): string {
+  return object.interactionPoints
+    .filter(({ kind }) => kind !== "insert" && kind !== "support")
+    .map((point, pointIndex) => {
+      const position = addVector(geometryOffset, point.localPosition);
+      const radius = clamp(point.clearanceMeters * 0.32, 0.012, 0.032);
+      const geometry = interactionPointGeometry(point.kind, radius);
+      return `      <geom name="world-object-interaction-${objectIndex}-${pointIndex}-${xmlName(point.id)}" type="${geometry.type}" pos="${numbers(worldVector(position))}" size="${numbers(geometry.size)}" mass="0.015" friction="${friction(object)}" rgba="0.88 0.66 0.28 1"/>`;
+    }).join("\n");
+}
+
+function interactionPointGeometry(
+  kind: NonNullable<HumanoidSceneObject["interactionPoints"]>[number]["kind"],
+  radius: number
+): { type: "sphere" | "capsule"; size: number[] } {
+  if (kind === "pull") {
+    return {
+      type: "capsule",
+      size: [
+        Math.min(radius, 0.022),
+        clamp(radius * 2.4, 0.035, 0.065)
+      ]
+    };
+  }
+  return { type: "sphere", size: [radius] };
 }
 
 function sceneObjectJointXml(object: ResolvedHumanoidSceneObject, index: number): string {
@@ -332,6 +376,10 @@ function numbers(values: readonly number[]): string {
 
 function number(value: number): number {
   return Number(value.toFixed(6));
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function xmlName(value: string): string {

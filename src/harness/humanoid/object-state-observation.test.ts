@@ -101,10 +101,11 @@ describe("humanoid role object observation", () => {
           hands: expect.objectContaining({
             left: expect.objectContaining({
               current_wrist_world: expect.any(Object),
-              surface_center_alignments: expect.arrayContaining([
+              interaction_alignments: expect.arrayContaining([
                 expect.objectContaining({
-                  hand_surface: "left_hand_palm_link",
-                  wrist_world_if_surface_at_object_center: expect.any(Object),
+                  interaction_point_id: expect.any(String),
+                  hand_surface: expect.any(String),
+                  wrist_world_target: expect.any(Object),
                   delta_from_current_wrist_world: expect.any(Object),
                   distance_from_current_wrist_m: expect.any(Number),
                   ik_reference_reachable: expect.any(Boolean)
@@ -120,19 +121,21 @@ describe("humanoid role object observation", () => {
       }
       const hands = record(geometries[0]).hands;
       const leftAlignments = record(record(hands).left)
-        .surface_center_alignments;
+        .interaction_alignments;
       if (!Array.isArray(leftAlignments)) {
         throw new Error("Expected left-hand reachability alignments");
       }
+      expect(leftAlignments.length).toBeGreaterThan(0);
+      expect(new Set(leftAlignments.map((alignment) => (
+        record(alignment).interaction_point_id
+      ))).size).toBe(leftAlignments.length);
       expect(leftAlignments).toEqual(expect.arrayContaining([
         expect.objectContaining({
-          hand_surface: "left_hand_middle_1_link",
-          ik_reference_reachable: true,
-          ik_residual_m: expect.any(Number)
-        }),
-        expect.objectContaining({
-          hand_surface: "left_hand_palm_link",
-          ik_reference_reachable: false,
+          interaction_point_id: expect.any(String),
+          hand_surface: expect.stringMatching(/^left_/),
+          wrist_world_target: expect.any(Object),
+          wrist_world_orientation: expect.anything(),
+          ik_reference_reachable: expect.any(Boolean),
           ik_residual_m: expect.any(Number)
         })
       ]));

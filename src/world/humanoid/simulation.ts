@@ -15,6 +15,7 @@ import {
 import {
   HUMANOID_HEAD_SENSOR,
   HUMANOID_BODY_NAMES,
+  HUMANOID_JOINT_INDEX,
   HUMANOID_JOINT_NAMES,
   YAHMP_POLICY,
   type HumanoidBodyName,
@@ -82,7 +83,8 @@ import type {
   HumanoidControllerState,
   HumanoidJointPositionCommand,
   HumanoidPolicyState,
-  HumanoidWholeBodyController
+  HumanoidWholeBodyController,
+  HumanoidWholeBodyControllerFactory
 } from "./whole-body-controller.js";
 
 const ORIENTATION_IK_WEIGHT = 0.25;
@@ -103,7 +105,12 @@ export interface HumanoidSimulationOptions {
   spawn?: HumanoidSpawn;
   solids?: readonly HumanoidSceneSolid[];
   objects?: readonly HumanoidSceneObject[];
-  controllerFactory?: () => Promise<HumanoidWholeBodyController>;
+  controllerFactory?: HumanoidWholeBodyControllerFactory;
+}
+
+export interface HumanoidPlanningRootPose {
+  position: Vec3;
+  yawRadians: number;
 }
 
 interface ResolvedHumanoidSimulationOptions
@@ -868,9 +875,14 @@ export class HumanoidSimulation {
       initialConfiguration?: "reference" | "current";
       preserveTrackingWeights?: boolean;
       maximumReferenceCorrectionRadians?: number;
+      planningRootPose?: HumanoidPlanningRootPose;
+      allowBestEffort?: boolean;
     } = {}
   ): HumanoidTaskSpaceSolution {
     if (targets.length === 0) return { reference, residuals: [] };
+    if (options.allowBestEffort && options.initialConfiguration !== "current") {
+      throw new Error("Best-effort task-space servo requires current-state initialization");
+    }
     if (new Set(targets.map((target) => target.body)).size !== targets.length) {
       throw new Error("A task-space keyframe cannot repeat an end effector");
     }
@@ -887,10 +899,16 @@ export class HumanoidSimulation {
     const saved = this.captureState();
     try {
       if (options.initialConfiguration === "current") {
+        if (options.planningRootPose) {
+          throw new Error("A current-state task-space solve cannot override the planning root pose");
+        }
         this.#validateReference(reference);
         this.#runtime.mj_forward(this.#model, this.#data);
       } else {
         this.#setReferenceConfiguration(reference);
+        if (options.planningRootPose) {
+          this.#setPlanningRootPose(options.planningRootPose);
+        }
       }
       const pelvis = this.#linkPosition("pelvis");
       const pelvisRotation = worldQuaternion(this.#data.xquat, this.#pelvisBodyId * 4);
@@ -912,9 +930,22 @@ export class HumanoidSimulation {
       }));
       const jointIndexes = [...new Set(resolved.flatMap((target) => (
         target.orientation
-          ? humanoidEndEffectorPoseJointIndexes(target.body)
-          : humanoidEndEffectorJointIndexes(target.body)
+          ? humanoidEndEffectorPoseJointIndexes(
+              target.body,
+              target.kinematicScope ?? "arm_only"
+            )
+          : humanoidEndEffectorJointIndexes(
+              target.body,
+              target.kinematicScope ?? "arm_only"
+            )
       )))];
+      const regularizedWaistJointIndexes = new Set(resolved
+        .filter((target) => target.kinematicScope === "whole_body_reach")
+        .flatMap(() => [
+          HUMANOID_JOINT_INDEX.get("waist_yaw_joint")!,
+          HUMANOID_JOINT_INDEX.get("waist_roll_joint")!,
+          HUMANOID_JOINT_INDEX.get("waist_pitch_joint")!
+        ]));
       const positionJacobian = new this.#runtime.DoubleBuffer(3 * this.#model.nv);
       const rotationJacobian = new this.#runtime.DoubleBuffer(3 * this.#model.nv);
       try {
@@ -926,7 +957,18 @@ export class HumanoidSimulation {
             ...(target.orientation ? { rotation: this.#linkRotation(target.body) } : {})
           }));
           if (resolved.every((target, index) => (
-            endEffectorTargetSatisfied(target, states[index]!)
+            endEffectorTargetSatisfied(
+              target,
+              states[index]!,
+              target.servoMode === "task_tolerance"
+                ? null
+                : {
+                    position: HUMANOID_TASK_SPACE_SERVO_AUTHORITY
+                      .generationPositionConvergenceMeters,
+                    orientation: HUMANOID_TASK_SPACE_SERVO_AUTHORITY
+                      .generationOrientationConvergenceRadians
+                  }
+            )
           ))) {
             return this.#taskSpaceSolution(
               reference,
@@ -992,6 +1034,20 @@ export class HumanoidSimulation {
               row += 3;
             }
           }
+          const postureWeight = Math.sqrt(
+            HUMANOID_TASK_SPACE_SERVO_AUTHORITY.wholeBodyPostureWeight
+          );
+          for (const jointIndex of regularizedWaistJointIndexes) {
+            const column = jointIndexes.indexOf(jointIndex);
+            if (column < 0) continue;
+            const postureRow = new Array<number>(jointIndexes.length).fill(0);
+            postureRow[column] = postureWeight;
+            jacobian.push(postureRow);
+            const address = this.#jointPositionAddresses[jointIndex]!;
+            error.push(postureWeight * (
+              reference.jointPositions[jointIndex]! - this.#data.qpos[address]!
+            ));
+          }
           const delta = dampedLeastSquares(
             jacobian,
             error,
@@ -1002,14 +1058,22 @@ export class HumanoidSimulation {
             const jointId = this.#jointIds[jointIndex]!;
             const rangeOffset = jointId * 2;
             const address = this.#jointPositionAddresses[jointIndex]!;
+            const postureMinimum = regularizedWaistJointIndexes.has(jointIndex)
+              ? reference.jointPositions[jointIndex]!
+                - HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumWaistDisplacementRadians
+              : Number.NEGATIVE_INFINITY;
+            const postureMaximum = regularizedWaistJointIndexes.has(jointIndex)
+              ? reference.jointPositions[jointIndex]!
+                + HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumWaistDisplacementRadians
+              : Number.POSITIVE_INFINITY;
             this.#data.qpos[address] = clamp(
               this.#data.qpos[address]! + clamp(
                 delta[column] ?? 0,
                 -HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumJointDeltaRadians,
                 HUMANOID_TASK_SPACE_SERVO_AUTHORITY.maximumJointDeltaRadians
               ),
-              this.#model.jnt_range[rangeOffset]!,
-              this.#model.jnt_range[rangeOffset + 1]!
+              Math.max(this.#model.jnt_range[rangeOffset]!, postureMinimum),
+              Math.min(this.#model.jnt_range[rangeOffset + 1]!, postureMaximum)
             );
           }
           this.#runtime.mj_forward(this.#model, this.#data);
@@ -1034,6 +1098,15 @@ export class HumanoidSimulation {
             }
           : {})
       }));
+      if (options.allowBestEffort) {
+        return this.#taskSpaceSolution(
+          reference,
+          resolved,
+          jointIndexes,
+          !options.preserveTrackingWeights,
+          maximumReferenceCorrectionRadians
+        );
+      }
       throw new HumanoidTaskSpaceIkError(residuals);
     } finally {
       this.restoreState(saved);
@@ -1042,7 +1115,8 @@ export class HumanoidSimulation {
 
   measureEndEffectorTargets(
     reference: HumanoidReference,
-    templates: readonly HumanoidEndEffectorTarget[]
+    templates: readonly HumanoidEndEffectorTarget[],
+    options: { planningRootPose?: HumanoidPlanningRootPose } = {}
   ): HumanoidEndEffectorTarget[] {
     if (templates.length === 0) return [];
     if (new Set(templates.map((target) => target.body)).size !== templates.length) {
@@ -1052,6 +1126,9 @@ export class HumanoidSimulation {
     const saved = this.captureState();
     try {
       this.#setReferenceConfiguration(reference);
+      if (options.planningRootPose) {
+        this.#setPlanningRootPose(options.planningRootPose);
+      }
       const pelvisPosition = this.#linkPosition("pelvis");
       const pelvisRotation = this.#linkRotation("pelvis");
       const inversePelvis = inverseQuaternion(pelvisRotation);
@@ -1131,6 +1208,21 @@ export class HumanoidSimulation {
     this.#runtime.mj_forward(this.#model, this.#data);
   }
 
+  #setPlanningRootPose(pose: HumanoidPlanningRootPose): void {
+    if (![pose.position.x, pose.position.y, pose.position.z, pose.yawRadians]
+      .every(Number.isFinite)) {
+      throw new Error("Humanoid planning root pose must be finite");
+    }
+    this.#data.qpos[0] = pose.position.z;
+    this.#data.qpos[1] = pose.position.x;
+    this.#data.qpos[2] = pose.position.y;
+    this.#data.qpos[3] = Math.cos(pose.yawRadians / 2);
+    this.#data.qpos[4] = 0;
+    this.#data.qpos[5] = 0;
+    this.#data.qpos[6] = Math.sin(pose.yawRadians / 2);
+    this.#runtime.mj_forward(this.#model, this.#data);
+  }
+
   #linkPosition(body: HumanoidBodyName): Vec3 {
     const bodyIndex = HUMANOID_BODY_NAMES.indexOf(body);
     if (bodyIndex < 0) throw new Error(`Unknown humanoid task-space body: ${body}`);
@@ -1166,7 +1258,8 @@ export class HumanoidSimulation {
       for (const target of targets) {
         for (const index of humanoidEndEffectorTrackingJointIndexes(
           target.body,
-          target.orientation !== undefined
+          target.orientation !== undefined,
+          target.kinematicScope ?? "arm_only"
         )) {
           jointTrackingWeights[index] = 1;
         }
@@ -1588,16 +1681,20 @@ function solidVisibilityPoints(solid: HumanoidSceneSolid): Vec3[] {
 
 function endEffectorTargetSatisfied(
   target: HumanoidEndEffectorTarget,
-  state: { position: Vec3; rotation?: Quaternion }
+  state: { position: Vec3; rotation?: Quaternion },
+  convergenceCap: { position: number; orientation: number } | null
 ): boolean {
   if (vectorDistance(target.position, state.position)
-    > HUMANOID_TASK_SPACE_SERVO_AUTHORITY.positionConvergenceMeters) {
+    > Math.min(target.tolerance, convergenceCap?.position ?? target.tolerance)) {
     return false;
   }
   if (!target.orientation) return true;
   return state.rotation !== undefined
     && quaternionAngularDistance(target.orientation, state.rotation)
-      <= HUMANOID_TASK_SPACE_SERVO_AUTHORITY.orientationConvergenceRadians;
+      <= Math.min(
+        target.orientationTolerance!,
+        convergenceCap?.orientation ?? target.orientationTolerance!
+      );
 }
 
 function vectorValues(value: Vec3, multiplier = 1): number[] {

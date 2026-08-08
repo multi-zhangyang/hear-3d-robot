@@ -43,6 +43,8 @@ const door = {
     velocity: 0,
     range: { minimum: 0, maximum: 1.5 },
     open_fraction: 0.4 / 1.5,
+    closed_position: 0,
+    open_position: 1.5,
     state: "intermediate"
   },
   relations: {
@@ -79,17 +81,51 @@ function observation(): HumanoidWorldObservation {
     },
     robot: {
       rootPosition: { x: 1, y: 0.76, z: 1 },
+      rootRotation: { x: 0, y: 0, z: 0, w: 1 },
+      contacts: [],
       links: {
-        left_wrist_yaw_link: { position: { x: 0.75, y: 1, z: 1.15 } },
-        right_wrist_yaw_link: { position: { x: 1.25, y: 1, z: 1.15 } }
+        left_ankle_roll_link: {
+          position: { x: 0.88, y: 0.08, z: 1 },
+          rotation: { x: 0, y: 0, z: 0, w: 1 }
+        },
+        right_ankle_roll_link: {
+          position: { x: 1.12, y: 0.08, z: 1 },
+          rotation: { x: 0, y: 0, z: 0, w: 1 }
+        },
+        left_wrist_yaw_link: {
+          position: { x: 0.75, y: 1, z: 1.15 },
+          rotation: { x: 0, y: 0, z: 0, w: 1 }
+        },
+        right_wrist_yaw_link: {
+          position: { x: 1.25, y: 1, z: 1.15 },
+          rotation: { x: 0, y: 0, z: 0, w: 1 }
+        }
       }
     },
     handSurfaces: [{
       hand: "right",
       handSurface: "right_hand_palm_link",
+      worldPosition: { x: 1.25, y: 1, z: 1.23 },
+      worldRotation: { x: 0, y: 0, z: 0, w: 1 },
       wristWorldPosition: { x: 1.25, y: 1, z: 1.15 },
       surfaceFromWristWorld: { x: 0, y: 0, z: 0.08 }
     }],
+    manipulationReachability: [],
+    manipulationBasePlacements: [],
+    handCoordination: {
+      left: {
+        thumb_opposition: 0,
+        thumb_curl: 0,
+        index_curl: 0,
+        middle_curl: 0
+      },
+      right: {
+        thumb_opposition: 0,
+        thumb_curl: 0,
+        index_curl: 0,
+        middle_curl: 0
+      }
+    },
     solidTokens: [{
       id: "stone:4:6",
       sourceId: "stone:4:6",
@@ -218,6 +254,104 @@ describe("humanoid skill binding", () => {
   });
 
   it("binds a model-selected open phase to live affordance and articulation evidence", () => {
+    const reachObservation = observation();
+    const wristWorldPosition = { x: 1.25, y: 1, z: 1.15 };
+    reachObservation.handSurfaces.push(...[
+      ["right_hand_thumb_2_link", { x: -0.025, y: 0.01, z: 0.1 }],
+      ["right_hand_index_1_link", { x: 0.02, y: 0, z: 0.11 }],
+      ["right_hand_middle_1_link", { x: 0, y: 0, z: 0.115 }]
+    ].map(([handSurface, offset]) => ({
+      hand: "right" as const,
+      handSurface: handSurface as "right_hand_thumb_2_link"
+        | "right_hand_index_1_link" | "right_hand_middle_1_link",
+      worldPosition: {
+        x: wristWorldPosition.x + (offset as { x: number }).x,
+        y: wristWorldPosition.y + (offset as { y: number }).y,
+        z: wristWorldPosition.z + (offset as { z: number }).z
+      },
+      worldRotation: { x: 0, y: 0, z: 0, w: 1 },
+      wristWorldPosition,
+      surfaceFromWristWorld: offset as { x: number; y: number; z: number }
+    })));
+    const reach = bindHumanoidSkill({
+      transactionId: "skill-call-reach",
+      agentId: "humanoid-motion-reference",
+      request: {
+        invocation: {
+          skill: "open",
+          object_id: "cabinet-door",
+          interaction_point_id: "door-handle",
+          joint_id: "cabinet-hinge",
+          hand: "right",
+          minimum_open_fraction: 0.8
+        },
+        phase: "reach_handle"
+      },
+      observation: reachObservation
+    });
+    if (!reach.accepted) throw new Error("Expected reach-handle binding");
+    const reachPlan = planAutonomousHumanoidSkill({
+      binding: reach.binding,
+      observation: reachObservation
+    });
+    if (reachPlan.kind !== "motion") throw new Error("Expected reach motion");
+    expect(reachPlan.batch.termination.predicates).toEqual([{
+      type: "hand_contact_object_region",
+      hand: "right",
+      object_id: "cabinet-door",
+      center_world: { x: 2.35, y: 1, z: 3 },
+      maximum_distance_m: 0.06,
+      minimum_normal_force: 1,
+      minimum_distinct_surfaces: 1
+    }, {
+      type: "root_near_point",
+      target: reachObservation.robot.rootPosition,
+      tolerance_m: 0.08
+    }]);
+    for (const candidate of reachPlan.batch.candidates) {
+      const stage = candidate.keyframes.at(-2)?.right_hand;
+      const contact = candidate.keyframes.at(-1)?.right_hand;
+      expect(candidate.keyframes).toHaveLength(6);
+      expect(stage?.orientation).toEqual(
+        reachObservation.robot.links.right_wrist_yaw_link.rotation
+      );
+      expect(contact?.orientation).not.toEqual(stage?.orientation);
+      expect(Math.hypot(
+        (contact?.position.x ?? 0) - (stage?.position.x ?? 0),
+        (contact?.position.y ?? 0) - (stage?.position.y ?? 0),
+        (contact?.position.z ?? 0) - (stage?.position.z ?? 0)
+      ))
+        .toBeGreaterThan(0.15);
+    }
+
+    const establish = bindHumanoidSkill({
+      transactionId: "skill-call-grasp",
+      agentId: "humanoid-motion-reference",
+      request: {
+        invocation: reach.binding.invocation,
+        phase: "establish_grasp"
+      },
+      observation: reachObservation
+    });
+    if (!establish.accepted) throw new Error("Expected establish-grasp binding");
+    const establishPlan = planAutonomousHumanoidSkill({
+      binding: establish.binding,
+      observation: reachObservation
+    });
+    if (establishPlan.kind !== "motion") throw new Error("Expected grasp motion");
+    expect(establishPlan.batch.termination.predicates).toEqual([
+      expect.objectContaining({
+        type: "hand_contact_object_region",
+        minimum_distinct_surfaces: 2
+      }),
+      expect.objectContaining({
+        type: "hand_coordination_displaced",
+        hand: "right",
+        origin: reachObservation.handCoordination.right
+      }),
+      expect.objectContaining({ type: "root_near_point" })
+    ]);
+
     const result = bindHumanoidSkill({
       transactionId: "skill-call-1",
       agentId: "humanoid-motion-reference",
@@ -245,6 +379,31 @@ describe("humanoid skill binding", () => {
       }
     });
     if (!result.accepted) throw new Error("Expected skill binding");
+
+    const planned = planAutonomousHumanoidSkill({
+      binding: result.binding,
+      observation: observation()
+    });
+    if (planned.kind !== "motion") throw new Error("Expected articulation motion");
+    expect(planned.batch.termination.predicates).toEqual([
+      expect.objectContaining({
+        type: "hand_contact_object_any",
+        hand: "right",
+        object_id: "cabinet-door"
+      }),
+      expect.objectContaining({
+        type: "articulation_displaced",
+        object_id: "cabinet-door",
+        joint_id: "cabinet-hinge",
+        origin_position: 0.4,
+        direction: "increasing"
+      })
+    ]);
+    const segment = planned.batch.termination.predicates[1];
+    expect(segment?.type === "articulation_displaced"
+      ? segment.minimum_delta : 0).toBeGreaterThan(0);
+    expect(segment?.type === "articulation_displaced"
+      ? segment.minimum_delta : Infinity).toBeLessThan(0.4);
 
     expect(validateSkillPlanningReference({
       binding: result.binding,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   G1HandArtifactCommandSchema,
   createG1HandArtifactCommand,
+  g1HandCoordinationFromJointPositions,
   g1HandCoordinationFromJointTargets,
   interpolateG1HandCoordination,
   resolveG1HandCoordination,
@@ -110,5 +111,16 @@ describe("G1 hand coordination", () => {
         expect(recovered[hand][channel]).toBeCloseTo(coordination[hand][channel], 12);
       }
     }
+  });
+
+  it("clamps finite measured overshoot without weakening target validation", () => {
+    const positions = resolveG1HandCoordination(FULL_COORDINATION);
+    positions.left_hand_thumb_2_joint += 0.02;
+    positions.right_hand_index_0_joint += 0.02;
+
+    expect(() => g1HandCoordinationFromJointTargets(positions)).toThrow();
+    expect(g1HandCoordinationFromJointPositions(positions)).toEqual(
+      FULL_COORDINATION
+    );
   });
 });

@@ -22,6 +22,7 @@ export interface RegisteredHumanoidSkillPlan {
   observed_frame: number;
   world_revision: number;
   completed_node_ids: string[];
+  completed_phases_by_node: Record<string, string[]>;
 }
 
 export const RegisteredHumanoidSkillPlanSchema = z.object({
@@ -33,7 +34,11 @@ export const RegisteredHumanoidSkillPlanSchema = z.object({
   selected_strategy_id: z.string().trim().min(1),
   observed_frame: z.number().int().nonnegative(),
   world_revision: z.number().int().nonnegative(),
-  completed_node_ids: z.array(z.string().trim().min(1)).max(16)
+  completed_node_ids: z.array(z.string().trim().min(1)).max(16),
+  completed_phases_by_node: z.record(
+    z.string().trim().min(1),
+    z.array(z.string().trim().min(1)).max(16)
+  ).default({})
 }).strict().superRefine((plan, context) => {
   if (plan.proposal_sha256 !== modelPayloadSha256(plan.proposal)) {
     context.addIssue({
@@ -61,6 +66,29 @@ export const RegisteredHumanoidSkillPlanSchema = z.object({
       message: "Registered Skill plan completion state is invalid"
     });
   }
+  for (const [nodeId, phases] of Object.entries(
+    plan.completed_phases_by_node
+  )) {
+    const node = selected?.nodes.find((candidate) => candidate.node_id === nodeId);
+    const actionable = node ? actionableSkillPhases(node.invocation) : [];
+    const isPrefix = phases.every((phase, index) => actionable[index] === phase);
+    if (!node || new Set(phases).size !== phases.length || !isPrefix) {
+      context.addIssue({
+        code: "custom",
+        path: ["completed_phases_by_node", nodeId],
+        message: "Registered Skill phase progress is invalid"
+      });
+      continue;
+    }
+    const nodeCompleted = plan.completed_node_ids.includes(nodeId);
+    if (nodeCompleted !== (phases.length === actionable.length)) {
+      context.addIssue({
+        code: "custom",
+        path: ["completed_phases_by_node", nodeId],
+        message: "Registered Skill node and phase completion disagree"
+      });
+    }
+  }
 });
 
 export function registerHumanoidSkillPlan(input: {
@@ -70,7 +98,9 @@ export function registerHumanoidSkillPlan(input: {
   observedFrame: number;
   worldRevision: number;
 }): RegisteredHumanoidSkillPlan {
-  const proposal = HumanoidSkillPlanProposalSchema.parse(input.proposal);
+  const proposal = compileHumanoidSkillDependencies(
+    HumanoidSkillPlanProposalSchema.parse(input.proposal)
+  );
   return RegisteredHumanoidSkillPlanSchema.parse({
     protocol: "humanoid-skill-plan-v1",
     transaction_id: input.transactionId,
@@ -80,8 +110,68 @@ export function registerHumanoidSkillPlan(input: {
     selected_strategy_id: proposal.selected_strategy_id,
     observed_frame: input.observedFrame,
     world_revision: input.worldRevision,
-    completed_node_ids: []
+    completed_node_ids: [],
+    completed_phases_by_node: {}
   });
+}
+
+export function compileHumanoidSkillDependencies(
+  proposal: HumanoidSkillPlanProposal
+): HumanoidSkillPlanProposal {
+  const compiled = structuredClone(proposal);
+  for (const strategy of compiled.strategies) {
+    strategy.nodes.forEach((node, index) => {
+      const prerequisiteSkills = prerequisiteSkillGroups(node.invocation.skill);
+      for (const alternatives of prerequisiteSkills) {
+        const prerequisite = strategy.nodes.slice(0, index).findLast((candidate) => (
+          alternatives.includes(candidate.invocation.skill)
+            && invocationsShareTarget(candidate.invocation, node.invocation)
+            && handsCompatible(candidate.invocation, node.invocation)
+        ));
+        if (prerequisite
+          && !node.depends_on_node_ids.includes(prerequisite.node_id)) {
+          node.depends_on_node_ids.push(prerequisite.node_id);
+        }
+      }
+      node.depends_on_node_ids.sort();
+    });
+  }
+  return HumanoidSkillPlanProposalSchema.parse(compiled);
+}
+
+function prerequisiteSkillGroups(
+  skill: HumanoidSkillInvocation["skill"]
+): HumanoidSkillInvocation["skill"][][] {
+  if (skill === "reach") return [["approach"]];
+  if (skill === "grasp") return [["reach"], ["approach"]];
+  if (skill === "lift") return [["grasp", "regrasp", "bimanual_support"]];
+  if (skill === "carry" || skill === "bimanual_carry") {
+    return [["lift", "grasp", "regrasp", "bimanual_support"]];
+  }
+  if (skill === "place") {
+    return [["carry", "bimanual_carry", "lift", "grasp", "regrasp"]];
+  }
+  if (["push", "pull", "press", "open", "close", "turn"].includes(skill)) {
+    return [["reach"], ["approach"]];
+  }
+  return [];
+}
+
+function invocationsShareTarget(
+  left: HumanoidSkillInvocation,
+  right: HumanoidSkillInvocation
+): boolean {
+  return "object_id" in left && "object_id" in right
+    && left.object_id === right.object_id;
+}
+
+function handsCompatible(
+  left: HumanoidSkillInvocation,
+  right: HumanoidSkillInvocation
+): boolean {
+  const leftHand = "hand" in left ? left.hand : null;
+  const rightHand = "hand" in right ? right.hand : null;
+  return leftHand === null || rightHand === null || leftHand === rightHand;
 }
 
 export function authorizeHumanoidSkillPlanNode(input: {
@@ -89,6 +179,7 @@ export function authorizeHumanoidSkillPlanNode(input: {
   planTransactionId: string | null;
   nodeId: string | null;
   invocation: HumanoidSkillInvocation;
+  phase: string;
   agentId: string;
   currentWorldRevision: number;
 }):
@@ -142,6 +233,24 @@ export function authorizeHumanoidSkillPlanNode(input: {
       completed_node_ids: plan.completed_node_ids
     });
   }
+  if (plan.completed_node_ids.includes(node.node_id)) {
+    return rejection("skill_plan_node_completed", {
+      node_id: node.node_id,
+      completed_node_ids: plan.completed_node_ids
+    });
+  }
+  const actionablePhases = actionableSkillPhases(node.invocation);
+  const completedPhases = completedSkillPhases(plan, node.node_id, node.invocation);
+  const expectedPhase = actionablePhases[completedPhases.length];
+  if (input.phase !== expectedPhase) {
+    return rejection("skill_plan_phase_out_of_order", {
+      node_id: node.node_id,
+      requested_phase: input.phase,
+      expected_phase: expectedPhase ?? null,
+      completed_phases: completedPhases,
+      actionable_phases: actionablePhases
+    });
+  }
   return { accepted: true, node: structuredClone(node) };
 }
 
@@ -154,23 +263,55 @@ export function advanceHumanoidSkillPlan(input: {
   if (!input.executionSucceeded) return null;
   const next = structuredClone(input.plan);
   next.world_revision = input.worldRevision;
-  if (humanoidSkillPhaseCompletesNode(input.binding)) {
-    const nodeId = input.binding.skill_node_id;
-    if (nodeId && !next.completed_node_ids.includes(nodeId)) {
-      next.completed_node_ids.push(nodeId);
-      next.completed_node_ids.sort();
-    }
+  const nodeId = input.binding.skill_node_id;
+  const strategy = next.proposal.strategies.find(
+    ({ strategy_id: strategyId }) => strategyId === next.selected_strategy_id
+  );
+  const node = strategy?.nodes.find(({ node_id: candidateId }) => candidateId === nodeId);
+  if (!node || nodeId === null) {
+    throw new Error("Executed Skill binding does not reference its selected DAG node");
   }
-  return next;
+  const actionablePhases = actionableSkillPhases(node.invocation);
+  const completedPhases = completedSkillPhases(next, nodeId, node.invocation);
+  const expectedPhase = actionablePhases[completedPhases.length];
+  if (input.binding.phase !== expectedPhase) {
+    throw new Error(
+      `Executed Skill phase is out of order: expected ${expectedPhase ?? "none"}, `
+      + `received ${input.binding.phase}`
+    );
+  }
+  const advancedPhases = [...completedPhases, input.binding.phase];
+  next.completed_phases_by_node = {
+    ...next.completed_phases_by_node,
+    [nodeId]: advancedPhases
+  };
+  if (advancedPhases.length === actionablePhases.length
+    && !next.completed_node_ids.includes(nodeId)) {
+    next.completed_node_ids.push(nodeId);
+    next.completed_node_ids.sort();
+  }
+  return RegisteredHumanoidSkillPlanSchema.parse(next);
 }
 
-function humanoidSkillPhaseCompletesNode(
-  binding: ActiveHumanoidSkillBinding
-): boolean {
-  const actionable = HUMANOID_SKILL_CONTRACTS[binding.invocation.skill].process
+function actionableSkillPhases(
+  invocation: HumanoidSkillInvocation
+): string[] {
+  return HUMANOID_SKILL_CONTRACTS[invocation.skill].process
     .filter(({ authority }) => authority === "navigation"
-      || authority === "whole_body" || authority === "grasp");
-  return actionable.at(-1)?.phase === binding.phase;
+      || authority === "whole_body" || authority === "grasp")
+    .map(({ phase }) => phase);
+}
+
+function completedSkillPhases(
+  plan: RegisteredHumanoidSkillPlan,
+  nodeId: string,
+  invocation: HumanoidSkillInvocation
+): string[] {
+  const explicit = plan.completed_phases_by_node[nodeId];
+  if (explicit) return [...explicit];
+  return plan.completed_node_ids.includes(nodeId)
+    ? actionableSkillPhases(invocation)
+    : [];
 }
 
 function rejection(code: string, detail: Record<string, unknown>): {

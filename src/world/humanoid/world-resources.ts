@@ -10,6 +10,9 @@ import {
 } from "./physical-region.js";
 import { HumanoidRolloutSimulationPool } from "./rollout-simulation-pool.js";
 import { HumanoidSimulation } from "./simulation.js";
+import type {
+  HumanoidWholeBodyControllerFactory
+} from "./whole-body-controller.js";
 
 export interface HumanoidWorldResources {
   simulation: HumanoidSimulation;
@@ -29,14 +32,19 @@ export async function createHumanoidWorldResources(
   anchors: readonly Pick<Vec3, "x" | "z">[] = [{
     x: scenario.robot.x,
     z: scenario.robot.z
-  }]
+  }],
+  controllerFactory?: HumanoidWholeBodyControllerFactory
 ): Promise<HumanoidWorldResources> {
   const navigation = new HumanoidNavigationPlanner(
     scenario,
     HUMANOID_NAVIGATION_PROFILE
   );
   try {
-    const physics = await createHumanoidPhysicsResources(scenario, anchors);
+    const physics = await createHumanoidPhysicsResources(
+      scenario,
+      anchors,
+      controllerFactory
+    );
     return { ...physics, navigation };
   } catch (error) {
     await navigation.dispose();
@@ -46,16 +54,20 @@ export async function createHumanoidWorldResources(
 
 export async function createHumanoidPhysicsResources(
   scenario: Scenario,
-  anchors: readonly Pick<Vec3, "x" | "z">[]
+  anchors: readonly Pick<Vec3, "x" | "z">[],
+  controllerFactory?: HumanoidWholeBodyControllerFactory
 ): Promise<HumanoidPhysicsResources> {
   const physicalRegion = humanoidPhysicalRegion(scenario, anchors);
   const environment = humanoidEnvironment(scenario, physicalRegion);
+  const simulationOptions = controllerFactory
+    ? { ...environment, controllerFactory }
+    : environment;
   let simulation: HumanoidSimulation | undefined;
   let rolloutPool: HumanoidRolloutSimulationPool | undefined;
   try {
     [simulation, rolloutPool] = await Promise.all([
-      HumanoidSimulation.create(environment),
-      HumanoidRolloutSimulationPool.create(environment)
+      HumanoidSimulation.create(simulationOptions),
+      HumanoidRolloutSimulationPool.create(simulationOptions)
     ]);
     return { simulation, rolloutPool, physicalRegion };
   } catch (error) {

@@ -1,4 +1,4 @@
-import type { Vec3 } from "../../domain/schema.js";
+import type { Quaternion, Vec3 } from "../../domain/schema.js";
 import type { ScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
 import type { HumanoidAuthorityIdentity } from "./authority-state.js";
 import type {
@@ -34,6 +34,9 @@ import type { G1HandContactSurfaceName } from "./morphology.js";
 import type { G1HandCoordination } from "./hand-coordination.js";
 import type { HumanoidNavigationArrivalHeading } from "./navigation-arrival.js";
 import type { HumanoidSpatialBeliefObservation } from "./spatial-belief-map.js";
+import type {
+  HumanoidWholeBodyControllerFactory
+} from "./whole-body-controller.js";
 
 export interface HumanoidWorldSnapshot {
   frame: number;
@@ -74,14 +77,17 @@ export interface HumanoidWorldObservation {
 
 export interface HumanoidManipulationReachabilityObservation {
   objectId: string;
+  interactionPointId?: string | undefined;
   handSurface: G1HandContactSurfaceName;
   wristWorldTarget: Vec3;
+  wristWorldOrientation?: Quaternion;
   ikReferenceReachable: boolean;
   ikResidualMeters: number | null;
 }
 
 export interface HumanoidManipulationBasePlacementObservation {
   objectId: string;
+  interactionPointId?: string | undefined;
   handSurface: G1HandContactSurfaceName;
   rootWorldTarget: Vec3;
   rootTranslationWorld: Vec3;
@@ -239,6 +245,7 @@ export interface HumanoidExecutionOptions {
 }
 
 export interface HumanoidWorldOptions {
+  controllerFactory?: HumanoidWholeBodyControllerFactory;
   motionGeneratorFactory?: () => Promise<HumanoidMotionGenerator>;
   planIntentLeaseSeconds?: number;
   scenarioChunks?: ScenarioChunkDeltaState;

@@ -5,7 +5,12 @@ import {
   type Vec3
 } from "../../domain/schema.js";
 import { type HumanoidBodyName } from "./model.js";
-import type { G1HandContactSurfaceName } from "./morphology.js";
+import {
+  G1_HAND_JOINT_NAMES,
+  type G1HandContactSurfaceName,
+  type G1HandJointName
+} from "./morphology.js";
+import { g1HandCoordinationFromJointPositions } from "./hand-coordination.js";
 import {
   humanoidEndEffectorPosition,
   humanoidEndEffectorRotation
@@ -60,7 +65,13 @@ export interface HumanoidMotionOptionRobotSnapshot {
     linearVelocity?: Vec3;
     angularVelocity?: Vec3;
   }>>;
+  hands?: {
+    joints: Readonly<Partial<Record<G1HandJointName, {
+      position: number;
+    }>>>;
+  };
   contacts: ReadonlyArray<{
+    position?: Vec3;
     normal?: Vec3 | null;
     normalForce: number;
     firstBody: HumanoidBodyName | null;
@@ -127,7 +138,8 @@ type PredicateUncertainty = "body_snapshot_missing"
   | "articulation_not_observable"
   | "relation_target_not_observable"
   | "relation_capability_missing"
-  | "balance_snapshot_missing";
+  | "balance_snapshot_missing"
+  | "hand_snapshot_missing";
 
 interface PredicateEvidenceBase {
   predicateIndex: number;
@@ -185,6 +197,50 @@ type HumanoidMotionOptionPredicateEvidence =
       maximumNormalForce: number | null;
       minimumNormalForce: number;
       reason?: Extract<PredicateUncertainty, "object_not_observable">;
+    }
+  | PredicateEvidenceBase & {
+      type: "hand_contact_object_any";
+      hand: "left" | "right";
+      objectId: string;
+      objectObservable: boolean;
+      maximumNormalForce: number | null;
+      minimumNormalForce: number;
+      distinctContactSurfaces: number | null;
+      minimumDistinctContactSurfaces: number;
+      reason?: Extract<PredicateUncertainty, "object_not_observable">;
+    }
+  | PredicateEvidenceBase & {
+      type: "hand_contact_object_region";
+      hand: "left" | "right";
+      objectId: string;
+      objectObservable: boolean;
+      centerWorld: Vec3;
+      maximumDistanceMeters: number;
+      closestContactDistanceMeters: number | null;
+      maximumNormalForce: number | null;
+      minimumNormalForce: number;
+      distinctContactSurfaces: number | null;
+      minimumDistinctContactSurfaces: number;
+      reason?: Extract<PredicateUncertainty, "object_not_observable">;
+    }
+  | PredicateEvidenceBase & {
+      type: "hand_coordination_displaced";
+      hand: "left" | "right";
+      origin: {
+        thumb_opposition: number;
+        thumb_curl: number;
+        index_curl: number;
+        middle_curl: number;
+      };
+      actual: {
+        thumb_opposition: number;
+        thumb_curl: number;
+        index_curl: number;
+        middle_curl: number;
+      } | null;
+      distance: number | null;
+      minimumDistance: number;
+      reason?: Extract<PredicateUncertainty, "hand_snapshot_missing">;
     }
   | PredicateEvidenceBase & {
       type: "body_contact_solid";
@@ -816,6 +872,49 @@ function detectPredicate(
       minimumSupportMarginMeters: predicate.minimum_support_margin_m
     };
   }
+  if (predicate.type === "hand_coordination_displaced") {
+    const joints = snapshot.hands?.joints;
+    const positions = joints && G1_HAND_JOINT_NAMES.every((joint) => (
+      Number.isFinite(joints[joint]?.position)
+    ))
+      ? Object.fromEntries(G1_HAND_JOINT_NAMES.map((joint) => [
+          joint,
+          joints[joint]!.position
+        ])) as Record<G1HandJointName, number>
+      : null;
+    if (!positions) {
+      return {
+        predicateIndex,
+        type: predicate.type,
+        status: "uncertain",
+        hand: predicate.hand,
+        origin: { ...predicate.origin },
+        actual: null,
+        distance: null,
+        minimumDistance: predicate.minimum_distance,
+        reason: "hand_snapshot_missing"
+      };
+    }
+    const actual = g1HandCoordinationFromJointPositions(positions)[predicate.hand];
+    const distance = Math.hypot(
+      actual.thumb_opposition - predicate.origin.thumb_opposition,
+      actual.thumb_curl - predicate.origin.thumb_curl,
+      actual.index_curl - predicate.origin.index_curl,
+      actual.middle_curl - predicate.origin.middle_curl
+    );
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: distance >= predicate.minimum_distance
+        ? "satisfied"
+        : "unsatisfied",
+      hand: predicate.hand,
+      origin: { ...predicate.origin },
+      actual,
+      distance,
+      minimumDistance: predicate.minimum_distance
+    };
+  }
   if (predicate.type === "body_contact_solid") {
     if (!solids.has(predicate.solid_id)) {
       return {
@@ -899,6 +998,61 @@ function detectPredicate(
       objectObservable: true,
       maximumNormalForce,
       minimumNormalForce: predicate.minimum_normal_force
+    };
+  }
+  if (predicate.type === "hand_contact_object_any") {
+    const contact = anyHandContactEvidence(
+      snapshot,
+      predicate.hand,
+      predicate.object_id,
+      predicate.minimum_normal_force
+    );
+    const minimumDistinctContactSurfaces = predicate.minimum_distinct_surfaces ?? 1;
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: contact.maximumNormalForce >= predicate.minimum_normal_force
+        && contact.distinctContactSurfaces >= minimumDistinctContactSurfaces
+        ? "satisfied"
+        : "unsatisfied",
+      hand: predicate.hand,
+      objectId: predicate.object_id,
+      objectObservable: true,
+      maximumNormalForce: contact.maximumNormalForce,
+      minimumNormalForce: predicate.minimum_normal_force,
+      distinctContactSurfaces: contact.distinctContactSurfaces,
+      minimumDistinctContactSurfaces
+    };
+  }
+  if (predicate.type === "hand_contact_object_region") {
+    const contact = anyHandContactEvidence(
+      snapshot,
+      predicate.hand,
+      predicate.object_id,
+      predicate.minimum_normal_force,
+      {
+        centerWorld: predicate.center_world,
+        maximumDistanceMeters: predicate.maximum_distance_m
+      }
+    );
+    const minimumDistinctContactSurfaces = predicate.minimum_distinct_surfaces ?? 1;
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: contact.maximumNormalForce >= predicate.minimum_normal_force
+        && contact.distinctContactSurfaces >= minimumDistinctContactSurfaces
+        ? "satisfied"
+        : "unsatisfied",
+      hand: predicate.hand,
+      objectId: predicate.object_id,
+      objectObservable: true,
+      centerWorld: { ...predicate.center_world },
+      maximumDistanceMeters: predicate.maximum_distance_m,
+      closestContactDistanceMeters: contact.closestContactDistanceMeters,
+      maximumNormalForce: contact.maximumNormalForce,
+      minimumNormalForce: predicate.minimum_normal_force,
+      distinctContactSurfaces: contact.distinctContactSurfaces,
+      minimumDistinctContactSurfaces
     };
   }
   if (predicate.type === "body_contact_object") {
@@ -1233,7 +1387,8 @@ function graspAssessmentIsPhysicallyUncertain(
 
 function unobservableObjectEvidence(
   predicate: Extract<HumanoidMotionOptionPredicate, {
-    type: "body_contact_object" | "hand_contact_object"
+    type: "body_contact_object" | "hand_contact_object" | "hand_contact_object_any"
+      | "hand_contact_object_region"
       | "object_near_point" | "object_in_zone" | "articulation_state"
       | "object_inside" | "object_on" | "object_displaced"
       | "articulation_displaced";
@@ -1263,6 +1418,39 @@ function unobservableObjectEvidence(
       objectObservable: false,
       maximumNormalForce: null,
       minimumNormalForce: predicate.minimum_normal_force,
+      reason: "object_not_observable"
+    };
+  }
+  if (predicate.type === "hand_contact_object_any") {
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: "uncertain",
+      hand: predicate.hand,
+      objectId: predicate.object_id,
+      objectObservable: false,
+      maximumNormalForce: null,
+      minimumNormalForce: predicate.minimum_normal_force,
+      distinctContactSurfaces: null,
+      minimumDistinctContactSurfaces: predicate.minimum_distinct_surfaces ?? 1,
+      reason: "object_not_observable"
+    };
+  }
+  if (predicate.type === "hand_contact_object_region") {
+    return {
+      predicateIndex,
+      type: predicate.type,
+      status: "uncertain",
+      hand: predicate.hand,
+      objectId: predicate.object_id,
+      objectObservable: false,
+      centerWorld: { ...predicate.center_world },
+      maximumDistanceMeters: predicate.maximum_distance_m,
+      closestContactDistanceMeters: null,
+      maximumNormalForce: null,
+      minimumNormalForce: predicate.minimum_normal_force,
+      distinctContactSurfaces: null,
+      minimumDistinctContactSurfaces: predicate.minimum_distinct_surfaces ?? 1,
       reason: "object_not_observable"
     };
   }
@@ -1397,6 +1585,56 @@ function maximumHandContactForce(
     if (matches) maximum = Math.max(maximum, contact.normalForce);
   }
   return maximum;
+}
+
+function anyHandContactEvidence(
+  snapshot: HumanoidMotionOptionRobotSnapshot,
+  hand: "left" | "right",
+  objectId: string,
+  minimumNormalForce: number,
+  region?: {
+    centerWorld: Vec3;
+    maximumDistanceMeters: number;
+  }
+): {
+  maximumNormalForce: number;
+  distinctContactSurfaces: number;
+  closestContactDistanceMeters: number | null;
+} {
+  let maximum = 0;
+  let closestContactDistanceMeters: number | null = null;
+  const surfaces = new Set<string>();
+  const prefix = `${hand}_hand_`;
+  for (const contact of snapshot.contacts) {
+    const matches = (contact.firstHandLink?.startsWith(prefix) === true
+      && contact.secondObject === objectId)
+      || (contact.secondHandLink?.startsWith(prefix) === true
+        && contact.firstObject === objectId);
+    if (!matches) continue;
+    const contactDistance = contact.position
+      ? distance(contact.position, region?.centerWorld ?? contact.position)
+      : null;
+    if (contactDistance !== null) {
+      closestContactDistanceMeters = Math.min(
+        closestContactDistanceMeters ?? Number.POSITIVE_INFINITY,
+        contactDistance
+      );
+    }
+    if (region && (contactDistance === null
+      || contactDistance > region.maximumDistanceMeters)) continue;
+    maximum = Math.max(maximum, contact.normalForce);
+    const surface = contact.firstHandLink?.startsWith(prefix) === true
+      ? contact.firstHandLink
+      : contact.secondHandLink?.startsWith(prefix) === true
+        ? contact.secondHandLink
+        : null;
+    if (surface && contact.normalForce >= minimumNormalForce) surfaces.add(surface);
+  }
+  return {
+    maximumNormalForce: maximum,
+    distinctContactSurfaces: surfaces.size,
+    closestContactDistanceMeters
+  };
 }
 
 function maximumSolidBodyContactForce(

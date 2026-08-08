@@ -4,6 +4,7 @@ import {
 } from "./motion-artifact.js";
 import {
   contactAwareG1GraspTargets,
+  contactAwareG1WristAdmittanceTargets,
   type G1ContactAwareGraspServoEvidence,
   type G1ContactAwareGraspTarget
 } from "./contact-aware-grasp-servo.js";
@@ -17,6 +18,11 @@ import type {
   HumanoidSimulationSnapshot
 } from "./simulation.js";
 import type { HumanoidEndEffectorBody } from "./task-space-targets.js";
+import {
+  stationKeepingHumanoidReference,
+  type HumanoidStationKeepingAnchor
+} from "./station-keeping.js";
+import { contactAwareTaskSpaceCompliance } from "./contact-aware-task-space-compliance.js";
 
 export interface HumanoidMotionFrameApplication {
   reference: HumanoidReference;
@@ -30,34 +36,76 @@ export async function applyHumanoidMotionArtifactFrame(
   options: {
     graspTargets?: readonly G1ContactAwareGraspTarget[];
     carryTaskSpaceTargets?: readonly HumanoidCarryTaskSpaceTarget[];
+    stationKeepingAnchor?: HumanoidStationKeepingAnchor;
+    stationKeepingCommand?: readonly [number, number];
   } = {}
 ): Promise<HumanoidMotionFrameApplication> {
   const artifactReference = hydrateHumanoidReference(frame.reference);
+  let currentSnapshot: HumanoidSimulationSnapshot | undefined;
+  const snapshotBeforeStep = (): HumanoidSimulationSnapshot => (
+    currentSnapshot ??= simulation.snapshot()
+  );
+  const taskSpaceTargets = frame.taskSpaceTargets
+    ? contactAwareG1WristAdmittanceTargets({
+        snapshot: snapshotBeforeStep(),
+        taskSpaceTargets: frame.taskSpaceTargets,
+        graspTargets: options.graspTargets ?? []
+      })
+    : undefined;
   const modelReference = frame.taskSpaceTargets
     ? simulation.solveEndEffectorTargets(
         artifactReference,
-        frame.taskSpaceTargets,
+        taskSpaceTargets!,
         {
           initialConfiguration: "current",
-          preserveTrackingWeights: true
+          preserveTrackingWeights: true,
+          allowBestEffort: true
         }
       ).reference
     : artifactReference;
+  const compliantModelReference = taskSpaceTargets
+    ? contactAwareTaskSpaceCompliance({
+        reference: modelReference,
+        snapshot: snapshotBeforeStep(),
+        taskSpaceTargets,
+        graspTargets: options.graspTargets ?? []
+      })
+    : modelReference;
   const modelControlledBodies = new Set<HumanoidEndEffectorBody>(
-    frame.taskSpaceTargets?.map((target) => target.body) ?? []
+    taskSpaceTargets?.map((target) => target.body) ?? []
   );
-  const reference = applyHumanoidCarryTaskSpaceServo({
+  const taskReference = applyHumanoidCarryTaskSpaceServo({
     simulation,
-    reference: modelReference,
+    reference: compliantModelReference,
     targets: options.carryTaskSpaceTargets ?? [],
     modelControlledBodies
   });
+  const reference = options.stationKeepingAnchor
+    ? stationKeepingHumanoidReference(
+        taskReference,
+        snapshotBeforeStep(),
+        options.stationKeepingAnchor,
+        {
+          preserveTrackedLowerBody: taskSpaceTargets?.some((target) => (
+            target.body === "left_ankle_roll_link"
+              || target.body === "right_ankle_roll_link"
+          )) ?? false,
+          ...(options.stationKeepingCommand
+            ? {
+                previousPlanarCommand: options.stationKeepingCommand,
+                controlStepSeconds:
+                  simulation.controllerDescriptor().controlStepSeconds
+              }
+            : {})
+        }
+      )
+    : taskReference;
   let graspServoEvidence: G1ContactAwareGraspServoEvidence | undefined;
   if ("handCommand" in frame) {
     const controlled = options.graspTargets && options.graspTargets.length > 0
       ? contactAwareG1GraspTargets({
           command: frame.handCommand,
-          snapshot: simulation.snapshot(),
+          snapshot: snapshotBeforeStep(),
           targets: options.graspTargets
         })
       : null;

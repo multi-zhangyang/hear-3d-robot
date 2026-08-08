@@ -2,16 +2,21 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { QuaternionSchema, Vec3Schema } from "../../domain/schema.js";
 import { normalizeQuaternion } from "../geometry.js";
-import { HUMANOID_END_EFFECTOR_BODIES } from "./task-space-targets.js";
+import {
+  HUMANOID_END_EFFECTOR_BODIES,
+  HUMANOID_TASK_SPACE_KINEMATIC_SCOPES
+} from "./task-space-targets.js";
 
 export const HUMANOID_TASK_SPACE_SERVO_AUTHORITY = Object.freeze({
   protocol: "humanoid-task-space-servo-v1" as const,
-  positionConvergenceMeters: 0.015,
-  orientationConvergenceRadians: 0.02,
+  generationPositionConvergenceMeters: 0.015,
+  generationOrientationConvergenceRadians: 0.02,
   maximumIterations: 128,
   damping: 0.018,
   maximumJointDeltaRadians: 0.14,
-  maximumReferenceCorrectionRadians: 0.06
+  maximumReferenceCorrectionRadians: 0.06,
+  wholeBodyPostureWeight: 0.08,
+  maximumWaistDisplacementRadians: 0.32
 });
 
 const HUMANOID_TASK_SPACE_SERVO_AUTHORITY_SHA256 = createHash("sha256")
@@ -33,6 +38,8 @@ const HumanoidTaskSpaceServoTargetSchema = z.object({
   position: Vec3Schema,
   frame: z.enum(["world", "pelvis"]),
   tolerance: z.number().finite().positive(),
+  kinematicScope: z.enum(HUMANOID_TASK_SPACE_KINEMATIC_SCOPES).optional(),
+  servoMode: z.enum(["precision", "task_tolerance"]).optional(),
   orientation: QuaternionSchema.optional(),
   orientationTolerance: z.number().finite().positive().max(Math.PI).optional()
 }).strict().superRefine((target, context) => {

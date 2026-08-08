@@ -48,6 +48,7 @@ export function createHumanoidRecoveryPolicy(input: {
   binding: ActiveHumanoidSkillBinding;
 }): HumanoidRecoveryPolicyState {
   const contract = HUMANOID_SKILL_CONTRACTS[input.binding.invocation.skill];
+  const failureReason = physicalFailureReason(input.physicalFailureCode);
   return {
     protocol: "humanoid-recovery-policy-v1",
     source_execution_transaction_id: input.executionTransactionId,
@@ -56,12 +57,44 @@ export function createHumanoidRecoveryPolicy(input: {
     source_skill: input.binding.invocation.skill,
     source_phase: input.binding.phase,
     physical_failure_code: input.physicalFailureCode,
-    failure_reason: physicalFailureReason(input.physicalFailureCode),
+    failure_reason: failureReason,
     world_revision: input.worldRevision,
-    candidate_skills: [...contract.recovery_entry],
+    candidate_skills: recoveryCandidates(
+      failureReason,
+      contract.recovery_entry
+    ),
     requires_model_selection: true,
     automatic_actuation: false
   };
+}
+
+function recoveryCandidates(
+  reason: HumanoidSkillFailureCode | null,
+  contractCandidates: readonly HumanoidSkillId[]
+): HumanoidSkillId[] {
+  const failureCandidates: Partial<Record<
+    HumanoidSkillFailureCode,
+    HumanoidSkillId[]
+  >> = {
+    balance_lost: ["stabilize", "retreat"],
+    collision_risk: ["retreat", "stabilize", "approach"],
+    object_slipped: ["regrasp", "bimanual_support", "place", "stabilize"],
+    grasp_unstable: ["regrasp", "reach", "bimanual_support", "place"],
+    contact_missing: ["reach", "regrasp", "approach", "stabilize"],
+    articulation_stalled: ["regrasp", "approach", "stabilize", "pull", "push", "retreat"],
+    placement_misaligned: ["regrasp", "place", "bimanual_support", "retreat"],
+    path_blocked: ["retreat", "approach", "explore", "stabilize"],
+    unexpected_world_change: ["explore", "approach", "retreat", "stabilize"],
+    unreachable: ["approach", "regrasp", "bimanual_support", "retreat"],
+    interaction_point_missing: ["regrasp", "approach", "explore"],
+    target_unobserved: ["explore", "approach", "retreat"],
+    affordance_missing: ["explore", "retreat"],
+    precondition_failed: ["approach", "reach", "stabilize"]
+  };
+  return [...new Set([
+    ...(reason ? failureCandidates[reason] ?? [] : []),
+    ...contractCandidates
+  ])];
 }
 
 export function humanoidRecoverySelectionAccepted(
