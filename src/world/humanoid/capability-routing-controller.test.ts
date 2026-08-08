@@ -286,18 +286,28 @@ describe("humanoid controller capability routing", () => {
     expect(() => new CapabilityRoutingHumanoidController(
       primary,
       controller("no-reference-tracking", ["balance", "locomotion"], 2)
-    )).toThrow("must support joint-reference tracking");
+    )).toThrow("must support balance, locomotion, and joint tracking");
+    expect(() => new CapabilityRoutingHumanoidController(
+      primary,
+      controller("no-locomotion", ["balance", "joint_reference_tracking"], 2)
+    )).toThrow("must support balance, locomotion, and joint tracking");
   });
 
   it("does not wrap controllers without a learned policy or controllers already routed", () => {
     const reference = controller(
       "reference-only",
-      ["joint_reference_tracking"],
+      ["balance", "locomotion", "joint_reference_tracking"],
       1
     );
     expect(humanoidControllerNeedsReferenceFallback(reference.descriptor)).toBe(false);
     const primary = controller("trained-velocity", ["balance", "locomotion"], 1);
     expect(humanoidControllerNeedsReferenceFallback(primary.descriptor)).toBe(true);
+    const trackingOnly = controller(
+      "trained-tracking",
+      ["joint_reference_tracking"],
+      1
+    );
+    expect(humanoidControllerNeedsReferenceFallback(trackingOnly.descriptor)).toBe(true);
     const routed = new CapabilityRoutingHumanoidController(primary, reference);
     expect(humanoidControllerNeedsReferenceFallback(routed.descriptor)).toBe(false);
 

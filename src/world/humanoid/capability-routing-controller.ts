@@ -1,4 +1,6 @@
 import type { JsonValue } from "../../domain/schema.js";
+import type { HumanoidLearnedPolicyCapability } from
+  "../../domain/humanoid-policy.js";
 import { HUMANOID_JOINT_NAMES } from "./model.js";
 import type { HumanoidReference } from "./reference.js";
 import type {
@@ -13,6 +15,11 @@ import type {
 
 const ROUTING_STATE_PROTOCOL_V1 = "humanoid-controller-capability-routing-state-v1";
 const ROUTING_STATE_PROTOCOL_V2 = "humanoid-controller-capability-routing-state-v2";
+const REFERENCE_CONTROL_CAPABILITIES = [
+  "balance",
+  "locomotion",
+  "joint_reference_tracking"
+] as const satisfies readonly HumanoidLearnedPolicyCapability[];
 type ControllerBranch = "primary" | "fallback";
 
 interface ControllerHandoff {
@@ -29,7 +36,9 @@ export function humanoidControllerNeedsReferenceFallback(
   const learnedPolicy = descriptor.learnedPolicy;
   return learnedPolicy !== undefined
     && descriptor.capabilityRouting === undefined
-    && !learnedPolicy.capabilities.includes("joint_reference_tracking");
+    && REFERENCE_CONTROL_CAPABILITIES.some((capability) => (
+      !learnedPolicy.capabilities.includes(capability)
+    ));
 }
 
 export class CapabilityRoutingHumanoidController
@@ -258,8 +267,11 @@ function assertRoutingPair(
     || primary.physicsStepSeconds !== fallback.physicsStepSeconds) {
     throw new Error("Humanoid capability-routing controllers must use identical timing and actuation");
   }
-  if (!fallback.learnedPolicy?.capabilities.includes("joint_reference_tracking")) {
-    throw new Error("Reference fallback must support joint-reference tracking");
+  const fallbackCapabilities = new Set(fallback.learnedPolicy?.capabilities ?? []);
+  if (REFERENCE_CONTROL_CAPABILITIES.some((capability) => (
+    !fallbackCapabilities.has(capability)
+  ))) {
+    throw new Error("Reference fallback must support balance, locomotion, and joint tracking");
   }
 }
 

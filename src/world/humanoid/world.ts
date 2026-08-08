@@ -168,6 +168,8 @@ import { onlineNavigationReplanDecision } from "./online-navigation-replanner.js
 import type {
   HumanoidWholeBodyControllerFactory
 } from "./whole-body-controller.js";
+import { humanoidControllerTaskCapabilities } from
+  "./controller-task-capabilities.js";
 
 export interface WholeBodyMotionPlanningOptions {
   retainTerminalJointTracking?: boolean;
@@ -2405,7 +2407,9 @@ export class HumanoidWorld {
       current,
       this.#stationKeepingAnchor
     );
-    const snapshot = await this.#simulation.step(this.#reference);
+    const snapshot = await this.#simulation.step(this.#reference, {
+      taskCommand: this.#stationKeepingTaskCommand()
+    });
     this.#commitFrameState();
     this.#observeGraspFrame(this.#frame, snapshot);
     this.#observeCarriedObjectFrame(snapshot);
@@ -2435,7 +2439,9 @@ export class HumanoidWorld {
 
   async #settle(steps: number): Promise<void> {
     for (let index = 0; index < steps; index += 1) {
-      await this.#simulation.step(this.#reference);
+      await this.#simulation.step(this.#reference, {
+        taskCommand: this.#stationKeepingTaskCommand()
+      });
     }
     const snapshot = this.#simulation.snapshot();
     if (snapshot.fallen) {
@@ -2448,6 +2454,18 @@ export class HumanoidWorld {
       currentFrame: 0,
       currentWorldRevision: 0
     });
+  }
+
+  #stationKeepingTaskCommand() {
+    return {
+      protocol: "humanoid-controller-task-v1" as const,
+      taskId: "station-keeping",
+      source: "motion_option" as const,
+      requestedCapabilities: humanoidControllerTaskCapabilities(this.#reference),
+      goal: null,
+      endEffectors: [],
+      grasps: []
+    };
   }
 
   #restore(rawCheckpoint: HumanoidWorldCheckpoint): void {

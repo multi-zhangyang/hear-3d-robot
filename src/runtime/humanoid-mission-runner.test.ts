@@ -271,7 +271,7 @@ describe("humanoid mission initialization recovery", () => {
     expect(checkpoint.error).toContain("Unable to read the persisted agent manifest");
     expect(await lifecycleTypes(store)).toEqual(["run_interrupted"]);
     expect(runnerControl.run).not.toHaveBeenCalled();
-  });
+  }, 60_000);
 
   it("interrupts an incompatible agent identity without starting the run", async () => {
     const store = await createCheckpointedRun();

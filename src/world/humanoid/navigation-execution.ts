@@ -50,6 +50,8 @@ import {
   humanoidNavigationStoppingDistance,
   type HumanoidNavigationArrivalHeading
 } from "./navigation-arrival.js";
+import { humanoidControllerTaskCapabilities } from
+  "./controller-task-capabilities.js";
 
 const NAVIGATION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.05;
 const NAVIGATION_PRECISION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.01;
@@ -673,55 +675,54 @@ export class HumanoidNavigationExecution {
         snapshot: simulation.snapshot(),
         targets: this.#graspTargets
       }) ? CARRY_NOSLIP_SOLVER_ITERATIONS : 0,
-      ...(this.#carrying
-        ? {
-            taskCommand: {
-              protocol: "humanoid-controller-task-v1" as const,
-              taskId: "carry-navigation",
-              source: "carry_navigation" as const,
-              requestedCapabilities: [
-                "locomotion" as const,
-                "contact_rich_manipulation" as const,
-                ...(new Set(this.#graspTargets.map(({ hand }) => hand)).size > 1
-                  ? ["bimanual_manipulation" as const]
-                  : [])
-              ],
-              goal: {
-                protocol: "humanoid-controller-navigation-goal-v1" as const,
-                target: { ...this.#plan.waypoints.at(-1)! },
-                positionTolerance: this.#finalAcceptedPositionTolerance(),
-                heading: this.#arrivalHeading?.type === "face_point"
-                  ? {
-                      type: "face_point" as const,
-                      target: { ...this.#arrivalHeading.target },
-                      toleranceRadians: this.#arrivalHeading.tolerance_radians
-                    }
-                  : this.#arrivalHeading?.type === "yaw"
-                    ? {
-                        type: "yaw" as const,
-                        yawRadians: this.#arrivalHeading.yaw_radians,
-                        toleranceRadians: this.#arrivalHeading.tolerance_radians
-                      }
-                    : null
-              },
-              endEffectors: this.#carryTaskSpaceTargets.map((target) => ({
-                body: target.body,
-                frame: target.frame,
-                position: { ...target.position },
-                tolerance: target.tolerance,
-                orientation: { ...target.orientation },
-                orientationTolerance: target.orientationTolerance
-              })),
-              grasps: this.#graspTargets.map((target) => ({
-                objectId: target.objectId,
-                hand: target.hand,
-                minimumNormalForceN: target.minimumNormalForceN,
-                minimumDistinctContactSurfaces:
-                  target.minimumDistinctContactSurfaces ?? 1
-              }))
-            }
-          }
-        : {})
+      taskCommand: {
+        protocol: "humanoid-controller-task-v1" as const,
+        taskId: this.#carrying ? "carry-navigation" : "navigation",
+        source: this.#carrying ? "carry_navigation" as const : "motion_option" as const,
+        requestedCapabilities: humanoidControllerTaskCapabilities(
+          this.#reference,
+          [
+            "locomotion",
+            ...(this.#carrying ? ["contact_rich_manipulation" as const] : []),
+            ...(new Set(this.#graspTargets.map(({ hand }) => hand)).size > 1
+              ? ["bimanual_manipulation" as const]
+              : [])
+          ]
+        ),
+        goal: {
+          protocol: "humanoid-controller-navigation-goal-v1" as const,
+          target: { ...this.#plan.waypoints.at(-1)! },
+          positionTolerance: this.#finalAcceptedPositionTolerance(),
+          heading: this.#arrivalHeading?.type === "face_point"
+            ? {
+                type: "face_point" as const,
+                target: { ...this.#arrivalHeading.target },
+                toleranceRadians: this.#arrivalHeading.tolerance_radians
+              }
+            : this.#arrivalHeading?.type === "yaw"
+              ? {
+                  type: "yaw" as const,
+                  yawRadians: this.#arrivalHeading.yaw_radians,
+                  toleranceRadians: this.#arrivalHeading.tolerance_radians
+                }
+              : null
+        },
+        endEffectors: this.#carryTaskSpaceTargets.map((target) => ({
+          body: target.body,
+          frame: target.frame,
+          position: { ...target.position },
+          tolerance: target.tolerance,
+          orientation: { ...target.orientation },
+          orientationTolerance: target.orientationTolerance
+        })),
+        grasps: this.#graspTargets.map((target) => ({
+          objectId: target.objectId,
+          hand: target.hand,
+          minimumNormalForceN: target.minimumNormalForceN,
+          minimumDistinctContactSurfaces:
+            target.minimumDistinctContactSurfaces ?? 1
+        }))
+      }
     });
     const prepared = {
       snapshot,

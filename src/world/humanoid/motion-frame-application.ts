@@ -24,6 +24,8 @@ import type {
 import type {
   HumanoidLearnedPolicyCapability
 } from "../../domain/humanoid-policy.js";
+import { humanoidControllerTaskCapabilities } from
+  "./controller-task-capabilities.js";
 import type { HumanoidEndEffectorBody } from "./task-space-targets.js";
 import type { HumanoidTaskSpaceServoTarget } from "./task-space-servo.js";
 import {
@@ -129,19 +131,14 @@ export async function applyHumanoidMotionArtifactFrame(
           || (options.graspTargets?.length ?? 0) > 0)
       ? "neutral"
       : "measured",
-    ...((taskSpaceTargets?.length ?? 0) > 0
-      || (options.carryTaskSpaceTargets?.length ?? 0) > 0
-      || (options.graspTargets?.length ?? 0) > 0
-      ? {
-          taskCommand: controllerTaskCommand({
-            taskId: options.taskId ?? "motion-option",
-            taskGoal: options.taskGoal ?? null,
-            taskSpaceTargets: taskSpaceTargets ?? [],
-            carryTaskSpaceTargets: options.carryTaskSpaceTargets ?? [],
-            graspTargets: options.graspTargets ?? []
-          })
-        }
-      : {})
+    taskCommand: controllerTaskCommand({
+      taskId: options.taskId ?? "motion-option",
+      taskGoal: options.taskGoal ?? null,
+      reference,
+      taskSpaceTargets: taskSpaceTargets ?? [],
+      carryTaskSpaceTargets: options.carryTaskSpaceTargets ?? [],
+      graspTargets: options.graspTargets ?? []
+    })
   });
   return {
     reference,
@@ -153,6 +150,7 @@ export async function applyHumanoidMotionArtifactFrame(
 function controllerTaskCommand(input: {
   taskId: string;
   taskGoal: HumanoidControllerTaskGoal | null;
+  reference: HumanoidReference;
   taskSpaceTargets: readonly HumanoidTaskSpaceServoTarget[];
   carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
   graspTargets: readonly G1ContactAwareGraspTarget[];
@@ -161,7 +159,10 @@ function controllerTaskCommand(input: {
     protocol: "humanoid-controller-task-v1",
     taskId: input.taskId,
     source: "motion_option",
-    requestedCapabilities: requestedPolicyCapabilities(input),
+    requestedCapabilities: humanoidControllerTaskCapabilities(
+      input.reference,
+      requestedPolicyCapabilities(input)
+    ),
     goal: input.taskGoal ? structuredClone(input.taskGoal) : null,
     endEffectors: [
       ...input.taskSpaceTargets.map((target) => ({

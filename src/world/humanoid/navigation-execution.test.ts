@@ -10,6 +10,8 @@ import type {
   HumanoidSimulation,
   HumanoidSimulationSnapshot
 } from "./simulation.js";
+import type { HumanoidControllerInferenceOptions } from
+  "./whole-body-controller.js";
 
 describe("humanoid navigation execution progress", () => {
   it("continues the same physical route from a durable frame cursor", async () => {
@@ -187,6 +189,27 @@ describe("humanoid navigation execution progress", () => {
     });
 
     expect(simulation.controllerResetCount).toBe(0);
+  });
+
+  it("publishes ordinary navigation as a balance and locomotion policy task", async () => {
+    const simulation = new NavigationSimulation();
+    const execution = new HumanoidNavigationExecution({
+      plan: route,
+      reference: neutralHumanoidReference(),
+      simulation: simulation.asHumanoidSimulation()
+    });
+
+    await execution.step(simulation.asHumanoidSimulation());
+
+    expect(simulation.lastControllerOptions?.taskCommand).toMatchObject({
+      taskId: "navigation",
+      source: "motion_option",
+      requestedCapabilities: ["balance", "locomotion"],
+      goal: {
+        protocol: "humanoid-controller-navigation-goal-v1",
+        target: route.waypoints.at(-1)
+      }
+    });
   });
 
   it("lets a stable slow gait finish a physical route without a false timeout", async () => {
@@ -503,6 +526,7 @@ class NavigationSimulation {
   readonly progressPerStep: number;
   readonly minimumCommandSpeed: number;
   controllerResetCount = 0;
+  lastControllerOptions: HumanoidControllerInferenceOptions | undefined;
   yaw = 0;
 
   constructor(
@@ -551,7 +575,13 @@ class NavigationSimulation {
     } as unknown as HumanoidSimulationSnapshot;
   }
 
-  async step(reference: HumanoidReference): Promise<HumanoidSimulationSnapshot> {
+  async step(
+    reference: HumanoidReference,
+    options?: HumanoidControllerInferenceOptions
+  ): Promise<HumanoidSimulationSnapshot> {
+    this.lastControllerOptions = options === undefined
+      ? undefined
+      : structuredClone(options);
     if (reference.rootVelocity[0] > 0
       && Math.hypot(...reference.rootVelocity) >= this.minimumCommandSpeed) {
       this.position.z = Math.min(

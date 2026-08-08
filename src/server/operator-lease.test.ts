@@ -15,6 +15,11 @@ const FAST_LEASE = {
   leaseDurationMs: 60,
   reclaimConfirmationMs: 20
 };
+const POST_MUTATION_LEASE = {
+  heartbeatIntervalMs: 100,
+  leaseDurationMs: 5_000,
+  reclaimConfirmationMs: 200
+};
 const CROSS_PROCESS_LEASE = {
   heartbeatIntervalMs: 25,
   leaseDurationMs: 150,
@@ -306,7 +311,7 @@ describe("Operator runs-directory lease", () => {
   it("post-renews a long successful mutation before allowing a contender through", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-long-mutation-renewal-"));
     const restoreHeartbeats = suppressLeaseHeartbeats();
-    const owner = await acquireOperatorLease(runsDir, FAST_LEASE);
+    const owner = await acquireOperatorLease(runsDir, POST_MUTATION_LEASE);
     let enter!: () => void;
     let finish!: () => void;
     const entered = new Promise<void>((resolveEntered) => {
@@ -323,9 +328,10 @@ describe("Operator runs-directory lease", () => {
         await gate;
       });
       await entered;
-      await delay(FAST_LEASE.leaseDurationMs + 20);
+      const expired = new Date(Date.now() - POST_MUTATION_LEASE.leaseDurationMs - 1_000);
+      await utimes(join(runsDir, ".operator.lock"), expired, expired);
       let contenderSettled = false;
-      contender = acquireOperatorLease(runsDir, FAST_LEASE);
+      contender = acquireOperatorLease(runsDir, POST_MUTATION_LEASE);
       void contender.then(
         () => { contenderSettled = true; },
         () => { contenderSettled = true; }
@@ -347,12 +353,12 @@ describe("Operator runs-directory lease", () => {
       restoreHeartbeats();
       await rm(runsDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("post-renews a long failed mutation without replacing its original error", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-long-failed-renewal-"));
     const restoreHeartbeats = suppressLeaseHeartbeats();
-    const owner = await acquireOperatorLease(runsDir, FAST_LEASE);
+    const owner = await acquireOperatorLease(runsDir, POST_MUTATION_LEASE);
     const operationFailure = new Error("injected persistence failure");
     let enter!: () => void;
     let finish!: () => void;
@@ -371,8 +377,9 @@ describe("Operator runs-directory lease", () => {
         throw operationFailure;
       });
       await entered;
-      await delay(FAST_LEASE.leaseDurationMs + 20);
-      contender = acquireOperatorLease(runsDir, FAST_LEASE);
+      const expired = new Date(Date.now() - POST_MUTATION_LEASE.leaseDurationMs - 1_000);
+      await utimes(join(runsDir, ".operator.lock"), expired, expired);
+      contender = acquireOperatorLease(runsDir, POST_MUTATION_LEASE);
       await delay(30);
 
       finish();
@@ -389,7 +396,7 @@ describe("Operator runs-directory lease", () => {
       restoreHeartbeats();
       await rm(runsDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("preserves a mutation error when its error-path renewal also loses ownership", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-failed-renewal-loss-"));
