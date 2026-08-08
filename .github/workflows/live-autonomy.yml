@@ -34,9 +34,9 @@ on:
         default: "30"
         type: string
       controller_module:
-        description: Optional humanoid controller module specifier
+        description: Optional controller override; blank uses the bundled hybrid controller
         required: false
-        default: hear/controllers/mjlab-g1-velocity
+        default: ""
         type: string
 
 permissions:

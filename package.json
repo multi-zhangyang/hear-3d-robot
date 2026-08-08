@@ -21,7 +21,8 @@
     "hear": "./dist/cli.js"
   },
   "exports": {
-    "./controllers/mjlab-g1-velocity": "./dist/controllers/mjlab-g1-velocity-module.js"
+    "./controllers/mjlab-g1-velocity": "./dist/controllers/mjlab-g1-velocity-module.js",
+    "./controllers/yahmp": "./dist/controllers/yahmp-module.js"
   },
   "scripts": {
     "build": "pnpm run build:server && pnpm run build:web",

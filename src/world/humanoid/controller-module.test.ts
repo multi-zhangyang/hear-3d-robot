@@ -230,9 +230,18 @@ export const humanoidControllerAssets = [
     );
   });
 
-  it("leaves the built-in controller selected when no module is configured", async () => {
-    await expect(loadConfiguredHumanoidControllerSource({})).resolves.toBeUndefined();
-  });
+  it("loads the bundled learned controller when no module is configured", async () => {
+    const source = await loadConfiguredHumanoidControllerSource({});
+    expect(source.sourceSha256).toMatch(/^[a-f0-9]{64}$/);
+    const controller = await source.controllerFactory();
+    expect(controller.descriptor).toMatchObject({
+      implementation: "mjlab_g1_velocity_onnx",
+      learnedPolicy: {
+        capabilities: ["balance", "locomotion"]
+      }
+    });
+    await controller.dispose();
+  }, 30_000);
 });
 
 async function temporaryDirectory(): Promise<string> {

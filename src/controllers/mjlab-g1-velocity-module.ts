@@ -9,11 +9,13 @@ import type {
 export const MJLAB_G1_POLICY_DIRECTORY_ENV =
   "HEAR_MJLAB_G1_POLICY_DIRECTORY";
 
-export function humanoidControllerAssets(): Array<{
+export function humanoidControllerAssets(
+  environment: NodeJS.ProcessEnv = process.env
+): Array<{
   id: string;
   path: string | URL;
 }> {
-  const directory = process.env[MJLAB_G1_POLICY_DIRECTORY_ENV]?.trim();
+  const directory = environment[MJLAB_G1_POLICY_DIRECTORY_ENV]?.trim();
   const policy = directory
     ? resolve(directory, "g1_velocity.onnx")
     : new URL(

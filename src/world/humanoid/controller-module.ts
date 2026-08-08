@@ -14,6 +14,8 @@ import {
 } from "./whole-body-controller.js";
 
 export const HUMANOID_CONTROLLER_MODULE_ENV = "HEAR_HUMANOID_CONTROLLER_MODULE";
+const BUNDLED_MJLAB_G1_CONTROLLER_SOURCE =
+  "hear-bundled-mjlab-g1-velocity-controller-v1";
 const HUMANOID_CONTROLLER_MODULE_FACTORY =
   "createHumanoidWholeBodyController";
 const HUMANOID_CONTROLLER_MODULE_ASSETS = "humanoidControllerAssets";
@@ -47,10 +49,31 @@ interface HumanoidControllerAssetDeclaration {
 export async function loadConfiguredHumanoidControllerSource(
   environment: NodeJS.ProcessEnv = process.env,
   baseDirectory = process.cwd()
-): Promise<HumanoidControllerSource | undefined> {
+): Promise<HumanoidControllerSource> {
   const specifier = environment[HUMANOID_CONTROLLER_MODULE_ENV]?.trim();
-  if (!specifier) return undefined;
+  if (!specifier) return loadBundledMjlabG1ControllerSource(environment);
   return loadHumanoidControllerSource(specifier, baseDirectory);
+}
+
+async function loadBundledMjlabG1ControllerSource(
+  environment: NodeJS.ProcessEnv
+): Promise<HumanoidControllerSource> {
+  const namespace: unknown = await import(
+    "../../controllers/mjlab-g1-velocity-module.js"
+  );
+  const assets = await loadControllerAssets(
+    namespace,
+    fileURLToPath(import.meta.url),
+    environment
+  );
+  return createControllerSource(
+    namespace,
+    controllerSourceSha256(
+      sha256(BUNDLED_MJLAB_G1_CONTROLLER_SOURCE),
+      assets
+    ),
+    assets
+  );
 }
 
 export async function loadHumanoidControllerSource(
@@ -65,9 +88,17 @@ export async function loadHumanoidControllerSource(
   const moduleUrl = pathToFileURL(entryPath);
   moduleUrl.searchParams.set("hear_controller_sha256", entrySha256);
   const namespace: unknown = await import(moduleUrl.href);
-  const moduleFactory = controllerModuleFactory(namespace);
   const assets = await loadControllerAssets(namespace, entryPath);
   const sourceSha256 = controllerSourceSha256(entrySha256, assets);
+  return createControllerSource(namespace, sourceSha256, assets);
+}
+
+function createControllerSource(
+  namespace: unknown,
+  sourceSha256: string,
+  assets: readonly HumanoidControllerModuleAsset[]
+): HumanoidControllerSource {
+  const moduleFactory = controllerModuleFactory(namespace);
   const instances = new WeakSet<object>();
   const controllerFactory: HumanoidWholeBodyControllerFactory = async () => {
     const context: HumanoidControllerModuleContext = Object.freeze({
@@ -94,12 +125,13 @@ export async function loadHumanoidControllerSource(
 
 async function loadControllerAssets(
   namespace: unknown,
-  entryPath: string
+  entryPath: string,
+  environment?: NodeJS.ProcessEnv
 ): Promise<HumanoidControllerModuleAsset[]> {
   const assetExport = moduleExport(namespace, HUMANOID_CONTROLLER_MODULE_ASSETS);
   if (assetExport === undefined) return [];
   const exported: unknown = typeof assetExport === "function"
-    ? await assetExport()
+    ? await assetExport(...(environment ? [environment] : []))
     : assetExport;
   if (!Array.isArray(exported)) {
     throw new Error("Humanoid controller assets must be an array");

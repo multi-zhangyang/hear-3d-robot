@@ -100,17 +100,22 @@ export function assertHumanoidControllerSourceCompatible(
   persistedSourceSha256: string | undefined,
   configuredSource: HumanoidControllerSource | undefined
 ): void {
+  resolveHumanoidControllerSourceForRun(
+    persistedSourceSha256,
+    configuredSource
+  );
+}
+
+export function resolveHumanoidControllerSourceForRun(
+  persistedSourceSha256: string | undefined,
+  configuredSource: HumanoidControllerSource | undefined
+): HumanoidControllerSource | undefined {
+  if (persistedSourceSha256 === undefined) return undefined;
   const configuredSourceSha256 = configuredSource?.sourceSha256;
-  if (persistedSourceSha256 === configuredSourceSha256) return;
-  if (persistedSourceSha256 === undefined) {
-    throw new Error(
-      "This run uses the built-in humanoid controller and cannot be resumed "
-      + "with an external controller module"
-    );
-  }
+  if (persistedSourceSha256 === configuredSourceSha256) return configuredSource;
   if (configuredSourceSha256 === undefined) {
     throw new Error(
-      "This run requires its original external humanoid controller module"
+      "This run requires its original humanoid controller source"
     );
   }
   throw new Error(
@@ -199,7 +204,7 @@ export async function resumeHumanoidMission(input: {
   if (store.definition.runtime !== "humanoid_g1") {
     throw new Error("This run was not created by the humanoid runtime");
   }
-  assertHumanoidControllerSourceCompatible(
+  const controllerSource = resolveHumanoidControllerSourceForRun(
     store.definition.controller_source_sha256,
     input.controllerSource
   );
@@ -219,8 +224,8 @@ export async function resumeHumanoidMission(input: {
     checkpoint.world_checkpoint,
     {
       scenarioChunks,
-      ...(input.controllerSource
-        ? { controllerFactory: input.controllerSource.controllerFactory }
+      ...(controllerSource
+        ? { controllerFactory: controllerSource.controllerFactory }
         : {})
     }
   );

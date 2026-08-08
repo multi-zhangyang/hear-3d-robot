@@ -18,7 +18,7 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 - 全身 Option 使用受限物理条件树和前置、持续、终止三个阶段，成功必须经过连续帧稳定验收
 - 预演轨迹与运动制品分别进行 SHA-256 校验；真实执行持续偏离预演时立即截断并重新规划
 - 预演与真实执行分别累计支撑余量、足底滑移、关节余量、速度、接触冲击和执行器力矩证据
-- 默认 YAHMP ONNX 策略在 50 Hz 执行平衡、行走和关节参考跟踪，MuJoCo 在 200 Hz 处理重力、力矩、碰撞与接触
+- 默认 mjlab G1 学习策略在 50 Hz 执行平衡和移动，YAHMP 在需要关节参考跟踪时接管对应控制步，MuJoCo 在 200 Hz 处理重力、力矩、碰撞与接触
 - Recast 导航网格和分段物理预演，不通过修改根节点坐标伪造移动
 - 导航遇到实时阻塞时保持语义目标不变并从当前物理状态在线重规划，安全失败返回上层恢复
 - 可见方块可通过接近、稳定掌指接触、执行授权和原子世界事务完成通用拆除
@@ -94,9 +94,9 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 层级智能体不直接输出电机值或关节动作。它负责语义目标、Skill DAG、交互对象和终止条件；低层运动由 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 执行。`HumanoidWorld.create` 的 `controllerFactory` 会分别为权威 MuJoCo 世界和独立预演池创建控制器实例，场景资源重建时继续使用同一工厂。控制器状态必须支持捕获与恢复，策略的观察空间、动作空间和真实能力随世界快照公开。
 
-设置 `HEAR_HUMANOID_CONTROLLER_MODULE` 可以把训练产物接入正式 CLI、Operator 与实时验证入口。值可以是相对路径、绝对路径或已安装包名；模块必须导出 `createHumanoidWholeBodyController(context)`，并在每次调用时创建独立的 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 实例。模块可以通过 `humanoidControllerAssets` 声明 ONNX、训练报告等本地策略文件，运行来源身份会同时覆盖入口与全部资产内容。运行定义不保存本机路径；恢复时入口或任一策略资产发生变化都会在创建世界前被拒绝。
+不设置 `HEAR_HUMANOID_CONTROLLER_MODULE` 时，正式 CLI 和 Operator 默认加载仓库随附的 mjlab G1 学习策略，并在缺少关节参考跟踪能力的控制步切换到 YAHMP。设置该变量可以用自己的训练产物覆盖默认主策略；值可以是相对路径、绝对路径或已安装包名。模块必须导出 `createHumanoidWholeBodyController(context)`，并在每次调用时创建独立的 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 实例。模块可以通过 `humanoidControllerAssets` 声明 ONNX、训练报告等本地策略文件，运行来源身份会同时覆盖入口与全部资产内容。运行定义不保存本机路径；恢复时入口或任一策略资产发生变化都会在创建世界前被拒绝。未记录来源身份的历史运行仍使用创建时的 YAHMP，不会被新的默认策略静默迁移。
 
-仓库自带的 YAHMP ONNX 策略只声明 `balance`、`locomotion` 和 `joint_reference_tracking`。任务空间 IK、接触柔顺和抓取检查器是参考生成与物理验收组件，不代表策略已经学会接触式操作或双手操作。后续可以接入强化学习、模仿学习或其他已训练策略；新控制器只有在真实支持时才应声明 `contact_rich_manipulation` 或 `bimanual_manipulation`，Harness 仍会用同一 MuJoCo 预演和执行回执验证结果。
+YAHMP 参考控制器声明 `balance`、`locomotion` 和 `joint_reference_tracking`。任务空间 IK、接触柔顺和抓取检查器是参考生成与物理验收组件，不代表策略已经学会接触式操作或双手操作。后续可以接入强化学习、模仿学习或其他已训练策略；新控制器只有在真实支持时才应声明 `contact_rich_manipulation` 或 `bimanual_manipulation`，Harness 仍会用同一 MuJoCo 预演和执行回执验证结果。只运行参考控制器时可设置 `HEAR_HUMANOID_CONTROLLER_MODULE=hear/controllers/yahmp`。
 
 外接学习策略缺少平衡、移动或关节参考跟踪中的任一基础能力时，模拟器会把它作为主控制器，并创建独立 YAHMP 参考控制器组成能力路由。站立、普通导航、持物导航和全身运动的每个控制步都会声明实际能力需求与任务目标；路由从当前 MuJoCo 状态选择覆盖该阶段的控制器。分支切换不会直接跳变电机目标，而是按控制器声明的响应周期连续插值关节目标、刚度和阻尼；正在进行的交接与两个控制器的内部状态共同保存到物理检查点。主策略的 `learnedPolicy.capabilities` 保持原值，参考控制不会被合并或冒充为训练能力。已经完整实现能力路由的外接控制器可以通过 `capabilityRouting` 描述自身边界，运行时不会再次包装。
 
@@ -104,11 +104,7 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 统一 Skill 合约逐阶段声明完成学习式执行所需的策略能力，实时目录会分别公开当前环境可用性与已训练能力覆盖。未被当前策略覆盖的阶段会明确标记为参考控制回退，不能被描述为已经训练完成。控制器收到的任务命令同时包含能力要求、任务空间目标、抓取约束和可观测物理终止谓词，训练侧不需要读取 Agent 提示词或依赖模型供应商格式。
 
-仓库随附一个由 mjlab 1.5.3 训练的 G1 速度策略及其训练报告。标准控制器严格校验报告版本、ONNX SHA-256、张量形状、29 关节顺序、控制周期和策略元数据，使用 MuJoCo 骨盆 IMU 坐标下的 99 维真实观察推理。它只声明并输出训练得到的 `balance` 与 `locomotion` 动作，不在策略输出中混入未训练的任务关节控制；这类任务由上述独立能力路由执行。启用方式：
-
-```dotenv
-HEAR_HUMANOID_CONTROLLER_MODULE=hear/controllers/mjlab-g1-velocity
-```
+仓库随附一个由 mjlab 1.5.3 训练的 G1 速度策略及其训练报告，并将它作为新运行的默认主策略。标准控制器严格校验报告版本、ONNX SHA-256、张量形状、29 关节顺序、控制周期和策略元数据，使用 MuJoCo 骨盆 IMU 坐标下的 99 维真实观察推理。它只声明并输出训练得到的 `balance` 与 `locomotion` 动作，不在策略输出中混入未训练的任务关节控制；这类任务由上述独立能力路由执行。
 
 仓库同时提供基于 [mjlab](https://github.com/mujocolab/mjlab) 与 RSL-RL 的 G1 速度策略训练入口。训练直接使用 mjlab 的正式 `Mjlab-Velocity-Flat-Unitree-G1` 环境和 MuJoCo Warp，不在仓库内另写一套强化学习算法。已登录 Colab CLI 后可启动 GPU 训练：
 

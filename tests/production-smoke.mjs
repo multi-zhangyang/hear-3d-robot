@@ -26,11 +26,14 @@ async function smokeProductionOperator() {
     assert.equal(cli.stderr, "");
     assert.match(cli.stdout, /^humanoid_frontier\t/m);
 
-    const { loadHumanoidControllerSource } = await import(
+    const {
+      loadConfiguredHumanoidControllerSource,
+      loadHumanoidControllerSource
+    } = await import(
       "../dist/world/humanoid/controller-module.js"
     );
-    const controllerSource = await loadHumanoidControllerSource(
-      "hear/controllers/mjlab-g1-velocity",
+    const controllerSource = await loadConfiguredHumanoidControllerSource(
+      {},
       originalWorkingDirectory
     );
     assert.match(controllerSource.sourceSha256, /^[a-f0-9]{64}$/);
@@ -45,6 +48,14 @@ async function smokeProductionOperator() {
     );
     await Promise.all([firstController.dispose(), secondController.dispose()]);
 
+    const referenceControllerSource = await loadHumanoidControllerSource(
+      "hear/controllers/yahmp",
+      originalWorkingDirectory
+    );
+    const referenceController = await referenceControllerSource.controllerFactory();
+    assert.equal(referenceController.descriptor.implementation, "yahmp_onnx");
+    await referenceController.dispose();
+
     const [{ loadRuntimeCatalog }, { createOperatorServer }] = await Promise.all([
       import("../dist/config/load.js"),
       import("../dist/server/operator-server.js")
@@ -58,7 +69,8 @@ async function smokeProductionOperator() {
         runsDir
       },
       catalog,
-      providerError: "Provider is not configured for the production smoke test"
+      providerError: "Provider is not configured for the production smoke test",
+      controllerSource
     });
     const origin = await app.listen({ host: "127.0.0.1", port: 0 });
 

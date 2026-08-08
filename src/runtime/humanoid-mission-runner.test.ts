@@ -36,6 +36,7 @@ import { HumanoidWorld } from "../world/humanoid/world.js";
 import { captureHumanoidSessionStateIdentity } from "./humanoid-agent-state.js";
 import {
   assertHumanoidControllerSourceCompatible,
+  resolveHumanoidControllerSourceForRun,
   humanoidModelProgressSnapshot,
   nextModelDecisionFollowUpState,
   recoverableDynamicToolRunStateError,
@@ -126,9 +127,11 @@ describe("humanoid mission initialization recovery", () => {
     expect(() => assertHumanoidControllerSourceCompatible(first.sourceSha256, first))
       .not.toThrow();
     expect(() => assertHumanoidControllerSourceCompatible(undefined, first))
-      .toThrow(/built-in humanoid controller/);
+      .not.toThrow();
+    expect(resolveHumanoidControllerSourceForRun(undefined, first)).toBeUndefined();
+    expect(resolveHumanoidControllerSourceForRun(first.sourceSha256, first)).toBe(first);
     expect(() => assertHumanoidControllerSourceCompatible(first.sourceSha256, undefined))
-      .toThrow(/requires its original external/);
+      .toThrow(/requires its original humanoid controller source/);
     expect(() => assertHumanoidControllerSourceCompatible(first.sourceSha256, second))
       .toThrow(/does not match/);
   });
