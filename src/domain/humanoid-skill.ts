@@ -160,13 +160,26 @@ export const HumanoidSkillInvocationSchema = z.discriminatedUnion("skill", [
   z.object({
     skill: z.literal("regrasp"),
     object_id: ObjectIdSchema,
+    interaction_point_id: InteractionPointIdSchema,
     from_hand: HandSchema,
     to_hand: HandSchema,
     excluded_interaction_point_ids: z.array(InteractionPointIdSchema)
-  }).strict().refine(
-    (value) => value.from_hand !== value.to_hand,
-    { path: ["to_hand"], message: "regrasp must change hands" }
-  ),
+  }).strict().superRefine((value, context) => {
+    if (value.from_hand === value.to_hand) {
+      context.addIssue({
+        code: "custom",
+        path: ["to_hand"],
+        message: "regrasp must transfer support to the other hand"
+      });
+    }
+    if (value.excluded_interaction_point_ids.includes(value.interaction_point_id)) {
+      context.addIssue({
+        code: "custom",
+        path: ["interaction_point_id"],
+        message: "regrasp target cannot be one of the excluded grasp points"
+      });
+    }
+  }),
   z.object({
     skill: z.literal("bimanual_support"),
     object_id: ObjectIdSchema,
@@ -286,7 +299,7 @@ export const HUMANOID_SKILL_CONTRACTS: Readonly<Record<
   place: contract("place", ["object_id", "hands", "destination", "release_after_settled"], ["movable"],
     ["verified carried-object binding exists", "destination constraint observable"],
     [["observe", "sensor"], ["align_destination", "whole_body"], ["lower", "whole_body"], ["settle_and_release", "grasp"], ["verify_relation", "checker"]],
-    ["destination relation satisfied, object settled, grasp released"],
+    ["destination relation satisfied; object settles after release or remains physically grasped when release is not requested"],
     ["placement_misaligned", "object_slipped"], ["regrasp", "place"]),
   push: contract("push", ["object_id", "interaction_point_id", "hand", "direction_world", "distance_m"], ["pushable"],
     ["push point observable", "force direction feasible"],
@@ -318,8 +331,8 @@ export const HUMANOID_SKILL_CONTRACTS: Readonly<Record<
     [["observe", "sensor"], ["reach_turn_point", "whole_body"], ["establish_grasp", "grasp"], ["actuate_joint", "whole_body"], ["verify_rotation", "checker"]],
     ["joint moves through the requested physical rotation"],
     ["articulation_stalled", "contact_missing"], ["regrasp", "approach", "stabilize"]),
-  regrasp: contract("regrasp", ["object_id", "from_hand", "to_hand", "excluded_interaction_point_ids"], ["graspable"],
-    ["object observable or physically carried", "alternative grasp point exists"],
+  regrasp: contract("regrasp", ["object_id", "interaction_point_id", "from_hand", "to_hand", "excluded_interaction_point_ids"], ["graspable"],
+    ["object observable or physically carried", "source hand has verified support", "selected alternative grasp point is not excluded", "destination hand is available"],
     [["observe", "sensor"], ["select_alternative_point", "checker"], ["support_object", "whole_body"], ["transfer_grasp", "grasp"], ["verify_grasp", "checker"]],
     ["new hand has a verified grasp at a different point"],
     ["interaction_point_missing", "grasp_unstable"], ["bimanual_support", "place", "retreat"]),

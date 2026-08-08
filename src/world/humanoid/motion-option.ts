@@ -268,6 +268,10 @@ type HumanoidMotionOptionPredicateEvidence =
       target: Vec3;
       distanceMeters: number | null;
       toleranceMeters: number;
+      actualOrientation?: Quaternion | null;
+      targetOrientation?: Quaternion;
+      orientationErrorRadians?: number | null;
+      orientationToleranceRadians?: number;
       reason?: Extract<PredicateUncertainty, "object_not_observable">;
     }
   | PredicateEvidenceBase & {
@@ -1076,16 +1080,39 @@ function detectPredicate(
   }
   if (predicate.type === "object_near_point") {
     const distanceMeters = distance(object.position, predicate.target);
+    const targetOrientation = predicate.target_orientation
+      ? normalizeQuaternion(predicate.target_orientation)
+      : undefined;
+    const actualOrientation = targetOrientation
+      ? normalizeQuaternion(object.rotation)
+      : undefined;
+    const orientationErrorRadians = targetOrientation && actualOrientation
+      ? quaternionAngularDistance(actualOrientation, targetOrientation)
+      : undefined;
+    const orientationSatisfied = orientationErrorRadians === undefined
+      || predicate.orientation_tolerance_rad !== undefined
+        && orientationErrorRadians <= predicate.orientation_tolerance_rad;
     return {
       predicateIndex,
       type: predicate.type,
-      status: distanceMeters <= predicate.tolerance_m ? "satisfied" : "unsatisfied",
+      status: distanceMeters <= predicate.tolerance_m && orientationSatisfied
+        ? "satisfied" : "unsatisfied",
       objectId: predicate.object_id,
       objectObservable: true,
       actualPosition: { ...object.position },
       target: { ...predicate.target },
       distanceMeters,
-      toleranceMeters: predicate.tolerance_m
+      toleranceMeters: predicate.tolerance_m,
+      ...(targetOrientation && actualOrientation
+        && orientationErrorRadians !== undefined
+        && predicate.orientation_tolerance_rad !== undefined
+        ? {
+            actualOrientation,
+            targetOrientation,
+            orientationErrorRadians,
+            orientationToleranceRadians: predicate.orientation_tolerance_rad
+          }
+        : {})
     };
   }
   if (predicate.type === "object_displaced") {
@@ -1465,6 +1492,15 @@ function unobservableObjectEvidence(
       target: { ...predicate.target },
       distanceMeters: null,
       toleranceMeters: predicate.tolerance_m,
+      ...(predicate.target_orientation
+        && predicate.orientation_tolerance_rad !== undefined
+        ? {
+            actualOrientation: null,
+            targetOrientation: normalizeQuaternion(predicate.target_orientation),
+            orientationErrorRadians: null,
+            orientationToleranceRadians: predicate.orientation_tolerance_rad
+          }
+        : {}),
       reason: "object_not_observable"
     };
   }

@@ -186,6 +186,8 @@ export class HumanoidMotionExecution {
     const applied = await applyHumanoidMotionArtifactFrame(simulation, frame, {
       graspTargets: this.#graspTargets,
       carryTaskSpaceTargets: this.#carryTaskSpaceTargets,
+      taskId: this.#stored.option?.contract.option_id
+        ?? `motion-plan:${this.#stored.plan.id}`,
       ...(this.#stationKeepingAnchor
         ? {
             stationKeepingAnchor: this.#stationKeepingAnchor,

@@ -48,6 +48,17 @@ export interface HumanoidObjectWorldModelEntry {
     clearance_m: number;
     source: "authored" | "geometry";
   }>;
+  container?: {
+    interior_center_world: Vec3;
+    interior_size: Vec3;
+    opening_direction_world: Vec3;
+    wall_thickness_m: number;
+  };
+  support_surface?: {
+    center_world: Vec3;
+    size: Vec3;
+    normal_world: Vec3;
+  };
   articulation: null | {
     joint_id: string;
     parent_object_id: string | null;
@@ -198,6 +209,37 @@ export function createHumanoidObjectWorldModel(input: {
           clearance_m: point.clearanceMeters,
           source: point.source
         })),
+        ...(capability.container
+          ? {
+              container: {
+                interior_center_world: add(
+                  pose.position,
+                  rotateVector(pose.rotation, capability.container.interior_center)
+                ),
+                interior_size: { ...capability.container.interior_size },
+                opening_direction_world: rotateVector(
+                  pose.rotation,
+                  capability.container.opening_direction
+                ),
+                wall_thickness_m: capability.container.wall_thickness_m
+              }
+            }
+          : {}),
+        ...(capability.supportSurface
+          ? {
+              support_surface: {
+                center_world: add(
+                  pose.position,
+                  rotateVector(pose.rotation, capability.supportSurface.local_center)
+                ),
+                size: { ...capability.supportSurface.size },
+                normal_world: rotateVector(
+                  pose.rotation,
+                  capability.supportSurface.normal
+                )
+              }
+            }
+          : {}),
         articulation: capability.articulation
           ? articulationState(capability.articulation, snapshot?.articulation)
           : null,

@@ -80,6 +80,7 @@ import {
 import type {
   HumanoidControllerInferenceOptions,
   HumanoidControllerDescriptor,
+  HumanoidControllerTaskCommand,
   HumanoidControllerState,
   HumanoidJointPositionCommand,
   HumanoidPolicyState,
@@ -455,6 +456,7 @@ export class HumanoidSimulation {
       trackedJointPolicyCommand?: HumanoidControllerInferenceOptions[
         "trackedJointPolicyCommand"
       ];
+      taskCommand?: HumanoidControllerTaskCommand;
     } = {}
   ): Promise<HumanoidSimulationSnapshot> {
     this.#validateReference(reference);
@@ -469,10 +471,14 @@ export class HumanoidSimulation {
       && options.trackedJointPolicyCommand !== "neutral") {
       throw new Error("Tracked-joint policy command must be measured or neutral");
     }
-    const controllerOptions: HumanoidControllerInferenceOptions =
-      options.trackedJointPolicyCommand === undefined
+    const controllerOptions: HumanoidControllerInferenceOptions = {
+      ...(options.trackedJointPolicyCommand === undefined
         ? {}
-        : { trackedJointPolicyCommand: options.trackedJointPolicyCommand };
+        : { trackedJointPolicyCommand: options.trackedJointPolicyCommand }),
+      ...(options.taskCommand === undefined
+        ? {}
+        : { taskCommand: structuredClone(options.taskCommand) })
+    };
     const command = await this.#controller.infer(
       this.#policyState(),
       reference,
@@ -1298,7 +1304,7 @@ export class HumanoidSimulation {
   }
 
   #policyState(): HumanoidPolicyState {
-    return {
+    const state: HumanoidPolicyState = {
       jointPositions: Float64Array.from(
         this.#jointPositionAddresses,
         (address) => this.#data.qpos[address]
@@ -1310,6 +1316,75 @@ export class HumanoidSimulation {
       rootQuaternion: this.#rootQuaternion(),
       rootAngularVelocity: [this.#data.qvel[3]!, this.#data.qvel[4]!, this.#data.qvel[5]!]
     };
+    const features = this.#controller.descriptor.learnedPolicy
+      ?.observationFeatures ?? [];
+    if (!features.some((feature) => [
+      "root_kinematics",
+      "hand_state",
+      "end_effector_state",
+      "contact_state",
+      "object_state",
+      "articulation_state"
+    ].includes(feature))) return state;
+    const snapshot = this.snapshot();
+    const endEffectorNames = [
+      "left_ankle_roll_link",
+      "right_ankle_roll_link",
+      "left_wrist_yaw_link",
+      "right_wrist_yaw_link"
+    ] as const;
+    state.environment = {
+      protocol: "humanoid-policy-environment-v1",
+      authority: "mujoco_state",
+      rootLinearVelocity: [
+        this.#data.qvel[0]!,
+        this.#data.qvel[1]!,
+        this.#data.qvel[2]!
+      ],
+      endEffectors: Object.fromEntries(endEffectorNames.map((name) => [name, {
+        position: { ...snapshot.links[name].position },
+        rotation: { ...snapshot.links[name].rotation }
+      }])),
+      hands: Object.fromEntries(Object.entries(snapshot.hands.joints).map(
+        ([name, joint]) => [name, {
+          position: joint.position,
+          velocity: joint.velocity,
+          target: joint.target
+        }]
+      )),
+      contacts: snapshot.contacts.map((contact) => ({
+        position: { ...contact.position },
+        normal: { ...contact.normal },
+        normalForce: contact.normalForce,
+        firstBody: contact.firstBody,
+        secondBody: contact.secondBody,
+        firstObject: contact.firstObject,
+        secondObject: contact.secondObject,
+        firstSolid: contact.firstSolid ?? null,
+        secondSolid: contact.secondSolid ?? null,
+        firstHandLink: contact.firstHandLink,
+        secondHandLink: contact.secondHandLink
+      })),
+      objects: Object.values(snapshot.objects).map((object) => ({
+        id: object.id,
+        position: { ...object.position },
+        rotation: { ...object.rotation },
+        linearVelocity: { ...object.linearVelocity },
+        angularVelocity: { ...object.angularVelocity },
+        ...(object.articulation
+          ? {
+              articulation: {
+                type: object.articulation.type,
+                position: object.articulation.position,
+                velocity: object.articulation.velocity,
+                minimum: object.articulation.minimum,
+                maximum: object.articulation.maximum
+              }
+            }
+          : {})
+      }))
+    };
+    return state;
   }
 
   #rootQuaternion(): [number, number, number, number] {

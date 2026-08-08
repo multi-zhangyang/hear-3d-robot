@@ -482,6 +482,49 @@ function validateSkillSemantics(
           observed_affordances: destination?.affordances ?? []
         });
       }
+      if (invocation.destination.type === "slot") {
+        const slot = invocation.destination;
+        const point = destination.interaction_points.find(
+          ({ id }) => id === slot.interaction_point_id
+        );
+        if (!point || point.kind !== "insert" || !point.approach_direction_world) {
+          return rejection("skill_destination_unavailable", {
+            skill: invocation.skill,
+            destination_id: destinationId,
+            interaction_point_id: slot.interaction_point_id,
+            reason: "slot placement requires an observed insert point and insertion direction"
+          });
+        }
+      }
+    }
+  }
+  if (invocation.skill === "regrasp") {
+    const grasp = observation.interaction.manipulable_objects
+      .find(({ object_id }) => object_id === invocation.object_id)?.grasp
+      .find(({ hand }) => hand === invocation.from_hand);
+    const carried = observation.interaction.carrying.bindings.some(
+      ({ object_id, hand }) => object_id === invocation.object_id
+        && hand === invocation.from_hand
+    );
+    if (!grasp?.verified && !carried) {
+      return rejection("skill_precondition_failed", {
+        skill: invocation.skill,
+        object_id: invocation.object_id,
+        from_hand: invocation.from_hand,
+        reason: "source hand must have verified support before regrasp"
+      });
+    }
+    const occupied = observation.interaction.carrying.bindings.find(
+      ({ hand }) => hand === invocation.to_hand
+    );
+    if (occupied && occupied.object_id !== invocation.object_id) {
+      return rejection("skill_precondition_failed", {
+        skill: invocation.skill,
+        object_id: invocation.object_id,
+        to_hand: invocation.to_hand,
+        occupied_by_object_id: occupied.object_id,
+        reason: "destination hand is carrying another object"
+      });
     }
   }
   const carrying = observation.interaction.carrying.bindings;
@@ -732,15 +775,32 @@ function validateMotionOutcome(
     });
   }
   if (invocation.skill === "place" && phase === "settle_and_release"
-    && (!has("object_released", invocation.object_id)
-      || !has("object_settled_on_support", invocation.object_id)
+    && ((invocation.release_after_settled
+      && (!has("object_released", invocation.object_id)
+        || !has("object_settled_on_support", invocation.object_id)))
+      || (!invocation.release_after_settled
+        && !(invocation.hands === "both"
+          ? (["left", "right"] as const).every((hand) => predicates.some(
+              (predicate) => predicate?.type === "grasp_verified"
+                && predicate.object_id === invocation.object_id
+                && predicate.hand === hand
+            ))
+          : predicates.some((predicate) => predicate?.type === "grasp_verified"
+              && predicate.object_id === invocation.object_id
+              && predicate.hand === invocation.hands)))
       || !placeRelationPredicatePresent(invocation, predicates))) {
     return rejection("skill_terminal_contract_mismatch", {
       skill: invocation.skill,
       phase,
       required_predicates: [
-        "object_released",
-        "object_settled_on_support",
+        ...(invocation.release_after_settled
+          ? ["object_released", "object_settled_on_support"]
+          : invocation.hands === "both"
+            ? [
+                { type: "grasp_verified", hand: "left" },
+                { type: "grasp_verified", hand: "right" }
+              ]
+            : [{ type: "grasp_verified", hand: invocation.hands }]),
         placeRelationPredicateName(invocation)
       ]
     });

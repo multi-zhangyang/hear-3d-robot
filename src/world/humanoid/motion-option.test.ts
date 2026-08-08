@@ -341,6 +341,60 @@ describe("humanoid motion option detector", () => {
     });
   });
 
+  it("requires both object position and orientation when a placement pose declares both", () => {
+    const targetOrientation = {
+      x: 0,
+      y: Math.SQRT1_2,
+      z: 0,
+      w: Math.SQRT1_2
+    };
+    const poseContract = HumanoidMotionOptionContractSchema.parse({
+      option_id: "oriented-placement",
+      stable_steps: 1,
+      predicates: [{
+        type: "object_near_point",
+        object_id: "crate",
+        target: { ...observableCrate.position },
+        tolerance_m: 0.01,
+        target_orientation: targetOrientation,
+        orientation_tolerance_rad: 0.05
+      }]
+    });
+    const misaligned = detectHumanoidMotionOption(poseContract, {
+      snapshot: robot,
+      observableObjects: [observableCrate],
+      zones: []
+    });
+    expect(misaligned.allSatisfied).toBe(false);
+    const misalignedEvidence = misaligned.evidence[0]!;
+    expect(misalignedEvidence).toMatchObject({
+      status: "unsatisfied",
+      distanceMeters: 0
+    });
+    expect("orientationErrorRadians" in misalignedEvidence
+      ? misalignedEvidence.orientationErrorRadians
+      : null).toBeCloseTo(Math.PI / 2, 12);
+
+    const aligned = detectHumanoidMotionOption(poseContract, {
+      snapshot: robot,
+      observableObjects: [{
+        ...observableCrate,
+        rotation: {
+          x: -targetOrientation.x,
+          y: -targetOrientation.y,
+          z: -targetOrientation.z,
+          w: -targetOrientation.w
+        }
+      }],
+      zones: []
+    });
+    expect(aligned.allSatisfied).toBe(true);
+    expect(aligned.evidence[0]).toMatchObject({
+      status: "satisfied",
+      orientationErrorRadians: 0
+    });
+  });
+
   it("verifies directed displacement and balance without scripted actions", () => {
     const physicalContract = HumanoidMotionOptionContractSchema.parse({
       option_id: "push-and-stabilize",

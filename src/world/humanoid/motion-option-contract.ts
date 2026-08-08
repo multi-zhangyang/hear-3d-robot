@@ -124,8 +124,32 @@ const ObjectNearPointPredicateSchema = z.object({
   type: z.literal("object_near_point"),
   object_id: z.string().trim().min(1),
   target: Vec3Schema,
-  tolerance_m: PositionToleranceSchema
-}).strict();
+  tolerance_m: PositionToleranceSchema,
+  target_orientation: QuaternionSchema.optional(),
+  orientation_tolerance_rad: z.number().finite().positive().max(Math.PI).optional()
+}).strict().superRefine((predicate, context) => {
+  if ((predicate.target_orientation === undefined)
+    !== (predicate.orientation_tolerance_rad === undefined)) {
+    context.addIssue({
+      code: "custom",
+      path: [predicate.target_orientation === undefined
+        ? "target_orientation"
+        : "orientation_tolerance_rad"],
+      message: "Object orientation and tolerance must be provided together"
+    });
+  }
+  if (predicate.target_orientation) {
+    try {
+      normalizeQuaternion(predicate.target_orientation);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        path: ["target_orientation"],
+        message: error instanceof Error ? error.message : "Invalid quaternion"
+      });
+    }
+  }
+});
 
 const ObjectInZonePredicateSchema = z.object({
   type: z.literal("object_in_zone"),

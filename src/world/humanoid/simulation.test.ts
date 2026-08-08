@@ -24,6 +24,7 @@ import {
 } from "./task-space-targets.js";
 import type {
   HumanoidControllerDescriptor,
+  HumanoidControllerInferenceOptions,
   HumanoidControllerState,
   HumanoidJointPositionCommand,
   HumanoidPolicyState,
@@ -74,6 +75,7 @@ describe("HumanoidSimulation", () => {
             protocol: "g1-joint-position-residual-v1",
             size: HUMANOID_JOINT_NAMES.length
           },
+          observationFeatures: ["proprioception", "command_history"],
           capabilities: ["balance", "locomotion", "joint_reference_tracking"]
         }
       });
@@ -404,6 +406,52 @@ describe("HumanoidSimulation", () => {
     expect(controller.disposed).toBe(true);
   });
 
+  it("feeds declared contact-rich policy observations and task commands through the controller boundary", async () => {
+    const controller = new ContractController({}, true);
+    const simulation = await HumanoidSimulation.create({
+      controllerFactory: async () => controller
+    });
+    try {
+      const wrist = simulation.snapshot().links.right_wrist_yaw_link;
+      await simulation.step(neutralHumanoidReference(), {
+        taskCommand: {
+          protocol: "humanoid-controller-task-v1",
+          taskId: "skill:grasp:contact",
+          source: "motion_option",
+          endEffectors: [{
+            body: "right_wrist_yaw_link",
+            frame: "world",
+            position: { ...wrist.position },
+            tolerance: 0.04
+          }],
+          grasps: [{
+            objectId: "workpiece",
+            hand: "right",
+            minimumNormalForceN: 1,
+            minimumDistinctContactSurfaces: 2
+          }]
+        }
+      });
+      expect(controller.lastState?.environment).toMatchObject({
+        protocol: "humanoid-policy-environment-v1",
+        authority: "mujoco_state",
+        rootLinearVelocity: [expect.any(Number), expect.any(Number), expect.any(Number)]
+      });
+      expect(Object.keys(controller.lastState!.environment!.endEffectors)).toEqual([
+        "left_ankle_roll_link",
+        "right_ankle_roll_link",
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link"
+      ]);
+      expect(controller.lastOptions?.taskCommand).toMatchObject({
+        taskId: "skill:grasp:contact",
+        grasps: [{ objectId: "workpiece", hand: "right" }]
+      });
+    } finally {
+      await simulation.dispose();
+    }
+  });
+
   it("rejects an invalid controller contract and releases the controller", async () => {
     const controller = new ContractController({
       controlStepSeconds: 0.019,
@@ -476,19 +524,53 @@ class ContractController implements HumanoidWholeBodyController {
   readonly descriptor: HumanoidControllerDescriptor;
   inferenceCount = 0;
   disposed = false;
+  lastState: HumanoidPolicyState | undefined;
+  lastOptions: HumanoidControllerInferenceOptions | undefined;
   commandMode: "valid" | "wrong_dimension" | "non_finite" | "negative_gain"
     | "saturated" = "valid";
 
   constructor(timing: Partial<Pick<
     HumanoidControllerDescriptor,
     "controlStepSeconds" | "physicsStepSeconds"
-  >> = {}) {
+  >> = {}, richObservation = false) {
     this.descriptor = {
       protocol: "humanoid-controller-v1",
       implementation: "contract_test_pd",
       actuation: "joint_position_pd",
       controlStepSeconds: timing.controlStepSeconds ?? 0.02,
-      physicsStepSeconds: timing.physicsStepSeconds ?? 0.005
+      physicsStepSeconds: timing.physicsStepSeconds ?? 0.005,
+      ...(richObservation
+        ? {
+            learnedPolicy: {
+              protocol: "humanoid-learned-policy-v1" as const,
+              runtime: "test",
+              observationSpace: {
+                protocol: "humanoid-contact-rich-test-v1",
+                size: 1
+              },
+              actionSpace: {
+                protocol: "g1-joint-position-test-v1",
+                size: HUMANOID_JOINT_NAMES.length
+              },
+              observationFeatures: [
+                "proprioception" as const,
+                "root_kinematics" as const,
+                "hand_state" as const,
+                "end_effector_state" as const,
+                "contact_state" as const,
+                "object_state" as const,
+                "articulation_state" as const,
+                "task_space_command" as const,
+                "grasp_command" as const
+              ],
+              capabilities: [
+                "balance" as const,
+                "joint_reference_tracking" as const,
+                "contact_rich_manipulation" as const
+              ]
+            }
+          }
+        : {})
     };
   }
 
@@ -497,10 +579,13 @@ class ContractController implements HumanoidWholeBodyController {
   }
 
   async infer(
-    _state: HumanoidPolicyState,
-    reference: ReturnType<typeof neutralHumanoidReference>
+    state: HumanoidPolicyState,
+    reference: ReturnType<typeof neutralHumanoidReference>,
+    options: HumanoidControllerInferenceOptions = {}
   ): Promise<HumanoidJointPositionCommand> {
     this.inferenceCount += 1;
+    this.lastState = state;
+    this.lastOptions = options;
     const length = this.commandMode === "wrong_dimension"
       ? HUMANOID_JOINT_NAMES.length - 1
       : HUMANOID_JOINT_NAMES.length;

@@ -662,7 +662,31 @@ export class HumanoidNavigationExecution {
       noslipIterations: g1CarriedGraspRequiresNoslip({
         snapshot: simulation.snapshot(),
         targets: this.#graspTargets
-      }) ? CARRY_NOSLIP_SOLVER_ITERATIONS : 0
+      }) ? CARRY_NOSLIP_SOLVER_ITERATIONS : 0,
+      ...(this.#carrying
+        ? {
+            taskCommand: {
+              protocol: "humanoid-controller-task-v1" as const,
+              taskId: "carry-navigation",
+              source: "carry_navigation" as const,
+              endEffectors: this.#carryTaskSpaceTargets.map((target) => ({
+                body: target.body,
+                frame: target.frame,
+                position: { ...target.position },
+                tolerance: target.tolerance,
+                orientation: { ...target.orientation },
+                orientationTolerance: target.orientationTolerance
+              })),
+              grasps: this.#graspTargets.map((target) => ({
+                objectId: target.objectId,
+                hand: target.hand,
+                minimumNormalForceN: target.minimumNormalForceN,
+                minimumDistinctContactSurfaces:
+                  target.minimumDistinctContactSurfaces ?? 1
+              }))
+            }
+          }
+        : {})
     });
     const prepared = {
       snapshot,

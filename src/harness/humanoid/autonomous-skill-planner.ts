@@ -20,6 +20,7 @@ import {
   solveHumanoidArticulationTrajectory
 } from "./articulation-trajectory.js";
 import {
+  inverseQuaternion,
   multiplyQuaternion,
   normalizeQuaternion,
   rotateVector,
@@ -242,6 +243,7 @@ interface SkillMotionTarget {
   toleranceM?: number;
   handSurfaces?: Partial<Record<"left" | "right", G1HandContactSurfaceName>>;
   objectTarget?: Vec3;
+  objectOrientationTarget?: Quaternion;
   direction?: Vec3;
   contactApproach?: {
     hand: "left" | "right";
@@ -290,14 +292,48 @@ function skillMotionTarget(
   }
   if (invocation.skill === "place") {
     const object = objectEntry(observation, invocation.object_id);
-    const objectTarget = placementTarget(invocation, observation);
-    const delta = subtract(objectTarget, object.pose.position);
+    const placement = placementTarget(invocation, observation);
+    const objectTarget = binding.phase === "align_destination"
+      ? placement.stagingPosition
+      : placement.finalPosition;
+    const rotationDelta = placement.targetRotation
+      ? normalizeQuaternion(multiplyQuaternion(
+          placement.targetRotation,
+          inverseQuaternion(object.pose.rotation)
+        ))
+      : null;
     const hands = carriedHands(observation, invocation.object_id, invocation.hands)
       .reduce<SkillMotionTarget["hands"]>((targets, hand) => {
-        targets[hand] = add(wristPosition(observation, hand), delta);
+        const wrist = wristPosition(observation, hand);
+        targets[hand] = rotationDelta
+          ? add(objectTarget, rotateVector(
+              rotationDelta,
+              subtract(wrist, object.pose.position)
+            ))
+          : add(wrist, subtract(objectTarget, object.pose.position));
         return targets;
       }, {});
-    return { hands, objectTarget };
+    const handOrientations = rotationDelta
+      ? Object.fromEntries(carriedHands(
+          observation,
+          invocation.object_id,
+          invocation.hands
+        ).map((hand) => [
+          hand,
+          normalizeQuaternion(multiplyQuaternion(
+            rotationDelta,
+            wristPose(observation, hand).rotation
+          ))
+        ])) as SkillMotionTarget["handOrientations"]
+      : undefined;
+    return {
+      hands,
+      ...(handOrientations ? { handOrientations } : {}),
+      objectTarget,
+      ...(placement.targetRotation
+        ? { objectOrientationTarget: placement.targetRotation }
+        : {})
+    };
   }
   if (invocation.skill === "bimanual_support") {
     return {
@@ -610,7 +646,7 @@ function skillPredicates(
     }];
   }
   if (invocation.skill === "place" && phase === "settle_and_release") {
-    return placePredicates(invocation, motion.objectTarget!);
+    return placePredicates(invocation, motion, observation);
   }
   if ((invocation.skill === "open" || invocation.skill === "close")
     && phase === "actuate_joint") {
@@ -675,7 +711,13 @@ function skillPredicates(
       type: "object_near_point",
       object_id: invocation.object_id,
       target: motion.objectTarget,
-      tolerance_m: 0.08
+      tolerance_m: 0.08,
+      ...(motion.objectOrientationTarget
+        ? {
+            target_orientation: motion.objectOrientationTarget,
+            orientation_tolerance_rad: 0.18
+          }
+        : {})
     }];
   }
   throw new Error(`Skill ${invocation.skill}.${phase} has no observable terminal`);
@@ -1513,6 +1555,7 @@ function handCoordinationForSkill(
     close(invocation.to_hand);
     open(invocation.from_hand);
   } else if (invocation.skill === "place" && phase === "settle_and_release") {
+    if (!invocation.release_after_settled) return null;
     if (invocation.hands === "both") {
       open("left");
       open("right");
@@ -1523,15 +1566,27 @@ function handCoordinationForSkill(
 
 function placePredicates(
   invocation: Extract<HumanoidSkillInvocation, { skill: "place" }>,
-  objectTarget: Vec3
+  motion: SkillMotionTarget,
+  observation: HumanoidWorldObservation
 ): HumanoidMotionOptionPredicate[] {
+  if (!motion.objectTarget) throw new Error("Place Skill has no object target");
   const hands = invocation.hands === "both"
     ? ["left", "right"] as const : [invocation.hands];
-  const released: HumanoidMotionOptionPredicate[] = hands.map((hand) => ({
-    type: "object_released",
-    object_id: invocation.object_id,
-    hand
-  }));
+  const handState: HumanoidMotionOptionPredicate[] = hands.map((hand) => (
+    invocation.release_after_settled
+      ? {
+          type: "object_released" as const,
+          object_id: invocation.object_id,
+          hand
+        }
+      : {
+          type: "grasp_verified" as const,
+          object_id: invocation.object_id,
+          hand,
+          grasp_contract_sha256:
+            observation.interaction.grasp_authority.contract_sha256
+        }
+  ));
   const relation: HumanoidMotionOptionPredicate = invocation.destination.type === "container"
     ? {
         type: "object_inside",
@@ -1551,22 +1606,59 @@ function placePredicates(
       : {
           type: "object_near_point",
           object_id: invocation.object_id,
-          target: objectTarget,
+          target: motion.objectTarget,
           tolerance_m: invocation.destination.type === "world_pose"
-            ? invocation.destination.position_tolerance_m : 0.05
+            ? invocation.destination.position_tolerance_m : 0.05,
+          ...(motion.objectOrientationTarget
+            ? {
+                target_orientation: motion.objectOrientationTarget,
+                orientation_tolerance_rad: 0.18
+              }
+            : {})
         };
-  return [...released, {
-    type: "object_settled_on_support",
-    object_id: invocation.object_id
-  }, relation];
+  const pose: HumanoidMotionOptionPredicate = {
+    type: "object_near_point",
+    object_id: invocation.object_id,
+    target: motion.objectTarget,
+    tolerance_m: invocation.destination.type === "world_pose"
+      ? invocation.destination.position_tolerance_m : 0.05,
+    ...(motion.objectOrientationTarget
+      ? {
+          target_orientation: motion.objectOrientationTarget,
+          orientation_tolerance_rad: 0.18
+        }
+      : {})
+  };
+  return [
+    ...handState,
+    ...(invocation.release_after_settled
+      ? [{
+          type: "object_settled_on_support" as const,
+          object_id: invocation.object_id
+        }]
+      : []),
+    relation,
+    ...(relation.type === "object_near_point" ? [] : [pose])
+  ];
+}
+
+interface PlacementTarget {
+  finalPosition: Vec3;
+  stagingPosition: Vec3;
+  targetRotation?: Quaternion;
 }
 
 function placementTarget(
   invocation: Extract<HumanoidSkillInvocation, { skill: "place" }>,
   observation: HumanoidWorldObservation
-): Vec3 {
+): PlacementTarget {
+  const object = objectEntry(observation, invocation.object_id);
   if (invocation.destination.type === "world_pose") {
-    return { ...invocation.destination.position };
+    const finalPosition = { ...invocation.destination.position };
+    return {
+      finalPosition,
+      stagingPosition: add(finalPosition, { x: 0, y: placementClearance(object), z: 0 })
+    };
   }
   const destination = objectEntry(observation, invocation.destination.object_id);
   if (invocation.destination.type === "slot") {
@@ -1578,23 +1670,123 @@ function placementTarget(
     if (!point.approach_direction_world) {
       throw new Error("Placement slot requires an observed insertion direction");
     }
-    return add(
+    const insertionDirection = normalize(point.approach_direction_world);
+    const finalPosition = add(
       point.world_position,
-      scale(normalize(point.approach_direction_world), invocation.destination.insertion_depth_m)
+      scale(insertionDirection, invocation.destination.insertion_depth_m)
     );
+    const targetRotation = insertionRotation(object, insertionDirection);
+    return {
+      finalPosition,
+      stagingPosition: add(
+        finalPosition,
+        scale(insertionDirection, -placementClearance(object, insertionDirection))
+      ),
+      targetRotation
+    };
   }
   if ((invocation.destination.type === "support_surface"
       || invocation.destination.type === "container")
     && invocation.destination.local_target) {
-    return add(destination.pose.position, invocation.destination.local_target);
+    const finalPosition = add(
+      destination.pose.position,
+      rotateVector(destination.pose.rotation, invocation.destination.local_target)
+    );
+    const insertionDirection = invocation.destination.type === "container"
+      ? destination.container
+        ? scale(normalize(destination.container.opening_direction_world), -1)
+        : { x: 0, y: -1, z: 0 }
+      : destination.support_surface
+        ? scale(normalize(destination.support_surface.normal_world), -1)
+        : { x: 0, y: -1, z: 0 };
+    return {
+      finalPosition,
+      stagingPosition: add(
+        finalPosition,
+        scale(insertionDirection, -placementClearance(object, insertionDirection))
+      )
+    };
   }
+  if (invocation.destination.type === "container") {
+    const container = destination.container;
+    if (!container) throw new Error("Place destination has no container geometry");
+    const insertionDirection = scale(
+      normalize(container.opening_direction_world),
+      -1
+    );
+    const finalPosition = { ...container.interior_center_world };
+    return {
+      finalPosition,
+      stagingPosition: add(
+        finalPosition,
+        scale(insertionDirection, -placementClearance(object, insertionDirection))
+      )
+    };
+  }
+  const support = destination.support_surface;
+  if (!support) throw new Error("Place destination has no support-surface geometry");
+  const normal = normalize(support.normal_world);
+  const finalPosition = add(
+    support.center_world,
+    scale(normal, objectExtentAlong(object.size, object.pose.rotation, normal))
+  );
+  const insertionDirection = scale(normal, -1);
   return {
-    x: destination.pose.position.x,
-    y: invocation.destination.type === "support_surface"
-      ? destination.pose.position.y + destination.size.y / 2
-      : destination.pose.position.y,
-    z: destination.pose.position.z
+    finalPosition,
+    stagingPosition: add(
+      finalPosition,
+      scale(insertionDirection, -placementClearance(object, insertionDirection))
+    )
   };
+}
+
+function placementClearance(
+  object: ReturnType<typeof objectEntry>,
+  direction: Vec3 = { x: 0, y: -1, z: 0 }
+): number {
+  return clamp(
+    objectExtentAlong(object.size, object.pose.rotation, normalize(direction)) + 0.08,
+    0.12,
+    0.45
+  );
+}
+
+function objectExtentAlong(size: Vec3, rotation: Quaternion, direction: Vec3): number {
+  const axes = [
+    rotateVector(rotation, { x: size.x / 2, y: 0, z: 0 }),
+    rotateVector(rotation, { x: 0, y: size.y / 2, z: 0 }),
+    rotateVector(rotation, { x: 0, y: 0, z: size.z / 2 })
+  ];
+  return axes.reduce((extent, axis) => extent + Math.abs(dot(axis, direction)), 0);
+}
+
+function insertionRotation(
+  object: ReturnType<typeof objectEntry>,
+  insertionDirection: Vec3
+): Quaternion {
+  const dimensions = [
+    { axis: { x: 1, y: 0, z: 0 }, extent: object.size.x },
+    { axis: { x: 0, y: 1, z: 0 }, extent: object.size.y },
+    { axis: { x: 0, y: 0, z: 1 }, extent: object.size.z }
+  ].sort((left, right) => right.extent - left.extent);
+  let currentAxis = normalize(rotateVector(object.pose.rotation, dimensions[0]!.axis));
+  const targetAxis = normalize(insertionDirection);
+  if (dot(currentAxis, targetAxis) < 0) currentAxis = scale(currentAxis, -1);
+  const delta = quaternionBetweenDirections(currentAxis, targetAxis);
+  return normalizeQuaternion(multiplyQuaternion(delta, object.pose.rotation));
+}
+
+function quaternionBetweenDirections(from: Vec3, to: Vec3): Quaternion {
+  const cosine = clamp(dot(from, to), -1, 1);
+  if (cosine >= 1 - 1e-9) return IDENTITY_QUATERNION;
+  if (cosine <= -1 + 1e-9) {
+    const candidate = Math.abs(from.x) < 0.8
+      ? { x: 1, y: 0, z: 0 }
+      : { x: 0, y: 1, z: 0 };
+    return axisAngleQuaternion(normalize(cross(from, candidate)), Math.PI);
+  }
+  const axis = cross(from, to);
+  return normalizeQuaternion({ x: axis.x, y: axis.y, z: axis.z, w: 1 + cosine });
 }
 
 function wristTargetForPoint(

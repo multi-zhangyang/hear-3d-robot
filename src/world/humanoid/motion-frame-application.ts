@@ -17,7 +17,9 @@ import type {
   HumanoidSimulation,
   HumanoidSimulationSnapshot
 } from "./simulation.js";
+import type { HumanoidControllerTaskCommand } from "./whole-body-controller.js";
 import type { HumanoidEndEffectorBody } from "./task-space-targets.js";
+import type { HumanoidTaskSpaceServoTarget } from "./task-space-servo.js";
 import {
   stationKeepingHumanoidReference,
   type HumanoidStationKeepingAnchor
@@ -38,6 +40,7 @@ export async function applyHumanoidMotionArtifactFrame(
     carryTaskSpaceTargets?: readonly HumanoidCarryTaskSpaceTarget[];
     stationKeepingAnchor?: HumanoidStationKeepingAnchor;
     stationKeepingCommand?: readonly [number, number];
+    taskId?: string;
   } = {}
 ): Promise<HumanoidMotionFrameApplication> {
   const artifactReference = hydrateHumanoidReference(frame.reference);
@@ -118,11 +121,65 @@ export async function applyHumanoidMotionArtifactFrame(
         && ((options.carryTaskSpaceTargets?.length ?? 0) > 0
           || (options.graspTargets?.length ?? 0) > 0)
       ? "neutral"
-      : "measured"
+      : "measured",
+    ...((taskSpaceTargets?.length ?? 0) > 0
+      || (options.carryTaskSpaceTargets?.length ?? 0) > 0
+      || (options.graspTargets?.length ?? 0) > 0
+      ? {
+          taskCommand: controllerTaskCommand({
+            taskId: options.taskId ?? "motion-option",
+            taskSpaceTargets: taskSpaceTargets ?? [],
+            carryTaskSpaceTargets: options.carryTaskSpaceTargets ?? [],
+            graspTargets: options.graspTargets ?? []
+          })
+        }
+      : {})
   });
   return {
     reference,
     snapshot,
     ...(graspServoEvidence ? { graspServoEvidence } : {})
+  };
+}
+
+function controllerTaskCommand(input: {
+  taskId: string;
+  taskSpaceTargets: readonly HumanoidTaskSpaceServoTarget[];
+  carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
+  graspTargets: readonly G1ContactAwareGraspTarget[];
+}): HumanoidControllerTaskCommand {
+  return {
+    protocol: "humanoid-controller-task-v1",
+    taskId: input.taskId,
+    source: "motion_option",
+    endEffectors: [
+      ...input.taskSpaceTargets.map((target) => ({
+        body: target.body,
+        frame: target.frame,
+        position: { ...target.position },
+        tolerance: target.tolerance,
+        ...(target.orientation && target.orientationTolerance !== undefined
+          ? {
+              orientation: { ...target.orientation },
+              orientationTolerance: target.orientationTolerance
+            }
+          : {})
+      })),
+      ...input.carryTaskSpaceTargets.map((target) => ({
+        body: target.body,
+        frame: target.frame,
+        position: { ...target.position },
+        tolerance: target.tolerance,
+        orientation: { ...target.orientation },
+        orientationTolerance: target.orientationTolerance
+      }))
+    ],
+    grasps: input.graspTargets.map((target) => ({
+      objectId: target.objectId,
+      hand: target.hand,
+      minimumNormalForceN: target.minimumNormalForceN,
+      minimumDistinctContactSurfaces:
+        target.minimumDistinctContactSurfaces ?? 1
+    }))
   };
 }

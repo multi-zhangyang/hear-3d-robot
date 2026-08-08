@@ -58,5 +58,22 @@ describe("humanoid recovery policy", () => {
       hand: "right",
       travel_m: 0.05
     })).toBe(false);
+    expect(humanoidRecoverySelectionAccepted(policy, binding.invocation)).toBe(false);
+    expect(humanoidRecoverySelectionAccepted(policy, {
+      skill: "regrasp",
+      object_id: "door",
+      interaction_point_id: "handle",
+      from_hand: "right",
+      to_hand: "left",
+      excluded_interaction_point_ids: []
+    })).toBe(false);
+    expect(humanoidRecoverySelectionAccepted(policy, {
+      skill: "regrasp",
+      object_id: "door",
+      interaction_point_id: "alternate-handle",
+      from_hand: "right",
+      to_hand: "left",
+      excluded_interaction_point_ids: ["handle"]
+    })).toBe(true);
   });
 });

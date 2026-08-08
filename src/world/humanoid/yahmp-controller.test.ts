@@ -26,6 +26,7 @@ describe("YAHMP whole-body motion tracking", () => {
         protocol: "g1-joint-position-residual-v1",
         size: HUMANOID_JOINT_NAMES.length
       },
+      observationFeatures: ["proprioception", "command_history"],
       capabilities: ["balance", "locomotion", "joint_reference_tracking"]
     });
     const reference = neutralHumanoidReference();

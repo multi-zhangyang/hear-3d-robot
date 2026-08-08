@@ -1998,6 +1998,8 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
             protocol: robot.controller.learnedPolicy.protocol,
             runtime: robot.controller.learnedPolicy.runtime,
             observation_space: robot.controller.learnedPolicy.observationSpace,
+            observation_features:
+              robot.controller.learnedPolicy.observationFeatures ?? [],
             action_space: robot.controller.learnedPolicy.actionSpace,
             capabilities: robot.controller.learnedPolicy.capabilities
           }
