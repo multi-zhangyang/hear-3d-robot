@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { HumanoidLearnedPolicyCapability } from "../../domain/humanoid-policy.js";
+import type { JsonValue } from "../../domain/schema.js";
 import {
   neutralHumanoidReference,
   targetReference
@@ -107,10 +108,12 @@ describe("humanoid controller capability routing", () => {
     expect(checkpoint).toMatchObject({
       implementation: "trained-velocity",
       payload: {
-        protocol: "humanoid-controller-capability-routing-state-v1",
+        protocol: "humanoid-controller-capability-routing-state-v2",
         active: "fallback",
         primary: { implementation: "trained-velocity" },
-        fallback: { implementation: "reference-tracking" }
+        fallback: { implementation: "reference-tracking" },
+        last_command: { kind: "joint_position_pd" },
+        handoff: null
       }
     });
 
@@ -130,6 +133,32 @@ describe("humanoid controller capability routing", () => {
     await restored.infer(state, task);
     expect(restoredFallback.calls.reset).toBe(0);
 
+    const v2Payload = checkpoint.payload as Record<string, JsonValue>;
+    const v1Primary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    const v1Fallback = controller(
+      "reference-tracking",
+      ["balance", "locomotion", "joint_reference_tracking"],
+      2
+    );
+    const restoredV1 = new CapabilityRoutingHumanoidController(
+      v1Primary,
+      v1Fallback
+    );
+    restoredV1.restoreState({
+      ...checkpoint,
+      payload: {
+        protocol: "humanoid-controller-capability-routing-state-v1",
+        active: v2Payload.active!,
+        primary: v2Payload.primary!,
+        fallback: v2Payload.fallback!
+      }
+    });
+    expect(restoredV1.executionState()).toMatchObject({
+      mode: "reference_control",
+      activeImplementation: "reference-tracking",
+      transition: null
+    });
+
     const legacyPrimary = controller("trained-velocity", ["balance", "locomotion"], 1);
     const legacyFallback = controller(
       "reference-tracking",
@@ -145,6 +174,107 @@ describe("humanoid controller capability routing", () => {
     expect(legacyPrimary.calls.restore).toBe(1);
     expect(legacyPrimary.calls.reset).toBe(0);
     expect(legacyFallback.calls.restore).toBe(0);
+  });
+
+  it("hands control over continuously and resumes an in-flight handoff after restore", async () => {
+    const primary = controller(
+      "trained-velocity",
+      ["balance", "locomotion"],
+      1,
+      0.02,
+      0.1
+    );
+    const fallback = controller(
+      "reference-tracking",
+      ["balance", "locomotion", "joint_reference_tracking"],
+      2,
+      0.02,
+      0.1
+    );
+    const routed = new CapabilityRoutingHumanoidController(primary, fallback);
+    const state = policyState();
+    const navigation = neutralHumanoidReference();
+    const task = targetReference(navigation, {
+      joints: { right_elbow_joint: 0.6 }
+    });
+
+    routed.reset(state, navigation);
+    const navigationCommand = await routed.infer(state, navigation);
+    expect(navigationCommand.positions[0]).toBe(1);
+    expect(routed.executionState()).toEqual({
+      protocol: "humanoid-controller-execution-v1",
+      mode: "learned_policy",
+      activeImplementation: "trained-velocity",
+      transition: null
+    });
+
+    const firstTaskCommand = await routed.infer(state, task);
+    expect(firstTaskCommand.positions[0]).toBeCloseTo(1.104, 12);
+    expect(firstTaskCommand.stiffness[0]).toBeCloseTo(1.104, 12);
+    expect(firstTaskCommand.damping[0]).toBeCloseTo(1.104, 12);
+    expect(routed.executionState()).toMatchObject({
+      mode: "reference_control",
+      activeImplementation: "reference-tracking",
+      transition: {
+        fromImplementation: "trained-velocity",
+        toImplementation: "reference-tracking",
+        progress: 0.2,
+        durationSeconds: 0.1
+      }
+    });
+    const secondTaskCommand = await routed.infer(state, task);
+    expect(secondTaskCommand.positions[0]).toBeCloseTo(1.352, 12);
+    const checkpoint = routed.captureState();
+
+    const malformed = structuredClone(checkpoint);
+    const malformedPayload = malformed.payload as Record<string, JsonValue>;
+    const malformedHandoff = malformedPayload.handoff as Record<string, JsonValue>;
+    malformedHandoff.completed_steps = malformedHandoff.total_steps!;
+    const rejectsMalformed = new CapabilityRoutingHumanoidController(
+      controller("trained-velocity", ["balance", "locomotion"], 1, 0.02, 0.1),
+      controller(
+        "reference-tracking",
+        ["balance", "locomotion", "joint_reference_tracking"],
+        2,
+        0.02,
+        0.1
+      )
+    );
+    expect(() => rejectsMalformed.restoreState(malformed)).toThrow(
+      "Invalid humanoid capability-routing handoff state"
+    );
+
+    const restored = new CapabilityRoutingHumanoidController(
+      controller("trained-velocity", ["balance", "locomotion"], 1, 0.02, 0.1),
+      controller(
+        "reference-tracking",
+        ["balance", "locomotion", "joint_reference_tracking"],
+        2,
+        0.02,
+        0.1
+      )
+    );
+    restored.restoreState(checkpoint);
+    expect(restored.executionState().transition?.progress).toBe(0.4);
+    const [continued, resumed] = await Promise.all([
+      routed.infer(state, task),
+      restored.infer(state, task)
+    ]);
+    expect([...resumed.positions]).toEqual([...continued.positions]);
+    expect(continued.positions[0]).toBeCloseTo(1.648, 12);
+
+    await routed.infer(state, task);
+    const completed = await routed.infer(state, task);
+    expect(completed.positions[0]).toBe(2);
+    expect(routed.executionState().transition).toBeNull();
+
+    const returned = await routed.infer(state, navigation);
+    expect(returned.positions[0]).toBeCloseTo(1.896, 12);
+    expect(routed.executionState()).toMatchObject({
+      mode: "learned_policy",
+      activeImplementation: "trained-velocity",
+      transition: { progress: 0.2 }
+    });
   });
 
   it("rejects controller pairs that cannot switch at one physical control boundary", () => {
@@ -190,7 +320,8 @@ function controller(
   implementation: string,
   capabilities: HumanoidLearnedPolicyCapability[],
   commandValue: number,
-  controlStepSeconds = 0.02
+  controlStepSeconds = 0.02,
+  commandResponseHorizonSeconds?: number
 ): TestController {
   let revision = 0;
   const calls = { reset: 0, infer: 0, advance: 0, restore: 0 };
@@ -200,6 +331,9 @@ function controller(
     actuation: "joint_position_pd",
     controlStepSeconds,
     physicsStepSeconds: 0.005,
+    ...(commandResponseHorizonSeconds === undefined
+      ? {}
+      : { commandResponseHorizonSeconds }),
     learnedPolicy: {
       protocol: "humanoid-learned-policy-v1",
       runtime: "test",
@@ -220,8 +354,8 @@ function controller(
       return {
         kind: "joint_position_pd",
         positions: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(commandValue),
-        stiffness: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(1),
-        damping: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(1)
+        stiffness: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(commandValue),
+        damping: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(commandValue)
       };
     },
     advanceHistory() {

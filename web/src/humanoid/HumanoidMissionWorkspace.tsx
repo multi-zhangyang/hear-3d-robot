@@ -15,7 +15,7 @@ import {
   agentNameLabel,
   bodyChannelLabel,
   entityLabel,
-  humanoidControllerLabel,
+  humanoidControllerExecutionLabel,
   motionGeneratorLabel,
   nodeStatusLabel,
   predicateLabel,
@@ -112,7 +112,14 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
       <section className="humanoid-state-hud game-card" aria-label="人形物理状态">
         <header>
           <span>物理闭环</span>
-          <b>{motionGeneratorLabel(frame.motionGenerator.implementation)} · {humanoidControllerLabel(frame.robot.controller.implementation)} · MuJoCo</b>
+          <b>
+            {motionGeneratorLabel(frame.motionGenerator.implementation)} · {
+              humanoidControllerExecutionLabel(
+                frame.robot.controllerExecution,
+                frame.robot.controller.implementation
+              )
+            } · MuJoCo
+          </b>
         </header>
         <div className="humanoid-state-grid">
           <Metric label="世界版本" value={frame.worldRevision} />

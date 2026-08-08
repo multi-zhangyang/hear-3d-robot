@@ -84,6 +84,7 @@ import {
 import type {
   HumanoidControllerInferenceOptions,
   HumanoidControllerDescriptor,
+  HumanoidControllerExecutionState,
   HumanoidControllerTaskCommand,
   HumanoidControllerState,
   HumanoidJointPositionCommand,
@@ -204,6 +205,7 @@ export interface HumanoidSimulationSnapshot {
   morphology: typeof G1_MORPHOLOGY;
   simulatedTime: number;
   controller: HumanoidWholeBodyController["descriptor"];
+  controllerExecution?: HumanoidControllerExecutionState | undefined;
   rootPosition: Vec3;
   rootRotation: Quaternion;
   joints: Record<HumanoidJointName, {
@@ -708,6 +710,7 @@ export class HumanoidSimulation {
       },
       simulatedTime: this.#data.time,
       controller: { ...this.#controller.descriptor },
+      controllerExecution: humanoidControllerExecutionState(this.#controller),
       rootPosition: worldVector(this.#data.qpos, 0),
       rootRotation: worldQuaternion(this.#data.qpos, 3),
       joints,
@@ -1731,6 +1734,34 @@ function assertSpawn(spawn: HumanoidSpawn): void {
     .every(Number.isFinite)) {
     throw new Error("Invalid humanoid spawn");
   }
+}
+
+function humanoidControllerExecutionState(
+  controller: HumanoidWholeBodyController
+): HumanoidControllerExecutionState {
+  const state = controller.executionState?.() ?? {
+    protocol: "humanoid-controller-execution-v1" as const,
+    mode: controller.descriptor.learnedPolicy
+      ? "learned_policy" as const
+      : "reference_control" as const,
+    activeImplementation: controller.descriptor.implementation,
+    transition: null
+  };
+  if (state.protocol !== "humanoid-controller-execution-v1"
+    || (state.mode !== "learned_policy" && state.mode !== "reference_control")
+    || state.activeImplementation.trim().length === 0
+    || (state.transition !== null
+      && (state.transition.fromImplementation.trim().length === 0
+        || state.transition.toImplementation !== state.activeImplementation
+        || state.transition.fromImplementation === state.transition.toImplementation
+        || !Number.isFinite(state.transition.progress)
+        || state.transition.progress < 0
+        || state.transition.progress > 1
+        || !Number.isFinite(state.transition.durationSeconds)
+        || state.transition.durationSeconds <= 0))) {
+    throw new Error("Humanoid controller returned invalid execution state");
+  }
+  return structuredClone(state);
 }
 
 function assertControllerTiming(controller: HumanoidWholeBodyController): void {

@@ -193,6 +193,17 @@ export interface HumanoidWorldSnapshot {
       controlStepSeconds: number;
       physicsStepSeconds: number;
     };
+    controllerExecution?: {
+      protocol: "humanoid-controller-execution-v1";
+      mode: "learned_policy" | "reference_control";
+      activeImplementation: string;
+      transition: {
+        fromImplementation: string;
+        toImplementation: string;
+        progress: number;
+        durationSeconds: number;
+      } | null;
+    };
     rootPosition: Vec3;
     rootRotation: Quaternion;
     joints: Record<string, HumanoidJointState>;

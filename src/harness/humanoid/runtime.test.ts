@@ -69,6 +69,12 @@ describe("HumanoidActionRuntime", () => {
           capabilities: ["balance", "locomotion", "joint_reference_tracking"]
         },
         reference_control: null,
+        active_control: {
+          protocol: "humanoid-controller-execution-v1",
+          mode: "learned_policy",
+          implementation: "test_learned_controller",
+          transition: null
+        },
         motion_generator: { implementation: "test_task_space_generator" }
       }
     });
@@ -276,6 +282,16 @@ describe("HumanoidActionRuntime", () => {
           strategy: "declared_capabilities",
           mode: "reference_control",
           implementation: "yahmp_onnx"
+        },
+        active_control: {
+          mode: "reference_control",
+          implementation: "yahmp_onnx",
+          transition: {
+            from_implementation: "test_learned_controller",
+            to_implementation: "yahmp_onnx",
+            progress: 0.4,
+            duration_seconds: 0.2
+          }
         }
       }
     });
@@ -1966,6 +1982,24 @@ function lightweightObservationWorld(
                 }
               : {})
           },
+          controllerExecution: capabilityRouting
+            ? {
+                protocol: "humanoid-controller-execution-v1",
+                mode: "reference_control",
+                activeImplementation: "yahmp_onnx",
+                transition: {
+                  fromImplementation: "test_learned_controller",
+                  toImplementation: "yahmp_onnx",
+                  progress: 0.4,
+                  durationSeconds: 0.2
+                }
+              }
+            : {
+                protocol: "humanoid-controller-execution-v1",
+                mode: "learned_policy",
+                activeImplementation: "test_learned_controller",
+                transition: null
+              },
           rootPosition: { x: 0, y: 0, z: 0 },
           rootRotation: { x: 0, y: 0, z: 0, w: 1 },
           fallen: false,

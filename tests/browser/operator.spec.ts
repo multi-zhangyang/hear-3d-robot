@@ -61,7 +61,7 @@ async function assertHumanoidOperator(
   await expect(page.getByLabel("人形身体通道")).toContainText("双足运动");
   const physics = page.getByLabel("人形物理状态");
   if (project === "desktop") await expect(physics).toBeVisible();
-  await expect(physics).toContainText("任务约束 · YAHMP · MuJoCo");
+  await expect(physics).toContainText("任务约束 · YAHMP · 学习控制 · MuJoCo");
   await expect(page.getByText("左脚", { exact: true })).toBeAttached();
   await expect(page.getByText("右脚", { exact: true })).toBeAttached();
   await expect(page.getByText("直立", { exact: true })).toBeAttached();

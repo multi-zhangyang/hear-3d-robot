@@ -4,6 +4,7 @@ import {
   agentNameLabel,
   bodyChannelLabel,
   entityLabel,
+  humanoidControllerExecutionLabel,
   humanoidControllerLabel,
   modelOutputLabel,
   motionGeneratorLabel,
@@ -52,7 +53,25 @@ describe("中文界面文案", () => {
     expect(motionGeneratorLabel("ardy_g1")).toBe("ARDY");
     expect(motionGeneratorLabel("unknown_backend")).toBe("运动生成器");
     expect(humanoidControllerLabel("yahmp_onnx")).toBe("YAHMP");
+    expect(humanoidControllerLabel("mjlab_g1_velocity_onnx")).toBe("mjlab G1");
     expect(humanoidControllerLabel("sonic_onnx")).toBe("SONIC");
+    expect(humanoidControllerExecutionLabel({
+      protocol: "humanoid-controller-execution-v1",
+      mode: "reference_control",
+      activeImplementation: "yahmp_onnx",
+      transition: null
+    }, "mjlab_g1_velocity_onnx")).toBe("YAHMP · 参考控制");
+    expect(humanoidControllerExecutionLabel({
+      protocol: "humanoid-controller-execution-v1",
+      mode: "reference_control",
+      activeImplementation: "yahmp_onnx",
+      transition: {
+        fromImplementation: "mjlab_g1_velocity_onnx",
+        toImplementation: "yahmp_onnx",
+        progress: 0.37,
+        durationSeconds: 0.2
+      }
+    }, "mjlab_g1_velocity_onnx")).toBe("YAHMP · 交接 37%");
   });
 
   it("完整显示具名末端的三维目标", () => {

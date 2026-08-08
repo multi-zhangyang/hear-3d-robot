@@ -166,6 +166,18 @@ export interface HumanoidControllerState {
   payload: JsonValue;
 }
 
+export interface HumanoidControllerExecutionState {
+  protocol: "humanoid-controller-execution-v1";
+  mode: "learned_policy" | "reference_control";
+  activeImplementation: string;
+  transition: {
+    fromImplementation: string;
+    toImplementation: string;
+    progress: number;
+    durationSeconds: number;
+  } | null;
+}
+
 export interface HumanoidControllerInferenceOptions {
   trackedJointPolicyCommand?: "measured" | "neutral";
   taskCommand?: HumanoidControllerTaskCommand | undefined;
@@ -173,6 +185,7 @@ export interface HumanoidControllerInferenceOptions {
 
 export interface HumanoidWholeBodyController {
   readonly descriptor: HumanoidControllerDescriptor;
+  executionState?(): HumanoidControllerExecutionState;
   reset(
     state: HumanoidPolicyState,
     reference: HumanoidReference,

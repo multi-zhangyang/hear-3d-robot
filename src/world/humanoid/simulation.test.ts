@@ -79,6 +79,12 @@ describe("HumanoidSimulation", () => {
           capabilities: ["balance", "locomotion", "joint_reference_tracking"]
         }
       });
+      expect(standing.controllerExecution).toEqual({
+        protocol: "humanoid-controller-execution-v1",
+        mode: "learned_policy",
+        activeImplementation: "yahmp_onnx",
+        transition: null
+      });
       expect(simulation.captureState().controller).toMatchObject({
         version: 1,
         implementation: "yahmp_onnx"

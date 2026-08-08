@@ -3,6 +3,7 @@ import type {
   GoalPredicate,
   HumanoidBodyChannel,
   HumanoidRunCheckpoint,
+  HumanoidWorldSnapshot,
   RunListItem,
   StreamState,
   TaskNode
@@ -185,8 +186,24 @@ export function motionGeneratorLabel(implementation: string): string {
 export function humanoidControllerLabel(implementation: string): string {
   const normalized = implementation.toLowerCase();
   if (normalized === "yahmp_onnx") return "YAHMP";
+  if (normalized === "mjlab_g1_velocity_onnx") return "mjlab G1";
   if (normalized.includes("sonic")) return "SONIC";
   return "全身控制器";
+}
+
+export function humanoidControllerExecutionLabel(
+  execution: HumanoidWorldSnapshot["robot"]["controllerExecution"],
+  configuredImplementation: string
+): string {
+  const implementation = execution?.activeImplementation
+    ?? configuredImplementation;
+  const controller = humanoidControllerLabel(implementation);
+  if (execution?.transition) {
+    return `${controller} · 交接 ${Math.round(execution.transition.progress * 100)}%`;
+  }
+  if (execution?.mode === "reference_control") return `${controller} · 参考控制`;
+  if (execution?.mode === "learned_policy") return `${controller} · 学习控制`;
+  return controller;
 }
 
 export function actionLabel(value: string): string {

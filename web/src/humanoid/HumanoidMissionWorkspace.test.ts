@@ -63,6 +63,31 @@ describe("人形身体通道", () => {
     expect(html).toContain("压缩线 8000");
   });
 
+  it("显示当前真实控制分支与连续交接进度", () => {
+    const world = worldSnapshot();
+    world.robot.controller.implementation = "mjlab_g1_velocity_onnx";
+    world.robot.controllerExecution = {
+      protocol: "humanoid-controller-execution-v1",
+      mode: "reference_control",
+      activeImplementation: "yahmp_onnx",
+      transition: {
+        fromImplementation: "mjlab_g1_velocity_onnx",
+        toImplementation: "yahmp_onnx",
+        progress: 0.4,
+        durationSeconds: 0.2
+      }
+    };
+    const frameBuffer = new HumanoidFrameBuffer();
+    frameBuffer.reset(world);
+    const html = renderToStaticMarkup(createElement(HumanoidMissionWorkspace, {
+      details: runDetails(world),
+      frameBuffer,
+      streamState: "connected"
+    }));
+
+    expect(html).toContain("YAHMP · 交接 40%");
+  });
+
   it("成功终态不再显示仍在选择 Goal", () => {
     const world = worldSnapshot();
     const frameBuffer = new HumanoidFrameBuffer();
@@ -259,6 +284,12 @@ function worldSnapshot(): HumanoidWorldSnapshot {
         actuation: "joint_position_pd",
         controlStepSeconds: 0.02,
         physicsStepSeconds: 0.002
+      },
+      controllerExecution: {
+        protocol: "humanoid-controller-execution-v1",
+        mode: "learned_policy",
+        activeImplementation: "yahmp_onnx",
+        transition: null
       },
       rootPosition: { x: 0, y: 0.8, z: 0 },
       rootRotation: { x: 0, y: 0, z: 0, w: 1 },

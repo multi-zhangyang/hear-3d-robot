@@ -113,6 +113,12 @@ describe("mjlab G1 velocity controller", () => {
           }
         }
       });
+      expect(start.controllerExecution).toEqual({
+        protocol: "humanoid-controller-execution-v1",
+        mode: "learned_policy",
+        activeImplementation: "mjlab_g1_velocity_onnx",
+        transition: null
+      });
       expect(HumanoidWorldSnapshotSchema.safeParse({
         frame: 0,
         worldRevision: 0,
@@ -144,7 +150,7 @@ describe("mjlab G1 velocity controller", () => {
         snapshot.rootPosition.z - start.rootPosition.z
       )).toBeGreaterThan(0.5);
       expect(first.captureState().controller.payload).toMatchObject({
-        protocol: "humanoid-controller-capability-routing-state-v1",
+        protocol: "humanoid-controller-capability-routing-state-v2",
         active: "primary"
       });
 
@@ -153,8 +159,18 @@ describe("mjlab G1 velocity controller", () => {
       });
       snapshot = await first.step(taskReference);
       expect(snapshot.fallen).toBe(false);
+      expect(snapshot.controllerExecution).toMatchObject({
+        mode: "reference_control",
+        activeImplementation: "yahmp_onnx",
+        transition: {
+          fromImplementation: "mjlab_g1_velocity_onnx",
+          toImplementation: "yahmp_onnx",
+          progress: 0.1,
+          durationSeconds: 0.2
+        }
+      });
       expect(first.captureState().controller.payload).toMatchObject({
-        protocol: "humanoid-controller-capability-routing-state-v1",
+        protocol: "humanoid-controller-capability-routing-state-v2",
         active: "fallback"
       });
 
@@ -162,6 +178,17 @@ describe("mjlab G1 velocity controller", () => {
       second.restoreState(checkpoint);
       expect(second.captureState().controller).toEqual(checkpoint.controller);
       expect(second.snapshot().rootPosition).toEqual(snapshot.rootPosition);
+      const [continuedTask, restoredTask] = await Promise.all([
+        first.step(taskReference),
+        second.step(taskReference)
+      ]);
+      expect(restoredTask.controllerExecution).toEqual(
+        continuedTask.controllerExecution
+      );
+      expect(second.captureState().controller).toEqual(
+        first.captureState().controller
+      );
+      expect(restoredTask.rootPosition).toEqual(continuedTask.rootPosition);
       expect((await second.step(reference)).fallen).toBe(false);
     } finally {
       await Promise.all([first.dispose(), second.dispose()]);

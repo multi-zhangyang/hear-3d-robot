@@ -2089,6 +2089,14 @@ function planIdFromReceipt(receipt: HumanoidActionReceipt): string | undefined {
 
 function modelObservation(snapshot: HumanoidWorldObservation): unknown {
   const robot = snapshot.robot;
+  const controllerExecution = robot.controllerExecution ?? {
+    protocol: "humanoid-controller-execution-v1" as const,
+    mode: robot.controller.learnedPolicy
+      ? "learned_policy" as const
+      : "reference_control" as const,
+    activeImplementation: robot.controller.implementation,
+    transition: null
+  };
   const rootYaw = yawFromQuaternion(robot.rootRotation);
   const exposeHandGeometry = requiresHandSurfaceGeometry(snapshot);
   const embodiedObjectIds = new Set([
@@ -2167,6 +2175,20 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
               robot.controller.capabilityRouting.fallback.implementation
           }
         : null,
+      active_control: {
+        protocol: controllerExecution.protocol,
+        mode: controllerExecution.mode,
+        implementation: controllerExecution.activeImplementation,
+        transition: controllerExecution.transition
+          ? {
+              from_implementation:
+                controllerExecution.transition.fromImplementation,
+              to_implementation: controllerExecution.transition.toImplementation,
+              progress: controllerExecution.transition.progress,
+              duration_seconds: controllerExecution.transition.durationSeconds
+            }
+          : null
+      },
       motion_generator: snapshot.motionGenerator
     },
     sensor: {

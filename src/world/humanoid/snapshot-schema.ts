@@ -136,6 +136,17 @@ const HumanoidSimulationSnapshotSchema = z.object({
       }).strict()
     }).strict().optional()
   }).strict(),
+  controllerExecution: z.object({
+    protocol: z.literal("humanoid-controller-execution-v1"),
+    mode: z.enum(["learned_policy", "reference_control"]),
+    activeImplementation: z.string().trim().min(1),
+    transition: z.object({
+      fromImplementation: z.string().trim().min(1),
+      toImplementation: z.string().trim().min(1),
+      progress: z.number().finite().min(0).max(1),
+      durationSeconds: z.number().finite().positive()
+    }).strict().nullable()
+  }).strict().optional(),
   rootPosition: Vec3Schema,
   rootRotation: QuaternionSchema,
   joints: z.record(z.enum(HUMANOID_JOINT_NAMES), JointSchema),
