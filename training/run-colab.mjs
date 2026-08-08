@@ -2,15 +2,17 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { extract } from "tar";
 
 const options = parseOptions(process.argv.slice(2));
 const session = options.session ?? `hear-g1-${randomUUID().slice(0, 8)}`;
 const localArchive = resolve(
   options.output ?? `artifacts/training/${session}.tar.gz`
 );
+const localBundle = trainingBundlePath(localArchive);
 const remoteArchive = `/content/${session}.tar.gz`;
-if (existsSync(localArchive)) {
-  throw new Error(`Training archive already exists: ${localArchive}`);
+if (existsSync(localArchive) || existsSync(localBundle)) {
+  throw new Error(`Training output already exists: ${localArchive}`);
 }
 mkdirSync(dirname(localArchive), { recursive: true });
 
@@ -47,6 +49,10 @@ try {
       localArchive
     ]);
     if (downloadExit !== 0) process.exitCode = downloadExit;
+    if (downloadExit === 0) {
+      await extractTrainingBundle(localArchive, localBundle);
+      console.log(`Training bundle: ${localBundle}`);
+    }
   }
 } finally {
   const stopExit = command(["stop", "--session", session], true);
@@ -99,4 +105,33 @@ function positiveInteger(value) {
     throw new Error(`Expected a positive integer, received: ${value}`);
   }
   return parsed;
+}
+
+async function extractTrainingBundle(archive, destination) {
+  const files = new Set([
+    "hear-g1-training/agent.yaml",
+    "hear-g1-training/env.yaml",
+    "hear-g1-training/g1_velocity.onnx",
+    "hear-g1-training/g1_velocity.pt",
+    "hear-g1-training/training-report.json"
+  ]);
+  mkdirSync(destination);
+  await extract({
+    file: archive,
+    cwd: destination,
+    strip: 1,
+    filter: (path) => files.has(path)
+  });
+  for (const path of files) {
+    const filename = path.slice(path.lastIndexOf("/") + 1);
+    if (!existsSync(resolve(destination, filename))) {
+      throw new Error(`Training bundle is missing: ${filename}`);
+    }
+  }
+}
+
+function trainingBundlePath(archive) {
+  return archive.endsWith(".tar.gz")
+    ? archive.slice(0, -".tar.gz".length)
+    : `${archive}.bundle`;
 }

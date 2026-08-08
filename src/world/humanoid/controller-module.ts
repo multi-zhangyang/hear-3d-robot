@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpath, readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -16,10 +16,18 @@ import {
 export const HUMANOID_CONTROLLER_MODULE_ENV = "HEAR_HUMANOID_CONTROLLER_MODULE";
 const HUMANOID_CONTROLLER_MODULE_FACTORY =
   "createHumanoidWholeBodyController";
+const HUMANOID_CONTROLLER_MODULE_ASSETS = "humanoidControllerAssets";
+
+export interface HumanoidControllerModuleAsset {
+  readonly id: string;
+  readonly sha256: string;
+  readonly bytes: Uint8Array;
+}
 
 export interface HumanoidControllerModuleContext {
   readonly protocol: "hear-humanoid-controller-module-v1";
   readonly sourceSha256: string;
+  readonly assets: readonly HumanoidControllerModuleAsset[];
 }
 
 export interface HumanoidControllerSource {
@@ -30,6 +38,11 @@ export interface HumanoidControllerSource {
 export type HumanoidControllerModuleFactory = (
   context: HumanoidControllerModuleContext
 ) => HumanoidWholeBodyController | Promise<HumanoidWholeBodyController>;
+
+interface HumanoidControllerAssetDeclaration {
+  readonly id: string;
+  readonly path: string | URL;
+}
 
 export async function loadConfiguredHumanoidControllerSource(
   environment: NodeJS.ProcessEnv = process.env,
@@ -47,19 +60,25 @@ export async function loadHumanoidControllerSource(
   const request = specifier.trim();
   if (!request) throw new Error("Humanoid controller module specifier is empty");
   const entryPath = await resolveControllerEntry(request, baseDirectory);
-  const sourceSha256 = createHash("sha256")
-    .update(await readFile(entryPath))
-    .digest("hex");
+  const entryBytes = await readFile(entryPath);
+  const entrySha256 = sha256(entryBytes);
   const moduleUrl = pathToFileURL(entryPath);
-  moduleUrl.searchParams.set("hear_controller_sha256", sourceSha256);
+  moduleUrl.searchParams.set("hear_controller_sha256", entrySha256);
   const namespace: unknown = await import(moduleUrl.href);
   const moduleFactory = controllerModuleFactory(namespace);
+  const assets = await loadControllerAssets(namespace, entryPath);
+  const sourceSha256 = controllerSourceSha256(entrySha256, assets);
   const instances = new WeakSet<object>();
-  const context: HumanoidControllerModuleContext = Object.freeze({
-    protocol: "hear-humanoid-controller-module-v1",
-    sourceSha256
-  });
   const controllerFactory: HumanoidWholeBodyControllerFactory = async () => {
+    const context: HumanoidControllerModuleContext = Object.freeze({
+      protocol: "hear-humanoid-controller-module-v1",
+      sourceSha256,
+      assets: Object.freeze(assets.map((asset) => Object.freeze({
+        id: asset.id,
+        sha256: asset.sha256,
+        bytes: asset.bytes.slice()
+      })))
+    });
     const controller = await moduleFactory(context);
     assertHumanoidWholeBodyController(controller);
     if (instances.has(controller)) {
@@ -71,6 +90,77 @@ export async function loadHumanoidControllerSource(
     return controller;
   };
   return Object.freeze({ sourceSha256, controllerFactory });
+}
+
+async function loadControllerAssets(
+  namespace: unknown,
+  entryPath: string
+): Promise<HumanoidControllerModuleAsset[]> {
+  const assetExport = moduleExport(namespace, HUMANOID_CONTROLLER_MODULE_ASSETS);
+  if (assetExport === undefined) return [];
+  const exported: unknown = typeof assetExport === "function"
+    ? await assetExport()
+    : assetExport;
+  if (!Array.isArray(exported)) {
+    throw new Error("Humanoid controller assets must be an array");
+  }
+  const declarations = exported.map((value, index) => (
+    assetDeclaration(value, index)
+  ));
+  const ids = declarations.map(({ id }) => id);
+  if (new Set(ids).size !== ids.length) {
+    throw new Error("Humanoid controller asset identifiers must be unique");
+  }
+  const assets = await Promise.all(declarations.map(async ({ id, path }) => {
+    const resolvedPath = await realpath(resolveAssetPath(path, entryPath));
+    const bytes = await readFile(resolvedPath);
+    return Object.freeze({ id, sha256: sha256(bytes), bytes });
+  }));
+  return assets.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function assetDeclaration(
+  value: unknown,
+  index: number
+): HumanoidControllerAssetDeclaration {
+  if (!isRecord(value)
+    || !isNonEmptyString(value.id)
+    || !/^[a-z0-9][a-z0-9._-]*$/.test(value.id)
+    || !(isNonEmptyString(value.path) || value.path instanceof URL)) {
+    throw new Error(`Humanoid controller asset ${index} is invalid`);
+  }
+  return { id: value.id, path: value.path };
+}
+
+function resolveAssetPath(path: string | URL, entryPath: string): string {
+  if (path instanceof URL) {
+    if (path.protocol !== "file:") {
+      throw new Error("Humanoid controller assets must use local files");
+    }
+    return fileURLToPath(path);
+  }
+  if (path.startsWith("file:")) return fileURLToPath(path);
+  return isAbsolute(path) ? path : resolve(dirname(entryPath), path);
+}
+
+function controllerSourceSha256(
+  entrySha256: string,
+  assets: readonly HumanoidControllerModuleAsset[]
+): string {
+  if (assets.length === 0) return entrySha256;
+  return sha256(JSON.stringify({
+    protocol: "hear-humanoid-controller-source-v2",
+    entry_sha256: entrySha256,
+    assets: assets.map(({ id, sha256: assetSha256, bytes }) => ({
+      id,
+      sha256: assetSha256,
+      bytes: bytes.byteLength
+    }))
+  }));
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function resolveControllerEntry(
@@ -106,17 +196,17 @@ function isPathSpecifier(specifier: string): boolean {
 }
 
 function controllerModuleFactory(namespace: unknown): HumanoidControllerModuleFactory {
-  if (!isRecord(namespace)) throw missingFactoryError();
-  const direct = namespace[HUMANOID_CONTROLLER_MODULE_FACTORY];
-  if (typeof direct === "function") return direct as HumanoidControllerModuleFactory;
-  const defaultExport = namespace.default;
-  if (isRecord(defaultExport)) {
-    const commonJsFactory = defaultExport[HUMANOID_CONTROLLER_MODULE_FACTORY];
-    if (typeof commonJsFactory === "function") {
-      return commonJsFactory as HumanoidControllerModuleFactory;
-    }
-  }
+  const factory = moduleExport(namespace, HUMANOID_CONTROLLER_MODULE_FACTORY);
+  if (typeof factory === "function") return factory as HumanoidControllerModuleFactory;
   throw missingFactoryError();
+}
+
+function moduleExport(namespace: unknown, name: string): unknown {
+  if (!isRecord(namespace)) return undefined;
+  const direct = namespace[name];
+  if (direct !== undefined) return direct;
+  const defaultExport = namespace.default;
+  return isRecord(defaultExport) ? defaultExport[name] : undefined;
 }
 
 function missingFactoryError(): Error {

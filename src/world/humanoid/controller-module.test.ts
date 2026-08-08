@@ -123,6 +123,56 @@ describe("humanoid controller modules", () => {
     expect(first.sourceSha256).not.toBe(second.sourceSha256);
   });
 
+  it("binds declared policy assets to the persisted source identity and factory context", async () => {
+    const directory = await temporaryDirectory();
+    const entry = join(directory, "asset-controller.mjs");
+    const policy = join(directory, "policy.onnx");
+    const report = join(directory, "training-report.json");
+    await writeFile(policy, "policy-v1", "utf8");
+    await writeFile(report, "report-v1", "utf8");
+    await writeFile(entry, `${controllerModule("asset-policy")}
+export const humanoidControllerAssets = [
+  { id: "policy", path: "./policy.onnx" },
+  { id: "report", path: new URL("./training-report.json", import.meta.url) }
+];
+`, "utf8");
+
+    const first = await loadHumanoidControllerSource(entry, directory);
+    const firstController = await first.controllerFactory();
+    expect(firstController.captureState().payload).toMatchObject({
+      asset_ids: ["policy", "report"],
+      asset_contents: ["policy-v1", "report-v1"]
+    });
+
+    await writeFile(policy, "policy-v2", "utf8");
+    const second = await loadHumanoidControllerSource(entry, directory);
+    expect(second.sourceSha256).not.toBe(first.sourceSha256);
+  });
+
+  it("rejects duplicate or non-file asset declarations", async () => {
+    const directory = await temporaryDirectory();
+    const duplicate = join(directory, "duplicate.mjs");
+    await writeFile(duplicate, `${controllerModule("duplicate-assets")}
+export const humanoidControllerAssets = [
+  { id: "policy", path: "./first.onnx" },
+  { id: "policy", path: "./second.onnx" }
+];
+`, "utf8");
+    await expect(loadHumanoidControllerSource(duplicate, directory)).rejects.toThrow(
+      /identifiers must be unique/
+    );
+
+    const remote = join(directory, "remote.mjs");
+    await writeFile(remote, `${controllerModule("remote-asset")}
+export const humanoidControllerAssets = [
+  { id: "policy", path: new URL("https://example.com/policy.onnx") }
+];
+`, "utf8");
+    await expect(loadHumanoidControllerSource(remote, directory)).rejects.toThrow(
+      /local files/
+    );
+  });
+
   it("leaves the built-in controller selected when no module is configured", async () => {
     await expect(loadConfiguredHumanoidControllerSource({})).resolves.toBeUndefined();
   });
@@ -163,7 +213,13 @@ function createController(context) {
         protocol: "humanoid-controller-state-v1",
         version: 1,
         implementation: ${JSON.stringify(implementation)},
-        payload: { source_sha256: context.sourceSha256 }
+        payload: {
+          source_sha256: context.sourceSha256,
+          asset_ids: context.assets?.map(({ id }) => id) ?? [],
+          asset_contents: context.assets?.map(({ bytes }) => (
+            new TextDecoder().decode(bytes)
+          )) ?? []
+        }
       };
     },
     restoreState() {},

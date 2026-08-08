@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "created_at": "2026-08-08T05:57:22.170677+00:00",
+  "framework": "mjlab",
+  "framework_version": "1.5.3",
+  "task": "Mjlab-Velocity-Flat-Unitree-G1",
+  "seed": 42,
+  "training": {
+    "iterations_requested": 1000,
+    "checkpoint_iteration": 999,
+    "environment_count": 4096,
+    "accelerator": "NVIDIA A100-SXM4-40GB",
+    "cuda_version": "12.8"
+  },
+  "evaluation": {
+    "environment_count": 256,
+    "physics_steps": 600,
+    "mean_episode_reward_sum": 55.101409912109375,
+    "mean_planar_displacement_m": 7.051569938659668,
+    "maximum_planar_displacement_m": 18.02885627746582,
+    "minimum_root_height_m": 0.40641874074935913,
+    "termination_count": 8,
+    "maximum_absolute_action": 8.416459083557129
+  },
+  "checkpoint": {
+    "file": "g1_velocity.pt",
+    "bytes": 5316259,
+    "sha256": "8b842df1c476eab9ec979acf9719d6235af5d1e9ea044b139051eb4f399aee60"
+  },
+  "onnx": {
+    "file": "g1_velocity.onnx",
+    "bytes": 880794,
+    "sha256": "a207c0b02b77d9f15a08095d86f8152700e246d2811f2d5a34575c231619c833",
+    "inputs": [
+      "obs"
+    ],
+    "outputs": [
+      "actions"
+    ],
+    "metadata": {
+      "run_path": "local",
+      "joint_names": "left_hip_pitch_joint,left_hip_roll_joint,left_hip_yaw_joint,left_knee_joint,left_ankle_pitch_joint,left_ankle_roll_joint,right_hip_pitch_joint,right_hip_roll_joint,right_hip_yaw_joint,right_knee_joint,right_ankle_pitch_joint,right_ankle_roll_joint,waist_yaw_joint,waist_roll_joint,waist_pitch_joint,left_shoulder_pitch_joint,left_shoulder_roll_joint,left_shoulder_yaw_joint,left_elbow_joint,left_wrist_roll_joint,left_wrist_pitch_joint,left_wrist_yaw_joint,right_shoulder_pitch_joint,right_shoulder_roll_joint,right_shoulder_yaw_joint,right_elbow_joint,right_wrist_roll_joint,right_wrist_pitch_joint,right_wrist_yaw_joint",
+      "joint_stiffness": "40.179,99.098,40.179,99.098,28.501,28.501,40.179,99.098,40.179,99.098,28.501,28.501,40.179,28.501,28.501,14.251,14.251,14.251,14.251,14.251,16.778,16.778,14.251,14.251,14.251,14.251,14.251,16.778,16.778",
+      "joint_damping": "2.558,6.309,2.558,6.309,1.814,1.814,2.558,6.309,2.558,6.309,1.814,1.814,2.558,1.814,1.814,0.907,0.907,0.907,0.907,0.907,1.068,1.068,0.907,0.907,0.907,0.907,0.907,1.068,1.068",
+      "default_joint_pos": "-0.312,0.000,0.000,0.669,-0.363,0.000,-0.312,0.000,0.000,0.669,-0.363,0.000,0.000,0.000,0.000,0.200,0.200,0.000,0.600,0.000,0.000,0.000,0.200,-0.200,0.000,0.600,0.000,0.000,0.000",
+      "command_names": "twist",
+      "observation_names": "base_lin_vel,base_ang_vel,projected_gravity,joint_pos,joint_vel,actions,command",
+      "observation_terms_scale": "1.000,1.000,1.000,1.000,1.000,1.000,1.000",
+      "observation_terms_flatten_history_dim": "1.000,1.000,1.000,1.000,1.000,1.000,1.000",
+      "observation_terms_history_length": "0.000,0.000,0.000,0.000,0.000,0.000,0.000",
+      "observation_terms_clip": "-inf;inf,-inf;inf,-inf;inf,-inf;inf,-inf;inf,-inf;inf,-inf;inf",
+      "action_scale": "0.548,0.351,0.548,0.351,0.439,0.439,0.548,0.351,0.548,0.351,0.439,0.439,0.548,0.439,0.439,0.439,0.439,0.439,0.439,0.439,0.075,0.075,0.439,0.439,0.439,0.439,0.439,0.075,0.075"
+    }
+  }
+}

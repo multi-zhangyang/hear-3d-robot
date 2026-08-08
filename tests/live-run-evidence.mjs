@@ -286,10 +286,6 @@ export async function inspectLiveRunEvidence(input) {
     trajectories: physicalTrajectories,
     world_mutation_hashes: worldMutationHashes
   });
-  const completedGoalCount = checkpoint.goal_dag.epochs.filter((epoch) => (
-    epoch.status === "completed"
-  )).length;
-
   return {
     version: 3,
     run_id: checkpoint.run_id,
@@ -300,15 +296,12 @@ export async function inspectLiveRunEvidence(input) {
     physical_verified: true,
     world_frame: checkpoint.world.frame,
     world_revision: checkpoint.world.worldRevision,
-    cycle_count: checkpoint.cycle_index,
-    completed_goal_count: completedGoalCount,
     model_call_count: startedCalls.length,
     model_usage: checkpoint.model_usage,
     exercised_agents: exercisedAgents,
     physical_execution_count: executions.length,
     physical_frame_count: physicalFrameCount,
     travelled_distance_m: travelledDistance,
-    evidence_count: evidenceRefs.size,
     context_compaction_count: checkpoint.context_memory.total_compactions,
     agent_manifest_epoch_count: manifests.length,
     embodied_episode_count: checkpoint.embodied_memory.total_episodes,

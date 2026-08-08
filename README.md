@@ -94,7 +94,7 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 层级智能体不直接输出电机值或关节动作。它负责语义目标、Skill DAG、交互对象和终止条件；低层运动由 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 执行。`HumanoidWorld.create` 的 `controllerFactory` 会分别为权威 MuJoCo 世界和独立预演池创建控制器实例，场景资源重建时继续使用同一工厂。控制器状态必须支持捕获与恢复，策略的观察空间、动作空间和真实能力随世界快照公开。
 
-设置 `HEAR_HUMANOID_CONTROLLER_MODULE` 可以把训练产物接入正式 CLI 与 Operator。值可以是相对路径、绝对路径或已安装包名；模块必须导出 `createHumanoidWholeBodyController(context)`，并在每次调用时创建独立的 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 实例。运行定义只保存解析后入口文件的 SHA-256，不保存本机路径；恢复时必须配置来源完全相同的模块，不能在内置控制器与外部策略之间静默切换。
+设置 `HEAR_HUMANOID_CONTROLLER_MODULE` 可以把训练产物接入正式 CLI 与 Operator。值可以是相对路径、绝对路径或已安装包名；模块必须导出 `createHumanoidWholeBodyController(context)`，并在每次调用时创建独立的 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 实例。模块可以通过 `humanoidControllerAssets` 声明 ONNX、训练报告等本地策略文件，运行来源身份会同时覆盖入口与全部资产内容。运行定义不保存本机路径；恢复时入口或任一策略资产发生变化都会在创建世界前被拒绝。
 
 仓库自带的 YAHMP ONNX 策略只声明 `balance`、`locomotion` 和 `joint_reference_tracking`。任务空间 IK、接触柔顺和抓取检查器是参考生成与物理验收组件，不代表策略已经学会接触式操作或双手操作。后续可以接入强化学习、模仿学习或其他已训练策略；新控制器只有在真实支持时才应声明 `contact_rich_manipulation` 或 `bimanual_manipulation`，Harness 仍会用同一 MuJoCo 预演和执行回执验证结果。
 
@@ -102,13 +102,19 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 统一 Skill 合约逐阶段声明完成学习式执行所需的策略能力，实时目录会分别公开当前环境可用性与已训练能力覆盖。未被当前策略覆盖的阶段会明确标记为参考控制回退，不能被描述为已经训练完成。控制器收到的任务命令同时包含能力要求、任务空间目标、抓取约束和可观测物理终止谓词，训练侧不需要读取 Agent 提示词或依赖模型供应商格式。
 
-仓库提供基于 [mjlab](https://github.com/mujocolab/mjlab) 与 RSL-RL 的 G1 速度策略训练入口。训练直接使用 mjlab 的正式 `Mjlab-Velocity-Flat-Unitree-G1` 环境和 MuJoCo Warp，不在仓库内另写一套强化学习算法。已登录 Colab CLI 后可启动 GPU 训练：
+仓库随附一个由 mjlab 1.5.3 训练的 G1 速度策略及其训练报告。标准控制器严格校验报告版本、ONNX SHA-256、张量形状、29 关节顺序、控制周期和策略元数据，使用 MuJoCo 骨盆 IMU 坐标下的 99 维真实观察推理，不生成替代动作。启用方式：
+
+```dotenv
+HEAR_HUMANOID_CONTROLLER_MODULE=hear/controllers/mjlab-g1-velocity
+```
+
+仓库同时提供基于 [mjlab](https://github.com/mujocolab/mjlab) 与 RSL-RL 的 G1 速度策略训练入口。训练直接使用 mjlab 的正式 `Mjlab-Velocity-Flat-Unitree-G1` 环境和 MuJoCo Warp，不在仓库内另写一套强化学习算法。已登录 Colab CLI 后可启动 GPU 训练：
 
 ```sh
 pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 ```
 
-命令会创建独立 Colab 会话，训练真实 PPO checkpoint，由 mjlab 导出带控制元数据的 ONNX，并在 GPU MuJoCo 环境中执行无界面策略评估。checkpoint、ONNX、环境配置、评估指标和 SHA-256 报告下载到 `artifacts/training/`，结束或失败后都会释放会话。GPU 型号、并行环境数和迭代数均可显式调整；训练或导出失败会直接返回非零状态，不生成替代策略。
+命令会创建独立 Colab 会话，训练真实 PPO checkpoint，由 mjlab 导出带控制元数据的 ONNX，并在 GPU MuJoCo 环境中执行无界面策略评估。checkpoint、ONNX、环境配置、评估指标和 SHA-256 报告下载到 `artifacts/training/`，同时解包为可直接运行的策略目录。将 `HEAR_MJLAB_G1_POLICY_DIRECTORY` 指向该目录即可替换随附策略；训练、下载、解包或校验失败都会直接返回错误，不生成替代策略。结束或失败后 Colab 会话都会释放。
 
 程序化场景生成开阔区域、方块障碍、可动物体和目标区域。头部视场持续更新 0.5 米空间信念网格，模型从未知区域边界选择探索目标。Recast 根据当前静态与动态几何生成导航路径，每段路线都先在当前物理状态副本中完整执行；执行中出现新的几何阻塞时，执行监控层保持原 Skill 目标并从真实终态重新规划，最多进行两次有界尝试。跌倒、物体滑脱或语义前提失效不会被低层重规划掩盖，而是返回模型选择恢复 Skill。
 
@@ -213,6 +219,7 @@ HEAR_PORT=8765
 HEAR_OPERATOR_PASSWORD=
 HEAR_RUNS_DIR=./runs
 HEAR_HUMANOID_CONTROLLER_MODULE=
+HEAR_MJLAB_G1_POLICY_DIRECTORY=
 ```
 
 可用传输协议：

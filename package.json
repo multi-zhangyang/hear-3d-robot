@@ -20,6 +20,9 @@
   "bin": {
     "hear": "./dist/cli.js"
   },
+  "exports": {
+    "./controllers/mjlab-g1-velocity": "./dist/controllers/mjlab-g1-velocity-module.js"
+  },
   "scripts": {
     "build": "pnpm run build:server && pnpm run build:web",
     "build:server": "tsc -p tsconfig.server.json",
@@ -77,6 +80,7 @@
     "@types/three": "^0.185.4",
     "@vitejs/plugin-react": "^6.0.5",
     "knip": "^6.32.0",
+    "tar": "^7.5.22",
     "tsx": "^4.23.11",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",

@@ -26,7 +26,9 @@ type HumanoidPolicyObservationFeature =
 interface HumanoidPolicyEnvironmentState {
   protocol: "humanoid-policy-environment-v1";
   authority: "mujoco_state";
+  rootVelocityFrame: "pelvis_imu";
   rootLinearVelocity: readonly [x: number, y: number, z: number];
+  rootAngularVelocity: readonly [x: number, y: number, z: number];
   endEffectors: Readonly<Record<string, {
     position: Vec3;
     rotation: Quaternion;

@@ -291,6 +291,8 @@ export class HumanoidSimulation {
   readonly #solidNamesByGeomId = new Map<number, string>();
   readonly #solidDescriptorsById = new Map<string, HumanoidSceneSolid>();
   readonly #pelvisBodyId: number;
+  readonly #pelvisImuSiteId: number;
+  readonly #rootVelocityBuffer: InstanceType<MujocoModule["DoubleBuffer"]>;
   readonly #headBodyId: number;
   readonly #leftFootBodyId: number;
   readonly #rightFootBodyId: number;
@@ -447,6 +449,15 @@ export class HumanoidSimulation {
       yaw: 0
     };
     assertSpawn(this.#spawn);
+    this.#pelvisImuSiteId = runtime.mj_name2id(
+      model,
+      runtime.mjtObj.mjOBJ_SITE.value,
+      "imu_in_pelvis"
+    );
+    if (this.#pelvisImuSiteId < 0) {
+      throw new Error("MuJoCo pelvis IMU site is missing");
+    }
+    this.#rootVelocityBuffer = new runtime.DoubleBuffer(6);
   }
 
   async step(
@@ -1167,6 +1178,7 @@ export class HumanoidSimulation {
 
   async dispose(): Promise<void> {
     await this.#controller.dispose();
+    this.#rootVelocityBuffer.delete();
     this.#data.delete();
     this.#model.delete();
   }
@@ -1304,6 +1316,15 @@ export class HumanoidSimulation {
   }
 
   #policyState(): HumanoidPolicyState {
+    this.#runtime.mj_objectVelocity(
+      this.#model,
+      this.#data,
+      this.#runtime.mjtObj.mjOBJ_SITE.value,
+      this.#pelvisImuSiteId,
+      this.#rootVelocityBuffer,
+      1
+    );
+    const rootVelocity = this.#rootVelocityBuffer.GetView();
     const state: HumanoidPolicyState = {
       jointPositions: Float64Array.from(
         this.#jointPositionAddresses,
@@ -1314,7 +1335,11 @@ export class HumanoidSimulation {
         (address) => this.#data.qvel[address]
       ),
       rootQuaternion: this.#rootQuaternion(),
-      rootAngularVelocity: [this.#data.qvel[3]!, this.#data.qvel[4]!, this.#data.qvel[5]!]
+      rootAngularVelocity: [
+        this.#data.qvel[3]!,
+        this.#data.qvel[4]!,
+        this.#data.qvel[5]!
+      ]
     };
     const features = this.#controller.descriptor.learnedPolicy
       ?.observationFeatures ?? [];
@@ -1336,10 +1361,16 @@ export class HumanoidSimulation {
     state.environment = {
       protocol: "humanoid-policy-environment-v1",
       authority: "mujoco_state",
+      rootVelocityFrame: "pelvis_imu",
       rootLinearVelocity: [
-        this.#data.qvel[0]!,
-        this.#data.qvel[1]!,
-        this.#data.qvel[2]!
+        requiredValue(rootVelocity, 3),
+        requiredValue(rootVelocity, 4),
+        requiredValue(rootVelocity, 5)
+      ],
+      rootAngularVelocity: [
+        requiredValue(rootVelocity, 0),
+        requiredValue(rootVelocity, 1),
+        requiredValue(rootVelocity, 2)
       ],
       endEffectors: Object.fromEntries(endEffectorNames.map((name) => [name, {
         position: { ...snapshot.links[name].position },

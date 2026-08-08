@@ -26,6 +26,25 @@ async function smokeProductionOperator() {
     assert.equal(cli.stderr, "");
     assert.match(cli.stdout, /^humanoid_frontier\t/m);
 
+    const { loadHumanoidControllerSource } = await import(
+      "../dist/world/humanoid/controller-module.js"
+    );
+    const controllerSource = await loadHumanoidControllerSource(
+      "hear/controllers/mjlab-g1-velocity",
+      originalWorkingDirectory
+    );
+    assert.match(controllerSource.sourceSha256, /^[a-f0-9]{64}$/);
+    const [firstController, secondController] = await Promise.all([
+      controllerSource.controllerFactory(),
+      controllerSource.controllerFactory()
+    ]);
+    assert.notEqual(firstController, secondController);
+    assert.deepEqual(
+      firstController.descriptor.learnedPolicy?.capabilities,
+      ["balance", "locomotion"]
+    );
+    await Promise.all([firstController.dispose(), secondController.dispose()]);
+
     const [{ loadRuntimeCatalog }, { createOperatorServer }] = await Promise.all([
       import("../dist/config/load.js"),
       import("../dist/server/operator-server.js")
