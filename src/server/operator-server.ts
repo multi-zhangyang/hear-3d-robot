@@ -23,6 +23,9 @@ import {
   OperatorLeaseLostError
 } from "./operator-lease.js";
 import { RunConflictError, RunManager } from "./run-manager.js";
+import type {
+  HumanoidControllerSource
+} from "../world/humanoid/controller-module.js";
 
 const bundledWebRoot = fileURLToPath(new URL("../../web/dist/", import.meta.url));
 
@@ -58,6 +61,7 @@ export async function createOperatorServer(input: {
   catalog: RuntimeCatalog;
   provider?: ProviderConfig;
   providerError?: string;
+  controllerSource?: HumanoidControllerSource;
   dev?: boolean;
 }): Promise<FastifyInstance> {
   const app = Fastify({
@@ -79,6 +83,7 @@ export async function createOperatorServer(input: {
     catalog: input.catalog,
     ...(input.provider ? { provider: input.provider } : {}),
     ...(input.providerError ? { providerError: input.providerError } : {}),
+    ...(input.controllerSource ? { controllerSource: input.controllerSource } : {}),
     mutationFence
   });
   const scenarioSummaries = Object.entries(input.catalog.templates).map(([id, template]) => {

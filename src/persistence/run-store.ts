@@ -71,8 +71,9 @@ const RunDefinitionSchema = z.object({
   goal: GoalSchema,
   runtime: z.literal("humanoid_g1"),
   run_mode: HumanoidRunModeSchema.default("mission"),
+  controller_source_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   created_at: z.string().datetime()
-});
+}).strict();
 const AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const AgentSessionStateIdentitySchema = z.object({
   item_count: z.number().int().nonnegative(),
@@ -169,13 +170,14 @@ export class RunStore {
       goal: Goal;
       runtime?: RunDefinition["runtime"];
       runMode?: HumanoidRunMode;
+      controllerSourceSha256?: string;
     },
     options: RunStoreOptions = {}
   ): Promise<RunStore> {
     const runId = createRunId(input.scenarioId);
     const runDir = resolve(runsDir, runId);
     const scenario = ScenarioSchema.parse(input.scenario);
-    const definition: RunDefinition = {
+    const definition = RunDefinitionSchema.parse({
       version: 1,
       run_id: runId,
       mission: input.mission,
@@ -184,8 +186,11 @@ export class RunStore {
       goal: structuredClone(input.goal),
       runtime: input.runtime ?? "humanoid_g1",
       run_mode: input.runMode ?? "mission",
+      ...(input.controllerSourceSha256
+        ? { controller_source_sha256: input.controllerSourceSha256 }
+        : {}),
       created_at: new Date().toISOString()
-    };
+    });
     const chunkDeltas = createScenarioChunkDeltaState(scenario);
     await runFencedMutation(options.mutationFence, async () => {
       await mkdir(runDir, { recursive: false });

@@ -94,6 +94,8 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 层级智能体不直接输出电机值或关节动作。它负责语义目标、Skill DAG、交互对象和终止条件；低层运动由 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 执行。`HumanoidWorld.create` 的 `controllerFactory` 会分别为权威 MuJoCo 世界和独立预演池创建控制器实例，场景资源重建时继续使用同一工厂。控制器状态必须支持捕获与恢复，策略的观察空间、动作空间和真实能力随世界快照公开。
 
+设置 `HEAR_HUMANOID_CONTROLLER_MODULE` 可以把训练产物接入正式 CLI 与 Operator。值可以是相对路径、绝对路径或已安装包名；模块必须导出 `createHumanoidWholeBodyController(context)`，并在每次调用时创建独立的 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 实例。运行定义只保存解析后入口文件的 SHA-256，不保存本机路径；恢复时必须配置来源完全相同的模块，不能在内置控制器与外部策略之间静默切换。
+
 仓库自带的 YAHMP ONNX 策略只声明 `balance`、`locomotion` 和 `joint_reference_tracking`。任务空间 IK、接触柔顺和抓取检查器是参考生成与物理验收组件，不代表策略已经学会接触式操作或双手操作。后续可以接入强化学习、模仿学习或其他已训练策略；新控制器只有在真实支持时才应声明 `contact_rich_manipulation` 或 `bimanual_manipulation`，Harness 仍会用同一 MuJoCo 预演和执行回执验证结果。
 
 控制器协议同时提供可声明的策略观察特征与逐控制步任务命令。训练策略可按自身编码消费根运动、手部状态、末端状态、MuJoCo 接触、对象与关节状态，以及当前任务空间目标和抓取约束；YAHMP 仍只读取原有本体状态与命令历史。语义 Skill 不会被展开成模型供应商或训练框架专用格式，因此本地 ONNX、远程策略服务和后续训练产物可以共用同一控制器边界。
@@ -210,6 +212,7 @@ HEAR_HOST=127.0.0.1
 HEAR_PORT=8765
 HEAR_OPERATOR_PASSWORD=
 HEAR_RUNS_DIR=./runs
+HEAR_HUMANOID_CONTROLLER_MODULE=
 ```
 
 可用传输协议：
@@ -285,7 +288,7 @@ pnpm hear operator [--host HOST] [--port PORT] [--dev]
 
 | 路径 | 内容 |
 |---|---|
-| `run.json` | 任务、场景和目标定义 |
+| `run.json` | 任务、场景、目标与可选控制器来源身份 |
 | `checkpoint.json` | 层级、世界、物理和记忆检查点 |
 | `agent-state.json` | 可恢复的 Agents SDK 运行状态 |
 | `session.json` | 协调智能体 Session |

@@ -23,6 +23,9 @@ import {
   type OperatorLeaseOptions
 } from "./server/operator-lease.js";
 import { createOperatorServer } from "./server/operator-server.js";
+import {
+  loadConfiguredHumanoidControllerSource
+} from "./world/humanoid/controller-module.js";
 
 loadEnvironment();
 
@@ -67,10 +70,11 @@ async function main(argv: string[]): Promise<void> {
       const goal = GoalSchema.parse(JSON.parse(required(options, "goal")));
       const seed = options.seed === undefined ? undefined : parseSeed(options.seed);
       const runMode = HumanoidRunModeSchema.parse(options.mode ?? "mission");
-      const [catalog, provider, server] = await Promise.all([
+      const [catalog, provider, server, controllerSource] = await Promise.all([
         loadRuntimeCatalog(),
         Promise.resolve(loadProviderConfig()),
-        Promise.resolve(loadServerConfig())
+        Promise.resolve(loadServerConfig()),
+        loadConfiguredHumanoidControllerSource()
       ]);
       const result = await withMissionSignals(server.runsDir, (signal, mutationFence) => startHumanoidMission({
         runsDir: server.runsDir,
@@ -82,7 +86,8 @@ async function main(argv: string[]): Promise<void> {
         runMode,
         ...(seed === undefined ? {} : { seed }),
         signal,
-        mutationFence
+        mutationFence,
+        ...(controllerSource ? { controllerSource } : {})
       }));
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return;
@@ -90,10 +95,11 @@ async function main(argv: string[]): Promise<void> {
     if (command === "resume") {
       requireConfirmation(options);
       const runId = required(options, "run");
-      const [catalog, provider, server] = await Promise.all([
+      const [catalog, provider, server, controllerSource] = await Promise.all([
         loadRuntimeCatalog(),
         Promise.resolve(loadProviderConfig()),
-        Promise.resolve(loadServerConfig())
+        Promise.resolve(loadServerConfig()),
+        loadConfiguredHumanoidControllerSource()
       ]);
       const result = await withMissionSignals(server.runsDir, (signal, mutationFence) => resumeHumanoidMission({
         runDir: resolveRunDirectory(server.runsDir, runId),
@@ -101,15 +107,17 @@ async function main(argv: string[]): Promise<void> {
         provider,
         freshAgentEpoch: options["fresh-agent-epoch"] === "true",
         signal,
-        mutationFence
+        mutationFence,
+        ...(controllerSource ? { controllerSource } : {})
       }));
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return;
     }
     if (command === "operator") {
-      const [catalog, server] = await Promise.all([
+      const [catalog, server, controllerSource] = await Promise.all([
         loadRuntimeCatalog(),
-        Promise.resolve(loadServerConfig())
+        Promise.resolve(loadServerConfig()),
+        loadConfiguredHumanoidControllerSource()
       ]);
       const host = options.host ?? server.host;
       const port = options.port ? Number(options.port) : server.port;
@@ -128,6 +136,7 @@ async function main(argv: string[]): Promise<void> {
         catalog,
         ...(provider ? { provider } : {}),
         ...(providerError ? { providerError } : {}),
+        ...(controllerSource ? { controllerSource } : {}),
         dev: options.dev === "true"
       });
       installOperatorSignals(app);

@@ -25,6 +25,9 @@ import {
   startHumanoidMission
 } from "../runtime/humanoid-mission-runner.js";
 import { RunPauseRequestedError } from "../runtime/run-pause.js";
+import type {
+  HumanoidControllerSource
+} from "../world/humanoid/controller-module.js";
 
 export interface RunListItem {
   run_id: string;
@@ -49,6 +52,7 @@ export class RunManager {
   readonly #provider: ProviderConfig | undefined;
   readonly #providerError: string | undefined;
   readonly #mutationFence: MutationFence | undefined;
+  readonly #controllerSource: HumanoidControllerSource | undefined;
   readonly #subscribers = new Map<string, Set<Subscriber>>();
   readonly #controllers = new Map<string, AbortController>();
   readonly #operations = new Map<string, Promise<void>>();
@@ -63,12 +67,14 @@ export class RunManager {
     provider?: ProviderConfig;
     providerError?: string;
     mutationFence?: MutationFence;
+    controllerSource?: HumanoidControllerSource;
   }) {
     this.#runsDir = input.runsDir;
     this.#catalog = input.catalog;
     this.#provider = input.provider;
     this.#providerError = input.providerError;
     this.#mutationFence = input.mutationFence;
+    this.#controllerSource = input.controllerSource;
   }
 
   /** Converts process-owned nonterminal checkpoints left by a prior operator into resumable state. */
@@ -143,6 +149,9 @@ export class RunManager {
       ...(input.seed === undefined ? {} : { seed: input.seed }),
       eventSink: sink,
       signal: controller.signal,
+      ...(this.#controllerSource
+        ? { controllerSource: this.#controllerSource }
+        : {}),
       ...(this.#mutationFence ? { mutationFence: this.#mutationFence } : {})
     });
     return this.#trackLaunch(operation, created, controller);
@@ -163,6 +172,9 @@ export class RunManager {
       provider,
       eventSink: sink,
       signal: controller.signal,
+      ...(this.#controllerSource
+        ? { controllerSource: this.#controllerSource }
+        : {}),
       ...(this.#mutationFence ? { mutationFence: this.#mutationFence } : {})
     });
     return this.#trackLaunch(operation, created, controller);

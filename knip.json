@@ -2,6 +2,7 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": [
     "tests/browser/start-operator.ts",
-    "tests/live-endurance-worker.mjs"
+    "tests/live-endurance-worker.mjs",
+    "src/world/humanoid/controller-module.ts"
   ]
 }

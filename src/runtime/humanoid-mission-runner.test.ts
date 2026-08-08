@@ -3,7 +3,7 @@ import {
   UserError,
   type RunStreamEvent
 } from "@openai/agents";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -35,12 +35,17 @@ import { RunStore } from "../persistence/run-store.js";
 import { HumanoidWorld } from "../world/humanoid/world.js";
 import { captureHumanoidSessionStateIdentity } from "./humanoid-agent-state.js";
 import {
+  assertHumanoidControllerSourceCompatible,
   humanoidModelProgressSnapshot,
   nextModelDecisionFollowUpState,
   recoverableDynamicToolRunStateError,
   resumeHumanoidMission,
+  startHumanoidMission,
   shouldPersistHumanoidAgentState
 } from "./humanoid-mission-runner.js";
+import type {
+  HumanoidControllerSource
+} from "../world/humanoid/controller-module.js";
 import { RunPauseRequestedError } from "./run-pause.js";
 
 const runnerControl = vi.hoisted(() => ({
@@ -112,6 +117,48 @@ afterEach(async () => {
 });
 
 describe("humanoid mission initialization recovery", () => {
+  it("requires the exact controller module source when resuming", () => {
+    const first = controllerSource("a".repeat(64));
+    const second = controllerSource("b".repeat(64));
+
+    expect(() => assertHumanoidControllerSourceCompatible(undefined, undefined))
+      .not.toThrow();
+    expect(() => assertHumanoidControllerSourceCompatible(first.sourceSha256, first))
+      .not.toThrow();
+    expect(() => assertHumanoidControllerSourceCompatible(undefined, first))
+      .toThrow(/built-in humanoid controller/);
+    expect(() => assertHumanoidControllerSourceCompatible(first.sourceSha256, undefined))
+      .toThrow(/requires its original external/);
+    expect(() => assertHumanoidControllerSourceCompatible(first.sourceSha256, second))
+      .toThrow(/does not match/);
+  });
+
+  it("persists and passes an external controller source into a new physical world", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-controller-start-"));
+    temporaryDirectories.push(runsDir);
+    const sourceSha256 = "e".repeat(64);
+    const source: HumanoidControllerSource = {
+      sourceSha256,
+      controllerFactory: async () => {
+        throw new Error("external-controller-factory-reached");
+      }
+    };
+
+    await expect(startHumanoidMission({
+      runsDir,
+      mission: "Start with a trained whole-body policy",
+      scenarioId: "humanoid-controller-test",
+      goal: scenario.default_goal,
+      catalog,
+      provider: provider(),
+      controllerSource: source
+    })).rejects.toThrow("external-controller-factory-reached");
+    const [runId] = (await readdir(runsDir)).filter((entry) => !entry.startsWith("."));
+    if (!runId) throw new Error("Controller-backed run definition was not created");
+    expect((await RunStore.open(join(runsDir, runId))).definition)
+      .toMatchObject({ controller_source_sha256: sourceSha256 });
+  }, 60_000);
+
   it("scopes no-progress receipts to the Agent that produced them", () => {
     const runtime = {
       rootAgentId: HUMANOID_AGENT_IDS.coordinator,
@@ -515,6 +562,68 @@ describe("humanoid mission initialization recovery", () => {
     ]);
   }, 30_000);
 
+  it("keeps decision follow-up budgets independent for each hierarchy node", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    const inputs: unknown[] = [];
+    const stalls = [
+      HUMANOID_AGENT_IDS.coordinator,
+      HUMANOID_AGENT_IDS.motion,
+      HUMANOID_AGENT_IDS.coordinator
+    ];
+    const inspectionComplete = new Error("per-agent follow-up budgets inspected");
+    runnerControl.run.mockImplementation(async (_agent, runInput) => {
+      inputs.push(runInput);
+      const stalledAgentId = stalls[runnerControl.run.mock.calls.length - 1];
+      if (!stalledAgentId) throw inspectionComplete;
+      return {
+        state: { toString: () => `stall:${stalledAgentId}` },
+        completed: Promise.resolve(),
+        finalOutput: undefined,
+        async *[Symbol.asyncIterator]() {
+          throw new ModelDecisionStallError(
+            stalledAgentId,
+            `${stalledAgentId} returned no formal decision`
+          );
+        }
+      };
+    });
+
+    await expect(resume(store, config)).rejects.toBe(inspectionComplete);
+    expect(runnerControl.run).toHaveBeenCalledTimes(4);
+    expect(String(inputs[1])).toContain(
+      `未完成正式决策的节点：${HUMANOID_AGENT_IDS.coordinator}`
+    );
+    expect(String(inputs[1])).toContain("续行轮次：1");
+    expect(String(inputs[2])).toContain(
+      `未完成正式决策的节点：${HUMANOID_AGENT_IDS.motion}`
+    );
+    expect(String(inputs[2])).toContain("续行轮次：1");
+    expect(String(inputs[3])).toContain(
+      `未完成正式决策的节点：${HUMANOID_AGENT_IDS.coordinator}`
+    );
+    expect(String(inputs[3])).toContain("续行轮次：2");
+    const followUps = (await store.readJournal("provider")).filter((entry) => (
+      isRecord(entry) && entry.status === "model_decision_follow_up"
+    ));
+    expect(followUps).toEqual([
+      expect.objectContaining({
+        agent_id: HUMANOID_AGENT_IDS.coordinator,
+        follow_up_attempt: 1
+      }),
+      expect.objectContaining({
+        agent_id: HUMANOID_AGENT_IDS.motion,
+        follow_up_attempt: 1
+      }),
+      expect.objectContaining({
+        agent_id: HUMANOID_AGENT_IDS.coordinator,
+        follow_up_attempt: 2
+      })
+    ]);
+  }, 30_000);
+
   it("scopes decision follow-ups to one authoritative progress state", () => {
     const first = nextModelDecisionFollowUpState(undefined, "authority-a");
     const second = nextModelDecisionFollowUpState(first ?? undefined, "authority-a");
@@ -705,6 +814,15 @@ function provider(model = "test-model"): ProviderConfig {
     AI_MODEL: model,
     AI_API_KEY: "test-credential"
   });
+}
+
+function controllerSource(sourceSha256: string): HumanoidControllerSource {
+  return {
+    sourceSha256,
+    controllerFactory: async () => {
+      throw new Error("Controller construction is outside this compatibility test");
+    }
+  };
 }
 
 function createManifest(config: ProviderConfig) {

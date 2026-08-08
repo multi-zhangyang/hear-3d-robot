@@ -78,6 +78,9 @@ import {
   transportRetryPlan
 } from "./transport-recovery.js";
 import { HumanoidWorld } from "../world/humanoid/world.js";
+import type {
+  HumanoidControllerSource
+} from "../world/humanoid/controller-module.js";
 import { drawSeed } from "../world/world-generator.js";
 
 setTracingDisabled(true);
@@ -93,6 +96,28 @@ export interface HumanoidMissionRunResult {
   output: string;
 }
 
+export function assertHumanoidControllerSourceCompatible(
+  persistedSourceSha256: string | undefined,
+  configuredSource: HumanoidControllerSource | undefined
+): void {
+  const configuredSourceSha256 = configuredSource?.sourceSha256;
+  if (persistedSourceSha256 === configuredSourceSha256) return;
+  if (persistedSourceSha256 === undefined) {
+    throw new Error(
+      "This run uses the built-in humanoid controller and cannot be resumed "
+      + "with an external controller module"
+    );
+  }
+  if (configuredSourceSha256 === undefined) {
+    throw new Error(
+      "This run requires its original external humanoid controller module"
+    );
+  }
+  throw new Error(
+    "The configured humanoid controller module does not match the source used by this run"
+  );
+}
+
 export async function startHumanoidMission(input: {
   runsDir: string;
   mission: string;
@@ -105,6 +130,7 @@ export async function startHumanoidMission(input: {
   eventSink?: RuntimeEventSink;
   signal?: AbortSignal;
   mutationFence?: MutationFence;
+  controllerSource?: HumanoidControllerSource;
 }): Promise<HumanoidMissionRunResult> {
   const scenario = input.catalog.materialize(
     input.scenarioId,
@@ -118,10 +144,18 @@ export async function startHumanoidMission(input: {
     scenario,
     goal: input.goal,
     runtime: "humanoid_g1",
-    runMode: input.runMode ?? "mission"
+    runMode: input.runMode ?? "mission",
+    ...(input.controllerSource
+      ? { controllerSourceSha256: input.controllerSource.sourceSha256 }
+      : {})
   }, input.mutationFence ? { mutationFence: input.mutationFence } : {});
   const scenarioChunks = await store.readScenarioChunkDeltaState();
-  const world = await HumanoidWorld.create(scenario, undefined, { scenarioChunks });
+  const world = await HumanoidWorld.create(scenario, undefined, {
+    scenarioChunks,
+    ...(input.controllerSource
+      ? { controllerFactory: input.controllerSource.controllerFactory }
+      : {})
+  });
   try {
     const checkpoint = createHumanoidRunCheckpoint({
       store,
@@ -156,6 +190,7 @@ export async function resumeHumanoidMission(input: {
   eventSink?: RuntimeEventSink;
   signal?: AbortSignal;
   mutationFence?: MutationFence;
+  controllerSource?: HumanoidControllerSource;
 }): Promise<HumanoidMissionRunResult> {
   const store = await RunStore.open(
     input.runDir,
@@ -164,6 +199,10 @@ export async function resumeHumanoidMission(input: {
   if (store.definition.runtime !== "humanoid_g1") {
     throw new Error("This run was not created by the humanoid runtime");
   }
+  assertHumanoidControllerSourceCompatible(
+    store.definition.controller_source_sha256,
+    input.controllerSource
+  );
   const checkpoint = await store.readHumanoidCheckpoint();
   if (checkpoint.status === "succeeded") throw new Error("A succeeded run cannot be resumed");
   if (input.freshAgentEpoch) {
@@ -178,7 +217,12 @@ export async function resumeHumanoidMission(input: {
   const world = await HumanoidWorld.create(
     store.definition.scenario,
     checkpoint.world_checkpoint,
-    { scenarioChunks }
+    {
+      scenarioChunks,
+      ...(input.controllerSource
+        ? { controllerFactory: input.controllerSource.controllerFactory }
+        : {})
+    }
   );
   try {
     const runtime = new HumanoidRunRuntime({
@@ -426,7 +470,13 @@ async function executeHumanoidMission(input: {
         controller.controlStepSeconds
       )}hz`,
       controller_protocol: controller.protocol,
-      actuation: controller.actuation
+      actuation: controller.actuation,
+      ...(input.runtime.store.definition.controller_source_sha256
+        ? {
+            controller_source_sha256:
+              input.runtime.store.definition.controller_source_sha256
+          }
+        : {})
     }, input.runtime.rootAgentId);
     initialized = true;
 
@@ -501,7 +551,11 @@ async function executeHumanoidMission(input: {
     };
 
     let serializedState = await resumableAgentState(input.runtime, sessions);
-    let decisionFollowUp: ModelDecisionFollowUpState | undefined;
+    const decisionFollowUps = new Map<string, ModelDecisionFollowUpState>();
+    let pendingDecisionFollowUp: {
+      agentId: string;
+      state: ModelDecisionFollowUpState;
+    } | undefined;
     for (;;) {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
@@ -534,8 +588,12 @@ async function executeHumanoidMission(input: {
             continue;
           }
         } else {
-          runInput = decisionFollowUp
-            ? autonomousDecisionFollowUpInput(input.runtime, decisionFollowUp.attempt)
+          runInput = pendingDecisionFollowUp
+            ? autonomousDecisionFollowUpInput(
+                input.runtime,
+                pendingDecisionFollowUp.agentId,
+                pendingDecisionFollowUp.state.attempt
+              )
             : autonomousCycleInput(input.runtime);
         }
         serializedState = undefined;
@@ -573,27 +631,35 @@ async function executeHumanoidMission(input: {
         const result = await acceptVerifiedTransition(output);
         if (result) return result;
         await input.runtime.store.clearAgentState();
-        decisionFollowUp = undefined;
+        decisionFollowUps.clear();
+        pendingDecisionFollowUp = undefined;
         await input.runtime.setActiveAgent(input.runtime.rootAgentId);
       } catch (error) {
         if (input.signal?.aborted) throw error;
         const decisionStall = modelDecisionStallFrom(error);
+        const previousDecisionFollowUp = decisionStall
+          ? decisionFollowUps.get(decisionStall.agentId)
+          : undefined;
         const nextDecisionFollowUp = decisionStall
           ? nextModelDecisionFollowUpState(
-              decisionFollowUp,
+              previousDecisionFollowUp,
               humanoidAgentStateFingerprint(input.runtime.checkpoint)
             )
           : null;
         if (decisionStall && nextDecisionFollowUp) {
-          const followUpBudgetReset = decisionFollowUp !== undefined
-            && decisionFollowUp.authorityFingerprint
+          const followUpBudgetReset = previousDecisionFollowUp !== undefined
+            && previousDecisionFollowUp.authorityFingerprint
               !== nextDecisionFollowUp.authorityFingerprint;
-          decisionFollowUp = nextDecisionFollowUp;
+          decisionFollowUps.set(decisionStall.agentId, nextDecisionFollowUp);
+          pendingDecisionFollowUp = {
+            agentId: decisionStall.agentId,
+            state: nextDecisionFollowUp
+          };
           await input.runtime.store.clearAgentState();
           await input.runtime.recordProvider({
             status: "model_decision_follow_up",
             agent_id: decisionStall.agentId,
-            follow_up_attempt: decisionFollowUp.attempt,
+            follow_up_attempt: nextDecisionFollowUp.attempt,
             maximum_follow_ups: MAX_MODEL_DECISION_FOLLOW_UPS,
             follow_up_scope: "unchanged_authoritative_harness_state",
             follow_up_budget_reset: followUpBudgetReset,
@@ -895,10 +961,12 @@ function autonomousCycleInput(runtime: HumanoidRunRuntime): string {
 
 function autonomousDecisionFollowUpInput(
   runtime: HumanoidRunRuntime,
+  stalledAgentId: string,
   followUpAttempt: number
 ): string {
   return [
     "继续当前人形自主闭环。上一次模型分支没有产生 Harness 可验收的正式工具决策。",
+    `未完成正式决策的节点：${stalledAgentId}`,
     `续行轮次：${followUpAttempt}`,
     `当前循环：${runtime.checkpoint.cycle_index + 1}`,
     "保留此前已完成的各 Agent 会话、工具回执和物理证据；根据末尾 CURRENT HARNESS AUTHORITY 直接选择当前阶段允许的正式工具。",

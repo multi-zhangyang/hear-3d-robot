@@ -7,6 +7,34 @@ import { RunStore } from "./run-store.js";
 import { FileSession } from "./file-session.js";
 
 describe("RunStore journal windows", () => {
+  it("persists only the external controller source identity and reads legacy definitions", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-store-controller-"));
+    const catalog = await loadRuntimeCatalog();
+    const scenario = catalog.materialize("humanoid_courtyard", 0);
+    const sourceSha256 = "c".repeat(64);
+    const external = await RunStore.create(runsDir, {
+      mission: "Keep the trained controller identity",
+      scenarioId: "humanoid_courtyard",
+      scenario,
+      goal: scenario.default_goal,
+      controllerSourceSha256: sourceSha256
+    });
+    expect((await RunStore.open(external.runDir)).definition).toMatchObject({
+      controller_source_sha256: sourceSha256
+    });
+    expect(JSON.parse(await readFile(join(external.runDir, "run.json"), "utf8")))
+      .not.toHaveProperty("controller_module");
+
+    const builtIn = await RunStore.create(runsDir, {
+      mission: "Keep the built-in controller",
+      scenarioId: "humanoid_courtyard",
+      scenario,
+      goal: scenario.default_goal
+    });
+    expect((await RunStore.open(builtIn.runDir)).definition)
+      .not.toHaveProperty("controller_source_sha256");
+  });
+
   it("clears only the replaceable SDK agent state", async () => {
     const runsDir = await mkdtemp(join(tmpdir(), "hear-store-state-"));
     const catalog = await loadRuntimeCatalog();

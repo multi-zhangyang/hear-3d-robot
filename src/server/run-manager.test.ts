@@ -8,6 +8,9 @@ import type { RuntimeEvent, RuntimeEventSink } from "../runtime/events.js";
 import type { MutationFence } from "../persistence/mutation-fence.js";
 import { RunStore } from "../persistence/run-store.js";
 import { RunManager } from "./run-manager.js";
+import type {
+  HumanoidControllerSource
+} from "../world/humanoid/controller-module.js";
 
 const missionRunner = vi.hoisted(() => ({
   startHumanoidMission: vi.fn(),
@@ -35,6 +38,63 @@ const TEST_PROVIDER: ProviderConfig = {
 };
 
 describe("RunManager event and process lifecycle", () => {
+  it("forwards one configured controller source through start and resume", async () => {
+    const { runsDir, runId, store } = await copiedFixture();
+    const catalog = await loadRuntimeCatalog();
+    const controllerSource: HumanoidControllerSource = {
+      sourceSha256: "d".repeat(64),
+      controllerFactory: async () => {
+        throw new Error("Controller construction belongs to the mission runner");
+      }
+    };
+    let startInput: { controllerSource?: HumanoidControllerSource } | undefined;
+    let resumeInput: { controllerSource?: HumanoidControllerSource } | undefined;
+    missionRunner.startHumanoidMission.mockImplementationOnce((input: {
+      controllerSource?: HumanoidControllerSource;
+      eventSink?: RuntimeEventSink;
+    }) => {
+      startInput = input;
+      input.eventSink?.(runtimeEvent(runId, "controller-started"));
+      return Promise.resolve({ runId, runDir: store.runDir, output: "started" });
+    });
+    missionRunner.resumeHumanoidMission.mockImplementationOnce((input: {
+      controllerSource?: HumanoidControllerSource;
+      eventSink?: RuntimeEventSink;
+    }) => {
+      resumeInput = input;
+      input.eventSink?.(runtimeEvent(runId, "controller-resumed"));
+      return Promise.resolve({ runId, runDir: store.runDir, output: "resumed" });
+    });
+    const startManager = new RunManager({
+      runsDir,
+      catalog,
+      provider: TEST_PROVIDER,
+      controllerSource
+    });
+
+    try {
+      await startManager.start({
+        mission: store.definition.mission,
+        scenarioId: store.definition.scenario_id,
+        goal: store.definition.goal
+      });
+      await startManager.drain();
+      const resumeManager = new RunManager({
+        runsDir,
+        catalog,
+        provider: TEST_PROVIDER,
+        controllerSource
+      });
+      await resumeManager.resume(runId);
+      await resumeManager.drain();
+      expect(startInput?.controllerSource).toBe(controllerSource);
+      expect(resumeInput?.controllerSource).toBe(controllerSource);
+    } finally {
+      missionRunner.startHumanoidMission.mockReset();
+      missionRunner.resumeHumanoidMission.mockReset();
+    }
+  }, 30_000);
+
   it("loads a complete humanoid run without a legacy compatibility path", async () => {
     const { runsDir, runId } = await copiedFixture();
     const catalog = await loadRuntimeCatalog();
