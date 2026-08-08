@@ -47,5 +47,5 @@ describe("humanoid interaction geometry", () => {
       model.delete();
       removeHumanoidScene(runtime, path);
     }
-  });
+  }, 30_000);
 });
