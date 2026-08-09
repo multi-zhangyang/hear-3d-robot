@@ -18,6 +18,7 @@ import {
   CONTEXT_COMPACTOR_TURNS_PER_ATTEMPT
 } from "../runtime/context-budget.js";
 import { errorMessage } from "../runtime/error-message.js";
+import { isTransportInterruption } from "../runtime/transport-recovery.js";
 import {
   estimateModelInputTokens,
   estimateToolTokens
@@ -40,6 +41,7 @@ const COMPACTOR_INSTRUCTIONS = [
   "Never turn a rejected receipt into completed evidence and never invent coordinates or success.",
   "The authority block is current; older observations and the prior checkpoint may be stale."
 ].join(" ");
+const contextCompactionAgentIds = new WeakMap<object, string>();
 
 export function contextCompactorIdentitySource(): {
   instructions: string;
@@ -257,6 +259,17 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
           ?? errorMessage(error)
         ).slice(0, 600);
         await this.#onAttemptFailure?.({ attempt, failure: lastFailure });
+        // A fresh compactor attempt can correct an invalid checkpoint, but it
+        // cannot repair a broken connection. Preserve the original transport
+        // object so the owning long-run Agent can apply its normal backoff and
+        // Session recovery instead of spending all compactor attempts at once.
+        if (isTransportInterruption(error)) {
+          throw new ContextCompactionInterruption(lastFailure, {
+            cause: error,
+            usage,
+            retryable: true
+          });
+        }
         if (error instanceof ContextCompactionCapacityError) throw error;
         if (observedContextWindowTokens !== undefined) {
           throw new ContextCompactionCapacityError(
@@ -270,7 +283,7 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
 
     throw new ContextCompactionInterruption(
       lastFailure ?? "Context Compactor returned no valid checkpoint",
-      { usage }
+      { usage, retryable: true }
     );
   }
 }
@@ -278,16 +291,22 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
 export class ContextCompactionInterruption extends Error {
   readonly code = "context_compaction_interrupted";
   readonly usage: ContextSummaryUsage | undefined;
+  readonly retryable: boolean;
 
   constructor(
     detail: string,
-    options: { cause?: unknown; usage?: ContextSummaryUsage } = {}
+    options: {
+      cause?: unknown;
+      usage?: ContextSummaryUsage;
+      retryable?: boolean;
+    } = {}
   ) {
     super(`Context compaction interruption: ${detail}`, {
       ...(options.cause === undefined ? {} : { cause: options.cause })
     });
     this.name = "ContextCompactionInterruption";
     this.usage = options.usage ? { ...options.usage } : undefined;
+    this.retryable = options.retryable ?? false;
   }
 }
 
@@ -306,8 +325,43 @@ export class ContextCompactionCapacityError extends ContextCompactionInterruptio
 }
 
 export function isContextCompactionInterruption(error: unknown): boolean {
+  return contextCompactionInterruptionChain(error).some((current) => (
+    current instanceof ContextCompactionInterruption
+      || (current as Record<string, unknown>).code === "context_compaction_interrupted"
+      || (current as Record<string, unknown>).name === "ContextCompactionInterruption"
+  ));
+}
+
+export function isRetryableContextCompactionInterruption(error: unknown): boolean {
+  return contextCompactionInterruptionChain(error).some((current) => (
+    current instanceof ContextCompactionInterruption && current.retryable
+  ));
+}
+
+export function bindContextCompactionInterruptionToAgent<T>(
+  error: T,
+  agentId: string
+): T {
+  if ((typeof error === "object" && error !== null) || typeof error === "function") {
+    contextCompactionAgentIds.set(error, agentId);
+  }
+  return error;
+}
+
+export function contextCompactionInterruptionAgentIdFrom(
+  error: unknown
+): string | undefined {
+  for (const current of contextCompactionInterruptionChain(error)) {
+    const agentId = contextCompactionAgentIds.get(current);
+    if (agentId) return agentId;
+  }
+  return undefined;
+}
+
+function contextCompactionInterruptionChain(error: unknown): object[] {
   const pending: unknown[] = [error];
   const seen = new Set<unknown>();
+  const chain: object[] = [];
   while (pending.length > 0) {
     const current = pending.shift();
     if (current === null || (typeof current !== "object" && typeof current !== "function")) {
@@ -315,14 +369,14 @@ export function isContextCompactionInterruption(error: unknown): boolean {
     }
     if (seen.has(current)) continue;
     seen.add(current);
-    if (current instanceof ContextCompactionInterruption) return true;
+    chain.push(current);
     const record = current as Record<string, unknown>;
-    if (record.code === "context_compaction_interrupted"
-      || record.name === "ContextCompactionInterruption") return true;
     if (record.cause !== undefined) pending.push(record.cause);
+    if (record.error !== undefined) pending.push(record.error);
+    if (record.originalError !== undefined) pending.push(record.originalError);
     if (Array.isArray(record.errors)) pending.push(...record.errors);
   }
-  return false;
+  return chain;
 }
 
 function compactorAgent(input: {

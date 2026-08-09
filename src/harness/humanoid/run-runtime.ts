@@ -1085,6 +1085,9 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   async start(resumed: boolean): Promise<void> {
     await this.#reconcileActionCommits();
+    const reconciledPhysicalTail = resumed
+      ? await this.#physicalExecution.synchronizePendingExecution()
+      : undefined;
     const at = new Date().toISOString();
     this.#checkpoint.status = "running";
     this.#checkpoint.error = null;
@@ -1109,6 +1112,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       persistCheckpoint: () => this.#persist(),
       eventSink: this.#eventSink
     });
+    if (reconciledPhysicalTail) {
+      await this.emit("physical_execution_tail_reconciled", json({
+        transaction_id: reconciledPhysicalTail.transactionId,
+        previous_committed_frame_count:
+          reconciledPhysicalTail.previousCommittedFrameCount,
+        committed_frame_count: reconciledPhysicalTail.committedFrameCount,
+        complete_trajectory: reconciledPhysicalTail.completeTrajectory,
+        automatic_actuation: false
+      }));
+    }
     await this.recoverPendingPhysicalExecution();
     this.#continuousPhysicsEnabled = true;
     const pendingExecution = activeActionExecutions(
@@ -2020,6 +2033,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
     this.#continuousPhysicsEnabled = false;
     await this.#physicsClock.stop();
+    await this.#physicalExecution.synchronizePendingExecution();
     this.#stageFinish(status, output, error, eventType, reason);
     await this.#persist();
     await reconcileLifecycleOutbox({

@@ -23,9 +23,11 @@ import {
   effectiveContextSummaryOutputTokens
 } from "../runtime/context-budget.js";
 import { agentIdFromInstructions, agentInvocationMarker } from "./agent-scope.js";
+import { bindModelTransportInterruptionToAgent } from "./model-telemetry.js";
 import {
   ContextCompactionCapacityError,
   ContextCompactionInterruption,
+  bindContextCompactionInterruptionToAgent,
   estimateContextSummaryRequestTokens,
   rebaseContextSummary,
   type ContextSummaryRequest,
@@ -37,6 +39,7 @@ import {
   estimateModelInputTokens,
   estimateToolTokens
 } from "./token-budget.js";
+import { isTransportInterruption } from "../runtime/transport-recovery.js";
 
 const HASH_SEED = "hear-context-ledger-v1";
 const CURRENT_AUTHORITY_POLICY = [
@@ -182,7 +185,24 @@ export class LongRunContextManager {
    * conversation prefix so a retry remains one topic and can reuse provider
    * prompt-cache entries.
    */
-  acceptSdkSessionRollback(agentId: string): void {
+  acceptSdkSessionRollback(
+    agentId: string,
+    restoredPhysical?: readonly AgentInputItem[]
+  ): void {
+    const recovered = this.#recoveredInputs.get(agentId);
+    if (recovered && restoredPhysical
+      && isPrefix(recovered.physical, [...restoredPhysical])) {
+      recovered.logical = recovered.logical.concat(structuredClone(
+        restoredPhysical.slice(recovered.physical.length)
+      ));
+      recovered.physical = structuredClone([...restoredPhysical]);
+      // A completed checkpoint still represents the removed prefix. Keep that
+      // logical mapping across a failed SDK branch; only revision-bound claims
+      // need rebasing against the latest authority.
+      this.#sessionRollbackScopes.delete(agentId);
+      this.#sessionRollbackRebaseScopes.add(agentId);
+      return;
+    }
     this.#recoveredInputs.delete(agentId);
     this.#sessionRollbackScopes.add(agentId);
     this.#sessionRollbackRebaseScopes.add(agentId);
@@ -339,10 +359,10 @@ export class LongRunContextManager {
     const hardLimit = config.contextWindowTokens
       - (config.maxOutputTokens ?? defaultOutputTokenReserve(config.contextWindowTokens));
     if (scope.active_estimated_tokens > hardLimit) {
-      throw new ContextCompactionInterruption(
+      throw bindContextCompactionInterruptionToAgent(new ContextCompactionInterruption(
         `Active context for ${agent.name} is estimated at ${scope.active_estimated_tokens} tokens, `
         + `above the configured ${hardLimit}-token input limit after compaction`
-      );
+      ), node.id);
     }
     this.#pendingModelEstimates.set(
       agentId,
@@ -393,9 +413,10 @@ export class LongRunContextManager {
     physical: AgentInputItem[]
   ): Promise<AgentInputItem[]> {
     // A restored Session may end at the same prefix as an abandoned attempt.
-    // Prefix equality is not permission to rehydrate that failed suffix;
-    // #recordRawDelta keeps the durable prefix and its validated checkpoint.
-    if (this.#sessionRollbackScopes.has(scope.scope_id)) return physical;
+    // Prefix equality is not permission to rehydrate that failed suffix. A
+    // validated compaction base may still translate the restored physical
+    // prefix into its logical hot tail; arbitrary journal suffixes may not.
+    const sdkSessionRollback = this.#sessionRollbackScopes.has(scope.scope_id);
     const recovered = this.#recoveredInputs.get(scope.scope_id);
     if (recovered) {
       if (!isPrefix(recovered.physical, physical)) {
@@ -434,6 +455,7 @@ export class LongRunContextManager {
       });
       return logical;
     }
+    if (sdkSessionRollback) return physical;
     const history = recoveredHistory.items;
     const shared = commonPrefixLength(history, physical);
     if (shared === 0) return physical;
@@ -641,9 +663,9 @@ export class LongRunContextManager {
       summaryOutputTokens
     );
     if (configuredMaxInputTokens <= 0) {
-      throw new ContextCompactionInterruption(
+      throw bindContextCompactionInterruptionToAgent(new ContextCompactionInterruption(
         "Context compactor has no input budget in the configured model window"
-      );
+      ), node.id);
     }
     type SelectedRequest = {
       cut: number;
@@ -687,11 +709,11 @@ export class LongRunContextManager {
         }
       }
       if (selected) return selected;
-      throw new ContextCompactionInterruption(
+      throw bindContextCompactionInterruptionToAgent(new ContextCompactionInterruption(
         `The next complete context turn for ${node.name} requires an estimated `
         + `${smallestCandidateTokens ?? "unknown"} compactor input tokens, above its `
         + `${maxInputTokens}-token hard limit; no oversized request was sent`
-      );
+      ), node.id);
     };
 
     const sourceFrom = scope.compacted_item_count;
@@ -713,9 +735,12 @@ export class LongRunContextManager {
           reconciledRequests = generated.usage.requests;
         }
         if (generated.origin !== "model") {
-          throw new ContextCompactionInterruption(
-            "Context Compactor returned a synthetic checkpoint instead of model-written memory",
-            { usage: generated.usage }
+          throw bindContextCompactionInterruptionToAgent(
+            new ContextCompactionInterruption(
+              "Context Compactor returned a synthetic checkpoint instead of model-written memory",
+              { usage: generated.usage }
+            ),
+            node.id
           );
         }
         this.#runtime.assertContextSummaryEvidence(generated.summary);
@@ -762,12 +787,36 @@ export class LongRunContextManager {
             }
           }
         }
+        if (isTransportInterruption(error)) {
+          const interruption = bindContextCompactionInterruptionToAgent(
+            bindModelTransportInterruptionToAgent(error, node.id),
+            node.id
+          );
+          await this.#runtime.recordProvider(json({
+            status: "context_compaction_transport_interrupted",
+            source: "agents_sdk",
+            scope_id: scope.scope_id,
+            agent_id: node.id,
+            error: interruption.message,
+            ...(usage ? { usage } : {}),
+            recoverable: true,
+            raw_history_preserved: true,
+            session_trimmed: false,
+            automatic_actuation: false
+          }), node.id);
+          throw interruption;
+        }
         const interruption = error instanceof ContextCompactionInterruption
           ? error
           : new ContextCompactionInterruption(
               error instanceof Error ? error.message : String(error),
-              { cause: error, ...(usage ? { usage } : {}) }
+              {
+                cause: error,
+                ...(usage ? { usage } : {}),
+                retryable: true
+              }
             );
+        bindContextCompactionInterruptionToAgent(interruption, node.id);
         await this.#runtime.recordProvider(json({
           status: "context_compaction_interrupted",
           source: "agents_sdk",

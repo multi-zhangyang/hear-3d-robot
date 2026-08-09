@@ -104,7 +104,7 @@ function normalizedOpenAICompatibleBody(
     return body;
   }
   if (!isRecord(value) || !Array.isArray(value.messages)) return body;
-  const messages = value.messages.map((message) => (
+  let messages = value.messages.map((message) => (
     isRecord(message) ? { ...message } : message
   ));
   let changed = false;
@@ -122,8 +122,68 @@ function normalizedOpenAICompatibleBody(
     messages.splice(index, 1);
     changed = true;
   }
+  const toolHistory = normalizedOpenAICompatibleToolHistory(messages);
+  messages = toolHistory.messages;
+  changed = changed || toolHistory.changed;
   if (!changed) return body;
   return JSON.stringify({ ...value, messages });
+}
+
+function normalizedOpenAICompatibleToolHistory(
+  messages: unknown[]
+): { messages: unknown[]; changed: boolean } {
+  const normalized: unknown[] = [];
+  let changed = false;
+  for (let index = 0; index < messages.length;) {
+    const message = messages[index];
+    if (isRecord(message) && message.role === "assistant"
+      && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      let resultEnd = index + 1;
+      while (resultEnd < messages.length
+        && messageRole(messages[resultEnd]) === "tool") {
+        resultEnd += 1;
+      }
+      const callIds = message.tool_calls.flatMap((toolCall) => (
+        isRecord(toolCall) && typeof toolCall.id === "string" && toolCall.id.length > 0
+          ? [toolCall.id]
+          : []
+      ));
+      const resultIds = messages.slice(index + 1, resultEnd).flatMap((result) => (
+        isRecord(result)
+          && typeof result.tool_call_id === "string"
+          && result.tool_call_id.length > 0
+          ? [result.tool_call_id]
+          : []
+      ));
+      const complete = callIds.length === message.tool_calls.length
+        && new Set(callIds).size === callIds.length
+        && resultIds.length === callIds.length
+        && new Set(resultIds).size === resultIds.length
+        && resultIds.every((id) => callIds.includes(id));
+      if (complete) {
+        normalized.push(message, ...messages.slice(index + 1, resultEnd));
+      } else {
+        const semantic = { ...message };
+        delete semantic.tool_calls;
+        if (!isEmptyAssistantMessage(semantic)) normalized.push(semantic);
+        changed = true;
+      }
+      index = resultEnd;
+      continue;
+    }
+    if (isRecord(message) && message.role === "tool") {
+      changed = true;
+      index += 1;
+      continue;
+    }
+    normalized.push(message);
+    index += 1;
+  }
+  return { messages: normalized, changed };
+}
+
+function messageRole(value: unknown): unknown {
+  return isRecord(value) ? value.role : undefined;
 }
 
 function isEmptyAssistantMessage(value: unknown): value is Record<string, unknown> {

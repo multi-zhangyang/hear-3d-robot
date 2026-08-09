@@ -383,11 +383,22 @@ function completedModelCall(
 function preserveModelInterruption(error: unknown, agentId: string): Error {
   const normalized = asError(error);
   if (isTransportInterruption(normalized)) {
-    transportInterruptionAgentIds.set(normalized, agentId);
-    recordAgentInvocationTransportInterruption(normalized);
+    bindModelTransportInterruptionToAgent(normalized, agentId);
   } else if (normalized instanceof ModelDecisionStallError) {
     recordAgentInvocationDecisionInterruption(normalized);
   }
+  return normalized;
+}
+
+/** Associates provider-neutral transport metadata with its concrete hierarchy node. */
+export function bindModelTransportInterruptionToAgent(
+  error: unknown,
+  agentId: string
+): Error {
+  const normalized = asError(error);
+  if (!isTransportInterruption(normalized)) return normalized;
+  transportInterruptionAgentIds.set(normalized, agentId);
+  recordAgentInvocationTransportInterruption(normalized);
   return normalized;
 }
 

@@ -26,6 +26,8 @@ import type {
 } from "../harness/context-runtime.js";
 import {
   AgentsSdkContextSummaryGenerator,
+  contextCompactionInterruptionAgentIdFrom,
+  isRetryableContextCompactionInterruption,
   isContextCompactionInterruption
 } from "../harness/context-summary-agent.js";
 import {
@@ -72,7 +74,7 @@ import {
   captureHumanoidSessionStateIdentity,
   humanoidAgentStateFingerprint,
   restoreHumanoidSessionBaseline,
-  restoreHumanoidSessionStateBaseline,
+  restoreHumanoidSessionStateBaselineDetailed,
   type HumanoidSessionBaseline
 } from "./humanoid-agent-state.js";
 import {
@@ -361,9 +363,12 @@ async function executeHumanoidMission(input: {
         contextManager.acceptSdkSessionRollback(agentId);
       }
     }
-    const acceptRestoredSessions = (agentIds: readonly string[]): void => {
+    const acceptRestoredSessions = (
+      agentIds: readonly string[],
+      baseline: HumanoidSessionBaseline
+    ): void => {
       for (const agentId of agentIds) {
-        contextManager.acceptSdkSessionRollback(agentId);
+        contextManager.acceptSdkSessionRollback(agentId, baseline.get(agentId));
       }
     };
     const modelTelemetryRuntime: ModelTelemetryRuntime = {
@@ -491,6 +496,14 @@ async function executeHumanoidMission(input: {
     await input.runtime.initializeGoalAutonomy(
       persistedManifest ?? currentManifest
     );
+    const initialResumableState = await resumableAgentState(input.runtime, sessions);
+    let serializedState = initialResumableState?.state;
+    if (initialResumableState && initialResumableState.restored.size > 0) {
+      acceptRestoredSessions(
+        [...initialResumableState.restored.keys()],
+        initialResumableState.restored
+      );
+    }
     await input.runtime.start(input.resumed);
     const controller = input.runtime.snapshot().robot.controller;
     await input.runtime.recordProvider({
@@ -593,8 +606,11 @@ async function executeHumanoidMission(input: {
       return undefined;
     };
 
-    let serializedState = await resumableAgentState(input.runtime, sessions);
     const decisionFollowUps = new Map<string, ModelDecisionFollowUpState>();
+    const contextCompactionRecoveries = new Map<string, {
+      compactionCount: number;
+      attempt: number;
+    }>();
     let pendingDecisionFollowUp: {
       agentId: string;
       state: ModelDecisionFollowUpState;
@@ -761,6 +777,49 @@ async function executeHumanoidMission(input: {
           serializedState = undefined;
           continue;
         }
+        if (isRetryableContextCompactionInterruption(error)
+          && !isTransportInterruption(error)) {
+          const interruptedAgentId = contextCompactionInterruptionAgentIdFrom(error)
+            ?? input.runtime.rootAgentId;
+          const compactionCount = contextManager.snapshot.scopes[interruptedAgentId]
+            ?.compaction_count ?? 0;
+          const previousRecovery = contextCompactionRecoveries.get(interruptedAgentId);
+          const recoveryAttempt = previousRecovery?.compactionCount === compactionCount
+            ? previousRecovery.attempt + 1
+            : 1;
+          contextCompactionRecoveries.set(interruptedAgentId, {
+            compactionCount,
+            attempt: recoveryAttempt
+          });
+          const persisted = await resumableAgentState(input.runtime, sessions);
+          let restoredAgentIds: string[] = [];
+          if (persisted === undefined) {
+            restoredAgentIds = await restoreHumanoidSessionBaseline(
+              sessions,
+              modelRequestSessionBaseline ?? sessionBaseline
+            );
+            acceptRestoredSessions(
+              restoredAgentIds,
+              modelRequestSessionBaseline ?? sessionBaseline
+            );
+          } else if (persisted.restored.size > 0) {
+            acceptRestoredSessions([...persisted.restored.keys()], persisted.restored);
+          }
+          serializedState = persisted?.state;
+          const retry = transportRetryPlan(error, recoveryAttempt);
+          await input.runtime.recordProvider({
+            status: "context_compaction_recovery_scheduled",
+            source: "long_run_context_lifecycle",
+            recovery_attempt: recoveryAttempt,
+            retry_after_ms: retry.waitMs,
+            resumed_sdk_state: serializedState !== undefined,
+            raw_history_preserved: true,
+            session_history_preserved: true,
+            automatic_actuation: false
+          }, interruptedAgentId);
+          await delay(retry.waitMs, input.signal);
+          continue;
+        }
         if (!isTransportInterruption(error)) throw error;
         modelProgressRecoveryEpoch += 1;
         const interruptedAgentId = modelTransportInterruptionAgentIdFrom(error)
@@ -772,9 +831,14 @@ async function executeHumanoidMission(input: {
             sessions,
             modelRequestSessionBaseline ?? sessionBaseline
           );
+        } else if (persisted.restored.size > 0) {
+          acceptRestoredSessions([...persisted.restored.keys()], persisted.restored);
         }
-        acceptRestoredSessions(restoredAgentIds);
-        serializedState = persisted;
+        acceptRestoredSessions(
+          restoredAgentIds,
+          modelRequestSessionBaseline ?? sessionBaseline
+        );
+        serializedState = persisted?.state;
         const recoveryAttempt = transportRecovery.nextAttempt(interruptedAgentId);
         if (recoveryAttempt === null) throw error;
         const retry = transportRetryPlan(error, recoveryAttempt);
@@ -788,7 +852,10 @@ async function executeHumanoidMission(input: {
             sessions,
             modelRequestSessionBaseline ?? sessionBaseline
           );
-          acceptRestoredSessions(restoredAgentIds);
+          acceptRestoredSessions(
+            restoredAgentIds,
+            modelRequestSessionBaseline ?? sessionBaseline
+          );
           await input.runtime.store.clearAgentState();
           serializedState = undefined;
         }
@@ -1003,7 +1070,10 @@ async function persistStreamEvent(
 async function resumableAgentState(
   runtime: HumanoidRunRuntime,
   sessions: ReadonlyMap<string, FileSession>
-): Promise<string | undefined> {
+): Promise<{
+  state: string;
+  restored: HumanoidSessionBaseline;
+} | undefined> {
   const record = await runtime.store.readAgentStateRecord();
   if (!record) return undefined;
   if (record.sessionBaseline === undefined
@@ -1011,15 +1081,15 @@ async function resumableAgentState(
     await runtime.store.clearAgentState();
     return undefined;
   }
-  const sessionsCompatible = await restoreHumanoidSessionStateBaseline(
+  const sessionRestore = await restoreHumanoidSessionStateBaselineDetailed(
     sessions,
     record.sessionBaseline
   );
-  if (!sessionsCompatible) {
+  if (!sessionRestore.compatible) {
     await runtime.store.clearAgentState();
     return undefined;
   }
-  return record.state;
+  return { state: record.state, restored: sessionRestore.restored };
 }
 
 function autonomousCycleInput(runtime: HumanoidRunRuntime): string {

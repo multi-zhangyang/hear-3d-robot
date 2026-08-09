@@ -10,8 +10,10 @@ import type { LongRunContextRuntime } from "./context-runtime.js";
 import { compactorInputTokenLimit } from "../runtime/context-budget.js";
 import { agentInvocationMarker } from "./agent-scope.js";
 import { LongRunContextManager } from "./context-compaction.js";
+import { modelTransportInterruptionAgentIdFrom } from "./model-telemetry.js";
 import {
   ContextCompactionCapacityError,
+  ContextCompactionInterruption,
   type ContextSummaryRequest
 } from "./context-summary-agent.js";
 
@@ -533,6 +535,255 @@ describe("LongRunContextManager hierarchy identity", () => {
       summary_origin: "model",
       summary_world_revision: 0
     });
+  });
+
+  it("keeps a completed checkpoint when its SDK request rolls back", async () => {
+    let memory = structuredClone(EmptyContextMemoryState);
+    let worldRevision = 3;
+    let compactorCalls = 0;
+    const node = taskNode("humanoid-motion-reference", "运动参考");
+    const runtime = {
+      rootAgentId: "humanoid-coordinator",
+      signal: undefined,
+      store: {},
+      activeNode: () => node,
+      contextAnchor: () => ({ world_revision: worldRevision }),
+      contextMemory: () => structuredClone(memory),
+      contextWorldIdentity: () => ({ worldRevision }),
+      contextReceipts: () => ({}),
+      assertContextSummaryEvidence: () => undefined,
+      async updateContextMemory(state: ContextMemoryState) {
+        memory = structuredClone(state);
+      },
+      async recordCompactionModelCall() {},
+      async reconcileCompactionModelCalls() {},
+      async recordProvider() {}
+    } as unknown as LongRunContextRuntime;
+    const manager = new LongRunContextManager({
+      runtime,
+      provider: providerConfig({
+        contextWindowTokens: 8_192,
+        compactTriggerTokens: 1_000,
+        compactRecentModelTurns: 1,
+        compactMaxOutputTokens: 120
+      }),
+      createGenerator: () => ({
+        async generate() {
+          compactorCalls += 1;
+          return {
+            summary: {
+              mission_state: "继续当前运动目标。",
+              constraints: [],
+              decisions: [],
+              completed: [],
+              pending: ["根据新权威继续规划。"],
+              blockers: [],
+              next_actions: ["读取当前物理状态。"]
+            },
+            origin: "model" as const,
+            usage: { requests: 1, inputTokens: 500, outputTokens: 40, totalTokens: 540 }
+          };
+        }
+      })
+    });
+    const physical = [
+      { role: "user", content: "x".repeat(3_000) },
+      { role: "assistant", content: "旧观察。" },
+      { role: "user", content: "保留当前规划轮。" }
+    ] as AgentInputItem[];
+    const request = {
+      modelData: {
+        instructions: `${agentInvocationMarker(node.id)}\nPlan motion.`,
+        input: physical
+      },
+      agent: { name: node.name, tools: [] }
+    } as never;
+
+    const first = await manager.filter(request);
+    expect(compactorCalls).toBe(1);
+    expect(JSON.stringify(first.input)).not.toContain("x".repeat(3_000));
+
+    manager.acceptSdkSessionRollback(node.id, physical);
+    worldRevision = 4;
+    const retried = await manager.filter(request);
+
+    expect(compactorCalls).toBe(1);
+    expect(JSON.stringify(retried.input)).not.toContain("x".repeat(3_000));
+    expect(JSON.stringify(retried.input)).toContain("world_revision\\\":4");
+    expect(manager.snapshot.scopes[node.id]).toMatchObject({
+      compaction_count: 1,
+      summary_origin: "model",
+      summary_world_revision: 4
+    });
+  });
+
+  it("rehydrates a compacted specialist Session after process interruption", async () => {
+    let memory = structuredClone(EmptyContextMemoryState);
+    const journal: unknown[] = [];
+    let compactorCalls = 0;
+    const node = taskNode("humanoid-motion-reference", "运动参考");
+    const runtime = {
+      rootAgentId: "humanoid-coordinator",
+      signal: undefined,
+      store: {
+        readJournalTail: async () => ({ total: journal.length }),
+        readJournalPage: async (_name: string, from: number, limit: number) => ({
+          entries: journal.slice(from, from + limit),
+          total: journal.length,
+          next: from + limit < journal.length ? from + limit : null
+        })
+      },
+      activeNode: () => node,
+      contextAnchor: () => ({
+        world_revision: 8,
+        coordinator_phase: "plan",
+        execution_authority: null
+      }),
+      contextMemory: () => structuredClone(memory),
+      contextWorldIdentity: () => ({ worldRevision: 8 }),
+      contextReceipts: () => ({}),
+      assertContextSummaryEvidence: () => undefined,
+      async updateContextMemory(state: ContextMemoryState, record?: unknown) {
+        memory = structuredClone(state);
+        if (record !== undefined) journal.push(structuredClone(record));
+      },
+      async recordCompactionModelCall() {},
+      async reconcileCompactionModelCalls() {},
+      async recordProvider() {}
+    } as unknown as LongRunContextRuntime;
+    const configured = providerConfig({
+      contextWindowTokens: 8_192,
+      compactTriggerTokens: 1_000,
+      compactRecentModelTurns: 1,
+      compactMaxOutputTokens: 120
+    });
+    const createManager = () => new LongRunContextManager({
+      runtime,
+      provider: configured,
+      createGenerator: () => ({
+        async generate() {
+          compactorCalls += 1;
+          return {
+            summary: {
+              mission_state: "继续当前运动目标。",
+              constraints: [],
+              decisions: [],
+              completed: [],
+              pending: ["保持当前 Goal。"],
+              blockers: [],
+              next_actions: ["读取恢复后的实时权威。"]
+            },
+            origin: "model" as const,
+            usage: { requests: 1, inputTokens: 500, outputTokens: 40, totalTokens: 540 }
+          };
+        }
+      })
+    });
+    const physical = [
+      { role: "user", content: "old-prefix:" + "x".repeat(3_000) },
+      { role: "assistant", content: "旧运动观察。" },
+      { role: "user", content: "当前规划轮。" }
+    ] as AgentInputItem[];
+    const request = {
+      modelData: {
+        instructions: `${agentInvocationMarker(node.id)}\nPlan motion.`,
+        input: physical
+      },
+      agent: { name: node.name, tools: [] }
+    } as never;
+
+    const originalManager = createManager();
+    await originalManager.filter(request);
+    await originalManager.filter({
+      ...request,
+      modelData: {
+        ...request.modelData,
+        input: [
+          ...physical,
+          { role: "assistant", content: "abandoned-response-suffix" }
+        ] as AgentInputItem[]
+      }
+    });
+    const recovered = createManager();
+    recovered.acceptSdkSessionRollback(node.id, physical);
+    const filtered = await recovered.filter(request);
+
+    expect(compactorCalls).toBe(1);
+    expect(JSON.stringify(filtered.input)).not.toContain("old-prefix:");
+    expect(JSON.stringify(filtered.input)).not.toContain("abandoned-response-suffix");
+    expect(JSON.stringify(filtered.input)).toContain("当前规划轮");
+    expect(filtered.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
+    expect(recovered.snapshot.scopes[node.id]).toMatchObject({
+      compaction_count: 1,
+      summary_origin: "model",
+      raw_item_count: 2,
+      retained_item_count: 2
+    });
+  });
+
+  it("attributes a compactor transport failure to the specialist that owns the context", async () => {
+    let memory = structuredClone(EmptyContextMemoryState);
+    const providerEvents: unknown[] = [];
+    const node = taskNode("humanoid-motion-reference", "运动参考");
+    const connectionFailure = Object.assign(new Error("gateway disconnected"), {
+      code: "ECONNRESET"
+    });
+    const runtime = {
+      rootAgentId: "humanoid-coordinator",
+      signal: undefined,
+      store: {},
+      activeNode: () => node,
+      contextAnchor: () => ({ world_revision: 5 }),
+      contextMemory: () => structuredClone(memory),
+      contextWorldIdentity: () => ({ worldRevision: 5 }),
+      contextReceipts: () => ({}),
+      assertContextSummaryEvidence: () => undefined,
+      async updateContextMemory(state: ContextMemoryState) {
+        memory = structuredClone(state);
+      },
+      async recordCompactionModelCall() {},
+      async reconcileCompactionModelCalls() {},
+      async recordProvider(event: unknown) {
+        providerEvents.push(event);
+      }
+    } as unknown as LongRunContextRuntime;
+    const manager = new LongRunContextManager({
+      runtime,
+      provider: providerConfig({
+        contextWindowTokens: 8_192,
+        compactTriggerTokens: 700,
+        compactRecentModelTurns: 1,
+        compactMaxOutputTokens: 120
+      }),
+      createGenerator: () => ({
+        async generate() {
+          throw new ContextCompactionInterruption("transport failed", {
+            cause: connectionFailure,
+            usage: { requests: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+          });
+        }
+      })
+    });
+
+    const failure = await manager.filter({
+      modelData: {
+        instructions: `${agentInvocationMarker(node.id)}\nPlan motion.`,
+        input: [
+          { role: "user", content: "x".repeat(3_000) },
+          { role: "assistant", content: "旧观察。" },
+          { role: "user", content: "继续。" }
+        ] as AgentInputItem[]
+      },
+      agent: { name: node.name, tools: [] }
+    } as never).catch((error: unknown) => error);
+
+    expect(modelTransportInterruptionAgentIdFrom(failure)).toBe(node.id);
+    expect(providerEvents).toContainEqual(expect.objectContaining({
+      status: "context_compaction_transport_interrupted",
+      agent_id: node.id,
+      raw_history_preserved: true,
+      automatic_actuation: false
+    }));
   });
 
   it("shrinks a compaction batch from a real response usage ceiling", async () => {

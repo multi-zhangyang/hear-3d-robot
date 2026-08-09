@@ -30,6 +30,10 @@ import {
 import { createHumanoidRunCheckpoint } from "../harness/humanoid/run-checkpoint.js";
 import { HumanoidRunRuntime } from "../harness/humanoid/run-runtime.js";
 import { ModelDecisionStallError } from "../harness/model-telemetry.js";
+import {
+  ContextCompactionInterruption,
+  bindContextCompactionInterruptionToAgent
+} from "../harness/context-summary-agent.js";
 import { createConfiguredModel } from "../model/factory.js";
 import { FileSession } from "../persistence/file-session.js";
 import { RunStore } from "../persistence/run-store.js";
@@ -404,6 +408,41 @@ describe("humanoid mission initialization recovery", () => {
       prompt_cache_prefix_preserved: true
     });
   });
+
+  it("keeps retryable real-model compaction in the same long-run lifecycle", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    const compactionFailure = bindContextCompactionInterruptionToAgent(
+      new ContextCompactionInterruption(
+        "real compactor omitted its checkpoint tool",
+        { retryable: true }
+      ),
+      HUMANOID_AGENT_IDS.motion
+    );
+    const inspectionComplete = new Error("compaction recovery lifecycle inspected");
+    runnerControl.run.mockImplementation(async () => {
+      if (runnerControl.run.mock.calls.length <= 10) throw compactionFailure;
+      throw inspectionComplete;
+    });
+
+    await expect(resume(store, config)).rejects.toBe(inspectionComplete);
+
+    expect(runnerControl.run).toHaveBeenCalledTimes(11);
+    const recoveries = (await store.readJournal("provider")).filter((entry) => (
+      isRecord(entry) && entry.status === "context_compaction_recovery_scheduled"
+    ));
+    expect(recoveries).toEqual(Array.from({ length: 10 }, (_, index) => (
+      expect.objectContaining({
+        agent_id: HUMANOID_AGENT_IDS.motion,
+        recovery_attempt: index + 1,
+        raw_history_preserved: true,
+        session_history_preserved: true,
+        automatic_actuation: false
+      })
+    )));
+  }, 30_000);
 
   it("keeps Session histories intact when the checkpoint rejects a RunState", async () => {
     const store = await createCheckpointedRun();

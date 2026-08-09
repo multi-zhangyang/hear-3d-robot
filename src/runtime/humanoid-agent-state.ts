@@ -122,9 +122,26 @@ export async function restoreHumanoidSessionStateBaseline(
   sessions: ReadonlyMap<string, FileSession>,
   baseline: AgentSessionStateBaseline
 ): Promise<boolean> {
+  return (await restoreHumanoidSessionStateBaselineDetailed(
+    sessions,
+    baseline
+  )).compatible;
+}
+
+export interface HumanoidSessionStateRestore {
+  compatible: boolean;
+  restored: HumanoidSessionBaseline;
+}
+
+export async function restoreHumanoidSessionStateBaselineDetailed(
+  sessions: ReadonlyMap<string, FileSession>,
+  baseline: AgentSessionStateBaseline
+): Promise<HumanoidSessionStateRestore> {
   const agentIds = Object.keys(baseline).sort(compareCodePoints);
   if (sessions.size !== agentIds.length
-    || agentIds.some((agentId) => !sessions.has(agentId))) return false;
+    || agentIds.some((agentId) => !sessions.has(agentId))) {
+    return { compatible: false, restored: new Map() };
+  }
   const candidates = await Promise.all(agentIds.map(async (agentId) => {
     const session = sessions.get(agentId)!;
     const current = await session.getItems();
@@ -132,14 +149,23 @@ export async function restoreHumanoidSessionStateBaseline(
     if (current.length < identity.item_count) return null;
     const items = current.slice(0, identity.item_count);
     if (agentInputItemsSha256(items) !== identity.items_sha256) return null;
-    return { session, currentCount: current.length, items };
+    return { agentId, session, currentCount: current.length, items };
   }));
-  if (candidates.some((candidate) => candidate === null)) return false;
+  if (candidates.some((candidate) => candidate === null)) {
+    return { compatible: false, restored: new Map() };
+  }
   await Promise.all(candidates.map(async (candidate) => {
     if (!candidate || candidate.currentCount === candidate.items.length) return;
     await candidate.session.replaceItems(candidate.items);
   }));
-  return true;
+  return {
+    compatible: true,
+    restored: new Map(candidates.flatMap((candidate) => (
+      candidate && candidate.currentCount !== candidate.items.length
+        ? [[candidate.agentId, structuredClone(candidate.items)] as const]
+        : []
+    )))
+  };
 }
 
 function agentInputItemsSha256(items: readonly AgentInputItem[]): string {

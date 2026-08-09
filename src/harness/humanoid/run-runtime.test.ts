@@ -1184,6 +1184,7 @@ describe("HumanoidRunRuntime", () => {
     let executionFrames = 0;
     let actuationStarted = false;
     let runtime: HumanoidRunRuntime | undefined;
+    let resumedWorld: HumanoidWorld | undefined;
     try {
       const initial = createHumanoidRunCheckpoint({
         store,
@@ -1204,7 +1205,7 @@ describe("HumanoidRunRuntime", () => {
           }
         }
       });
-      await activateGoal(runtime, scenario.default_goal);
+      const manifest = await activateGoal(runtime, scenario.default_goal);
       await runtime.start(false);
       await runtime.stopContinuousPhysics();
       const planned = await invokeModelAction(runtime,
@@ -1261,19 +1262,148 @@ describe("HumanoidRunRuntime", () => {
         `Physical execution ${transactionId} must be recovered before tool-signal-unrelated`
       );
 
-      const recovered = await runtime.recoverPendingPhysicalExecution();
+      await runtime.pause("persist the interrupted physical tail");
+      const paused = await store.readHumanoidCheckpoint();
+      const pausedExecution = paused.action_execution_ledger.active[transactionId]!;
+      expect(paused).toMatchObject({
+        status: "paused",
+        world: { frame: stoppedRevision, worldRevision: stoppedRevision },
+        world_checkpoint: { frame: stoppedRevision, worldRevision: stoppedRevision }
+      });
+      expect(pausedExecution.progress).toMatchObject({
+        committed_frame_count: 3,
+        world_frame: stoppedRevision,
+        world_revision: stoppedRevision,
+        physical_trajectory: {
+          complete_from_admission: true,
+          end_frame: stoppedRevision,
+          end_world_revision: stoppedRevision
+        }
+      });
+
+      resumedWorld = await HumanoidWorld.create(scenario, paused.world_checkpoint);
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: paused
+      });
+      await resumed.initializeGoalAutonomy(manifest);
+      await resumed.start(true);
+      await resumed.stopContinuousPhysics();
+      const recovered = resumed.receipt(transactionId);
       expect(recovered).toMatchObject({
         transactionId,
         accepted: true,
         code: "motion_completed"
       });
-      expect(runtime.pendingPhysicalExecutionTransactionId()).toBeUndefined();
+      expect(resumed.pendingPhysicalExecutionTransactionId()).toBeUndefined();
       const matchingReceipts = (await store.readJournal("actions")).filter((entry) => (
         journalField(entry, "transactionId") === transactionId
       ));
       expect(matchingReceipts).toHaveLength(1);
     } finally {
       await runtime?.stopContinuousPhysics();
+      await resumedWorld?.dispose();
+      await world.dispose();
+    }
+  }, 45_000);
+
+  it("resumes an older checkpoint whose exact MuJoCo tail is ahead of its ledger cut", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-legacy-tail-recovery-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "验证旧检查点物理尾部恢复",
+      scenarioId: "humanoid-legacy-tail-recovery",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    const controller = new AbortController();
+    let resumedWorld: HumanoidWorld | undefined;
+    let executionFrames = 0;
+    let actuationStarted = false;
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial,
+        signal: controller.signal,
+        eventSink: (event) => {
+          if (!actuationStarted || event.type !== "humanoid_world_frame") return;
+          executionFrames += 1;
+          if (executionFrames === 3) {
+            controller.abort(new Error("legacy process stopped before periodic ledger cut"));
+          }
+        }
+      });
+      const manifest = await activateGoal(runtime, scenario.default_goal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+      const planned = await invokeModelAction(runtime,
+        "plan_whole_body_motion",
+        {
+          id: "legacy-tail-motion",
+          intent: "执行一段可从旧检查点继续的全身保持动作",
+          duration_seconds: 0.3,
+          keyframes: [{ at_seconds: 0 }, { at_seconds: 0.3 }]
+        },
+        "legacy-tail-plan",
+        HUMANOID_AGENT_IDS.motion
+      );
+      actuationStarted = true;
+      await expect(invokeModelAction(runtime,
+        "execute_whole_body_motion",
+        { planning_transaction_id: planned.transactionId },
+        "legacy-tail-execute",
+        HUMANOID_AGENT_IDS.executor
+      )).rejects.toThrow("legacy process stopped before periodic ledger cut");
+
+      const legacy = runtime.checkpoint;
+      const legacyExecution = legacy.action_execution_ledger.active[
+        "legacy-tail-execute"
+      ]!;
+      expect(legacyExecution.progress.committed_frame_count).toBe(0);
+      expect(legacy.world.worldRevision).toBe(
+        legacyExecution.admission.world_revision + 3
+      );
+      await store.writeCheckpoint(legacy);
+
+      resumedWorld = await HumanoidWorld.create(scenario, legacy.world_checkpoint);
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: legacy
+      });
+      await resumed.initializeGoalAutonomy(manifest);
+      await resumed.start(true);
+      await resumed.stopContinuousPhysics();
+      const recovered = resumed.receipt("legacy-tail-execute")!;
+      expect(recovered).toMatchObject({
+        accepted: true,
+        code: "motion_completed",
+        worldBeforeRevision: legacyExecution.admission.world_revision
+      });
+      expect(recovered.detail).toMatchObject({
+        physical_trajectory: {
+          complete_from_admission: false,
+          start_frame: legacy.world.frame,
+          start_world_revision: legacy.world.worldRevision,
+          end_frame: recovered.worldAfterRevision,
+          end_world_revision: recovered.worldAfterRevision
+        }
+      });
+    } finally {
+      await resumedWorld?.dispose();
       await world.dispose();
     }
   }, 45_000);

@@ -142,6 +142,65 @@ describe("OpenAI-compatible request normalization", () => {
       ]
     }]);
   });
+
+  it("removes incomplete tool protocol fragments after an interrupted Agent turn", async () => {
+    const bodies: unknown[] = [];
+    const implementation = vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(null, { status: 200 });
+    });
+    const compatible = openAICompatibleRequestFetch(implementation as typeof fetch);
+
+    await compatible("https://example.test/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "configured-model",
+        messages: [
+          { role: "user", content: "continue" },
+          {
+            role: "assistant",
+            content: "I will use the tool.",
+            tool_calls: [{
+              id: "interrupted-call",
+              type: "function",
+              function: { name: "move", arguments: "{}" }
+            }]
+          },
+          { role: "assistant", content: "recovered from durable state" },
+          { role: "tool", tool_call_id: "orphan-result", content: "orphan" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: "complete-call",
+              type: "function",
+              function: { name: "observe", arguments: "{}" }
+            }]
+          },
+          { role: "tool", tool_call_id: "complete-call", content: "observed" }
+        ]
+      })
+    });
+
+    expect(bodies).toEqual([{
+      model: "configured-model",
+      messages: [
+        { role: "user", content: "continue" },
+        { role: "assistant", content: "I will use the tool." },
+        { role: "assistant", content: "recovered from durable state" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "complete-call",
+            type: "function",
+            function: { name: "observe", arguments: "{}" }
+          }]
+        },
+        { role: "tool", tool_call_id: "complete-call", content: "observed" }
+      ]
+    }]);
+  });
 });
 
 describe("public provider identity", () => {

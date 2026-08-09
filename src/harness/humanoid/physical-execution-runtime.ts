@@ -119,8 +119,7 @@ export class HumanoidPhysicalExecutionRuntime {
     if (existing) {
       this.#assertExecutionIntent(existing, intent);
       if (existing.status !== "terminal") {
-        this.#recordTrajectoryFrame(existing, cut.world);
-        this.#recordExecutionProgress(existing, cut);
+        this.#synchronizeExecutionProgress(existing, cut);
       }
     } else {
       const trajectory = createPhysicalTrajectory(cut.world);
@@ -204,9 +203,40 @@ export class HumanoidPhysicalExecutionRuntime {
     const cut = await this.#capturePhysicalCut();
     this.#applyPhysicalCut(cut);
     if (entry.status !== "terminal") {
-      this.#recordTrajectoryFrame(entry, cut.world);
-      this.#recordExecutionProgress(entry, cut);
+      this.#synchronizeExecutionProgress(entry, cut);
     }
+  }
+
+  async synchronizePendingExecution(): Promise<{
+    transactionId: string;
+    previousCommittedFrameCount: number;
+    committedFrameCount: number;
+    completeTrajectory: boolean;
+  } | undefined> {
+    const pending = activeActionExecutions(
+      this.#checkpoint().action_execution_ledger
+    );
+    if (pending.length > 1) {
+      throw new Error("Multiple physical executions cannot share one humanoid runtime");
+    }
+    const [entry] = pending;
+    if (!entry || entry.status === "terminal") return undefined;
+    const previousCommittedFrameCount = entry.progress.committed_frame_count;
+    await this.synchronizeProgress(entry.transaction_id);
+    const current = this.#checkpoint().action_execution_ledger.active[
+      entry.transaction_id
+    ];
+    if (!current
+      || current.progress.committed_frame_count === previousCommittedFrameCount) {
+      return undefined;
+    }
+    return {
+      transactionId: entry.transaction_id,
+      previousCommittedFrameCount,
+      committedFrameCount: current.progress.committed_frame_count,
+      completeTrajectory:
+        current.progress.physical_trajectory?.complete_from_admission === true
+    };
   }
 
   async recordFrame(
@@ -382,6 +412,70 @@ export class HumanoidPhysicalExecutionRuntime {
         physicalCheckpointSha256: physicalCheckpointSha256(cut),
         physicalTrajectory: this.#requiredTrajectory(entry, cut.world)
       }
+    );
+  }
+
+  #synchronizeExecutionProgress(
+    entry: ActionExecutionLedgerEntry,
+    cut: HumanoidPersistenceCut
+  ): void {
+    this.#recoverRestoredPhysicalTail(entry, cut);
+    this.#recordTrajectoryFrame(entry, cut.world);
+    this.#recordExecutionProgress(entry, cut);
+  }
+
+  #recoverRestoredPhysicalTail(
+    entry: ActionExecutionLedgerEntry,
+    cut: HumanoidPersistenceCut
+  ): void {
+    if (this.#physicalTrajectories.has(entry.transaction_id)
+      || cut.world.worldRevision <= entry.progress.world_revision + 1) return;
+
+    const committedFrameCount = cut.world.worldRevision
+      - entry.admission.world_revision;
+    if (committedFrameCount <= entry.progress.committed_frame_count
+      || cut.world.frame !== entry.admission.world_frame + committedFrameCount) {
+      throw new Error(
+        `Restored physical tail is not aligned with execution ${entry.transaction_id}`
+      );
+    }
+    const planId = entry.admission.plan_id;
+    const motion = cut.worldCheckpoint.motions.find((candidate) => (
+      candidate.plan.id === planId
+    ));
+    const route = cut.worldCheckpoint.routes.find((candidate) => (
+      candidate.id === planId
+    ));
+    const expectsMotion = entry.action === "execute_whole_body_motion";
+    const expectsRoute = entry.action === "execute_humanoid_navigation";
+    const matchedPlanCount = Number(Boolean(motion)) + Number(Boolean(route));
+    if ((expectsMotion && (!motion || route))
+      || (expectsRoute && (!route || motion))
+      || (!expectsMotion && !expectsRoute && matchedPlanCount !== 1)) {
+      throw new Error(
+        `Restored physical plan is unavailable for execution ${entry.transaction_id}`
+      );
+    }
+    const planProgressRevision = motion
+      ? (motion.validatedRevision ?? motion.createdRevision)
+        + motion.progress.nextFrameIndex
+      : route?.progress
+        ? (route.validatedRevision ?? route.createdRevision)
+          + route.progress.committed_frame_count
+        : undefined;
+    if (planProgressRevision !== cut.world.worldRevision) {
+      throw new Error(
+        `Restored physical plan progress is not aligned with execution ${entry.transaction_id}`
+      );
+    }
+
+    // Older checkpoints could persist the exact MuJoCo state after the last
+    // periodic ledger cut. The missing intermediate observations cannot be
+    // reconstructed, so resume from the authoritative endpoint and mark the
+    // trajectory as incomplete instead of inventing samples.
+    this.#physicalTrajectories.set(
+      entry.transaction_id,
+      createPhysicalTrajectory(cut.world, false)
     );
   }
 

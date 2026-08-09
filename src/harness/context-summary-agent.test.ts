@@ -10,10 +10,12 @@ import {
   AgentsSdkContextSummaryGenerator,
   ContextCompactionCapacityError,
   ContextCompactionInterruption,
+  isRetryableContextCompactionInterruption,
   estimateContextSummaryRequestTokens,
   isContextCompactionInterruption,
   rebaseContextSummary
 } from "./context-summary-agent.js";
+import { isTransportInterruption } from "../runtime/transport-recovery.js";
 
 describe("context summary fidelity", () => {
   it("uses the tightest source, compactor, and model output ceiling", () => {
@@ -117,6 +119,45 @@ describe("context summary fidelity", () => {
       Array.from({ length: CONTEXT_COMPACTOR_MAX_ATTEMPTS }, () => undefined)
     );
     expect(isContextCompactionInterruption(new Error("wrapper", { cause: failure }))).toBe(true);
+  });
+
+  it("returns a transport interruption to the owning runtime after one request", async () => {
+    const connectionFailure = Object.assign(new Error("upstream connection reset"), {
+      code: "ECONNRESET"
+    });
+    let calls = 0;
+    const model = {
+      getResponse: async () => {
+        calls += 1;
+        throw connectionFailure;
+      },
+      getStreamedResponse: () => {
+        throw new Error("streaming is not used by this compactor test");
+      }
+    } as unknown as Model;
+    const generator = new AgentsSdkContextSummaryGenerator({
+      model,
+      temperature: 0
+    });
+
+    const failure = await generator.generate({
+      priorSummary: null,
+      sourceItems: [{ role: "user", content: "Preserve the active objective." }],
+      authority: { world_revision: 4 },
+      acceptedTransactionIds: [],
+      blockerTransactionIds: [],
+      maxInputTokens: 16_000,
+      maxOutputTokens: 256
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      code: "context_compaction_interrupted",
+      cause: connectionFailure,
+      usage: { requests: 1 }
+    });
+    expect(isTransportInterruption(failure)).toBe(true);
+    expect(isRetryableContextCompactionInterruption(failure)).toBe(true);
+    expect(calls).toBe(1);
   });
 
   it("does not send a compactor request beyond the retry-safe input envelope", async () => {

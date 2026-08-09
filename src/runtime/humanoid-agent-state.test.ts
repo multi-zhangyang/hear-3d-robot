@@ -18,6 +18,7 @@ import {
   humanoidSessionBaselineIdentity,
   restoreHumanoidSessionBaseline,
   restoreHumanoidSessionStateBaseline,
+  restoreHumanoidSessionStateBaselineDetailed,
   type HumanoidAgentStateCheckpoint,
   type HumanoidSessionBaseline
 } from "./humanoid-agent-state.js";
@@ -207,6 +208,35 @@ describe("humanoid Agent state recovery identity", () => {
     expect(await sessions.get("worker")!.getItems()).toEqual([
       { role: "user", content: "worker history" }
     ]);
+  });
+
+  it("reports the exact Session prefixes removed for context rollback", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hear-agent-session-state-detail-"));
+    temporaryDirectories.push(directory);
+    const coordinator = new FileSession(join(directory, "coordinator.json"), "coordinator");
+    const motion = new FileSession(join(directory, "motion.json"), "motion");
+    const sessions = new Map([
+      ["coordinator", coordinator],
+      ["motion", motion]
+    ]);
+    await coordinator.addItems([{ role: "user", content: "stable coordinator" }]);
+    await motion.addItems([{ role: "user", content: "stable motion" }]);
+    const baseline = humanoidSessionBaselineIdentity(
+      await captureHumanoidSessionBaseline(sessions)
+    );
+    await motion.addItems([{ role: "assistant", content: "abandoned model suffix" }]);
+
+    const restored = await restoreHumanoidSessionStateBaselineDetailed(
+      sessions,
+      baseline
+    );
+
+    expect(restored.compatible).toBe(true);
+    expect([...restored.restored.keys()]).toEqual(["motion"]);
+    expect(restored.restored.get("motion")).toEqual([
+      { role: "user", content: "stable motion" }
+    ]);
+    expect(await motion.getItems()).toEqual(restored.restored.get("motion"));
   });
 
   it("captures the persisted identity without cloning Session item arrays", async () => {
