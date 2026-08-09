@@ -1781,7 +1781,9 @@ function humanoidControllerExecutionState(
     transition: null
   };
   if (state.protocol !== "humanoid-controller-execution-v1"
-    || (state.mode !== "learned_policy" && state.mode !== "reference_control")
+    || (state.mode !== "learned_policy"
+      && state.mode !== "reference_control"
+      && state.mode !== "hybrid_control")
     || state.activeImplementation.trim().length === 0
     || (state.transition !== null
       && (state.transition.fromImplementation.trim().length === 0

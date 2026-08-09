@@ -15,12 +15,17 @@ import type {
 
 const ROUTING_STATE_PROTOCOL_V1 = "humanoid-controller-capability-routing-state-v1";
 const ROUTING_STATE_PROTOCOL_V2 = "humanoid-controller-capability-routing-state-v2";
+const ROUTING_STATE_PROTOCOL_V3 = "humanoid-controller-capability-routing-state-v3";
 const REFERENCE_CONTROL_CAPABILITIES = [
   "balance",
   "locomotion",
   "joint_reference_tracking"
 ] as const satisfies readonly HumanoidLearnedPolicyCapability[];
-type ControllerBranch = "primary" | "fallback";
+type ControllerRoute = "primary" | "fallback" | "upper_body_overlay";
+
+const FIRST_UPPER_BODY_JOINT_INDEX = HUMANOID_JOINT_NAMES.findIndex((joint) => (
+  joint.includes("shoulder")
+));
 
 interface ControllerHandoff {
   fromImplementation: string;
@@ -47,7 +52,7 @@ implements HumanoidWholeBodyController {
   readonly #primary: HumanoidWholeBodyController;
   readonly #fallback: HumanoidWholeBodyController;
   readonly #handoffSteps: number;
-  #active: ControllerBranch | null = null;
+  #active: ControllerRoute | null = null;
   #lastCommand: HumanoidJointPositionCommand | null = null;
   #handoff: ControllerHandoff | null = null;
 
@@ -77,11 +82,14 @@ implements HumanoidWholeBodyController {
 
   executionState(): HumanoidControllerExecutionState {
     const active = this.#active ?? "primary";
-    const controller = this.#controller(active);
     return {
       protocol: "humanoid-controller-execution-v1",
-      mode: active === "fallback" ? "reference_control" : "learned_policy",
-      activeImplementation: controller.descriptor.implementation,
+      mode: active === "fallback"
+        ? "reference_control"
+        : active === "upper_body_overlay"
+          ? "hybrid_control"
+          : "learned_policy",
+      activeImplementation: this.#routeImplementation(active),
       transition: this.#handoff
         ? {
             fromImplementation: this.#handoff.fromImplementation,
@@ -101,7 +109,7 @@ implements HumanoidWholeBodyController {
   ): void {
     this.#primary.reset(state, reference, options);
     this.#fallback.reset(state, reference, options);
-    this.#active = selectedBranch(this.#primary.descriptor, reference, options);
+    this.#active = selectedRoute(this.#primary.descriptor, reference, options);
     this.#lastCommand = null;
     this.#handoff = null;
   }
@@ -111,14 +119,13 @@ implements HumanoidWholeBodyController {
     reference: HumanoidReference,
     options: HumanoidControllerInferenceOptions = {}
   ): Promise<HumanoidJointPositionCommand> {
-    const selected = selectedBranch(this.#primary.descriptor, reference, options);
-    const controller = this.#controller(selected);
+    const selected = selectedRoute(this.#primary.descriptor, reference, options);
     const previous = this.#active;
     const routeChanged = selected !== previous;
     if (routeChanged) {
-      controller.reset(state, reference, options);
+      this.#resetNewRouteParticipants(previous, selected, state, reference, options);
     }
-    const target = await controller.infer(state, reference, options);
+    const target = await this.#inferRoute(selected, state, reference, options);
     if (routeChanged) {
       this.#active = selected;
       this.#handoff = previous !== null
@@ -126,8 +133,8 @@ implements HumanoidWholeBodyController {
         && this.#handoffSteps > 1
         ? {
             fromImplementation:
-              this.#controller(previous).descriptor.implementation,
-            toImplementation: controller.descriptor.implementation,
+              this.#routeImplementation(previous),
+            toImplementation: this.#routeImplementation(selected),
             source: cloneCommand(this.#lastCommand),
             completedSteps: 0,
             totalSteps: this.#handoffSteps
@@ -150,9 +157,14 @@ implements HumanoidWholeBodyController {
     reference: HumanoidReference,
     options: HumanoidControllerInferenceOptions = {}
   ): void {
-    const selected = selectedBranch(this.#primary.descriptor, reference, options);
+    const selected = selectedRoute(this.#primary.descriptor, reference, options);
     if (selected !== this.#active) {
       throw new Error("Humanoid controller capability route changed within one control step");
+    }
+    if (selected === "upper_body_overlay") {
+      this.#primary.advanceHistory(state, reference, options);
+      this.#fallback.advanceHistory(state, reference, options);
+      return;
     }
     this.#controller(selected).advanceHistory(state, reference, options);
   }
@@ -163,7 +175,7 @@ implements HumanoidWholeBodyController {
       version: 1,
       implementation: this.descriptor.implementation,
       payload: {
-        protocol: ROUTING_STATE_PROTOCOL_V2,
+        protocol: ROUTING_STATE_PROTOCOL_V3,
         active: this.#active,
         primary: controllerStateJson(this.#primary.captureState()),
         fallback: controllerStateJson(this.#fallback.captureState()),
@@ -230,26 +242,76 @@ implements HumanoidWholeBodyController {
     }
   }
 
-  #controller(branch: ControllerBranch): HumanoidWholeBodyController {
-    return branch === "primary" ? this.#primary : this.#fallback;
+  #controller(route: Exclude<ControllerRoute, "upper_body_overlay">):
+  HumanoidWholeBodyController {
+    return route === "primary" ? this.#primary : this.#fallback;
+  }
+
+  #routeImplementation(route: ControllerRoute): string {
+    if (route === "upper_body_overlay") {
+      return `${this.#primary.descriptor.implementation}+${this.#fallback.descriptor.implementation}`;
+    }
+    return this.#controller(route).descriptor.implementation;
+  }
+
+  #resetNewRouteParticipants(
+    previous: ControllerRoute | null,
+    selected: ControllerRoute,
+    state: HumanoidPolicyState,
+    reference: HumanoidReference,
+    options: HumanoidControllerInferenceOptions
+  ): void {
+    if (selected !== "fallback" && previous !== "primary"
+      && previous !== "upper_body_overlay") {
+      this.#primary.reset(state, reference, options);
+    }
+    if (selected !== "primary" && previous !== "fallback"
+      && previous !== "upper_body_overlay") {
+      this.#fallback.reset(state, reference, options);
+    }
+  }
+
+  async #inferRoute(
+    route: ControllerRoute,
+    state: HumanoidPolicyState,
+    reference: HumanoidReference,
+    options: HumanoidControllerInferenceOptions
+  ): Promise<HumanoidJointPositionCommand> {
+    if (route !== "upper_body_overlay") {
+      return this.#controller(route).infer(state, reference, options);
+    }
+    const primary = await this.#primary.infer(state, reference, options);
+    const fallback = await this.#fallback.infer(state, reference, options);
+    return upperBodyOverlayCommand(primary, fallback, reference);
   }
 }
 
-function selectedBranch(
+function selectedRoute(
   descriptor: HumanoidControllerDescriptor,
   reference: HumanoidReference,
   options: HumanoidControllerInferenceOptions
-): ControllerBranch {
+): ControllerRoute {
   const available = new Set(descriptor.learnedPolicy?.capabilities ?? []);
   const requested = options.taskCommand?.requestedCapabilities ?? [];
-  const missingRequestedCapability = requested.some((capability) => (
+  const missingRequestedCapabilities = requested.filter((capability) => (
     !available.has(capability)
   ));
+  const activeTrackingIndexes = Array.from(
+    reference.jointTrackingWeights,
+    (weight, index) => weight > 0 ? index : -1
+  ).filter((index) => index >= 0);
   const unsupportedJointReference = !available.has("joint_reference_tracking")
-    && Array.from(reference.jointTrackingWeights).some((weight) => weight > 0);
-  return missingRequestedCapability || unsupportedJointReference
-    ? "fallback"
-    : "primary";
+    && activeTrackingIndexes.length > 0;
+  const missingBeyondJointTracking = missingRequestedCapabilities.some(
+    (capability) => capability !== "joint_reference_tracking"
+  );
+  if (missingBeyondJointTracking) return "fallback";
+  if (!unsupportedJointReference) return "primary";
+  return activeTrackingIndexes.every((index) => (
+    index >= FIRST_UPPER_BODY_JOINT_INDEX
+  ))
+    ? "upper_body_overlay"
+    : "fallback";
 }
 
 function assertRoutingPair(
@@ -285,7 +347,7 @@ function controllerStateJson(state: HumanoidControllerState): JsonValue {
 }
 
 interface RoutingStatePayload {
-  active: ControllerBranch | null;
+  active: ControllerRoute | null;
   primary: HumanoidControllerState;
   fallback: HumanoidControllerState;
   lastCommand: HumanoidJointPositionCommand | null;
@@ -295,8 +357,13 @@ interface RoutingStatePayload {
 function routingStatePayload(value: JsonValue): RoutingStatePayload | null {
   if (!isRecord(value)
     || (value.protocol !== ROUTING_STATE_PROTOCOL_V1
-      && value.protocol !== ROUTING_STATE_PROTOCOL_V2)) return null;
-  if (value.active !== null && value.active !== "primary" && value.active !== "fallback") {
+      && value.protocol !== ROUTING_STATE_PROTOCOL_V2
+      && value.protocol !== ROUTING_STATE_PROTOCOL_V3)) return null;
+  if (value.active !== null
+    && value.active !== "primary"
+    && value.active !== "fallback"
+    && (value.protocol !== ROUTING_STATE_PROTOCOL_V3
+      || value.active !== "upper_body_overlay")) {
     throw new Error("Invalid humanoid capability-routing active branch");
   }
   const primary = controllerStateFrom(value.primary);
@@ -403,20 +470,48 @@ function assertRestoredHandoff(
     throw new Error("Humanoid capability-routing command has no active controller");
   }
   if (!state.handoff) return;
-  const active = state.active === "primary" ? primary
-    : state.active === "fallback" ? fallback
-      : null;
-  const inactive = state.active === "primary" ? fallback
-    : state.active === "fallback" ? primary
-      : null;
-  if (!active
-    || !inactive
+  const implementations = {
+    primary: primary.implementation,
+    fallback: fallback.implementation,
+    upper_body_overlay: `${primary.implementation}+${fallback.implementation}`
+  } as const;
+  const activeImplementation = state.active === null
+    ? null
+    : implementations[state.active];
+  const validSources = Object.entries(implementations)
+    .filter(([route]) => route !== state.active)
+    .map(([, implementation]) => implementation);
+  if (!activeImplementation
     || !state.lastCommand
-    || state.handoff.toImplementation !== active.implementation
-    || state.handoff.fromImplementation !== inactive.implementation
+    || state.handoff.toImplementation !== activeImplementation
+    || !validSources.includes(state.handoff.fromImplementation)
     || state.handoff.totalSteps !== controllerHandoffSteps(primary, fallback)) {
     throw new Error("Humanoid capability-routing handoff does not match the controller pair");
   }
+}
+
+function upperBodyOverlayCommand(
+  primary: HumanoidJointPositionCommand,
+  fallback: HumanoidJointPositionCommand,
+  reference: HumanoidReference
+): HumanoidJointPositionCommand {
+  assertCommandDimensions(primary);
+  assertCommandDimensions(fallback);
+  const blend = (
+    primaryValues: Float64Array,
+    fallbackValues: Float64Array
+  ) => Float64Array.from(primaryValues, (value, index) => {
+    const weight = index >= FIRST_UPPER_BODY_JOINT_INDEX
+      ? reference.jointTrackingWeights[index]!
+      : 0;
+    return value + (fallbackValues[index]! - value) * weight;
+  });
+  return {
+    kind: "joint_position_pd",
+    positions: blend(primary.positions, fallback.positions),
+    stiffness: blend(primary.stiffness, fallback.stiffness),
+    damping: blend(primary.damping, fallback.damping)
+  };
 }
 
 function controllerHandoffSteps(

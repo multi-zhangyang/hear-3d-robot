@@ -1076,7 +1076,7 @@ function motionInstructions(): string {
     "每次响应必须调用一个正式工具，不输出普通聊天；新委派和任何物理执行后都先调用 observe_humanoid，不能借用其他 Agent 或历史记忆充当当前传感事实。",
     "根据 active Goal、实时空间信念、对象世界模型、Affordance、关节状态、掌指几何、平衡和近期真实失败，自主选择当前局部阶段。不得使用固定巡逻点、预设动作序列、随机电机噪声或猜测坐标。",
     "每个 Skill 必须对 active Goal 具有可验证因果关系：空间目标应推进对应位置或区域谓词，操作 Skill 应匹配 Goal 中的对象、方块或关节，准备阶段应建立同一实体的真实前置条件。与 Goal 无关或令目标距离增加的另一 frontier 会被 Harness 拒绝；真实物理失败授权的安全恢复除外。",
-    "观察中的 control_authority 区分 MuJoCo 物理后端、已加载学习策略的真实能力和任务空间生成器。active_control 是当前物理帧实际执行的控制器，transition 是学习控制与参考控制之间尚未结束的连续交接。只有 learned_policy.capabilities 明确列出的能力才能称为已经由策略学习；未列出的接触操作能力不能靠叙述冒充已训练，是否可执行仍以当前控制后端的完整 MuJoCo 预演为准。",
+    "观察中的 control_authority 区分 MuJoCo 物理后端、已加载学习策略的真实能力和任务空间生成器。active_control 是当前物理帧实际执行的控制来源：learned_policy 为学习控制，reference_control 为参考控制，hybrid_control 为学习式下肢运动与参考式上肢跟踪的同帧组合；transition 表示尚未结束的连续交接。只有 learned_policy.capabilities 明确列出的能力才能称为已经由策略学习；未列出的接触操作能力不能靠叙述冒充已训练，是否可执行仍以当前控制后端的完整 MuJoCo 预演为准。",
     "skill_catalog 的 learned_policy_ready 与 learned_policy_missing_capabilities 表示当前训练策略是否完整覆盖该 Skill；false 不等于物理成功或失败，而是说明本次将使用 reference_control_fallback 并仍须通过完整 MuJoCo 预演。begin_humanoid_skill 回执中的 control_mode 是该具体阶段和手数约束下的最终控制来源声明。",
     "观察后若当前没有仍与 world_revision 一致的 Skill 计划，调用 submit_humanoid_skill_plan 提交短程 Skill DAG；已有有效计划时继续其中依赖已满足的节点。你必须自己选择策略、Skill、目标对象或 frontier、交互点、手、操作方向及依赖；同一 Skill 的多个可执行 phase 按 process 顺序在后续观察中重新绑定同一节点，只有最后一个可执行 phase 才完成该节点。未知阶段留到执行并重新观察后决定。",
     "调用 begin_humanoid_skill 时逐字引用已选策略中的节点、invocation 和当前可执行 phase。只绑定 navigation、whole_body 或 grasp 权限阶段；sensor 和 checker 阶段不能伪装成动作。",

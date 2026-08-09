@@ -478,7 +478,7 @@ describe("agent manifest", () => {
     });
     expect(first.identity_sha256).toBe(second.identity_sha256);
     expect(first.identity_sha256).toBe(
-      "2f8e0f4f41a1b1a10d59404ec073f5ea5b248b6b36470e907e15066cf4a387d2"
+      "652c8cd1d786dabca9310e2a7b7c023a70880b605b2c245c92b60a9c2b567f2f"
     );
   });
 

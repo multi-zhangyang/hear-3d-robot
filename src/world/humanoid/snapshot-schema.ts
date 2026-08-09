@@ -138,7 +138,7 @@ const HumanoidSimulationSnapshotSchema = z.object({
   }).strict(),
   controllerExecution: z.object({
     protocol: z.literal("humanoid-controller-execution-v1"),
-    mode: z.enum(["learned_policy", "reference_control"]),
+    mode: z.enum(["learned_policy", "reference_control", "hybrid_control"]),
     activeImplementation: z.string().trim().min(1),
     transition: z.object({
       fromImplementation: z.string().trim().min(1),

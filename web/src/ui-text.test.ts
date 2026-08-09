@@ -72,6 +72,12 @@ describe("中文界面文案", () => {
         durationSeconds: 0.2
       }
     }, "mjlab_g1_velocity_onnx")).toBe("YAHMP · 交接 37%");
+    expect(humanoidControllerExecutionLabel({
+      protocol: "humanoid-controller-execution-v1",
+      mode: "hybrid_control",
+      activeImplementation: "mjlab_g1_velocity_onnx+yahmp_onnx",
+      transition: null
+    }, "mjlab_g1_velocity_onnx")).toBe("mjlab G1 + YAHMP · 混合控制");
   });
 
   it("完整显示具名末端的三维目标", () => {

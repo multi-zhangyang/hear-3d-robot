@@ -150,45 +150,67 @@ describe("mjlab G1 velocity controller", () => {
         snapshot.rootPosition.z - start.rootPosition.z
       )).toBeGreaterThan(0.5);
       expect(first.captureState().controller.payload).toMatchObject({
-        protocol: "humanoid-controller-capability-routing-state-v2",
+        protocol: "humanoid-controller-capability-routing-state-v3",
         active: "primary"
       });
 
+      const taskStart = { ...snapshot.rootPosition };
       const taskReference = targetReference(reference, {
         joints: { right_shoulder_pitch_joint: 0.35 }
       });
       snapshot = await first.step(taskReference);
       expect(snapshot.fallen).toBe(false);
       expect(snapshot.controllerExecution).toMatchObject({
-        mode: "reference_control",
-        activeImplementation: "yahmp_onnx",
+        mode: "hybrid_control",
+        activeImplementation: "mjlab_g1_velocity_onnx+yahmp_onnx",
         transition: {
           fromImplementation: "mjlab_g1_velocity_onnx",
-          toImplementation: "yahmp_onnx",
+          toImplementation: "mjlab_g1_velocity_onnx+yahmp_onnx",
           progress: 0.1,
           durationSeconds: 0.2
         }
       });
       expect(first.captureState().controller.payload).toMatchObject({
-        protocol: "humanoid-controller-capability-routing-state-v2",
-        active: "fallback"
+        protocol: "humanoid-controller-capability-routing-state-v3",
+        active: "upper_body_overlay"
       });
 
       const checkpoint = first.captureState();
       second.restoreState(checkpoint);
       expect(second.captureState().controller).toEqual(checkpoint.controller);
       expect(second.snapshot().rootPosition).toEqual(snapshot.rootPosition);
-      const [continuedTask, restoredTask] = await Promise.all([
-        first.step(taskReference),
-        second.step(taskReference)
-      ]);
+      const continuedTask = await first.step(taskReference);
+      const restoredTask = await second.step(taskReference);
       expect(restoredTask.controllerExecution).toEqual(
         continuedTask.controllerExecution
       );
-      expect(second.captureState().controller).toEqual(
-        first.captureState().controller
-      );
-      expect(restoredTask.rootPosition).toEqual(continuedTask.rootPosition);
+      expect(second.captureState().controller).toMatchObject({
+        implementation: "mjlab_g1_velocity_onnx",
+        payload: {
+          protocol: "humanoid-controller-capability-routing-state-v3",
+          active: "upper_body_overlay"
+        }
+      });
+      expect(Math.hypot(
+        restoredTask.rootPosition.x - continuedTask.rootPosition.x,
+        restoredTask.rootPosition.y - continuedTask.rootPosition.y,
+        restoredTask.rootPosition.z - continuedTask.rootPosition.z
+      )).toBeLessThan(0.01);
+      let hybridSnapshot = restoredTask;
+      for (let step = 0; step < 100; step += 1) {
+        hybridSnapshot = await second.step(taskReference);
+      }
+      expect(hybridSnapshot.fallen).toBe(false);
+      expect(hybridSnapshot.balance.upright).toBeGreaterThan(0.95);
+      expect(hybridSnapshot.controllerExecution).toMatchObject({
+        mode: "hybrid_control",
+        activeImplementation: "mjlab_g1_velocity_onnx+yahmp_onnx",
+        transition: null
+      });
+      expect(Math.hypot(
+        hybridSnapshot.rootPosition.x - taskStart.x,
+        hybridSnapshot.rootPosition.z - taskStart.z
+      )).toBeGreaterThan(0.3);
       expect((await second.step(reference)).fallen).toBe(false);
     } finally {
       await Promise.all([first.dispose(), second.dispose()]);

@@ -185,6 +185,9 @@ export function motionGeneratorLabel(implementation: string): string {
 }
 
 export function humanoidControllerLabel(implementation: string): string {
+  if (implementation.includes("+")) {
+    return implementation.split("+").map(humanoidControllerLabel).join(" + ");
+  }
   const normalized = implementation.toLowerCase();
   if (normalized === "yahmp_onnx") return "YAHMP";
   if (normalized === "mjlab_g1_velocity_onnx") return "mjlab G1";
@@ -203,6 +206,7 @@ export function humanoidControllerExecutionLabel(
     return `${controller} · 交接 ${Math.round(execution.transition.progress * 100)}%`;
   }
   if (execution?.mode === "reference_control") return `${controller} · 参考控制`;
+  if (execution?.mode === "hybrid_control") return `${controller} · 混合控制`;
   if (execution?.mode === "learned_policy") return `${controller} · 学习控制`;
   return controller;
 }

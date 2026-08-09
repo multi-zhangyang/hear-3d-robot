@@ -20,7 +20,7 @@ import type {
 } from "./whole-body-controller.js";
 
 describe("humanoid controller capability routing", () => {
-  it("routes velocity control to the trained policy and joint tasks to reference control", async () => {
+  it("keeps learned locomotion active while overlaying upper-body reference tracking", async () => {
     const primary = controller("trained-velocity", ["balance", "locomotion"], 1);
     const fallback = controller(
       "reference-tracking",
@@ -33,6 +33,9 @@ describe("humanoid controller capability routing", () => {
     const armTask = targetReference(navigation, {
       joints: { right_shoulder_pitch_joint: 0.45 }
     });
+    const shoulderIndex = HUMANOID_JOINT_NAMES.indexOf(
+      "right_shoulder_pitch_joint"
+    );
 
     expect(routed.descriptor).toMatchObject({
       implementation: "trained-velocity",
@@ -53,12 +56,63 @@ describe("humanoid controller capability routing", () => {
     expect(primary.calls).toMatchObject({ reset: 1, infer: 1, advance: 1 });
     expect(fallback.calls).toMatchObject({ reset: 1, infer: 0, advance: 0 });
 
-    expect((await routed.infer(state, armTask)).positions[0]).toBe(2);
+    const armCommand = await routed.infer(state, armTask);
+    expect(armCommand.positions[0]).toBe(1);
+    expect(armCommand.positions[shoulderIndex]).toBe(2);
     routed.advanceHistory(state, armTask);
+    expect(primary.calls).toMatchObject({ reset: 1, infer: 2, advance: 2 });
     expect(fallback.calls).toMatchObject({ reset: 2, infer: 1, advance: 1 });
+    expect(routed.executionState()).toMatchObject({
+      mode: "hybrid_control",
+      activeImplementation: "trained-velocity+reference-tracking"
+    });
 
     expect((await routed.infer(state, navigation)).positions[0]).toBe(1);
-    expect(primary.calls.reset).toBe(2);
+    expect(primary.calls.reset).toBe(1);
+  });
+
+  it("uses full fallback when tracking includes the waist or legs", async () => {
+    const primary = controller("trained-velocity", ["balance", "locomotion"], 1);
+    const fallback = controller(
+      "reference-tracking",
+      ["balance", "locomotion", "joint_reference_tracking"],
+      2
+    );
+    const routed = new CapabilityRoutingHumanoidController(primary, fallback);
+    const state = policyState();
+    const navigation = neutralHumanoidReference();
+
+    for (const joint of ["waist_yaw_joint", "left_knee_joint"] as const) {
+      const task = targetReference(navigation, { joints: { [joint]: 0.2 } });
+      routed.reset(state, navigation);
+      expect((await routed.infer(state, task)).positions[0]).toBe(2);
+      expect(routed.executionState()).toMatchObject({
+        mode: "reference_control",
+        activeImplementation: "reference-tracking"
+      });
+    }
+  });
+
+  it("blends only tracked upper-body joints by their reference authority", async () => {
+    const routed = new CapabilityRoutingHumanoidController(
+      controller("trained-velocity", ["balance", "locomotion"], 1),
+      controller(
+        "reference-tracking",
+        ["balance", "locomotion", "joint_reference_tracking"],
+        3
+      )
+    );
+    const state = policyState();
+    const reference = neutralHumanoidReference();
+    const elbowIndex = HUMANOID_JOINT_NAMES.indexOf("left_elbow_joint");
+    reference.jointTrackingWeights[elbowIndex] = 0.25;
+
+    routed.reset(state, reference);
+    const command = await routed.infer(state, reference);
+    expect(command.positions[0]).toBe(1);
+    expect(command.positions[elbowIndex]).toBe(1.5);
+    expect(command.stiffness[elbowIndex]).toBe(1.5);
+    expect(command.damping[elbowIndex]).toBe(1.5);
   });
 
   it("routes a missing task capability without inventing it on the trained policy", async () => {
@@ -70,7 +124,9 @@ describe("humanoid controller capability routing", () => {
     );
     const routed = new CapabilityRoutingHumanoidController(primary, fallback);
     const state = policyState();
-    const reference = neutralHumanoidReference();
+    const reference = targetReference(neutralHumanoidReference(), {
+      joints: { left_wrist_pitch_joint: 0.25 }
+    });
     const options = taskOptions(["locomotion", "contact_rich_manipulation"]);
 
     routed.reset(state, reference);
@@ -108,8 +164,8 @@ describe("humanoid controller capability routing", () => {
     expect(checkpoint).toMatchObject({
       implementation: "trained-velocity",
       payload: {
-        protocol: "humanoid-controller-capability-routing-state-v2",
-        active: "fallback",
+        protocol: "humanoid-controller-capability-routing-state-v3",
+        active: "upper_body_overlay",
         primary: { implementation: "trained-velocity" },
         fallback: { implementation: "reference-tracking" },
         last_command: { kind: "joint_position_pd" },
@@ -148,12 +204,37 @@ describe("humanoid controller capability routing", () => {
       ...checkpoint,
       payload: {
         protocol: "humanoid-controller-capability-routing-state-v1",
-        active: v2Payload.active!,
+        active: "fallback",
         primary: v2Payload.primary!,
         fallback: v2Payload.fallback!
       }
     });
     expect(restoredV1.executionState()).toMatchObject({
+      mode: "reference_control",
+      activeImplementation: "reference-tracking",
+      transition: null
+    });
+
+    const restoredV2 = new CapabilityRoutingHumanoidController(
+      controller("trained-velocity", ["balance", "locomotion"], 1),
+      controller(
+        "reference-tracking",
+        ["balance", "locomotion", "joint_reference_tracking"],
+        2
+      )
+    );
+    restoredV2.restoreState({
+      ...checkpoint,
+      payload: {
+        protocol: "humanoid-controller-capability-routing-state-v2",
+        active: "fallback",
+        primary: v2Payload.primary!,
+        fallback: v2Payload.fallback!,
+        last_command: v2Payload.last_command!,
+        handoff: null
+      }
+    });
+    expect(restoredV2.executionState()).toMatchObject({
       mode: "reference_control",
       activeImplementation: "reference-tracking",
       transition: null
@@ -197,6 +278,7 @@ describe("humanoid controller capability routing", () => {
     const task = targetReference(navigation, {
       joints: { right_elbow_joint: 0.6 }
     });
+    const elbowIndex = HUMANOID_JOINT_NAMES.indexOf("right_elbow_joint");
 
     routed.reset(state, navigation);
     const navigationCommand = await routed.infer(state, navigation);
@@ -209,21 +291,22 @@ describe("humanoid controller capability routing", () => {
     });
 
     const firstTaskCommand = await routed.infer(state, task);
-    expect(firstTaskCommand.positions[0]).toBeCloseTo(1.104, 12);
-    expect(firstTaskCommand.stiffness[0]).toBeCloseTo(1.104, 12);
-    expect(firstTaskCommand.damping[0]).toBeCloseTo(1.104, 12);
+    expect(firstTaskCommand.positions[0]).toBe(1);
+    expect(firstTaskCommand.positions[elbowIndex]).toBeCloseTo(1.104, 12);
+    expect(firstTaskCommand.stiffness[elbowIndex]).toBeCloseTo(1.104, 12);
+    expect(firstTaskCommand.damping[elbowIndex]).toBeCloseTo(1.104, 12);
     expect(routed.executionState()).toMatchObject({
-      mode: "reference_control",
-      activeImplementation: "reference-tracking",
+      mode: "hybrid_control",
+      activeImplementation: "trained-velocity+reference-tracking",
       transition: {
         fromImplementation: "trained-velocity",
-        toImplementation: "reference-tracking",
+        toImplementation: "trained-velocity+reference-tracking",
         progress: 0.2,
         durationSeconds: 0.1
       }
     });
     const secondTaskCommand = await routed.infer(state, task);
-    expect(secondTaskCommand.positions[0]).toBeCloseTo(1.352, 12);
+    expect(secondTaskCommand.positions[elbowIndex]).toBeCloseTo(1.352, 12);
     const checkpoint = routed.captureState();
 
     const malformed = structuredClone(checkpoint);
@@ -261,15 +344,17 @@ describe("humanoid controller capability routing", () => {
       restored.infer(state, task)
     ]);
     expect([...resumed.positions]).toEqual([...continued.positions]);
-    expect(continued.positions[0]).toBeCloseTo(1.648, 12);
+    expect(continued.positions[elbowIndex]).toBeCloseTo(1.648, 12);
 
     await routed.infer(state, task);
     const completed = await routed.infer(state, task);
-    expect(completed.positions[0]).toBe(2);
+    expect(completed.positions[0]).toBe(1);
+    expect(completed.positions[elbowIndex]).toBe(2);
     expect(routed.executionState().transition).toBeNull();
 
     const returned = await routed.infer(state, navigation);
-    expect(returned.positions[0]).toBeCloseTo(1.896, 12);
+    expect(returned.positions[0]).toBe(1);
+    expect(returned.positions[elbowIndex]).toBeCloseTo(1.896, 12);
     expect(routed.executionState()).toMatchObject({
       mode: "learned_policy",
       activeImplementation: "trained-velocity",

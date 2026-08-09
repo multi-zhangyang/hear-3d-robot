@@ -168,7 +168,7 @@ export interface HumanoidControllerState {
 
 export interface HumanoidControllerExecutionState {
   protocol: "humanoid-controller-execution-v1";
-  mode: "learned_policy" | "reference_control";
+  mode: "learned_policy" | "reference_control" | "hybrid_control";
   activeImplementation: string;
   transition: {
     fromImplementation: string;
