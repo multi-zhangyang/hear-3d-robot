@@ -142,6 +142,16 @@ describe("HumanoidWorld", () => {
         ["crate", "right", 0]
       ]);
       expect(observed.grasp).toEqual(initial.grasp);
+      expect(observed.spatialBelief).toMatchObject({
+        protocol: "humanoid-spatial-belief-v2",
+        visibility_model: "occlusion_aware_head_camera",
+        frontier_model: "reachable_geodesic_diversity"
+      });
+      expect(observed.spatialBelief.reachable_free_cell_count)
+        .toBeLessThanOrEqual(observed.spatialBelief.free_cell_count);
+      expect(observed.spatialBelief.frontiers.every(({ travel_distance_m }) => (
+        travel_distance_m >= observed.spatialBelief.resolution_m
+      ))).toBe(true);
       expect(world.checkpoint().graspRegistry.last_frame).toBe(initial.frame);
 
       const advanced = await world.advanceStationary();

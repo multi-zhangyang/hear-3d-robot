@@ -658,6 +658,33 @@ async function executeHumanoidMission(input: {
       } catch (error) {
         if (input.signal?.aborted) throw error;
         const decisionStall = modelDecisionStallFrom(error);
+        const pendingPhysicalTransactionId = decisionStall
+          ? input.runtime.pendingPhysicalExecutionTransactionId()
+          : undefined;
+        if (decisionStall && pendingPhysicalTransactionId) {
+          const receipt = await input.runtime.recoverPendingPhysicalExecution();
+          if (!receipt || receipt.transactionId !== pendingPhysicalTransactionId) {
+            throw new Error(
+              `Physical execution recovery changed transaction identity: ${pendingPhysicalTransactionId}`
+            );
+          }
+          await input.runtime.store.clearAgentState();
+          decisionFollowUps.clear();
+          decisionProtocolRecovery.clear();
+          pendingDecisionFollowUp = undefined;
+          serializedState = undefined;
+          await input.runtime.recordProvider({
+            status: "physical_execution_recovered_before_model_follow_up",
+            transaction_id: receipt.transactionId,
+            action: receipt.action,
+            accepted: receipt.accepted,
+            code: receipt.code,
+            world_revision: receipt.worldAfterRevision,
+            automatic_actuation: false
+          }, receipt.agentId);
+          await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+          continue;
+        }
         const previousDecisionFollowUp = decisionStall
           ? decisionFollowUps.get(decisionStall.agentId)
           : undefined;

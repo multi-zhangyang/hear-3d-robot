@@ -350,9 +350,15 @@ describe("HumanoidSimulation", () => {
         "hand-probe",
         "near-solid"
       ]);
-      expect(Object.keys(simulation.senseSolids(5).solids)).toEqual([
+      const sensed = simulation.senseSolids(5);
+      expect(Object.keys(sensed.solids)).toEqual([
         "near-solid"
       ]);
+      expect(simulation.scenePointVisibility(sensed.sensor.position, [
+        { x: 0, y: 1.05, z: 3 },
+        { x: 1, y: 1.05, z: 3 },
+        { x: 0, y: 0.04, z: 3 }
+      ])).toEqual([false, true, true]);
 
       for (let index = 0; index < 2; index += 1) {
         await simulation.step(neutralHumanoidReference());

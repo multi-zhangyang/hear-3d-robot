@@ -264,9 +264,6 @@ export async function inspectLiveRunEvidence(input) {
       `Physical trajectory omits committed frames: ${execution.transactionId}`);
     return trajectory;
   });
-  const physicalFrameCount = physicalTrajectories.reduce((total, trajectory) => (
-    total + trajectory.observed_frame_count - 1
-  ), 0);
   const worldMutationHashes = actions.flatMap((receipt) => {
     if (!isRecord(receipt) || receipt.accepted !== true
       || receipt.action !== "remove_world_block" || !isRecord(receipt.detail)) return [];
@@ -296,16 +293,9 @@ export async function inspectLiveRunEvidence(input) {
     physical_verified: true,
     world_frame: checkpoint.world.frame,
     world_revision: checkpoint.world.worldRevision,
-    model_call_count: startedCalls.length,
     model_usage: checkpoint.model_usage,
     exercised_agents: exercisedAgents,
-    physical_execution_count: executions.length,
-    physical_frame_count: physicalFrameCount,
     travelled_distance_m: travelledDistance,
-    context_compaction_count: checkpoint.context_memory.total_compactions,
-    agent_manifest_epoch_count: manifests.length,
-    embodied_episode_count: checkpoint.embodied_memory.total_episodes,
-    causal_episode_count: episodeByExecution.size,
     ...(missionCompletion
       ? { mission_goal_evaluation_ref: missionCompletion.goal_evaluation_ref }
       : {}),

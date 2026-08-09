@@ -164,6 +164,7 @@ import {
   HumanoidSpatialBeliefMap,
   type HumanoidSpatialBeliefMapCheckpoint
 } from "./spatial-belief-map.js";
+import { humanoidSpatialBeliefSolids } from "./spatial-belief-solids.js";
 import { onlineNavigationReplanDecision } from "./online-navigation-replanner.js";
 import type {
   HumanoidWholeBodyControllerFactory
@@ -404,11 +405,26 @@ export class HumanoidWorld {
       sensed: sensedSolids,
       contacts: snapshot.robot.contacts
     });
+    const carriedObjectIds = new Set(
+      this.#requiredCarriedObjectLifecycle().active?.bindings.map(
+        ({ object_id }) => object_id
+      ) ?? []
+    );
     this.#spatialBelief.observe({
       frame: snapshot.frame,
       rootPosition: snapshot.robot.rootPosition,
       sensor: sensed.sensor,
-      visibleSolids: solidTokens
+      visibleSolids: humanoidSpatialBeliefSolids({
+        scenario: this.#scenario,
+        robot: snapshot.robot,
+        visibleObjectIds: Object.keys(sensed.objects),
+        solidTokens,
+        carriedObjectIds
+      }),
+      pointVisibility: (points) => this.#simulation.scenePointVisibility(
+        sensed.sensor.position,
+        points
+      )
     });
     const { objects: _objects, ...robot } = snapshot.robot;
     return {

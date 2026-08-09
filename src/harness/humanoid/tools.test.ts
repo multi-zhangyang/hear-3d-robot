@@ -132,6 +132,62 @@ describe("humanoid Agents SDK tools", () => {
     );
   });
 
+  it("passes the current Agents SDK tool cancellation signal into the Harness", async () => {
+    const controller = new AbortController();
+    const invoke = vi.fn(async (
+      action,
+      _input,
+      transactionId,
+      agentId
+    ): Promise<HumanoidActionReceipt> => ({
+      transactionId,
+      agentId,
+      action,
+      accepted: true,
+      code: "humanoid_observed",
+      worldBeforeRevision: 2,
+      worldAfterRevision: 2,
+      frameCount: 0,
+      channels: [],
+      detail: {},
+      committedAt: "2026-08-09T00:00:00.000Z"
+    }));
+    const observe = createHumanoidActionTools(
+      { invoke } as HumanoidActionInvoker,
+      "humanoid-sentry",
+      ["observe_humanoid"]
+    )[0];
+    if (!observe || observe.type !== "function") throw new Error("Observe tool is missing");
+
+    await observe.invoke(
+      new RunContext({ runId: "tool-signal" }),
+      "{}",
+      {
+        signal: controller.signal,
+        toolCall: {
+          type: "function_call",
+          callId: "observe-with-signal",
+          name: "observe_humanoid",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    );
+
+    expect(invoke).toHaveBeenCalledWith(
+      "observe_humanoid",
+      {},
+      "observe-with-signal",
+      "humanoid-sentry",
+      {
+        tool_call_id: "observe-with-signal",
+        tool_name: "observe_humanoid",
+        arguments_sha256: modelPayloadSha256({})
+      },
+      { signal: controller.signal }
+    );
+  });
+
   it("rejects duplicate action grants instead of exposing ambiguous tools", () => {
     const runtime = {
       invoke: vi.fn()

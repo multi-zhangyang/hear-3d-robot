@@ -1169,6 +1169,115 @@ describe("HumanoidRunRuntime", () => {
     }
   }, 30_000);
 
+  it("stops an SDK-cancelled MuJoCo command and resumes only its durable transaction", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-tool-signal-recovery-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "验证工具取消后的同事务物理恢复",
+      scenarioId: "humanoid-tool-signal-recovery",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    const toolCall = new AbortController();
+    let executionFrames = 0;
+    let actuationStarted = false;
+    let runtime: HumanoidRunRuntime | undefined;
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial,
+        eventSink: (event) => {
+          if (!actuationStarted || event.type !== "humanoid_world_frame") return;
+          executionFrames += 1;
+          if (executionFrames === 3) {
+            toolCall.abort(new Error("SDK tool branch cancelled"));
+          }
+        }
+      });
+      await activateGoal(runtime, scenario.default_goal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+      const planned = await invokeModelAction(runtime,
+        "plan_whole_body_motion",
+        {
+          id: "tool-signal-motion",
+          intent: "执行一段可在取消后续行的全身保持动作",
+          duration_seconds: 0.3,
+          keyframes: [{ at_seconds: 0 }, { at_seconds: 0.3 }]
+        },
+        "tool-signal-plan",
+        HUMANOID_AGENT_IDS.motion
+      );
+      const executionInput = { planning_transaction_id: planned.transactionId };
+      const transactionId = "tool-signal-execute";
+      const authority = await authorizeModelAction(
+        runtime,
+        "execute_whole_body_motion",
+        executionInput,
+        transactionId,
+        HUMANOID_AGENT_IDS.executor
+      );
+
+      actuationStarted = true;
+      await expect(runtime.invoke(
+        "execute_whole_body_motion",
+        executionInput,
+        transactionId,
+        HUMANOID_AGENT_IDS.executor,
+        authority,
+        { signal: toolCall.signal }
+      )).rejects.toThrow("SDK tool branch cancelled");
+      expect(executionFrames).toBe(3);
+      const stoppedRevision = world.snapshot().worldRevision;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 80));
+      expect(world.snapshot().worldRevision).toBe(stoppedRevision);
+      expect(runtime.pendingPhysicalExecutionTransactionId()).toBe(transactionId);
+      expect(runtime.receipt(transactionId)).toBeUndefined();
+
+      const unrelatedAuthority = await authorizeModelAction(
+        runtime,
+        "observe_humanoid",
+        {},
+        "tool-signal-unrelated",
+        HUMANOID_AGENT_IDS.sentry
+      );
+      await expect(runtime.invoke(
+        "observe_humanoid",
+        {},
+        "tool-signal-unrelated",
+        HUMANOID_AGENT_IDS.sentry,
+        unrelatedAuthority
+      )).rejects.toThrow(
+        `Physical execution ${transactionId} must be recovered before tool-signal-unrelated`
+      );
+
+      const recovered = await runtime.recoverPendingPhysicalExecution();
+      expect(recovered).toMatchObject({
+        transactionId,
+        accepted: true,
+        code: "motion_completed"
+      });
+      expect(runtime.pendingPhysicalExecutionTransactionId()).toBeUndefined();
+      const matchingReceipts = (await store.readJournal("actions")).filter((entry) => (
+        journalField(entry, "transactionId") === transactionId
+      ));
+      expect(matchingReceipts).toHaveLength(1);
+    } finally {
+      await runtime?.stopContinuousPhysics();
+      await world.dispose();
+    }
+  }, 45_000);
+
   it.each([1, 9])(
     "automatically recovers on startup from process loss after physical frame %i",
     async (crashFrame) => {

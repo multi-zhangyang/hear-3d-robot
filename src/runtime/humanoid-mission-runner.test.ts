@@ -28,6 +28,7 @@ import {
   HUMANOID_AGENT_IDS
 } from "../harness/humanoid/agents.js";
 import { createHumanoidRunCheckpoint } from "../harness/humanoid/run-checkpoint.js";
+import { HumanoidRunRuntime } from "../harness/humanoid/run-runtime.js";
 import { ModelDecisionStallError } from "../harness/model-telemetry.js";
 import { createConfiguredModel } from "../model/factory.js";
 import { FileSession } from "../persistence/file-session.js";
@@ -568,6 +569,73 @@ describe("humanoid mission initialization recovery", () => {
         continuation: "same_agent_model_and_session"
       })
     ]);
+  }, 30_000);
+
+  it("recovers an admitted physical transaction before any model decision follow-up", async () => {
+    const store = await createCheckpointedRun();
+    const config = provider();
+    const manifest = createManifest(config);
+    await store.writeAgentManifest(manifest);
+    const transactionId = "pending-physical-transaction";
+    const inspectionComplete = new Error("physical recovery branch inspected");
+    const pending = vi.spyOn(
+      HumanoidRunRuntime.prototype,
+      "pendingPhysicalExecutionTransactionId"
+    ).mockReturnValue(transactionId);
+    const recovery = vi.spyOn(
+      HumanoidRunRuntime.prototype,
+      "recoverPendingPhysicalExecution"
+    ).mockResolvedValueOnce(undefined).mockResolvedValueOnce({
+      transactionId,
+      agentId: HUMANOID_AGENT_IDS.executor,
+      action: "execute_whole_body_motion",
+      input: { planning_transaction_id: "pending-physical-plan" },
+      fingerprint: "pending-physical-fingerprint",
+      accepted: true,
+      code: "motion_completed",
+      worldBeforeRevision: 10,
+      worldAfterRevision: 25,
+      frameCount: 15,
+      channels: ["locomotion"],
+      detail: {},
+      committedAt: "2026-08-09T00:00:00.000Z"
+    });
+    try {
+      runnerControl.run.mockImplementation(async () => {
+        if (runnerControl.run.mock.calls.length > 1) throw inspectionComplete;
+        return {
+          state: { toString: () => "physical-tool-stall-state" },
+          completed: Promise.resolve(),
+          finalOutput: undefined,
+          async *[Symbol.asyncIterator]() {
+            throw new ModelDecisionStallError(
+              HUMANOID_AGENT_IDS.executor,
+              "executor tool branch ended before its terminal receipt"
+            );
+          }
+        };
+      });
+
+      await expect(resume(store, config)).rejects.toBe(inspectionComplete);
+
+      expect(runnerControl.run).toHaveBeenCalledTimes(2);
+      expect(recovery).toHaveBeenCalledTimes(2);
+      const providerJournal = await store.readJournal("provider");
+      expect(providerJournal.filter((entry) => (
+        isRecord(entry) && entry.status === "model_decision_follow_up"
+      ))).toEqual([]);
+      expect(providerJournal).toContainEqual(expect.objectContaining({
+        status: "physical_execution_recovered_before_model_follow_up",
+        transaction_id: transactionId,
+        agent_id: HUMANOID_AGENT_IDS.executor,
+        accepted: true,
+        code: "motion_completed",
+        automatic_actuation: false
+      }));
+    } finally {
+      pending.mockRestore();
+      recovery.mockRestore();
+    }
   }, 30_000);
 
   it("keeps decision recovery epochs independent for each hierarchy node", async () => {

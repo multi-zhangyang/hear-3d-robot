@@ -196,20 +196,30 @@ function humanoidActionTool(
       }
       const argumentsSha256 = modelToolArgumentsSha256(toolCall.arguments);
       const normalizedArgumentsSha256 = modelPayloadSha256(input);
-      const receipt: HumanoidActionReceipt = await runtime.invoke(
-        name,
-        input,
-        transactionId,
-        agentId,
-        {
-          tool_call_id: transactionId,
-          tool_name: name,
-          arguments_sha256: argumentsSha256,
-          ...(normalizedArgumentsSha256 === argumentsSha256
-            ? {}
-            : { normalized_arguments_sha256: normalizedArgumentsSha256 })
-        }
-      );
+      const authority = {
+        tool_call_id: transactionId,
+        tool_name: name,
+        arguments_sha256: argumentsSha256,
+        ...(normalizedArgumentsSha256 === argumentsSha256
+          ? {}
+          : { normalized_arguments_sha256: normalizedArgumentsSha256 })
+      };
+      const receipt: HumanoidActionReceipt = details?.signal
+        ? await runtime.invoke(
+            name,
+            input,
+            transactionId,
+            agentId,
+            authority,
+            { signal: details.signal }
+          )
+        : await runtime.invoke(
+            name,
+            input,
+            transactionId,
+            agentId,
+            authority
+          );
       return humanoidActionReceiptModelOutput(receipt);
     }
   });

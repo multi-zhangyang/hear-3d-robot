@@ -12,6 +12,7 @@ import { RunManager } from "../dist/server/run-manager.js";
 import { loadConfiguredHumanoidControllerSource } from
   "../dist/world/humanoid/controller-module.js";
 import { drawSeed } from "../dist/world/world-generator.js";
+import { inspectLiveRunEvidence } from "./live-run-evidence.mjs";
 
 loadEnvironment();
 
@@ -35,7 +36,6 @@ const manager = new RunManager({
   provider,
   ...(controllerSource ? { controllerSource } : {})
 });
-const startedAt = Date.now();
 let runId;
 
 try {
@@ -57,19 +57,12 @@ try {
   manager.stop(runId, "Continuous observation window ended");
   await waitUntil(() => !manager.isActive(runId), 10 * 60_000,
     "Continuous run did not accept an operator pause");
-  const checkpoint = await store.readHumanoidCheckpoint();
-  assert.equal(checkpoint.status, "paused", "Continuous run did not pause cleanly");
-  assert.equal(checkpoint.error, null, "Continuous run recorded the operator pause as a failure");
-
-  const report = {
-    version: 1,
-    run_id: runId,
-    scenario_id: scenarioId,
-    seed,
-    run_mode: "continuous",
-    status: checkpoint.status,
-    observation_duration_ms: Date.now() - startedAt
-  };
+  const report = await inspectLiveRunEvidence({
+    store,
+    scenario,
+    expectedStatus: "paused",
+    requireMissionCompletion: false
+  });
   if (reportPath) {
     await writeFile(resolve(reportPath), `${JSON.stringify(report, null, 2)}\n`, "utf8");
   }

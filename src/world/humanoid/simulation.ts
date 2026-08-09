@@ -821,6 +821,39 @@ export class HumanoidSimulation {
     };
   }
 
+  scenePointVisibility(origin: Vec3, points: readonly Vec3[]): boolean[] {
+    if (![origin.x, origin.y, origin.z].every(Number.isFinite)) {
+      throw new Error("Humanoid visibility origin must be finite");
+    }
+    const geometryId = new this.#runtime.IntBuffer(1);
+    const normal = new this.#runtime.DoubleBuffer(3);
+    try {
+      return points.map((point) => {
+        if (![point.x, point.y, point.z].every(Number.isFinite)) {
+          throw new Error("Humanoid visibility target must be finite");
+        }
+        const delta = subtract(point, origin);
+        const distance = vectorLength(delta);
+        if (distance <= 1e-9) return true;
+        const hitDistance = this.#runtime.mj_ray(
+          this.#model,
+          this.#data,
+          mujocoVector(origin),
+          mujocoVector(scale(delta, 1 / distance)),
+          [1, 1, 1, 1, 1, 1],
+          true,
+          this.#headBodyId,
+          geometryId,
+          normal
+        );
+        return hitDistance < 0 || hitDistance >= distance - 0.01;
+      });
+    } finally {
+      normal.delete();
+      geometryId.delete();
+    }
+  }
+
   captureState(): HumanoidSimulationState {
     return {
       time: this.#data.time,

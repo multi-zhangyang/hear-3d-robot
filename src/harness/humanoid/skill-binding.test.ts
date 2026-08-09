@@ -65,12 +65,15 @@ function observation(): HumanoidWorldObservation {
     frame: 12,
     worldRevision: 7,
     spatialBelief: {
-      protocol: "humanoid-spatial-belief-v1",
+      protocol: "humanoid-spatial-belief-v2",
+      visibility_model: "occlusion_aware_head_camera",
+      frontier_model: "reachable_geodesic_diversity",
       resolution_m: 0.5,
       observed_cell_count: 16,
       free_cell_count: 15,
       occupied_cell_count: 1,
       visited_cell_count: 2,
+      reachable_free_cell_count: 15,
       total_cell_count: 100,
       coverage_ratio: 0.16,
       frontiers: [{

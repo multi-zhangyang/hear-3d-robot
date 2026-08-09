@@ -87,6 +87,7 @@ import type { LongRunContextRuntime } from "../context-runtime.js";
 import {
   HumanoidActionRuntime,
   humanoidActionFingerprint,
+  type HumanoidActionInvocationOptions,
   type HumanoidActionToolCallAuthority,
   type HumanoidActionReceipt
 } from "./runtime.js";
@@ -637,7 +638,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     rawInput: unknown,
     transactionId: string,
     agentId: string,
-    authority: HumanoidActionToolCallAuthority
+    authority: HumanoidActionToolCallAuthority,
+    options: HumanoidActionInvocationOptions = {}
   ): ReturnType<HumanoidActionRuntime["invoke"]> {
     return this.#actionMutex.runExclusive(async () => {
       await this.#assertKnownTransactionFingerprint(
@@ -671,7 +673,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           rawInput,
           transactionId,
           agentId,
-          decision
+          decision,
+          options
         );
       }
       const resumeClock = this.#continuousPhysicsEnabled;
@@ -682,7 +685,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           rawInput,
           transactionId,
           agentId,
-          decision
+          decision,
+          options
         );
       } finally {
         if (resumeClock
@@ -1105,7 +1109,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       persistCheckpoint: () => this.#persist(),
       eventSink: this.#eventSink
     });
-    await this.#recoverPendingPhysicalExecution();
+    await this.recoverPendingPhysicalExecution();
     this.#continuousPhysicsEnabled = true;
     const pendingExecution = activeActionExecutions(
       this.#checkpoint.action_execution_ledger
@@ -1125,11 +1129,17 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     );
   }
 
-  async #recoverPendingPhysicalExecution(): Promise<void> {
+  pendingPhysicalExecutionTransactionId(): string | undefined {
+    return activeActionExecutions(
+      this.#checkpoint.action_execution_ledger
+    )[0]?.transaction_id;
+  }
+
+  async recoverPendingPhysicalExecution(): Promise<HumanoidActionReceipt | undefined> {
     const pending = activeActionExecutions(
       this.#checkpoint.action_execution_ledger
     );
-    if (pending.length === 0) return;
+    if (pending.length === 0) return undefined;
     if (pending.length > 1) {
       throw new Error("Multiple physical executions cannot share one humanoid runtime");
     }
@@ -1174,6 +1184,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       frame_count: receipt.frameCount,
       world_revision: receipt.worldAfterRevision
     }));
+    return receipt;
   }
 
   async completeCycle(output: string): Promise<boolean> {

@@ -172,6 +172,10 @@ export interface HumanoidActionToolCallAuthority {
   normalized_arguments_sha256?: string;
 }
 
+export interface HumanoidActionInvocationOptions {
+  signal?: AbortSignal;
+}
+
 export interface HumanoidActionInvoker {
   isActionAvailable?(
     name: HumanoidActionName,
@@ -182,7 +186,8 @@ export interface HumanoidActionInvoker {
     rawInput: unknown,
     transactionId: string,
     agentId: string,
-    authority: HumanoidActionToolCallAuthority
+    authority: HumanoidActionToolCallAuthority,
+    options?: HumanoidActionInvocationOptions
   ): Promise<HumanoidActionReceipt>;
 }
 
@@ -565,7 +570,8 @@ export class HumanoidActionRuntime {
     rawInput: unknown,
     transactionId: string,
     agentId: string,
-    decision?: ModelDecisionRef
+    decision?: ModelDecisionRef,
+    options: HumanoidActionInvocationOptions = {}
   ): Promise<HumanoidActionReceipt> {
     const normalizedTransactionId = transactionId.trim();
     const normalizedAgentId = agentId.trim();
@@ -598,7 +604,8 @@ export class HumanoidActionRuntime {
       normalizedTransactionId,
       normalizedAgentId,
       fingerprint,
-      decision
+      decision,
+      options.signal
     );
     this.#transactions.set(normalizedTransactionId, {
       fingerprint,
@@ -661,13 +668,15 @@ export class HumanoidActionRuntime {
     transactionId: string,
     agentId: string,
     fingerprint: string,
-    decision: ModelDecisionRef | undefined
+    decision: ModelDecisionRef | undefined,
+    signal: AbortSignal | undefined
   ): Promise<HumanoidActionReceipt> {
     const before = this.#world.snapshot();
     const result = await this.#execute(name, rawInput, {
       transactionId,
       agentId,
-      fingerprint
+      fingerprint,
+      ...(signal ? { signal } : {})
     });
     const after = this.#world.snapshot();
     const baseReceipt: HumanoidActionReceipt = {
@@ -979,6 +988,7 @@ export class HumanoidActionRuntime {
       transactionId: string;
       agentId: string;
       fingerprint: string;
+      signal?: AbortSignal;
     }
   ): Promise<{
     accepted: boolean;
@@ -1450,13 +1460,17 @@ export class HumanoidActionRuntime {
         planningTransactionId: input.planning_transaction_id,
         planId: reference.planId
       });
+      const executionSignal = combineExecutionSignals(
+        this.#signal,
+        invocation.signal
+      );
       const options = {
         realtime: this.#realtimeExecution,
         retainTerminal: this.#retainPhysicalTerminals,
         ...(this.#physicalFrameSink
           ? { persistenceSink: this.#physicalFrameSink }
           : {}),
-        ...(this.#signal ? { signal: this.#signal } : {})
+        ...(executionSignal ? { signal: executionSignal } : {})
       };
       const initialResult = planKind === "motion"
         ? await this.#world.executeWholeBodyMotion(
@@ -1656,6 +1670,10 @@ export class HumanoidActionRuntime {
         planningTransactionId: input.planning_transaction_id,
         planId: reference.planId
       });
+      const executionSignal = combineExecutionSignals(
+        this.#signal,
+        invocation.signal
+      );
       const result = await this.#world.executeWholeBodyMotion(
         reference.planId,
         this.#frameSink,
@@ -1665,7 +1683,7 @@ export class HumanoidActionRuntime {
           ...(this.#physicalFrameSink
             ? { persistenceSink: this.#physicalFrameSink }
             : {}),
-          ...(this.#signal ? { signal: this.#signal } : {})
+          ...(executionSignal ? { signal: executionSignal } : {})
         }
       );
       if (!this.#retainPhysicalTerminals) this.#planChannels.delete(reference.planId);
@@ -1816,6 +1834,10 @@ export class HumanoidActionRuntime {
       planningTransactionId: input.planning_transaction_id,
       planId: reference.planId
     });
+    const executionSignal = combineExecutionSignals(
+      this.#signal,
+      invocation.signal
+    );
     const result = await this.#world.executeNavigation(
       reference.planId,
       this.#frameSink,
@@ -1825,7 +1847,7 @@ export class HumanoidActionRuntime {
         ...(this.#physicalFrameSink
           ? { persistenceSink: this.#physicalFrameSink }
           : {}),
-        ...(this.#signal ? { signal: this.#signal } : {})
+        ...(executionSignal ? { signal: executionSignal } : {})
       }
     );
     if (!this.#retainPhysicalTerminals) this.#planChannels.delete(reference.planId);
@@ -2809,4 +2831,13 @@ function stableJson(value: unknown): string {
     )).join(",")}}`;
   }
   throw new Error("Humanoid action input must be JSON serializable");
+}
+
+function combineExecutionSignals(
+  runtimeSignal: AbortSignal | undefined,
+  invocationSignal: AbortSignal | undefined
+): AbortSignal | undefined {
+  if (!runtimeSignal) return invocationSignal;
+  if (!invocationSignal || invocationSignal === runtimeSignal) return runtimeSignal;
+  return AbortSignal.any([runtimeSignal, invocationSignal]);
 }

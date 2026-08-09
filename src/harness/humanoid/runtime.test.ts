@@ -1180,12 +1180,15 @@ describe("HumanoidActionRuntime", () => {
       reason: collisionReason
     }, {
       spatialBelief: {
-        protocol: "humanoid-spatial-belief-v1",
+        protocol: "humanoid-spatial-belief-v2",
+        visibility_model: "occlusion_aware_head_camera",
+        frontier_model: "reachable_geodesic_diversity",
         resolution_m: 0.5,
         observed_cell_count: 20,
         free_cell_count: 18,
         occupied_cell_count: 2,
         visited_cell_count: 4,
+        reachable_free_cell_count: 18,
         total_cell_count: 100,
         coverage_ratio: 0.2,
         frontiers: [{

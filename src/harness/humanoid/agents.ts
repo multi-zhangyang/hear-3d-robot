@@ -183,8 +183,13 @@ export function goalManagerInvocationInput(
         continuation_verified: carrying.continuation_verified ?? null
       },
       exploration: {
+        visibility_model: spatialBelief.visibility_model ?? null,
+        frontier_model: spatialBelief.frontier_model ?? null,
         coverage_ratio: spatialBelief.coverage_ratio ?? null,
         observed_cell_count: spatialBelief.observed_cell_count ?? null,
+        free_cell_count: spatialBelief.free_cell_count ?? null,
+        occupied_cell_count: spatialBelief.occupied_cell_count ?? null,
+        reachable_free_cell_count: spatialBelief.reachable_free_cell_count ?? null,
         frontier_candidates: Array.isArray(spatialBelief.frontiers)
           ? spatialBelief.frontiers.slice(0, 12)
           : []
