@@ -188,14 +188,66 @@ export function humanoidGoalProgressFrom(value: unknown): HumanoidGoalProgress |
 export function goalDAGFrom(value: unknown): GoalDAG | null {
   const record = asRecord(value);
   const candidates = asRecord(record?.candidates);
-  if (!record || record.version !== 1
+  const candidateSequences = asRecord(record?.candidate_sequences);
+  const evidence = asRecord(record?.evidence);
+  const archive = asRecord(record?.archive);
+  if (!record || record.version !== 2
     || (record.status !== "awaiting_model_selection" && record.status !== "active")
     || candidates === null
+    || !Object.values(candidates).every((candidate) => asRecord(candidate) !== null)
+    || candidateSequences === null
+    || !Object.values(candidateSequences).every(positiveInteger)
+    || !positiveInteger(record.next_candidate_sequence)
     || !Array.isArray(record.epochs)
     || (record.current_epoch_id !== null && typeof record.current_epoch_id !== "string")
-    || typeof record.next_epoch_index !== "number"
+    || !nonnegativeInteger(record.next_epoch_index)
+    || evidence === null
+    || archive === null
+    || !nonnegativeInteger(archive.record_count)
+    || (archive.last_record_sha256 !== null
+      && typeof archive.last_record_sha256 !== "string")
+    || (archive.last_epoch_id !== null && typeof archive.last_epoch_id !== "string")
+    || !Array.isArray(archive.retained_candidate_ids)
+    || !archive.retained_candidate_ids.every((candidateId) => typeof candidateId === "string")
+    || !goalHistorySummary(archive.summary)
+    || !goalHistoryArchiveSummaryMatches(archive)
     || typeof record.state_sha256 !== "string") return null;
   return record as unknown as GoalDAG;
+}
+
+function goalHistorySummary(value: unknown): boolean {
+  if (value === null) return true;
+  const summary = asRecord(value);
+  const outcomes = asRecord(summary?.outcomes);
+  const selected = asRecord(outcomes?.selected);
+  if (!summary || summary.version !== 1
+    || !nonnegativeInteger(summary.archived_epoch_count)
+    || (summary.last_record_sha256 !== null
+      && typeof summary.last_record_sha256 !== "string")
+    || !nonnegativeInteger(summary.records_without_alternate_history)
+    || !outcomes
+    || !selected
+    || !nonnegativeInteger(selected.total)
+    || !nonnegativeInteger(selected.completed)
+    || !nonnegativeInteger(selected.blocked)
+    || !nonnegativeInteger(selected.abandoned)
+    || !nonnegativeInteger(selected.superseded)
+    || !nonnegativeInteger(selected.expired)
+    || !nonnegativeInteger(outcomes.not_selected)
+    || !Array.isArray(outcomes.predicate_outcomes)
+    || !Array.isArray(outcomes.entity_outcomes)) return false;
+  return selected.total === selected.completed + selected.blocked
+      + selected.abandoned + selected.superseded + selected.expired
+    && selected.total === summary.archived_epoch_count
+    && summary.records_without_alternate_history <= summary.archived_epoch_count;
+}
+
+function goalHistoryArchiveSummaryMatches(archive: Record<string, unknown>): boolean {
+  if (archive.summary === null) return true;
+  const summary = asRecord(archive.summary);
+  return summary !== null
+    && summary.archived_epoch_count === archive.record_count
+    && summary.last_record_sha256 === archive.last_record_sha256;
 }
 
 export function contextMemoryFrom(value: unknown): ContextMemoryState | null {

@@ -10,6 +10,10 @@ import {
   type GoalDAG,
   type GoalEpoch
 } from "./goal-epoch.js";
+import {
+  appendGoalHistorySummary,
+  createEmptyGoalHistorySummary
+} from "./goal-history-summary.js";
 
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 
@@ -296,6 +300,21 @@ export function applyGoalHistoryArchiveRecord(
   const evidence = Object.fromEntries(Object.entries(persisted.evidence)
     .filter(([ref]) => retainedEvidence.has(ref)));
 
+  const currentSummary = persisted.archive.summary
+    ?? (persisted.archive.record_count === 0
+      ? createEmptyGoalHistorySummary()
+      : undefined);
+  if (!currentSummary) {
+    throw new Error("Goal history summary must be rebuilt before advancing the archive");
+  }
+  const summary = appendGoalHistorySummary(currentSummary, {
+    sequence: record.sequence,
+    recordSha256: record.record_sha256,
+    candidate: record.candidate,
+    epoch: record.epoch,
+    alternateCandidates: recordAlternates.map((entry) => entry.candidate),
+    alternateHistoryComplete: record.version === 2
+  });
   return rehashGoalDAG({
     ...persisted,
     candidates,
@@ -306,7 +325,8 @@ export function applyGoalHistoryArchiveRecord(
       record_count: record.sequence,
       last_record_sha256: record.record_sha256,
       last_epoch_id: record.epoch.epoch_id,
-      retained_candidate_ids: retainedArchivedCandidateIds
+      retained_candidate_ids: retainedArchivedCandidateIds,
+      summary
     }
   });
 }

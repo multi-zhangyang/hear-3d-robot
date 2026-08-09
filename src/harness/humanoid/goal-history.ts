@@ -6,7 +6,11 @@ import {
   type GoalDAG,
   type GoalEpoch
 } from "../../domain/goal-epoch.js";
-import type { JsonValue, Vec3 } from "../../domain/schema.js";
+import {
+  GOAL_PREDICATE_TYPES,
+  type JsonValue,
+  type Vec3
+} from "../../domain/schema.js";
 import type { JournalPage } from "../../persistence/run-store.js";
 
 export const GOAL_HISTORY_STATUSES = [
@@ -19,19 +23,7 @@ export const GOAL_HISTORY_STATUSES = [
   "expired"
 ] as const;
 
-export const GOAL_HISTORY_PREDICATE_TYPES = [
-  "robot_at",
-  "robot_in_zone",
-  "block_removed",
-  "object_in_zone",
-  "object_placed",
-  "object_at",
-  "object_grasped",
-  "object_inside",
-  "object_on",
-  "articulation_state",
-  "end_effector_at"
-] as const;
+export const GOAL_HISTORY_PREDICATE_TYPES = GOAL_PREDICATE_TYPES;
 
 export interface GoalHistoryRecallRequest {
   candidate_ids?: string[];

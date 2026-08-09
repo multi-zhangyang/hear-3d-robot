@@ -67,6 +67,10 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
   const total = goal?.predicates.length ?? 0;
   const context = checkpoint.context_memory;
   const contextUsage = activeContextUsage(context);
+  const archivedGoalOutcomes = checkpoint.goal_dag?.archive?.summary?.outcomes.selected;
+  const archivedGoalMemory = archivedGoalOutcomes
+    ? `${archivedGoalOutcomes.completed}/${archivedGoalOutcomes.total} 个归档 Goal 完成`
+    : `${checkpoint.goal_dag?.archive?.record_count ?? 0} 个归档 Goal`;
   const activeGrasps = activeHumanoidGrasps(frame);
   const manipulation = humanoidManipulationTelemetry(
     frame,
@@ -213,7 +217,7 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
             <b>{compactTokens(contextUsage.activeEstimatedTokens)} / {compactTokens(contextUsage.contextWindowTokens)}</b>
           </span>
           <i><em style={{ width: `${contextUsage.loadFraction * 100}%` }} /></i>
-          <small>压缩线 {compactTokens(contextUsage.compactTriggerTokens)} · {context.total_compactions} 次 · {checkpoint.embodied_memory.total_episodes} 段经历</small>
+          <small>压缩线 {compactTokens(contextUsage.compactTriggerTokens)} · {context.total_compactions} 次 · {checkpoint.embodied_memory.total_episodes} 段经历 · {archivedGoalMemory}</small>
         </div>
       </section>
     </section>

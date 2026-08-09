@@ -84,6 +84,22 @@ describe("humanoid agent hierarchy", () => {
       },
       goal_context: {
         evidence_ref: evidenceRef,
+        autonomy: {
+          history: {
+            lifetime_outcomes: {
+              total_selected_epoch_count: 14,
+              resolved_selected_goal_count: 13,
+              active_selected_goal_count: 1,
+              archived_selected_goal_count: 3,
+              working_selected_goal_count: 11,
+              records_without_alternate_history: 1,
+              selected: { total: 13, completed: 8, blocked: 5 },
+              not_selected: 21,
+              predicate_outcomes: [],
+              entity_outcomes: []
+            }
+          }
+        },
         observation: {
           zone_ids: ["courtyard_beacon"],
           visible_object_ids: ["courtyard_crate"],
@@ -131,7 +147,7 @@ describe("humanoid agent hierarchy", () => {
       '"status":"proposed","goal":{"summary":"进入庭院信标区"'
     );
     expect(rendered).toContain(
-      '"mission_link":"直接推进长期任务","dependency_candidate_ids":[]'
+      '"mission_link":"直接推进长期任务","dependency_candidate_ids":[],"dependency_candidates":[]'
     );
     expect(rendered).toContain(
       '"visible_object_ids":["courtyard_crate"],"portable_object_ids":["courtyard_crate"]'
@@ -144,6 +160,10 @@ describe("humanoid agent hierarchy", () => {
     expect(rendered).toContain(
       '"recent_action_evidence":[{"evidence_ref":"action:planning-call-42","transaction_id":"planning-call-42"'
     );
+    expect(rendered).toContain(
+      '"candidate_history":{"total":1,"visible":1,"truncated":false,"lifetime_outcomes":{"total_selected_epoch_count":14'
+    );
+    expect(rendered).toContain('"records_without_alternate_history":1');
     expect(rendered).toContain('"world_after_revision":21,"frame_count":0');
     expect(rendered).toContain(
       '"detail":{"reachable_base_placements":[{"object_id":"courtyard_crate"'

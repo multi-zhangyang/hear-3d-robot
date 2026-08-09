@@ -49,6 +49,20 @@ const Size3Schema = Vec3Schema.refine(
   "size components must be positive"
 );
 
+export const GOAL_PREDICATE_TYPES = [
+  "robot_at",
+  "robot_in_zone",
+  "block_removed",
+  "object_in_zone",
+  "object_placed",
+  "object_at",
+  "object_grasped",
+  "object_inside",
+  "object_on",
+  "articulation_state",
+  "end_effector_at"
+] as const;
+
 const GoalPredicateUnionSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("robot_at"),

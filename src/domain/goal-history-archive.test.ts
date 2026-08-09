@@ -17,6 +17,7 @@ import {
   createGoalHistoryArchiveRecord,
   type GoalHistoryArchiveRecord
 } from "./goal-history-archive.js";
+import { goalHistoryLifetimeProjection } from "./goal-history-summary.js";
 
 const MANIFEST_SHA256 = "a".repeat(64);
 const MANIFEST_EPOCH_ID = "00000000-0000-4000-8000-000000000001";
@@ -42,9 +43,31 @@ describe("Goal history archive", () => {
     expect(Object.keys(dag.candidates)).toHaveLength(12);
     expect(Object.keys(dag.evidence)).toHaveLength(36);
     expect(dag.archive).toMatchObject({ record_count: 288 });
+    expect(dag.archive.summary).toMatchObject({
+      archived_epoch_count: 288,
+      last_record_sha256: records.at(-1)?.record_sha256,
+      outcomes: {
+        selected: { total: 288, completed: 288 },
+        not_selected: 0,
+        predicate_outcomes: [{
+          predicate_type: "robot_at",
+          selected: { total: 288, completed: 288 },
+          not_selected: 0
+        }]
+      }
+    });
     expect(dag.next_epoch_index).toBe(300);
     expect(dag.next_candidate_sequence).toBe(301);
     expect(records).toHaveLength(288);
+    expect(goalHistoryLifetimeProjection(dag)).toMatchObject({
+      total_selected_epoch_count: 300,
+      resolved_selected_goal_count: 300,
+      active_selected_goal_count: 0,
+      archived_selected_goal_count: 288,
+      working_selected_goal_count: 12,
+      selected: { total: 300, completed: 300 },
+      not_selected: 0
+    });
     expect(records[0]).toMatchObject({
       sequence: 1,
       candidate_sequence: 1,
@@ -70,6 +93,17 @@ describe("Goal history archive", () => {
     }
     const record = createGoalHistoryArchiveRecord(dag);
     dag = applyGoalHistoryArchiveRecord(dag, record);
+    expect(dag.archive.summary).toMatchObject({
+      outcomes: {
+        selected: { total: 1, completed: 1 },
+        not_selected: 0,
+        predicate_outcomes: [{
+          predicate_type: "robot_at",
+          selected: { total: 1, completed: 1 },
+          not_selected: 0
+        }]
+      }
+    });
 
     expect(dag.archive.retained_candidate_ids).toEqual([parentId]);
     expect(dag.candidates[parentId]?.status).toBe("completed");

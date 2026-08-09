@@ -427,8 +427,50 @@ export interface GoalDAG {
     last_record_sha256: string | null;
     last_epoch_id: string | null;
     retained_candidate_ids: string[];
+    summary: GoalHistorySummary | null;
   };
   state_sha256: string;
+}
+
+interface GoalHistorySummary {
+  version: 1;
+  archived_epoch_count: number;
+  last_record_sha256: string | null;
+  records_without_alternate_history: number;
+  outcomes: {
+    selected: GoalHistorySelectedOutcomes;
+    not_selected: number;
+    predicate_outcomes: Array<GoalHistoryDimensionOutcome & {
+      predicate_type: string;
+    }>;
+    entity_outcomes: Array<GoalHistoryDimensionOutcome & {
+      entity_kind: "object" | "zone" | "solid" | "end_effector";
+      entity_id: string;
+    }>;
+  };
+}
+
+interface GoalHistorySelectedOutcomes {
+  total: number;
+  completed: number;
+  blocked: number;
+  abandoned: number;
+  superseded: number;
+  expired: number;
+}
+
+interface GoalHistoryDimensionOutcome {
+  selected: GoalHistorySelectedOutcomes;
+  not_selected: number;
+  last_selected: {
+    epoch_sequence: number;
+    status: "completed" | "blocked" | "abandoned" | "superseded" | "expired";
+    world_revision: number;
+  } | null;
+  last_not_selected: {
+    epoch_sequence: number;
+    world_revision: number;
+  } | null;
 }
 
 export interface HumanoidEmbodiedEpisode {

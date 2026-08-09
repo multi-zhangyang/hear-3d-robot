@@ -71,6 +71,33 @@ describe("reduceHumanoidRunDetails", () => {
     expect(stale.checkpoint.goal_progress).toEqual(goal_progress);
   });
 
+  it("applies the live V2 Goal DAG stream and rejects obsolete V1 events", () => {
+    const current = details();
+    const goalDAG = streamedGoalDAG("live-v2-state");
+    const updated = reduce(current, event("humanoid_goal_state_updated", {
+      goal_dag: goalDAG,
+      goal_progress: null,
+      checker: null,
+      world_frame: 0,
+      world_revision: 0
+    }));
+
+    expect(updated.checkpoint.goal_dag).toEqual(goalDAG);
+    expect(updated.checkpoint.goal_dag?.archive.summary).toMatchObject({
+      archived_epoch_count: 3,
+      outcomes: { selected: { total: 3, completed: 2 } }
+    });
+
+    const obsolete = reduce(updated, event("humanoid_goal_state_updated", {
+      goal_dag: { ...streamedGoalDAG("obsolete-v1-state"), version: 1 },
+      goal_progress: null,
+      checker: null,
+      world_frame: 0,
+      world_revision: 0
+    }));
+    expect(obsolete).toBe(updated);
+  });
+
   it("commits one receipt exactly once", () => {
     const scenarioChunks = {
       ...emptyScenarioChunks(),
@@ -271,7 +298,7 @@ function details(): HumanoidRunDetails {
     scenario_chunks: emptyScenarioChunks(),
     event_cursor: null,
     checkpoint: {
-      version: 4,
+      version: 6,
       runtime: "humanoid_g1",
       run_id: "humanoid-run",
       status: "running",
@@ -314,6 +341,46 @@ function details(): HumanoidRunDetails {
       updated_at: "2026-08-02T00:00:00.000Z"
     }
   } as unknown as HumanoidRunDetails;
+}
+
+function streamedGoalDAG(stateSha256: string) {
+  return {
+    version: 2 as const,
+    status: "awaiting_model_selection" as const,
+    candidates: {},
+    candidate_sequences: {},
+    next_candidate_sequence: 4,
+    epochs: [],
+    current_epoch_id: null,
+    next_epoch_index: 3,
+    evidence: {},
+    archive: {
+      record_count: 3,
+      last_record_sha256: "a".repeat(64),
+      last_epoch_id: `goal-epoch:${"b".repeat(64)}`,
+      retained_candidate_ids: [],
+      summary: {
+        version: 1 as const,
+        archived_epoch_count: 3,
+        last_record_sha256: "a".repeat(64),
+        records_without_alternate_history: 1,
+        outcomes: {
+          selected: {
+            total: 3,
+            completed: 2,
+            blocked: 1,
+            abandoned: 0,
+            superseded: 0,
+            expired: 0
+          },
+          not_selected: 4,
+          predicate_outcomes: [],
+          entity_outcomes: []
+        }
+      }
+    },
+    state_sha256: stateSha256
+  };
 }
 
 function emptyScenarioChunks() {

@@ -6,6 +6,9 @@ import {
 } from "./schema.js";
 import { goalSha256 } from "./goal-identity.js";
 import { ModelDecisionRefSchema } from "./model-call-authority.js";
+import {
+  GoalHistorySummarySchema
+} from "./goal-history-summary-schema.js";
 
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const CandidateIdSchema = z.string().regex(/^goal-candidate:[a-f0-9]{64}$/);
@@ -207,7 +210,8 @@ const GoalDAGArchiveStateSchema = z.object({
   record_count: z.number().int().nonnegative(),
   last_record_sha256: Sha256Schema.nullable(),
   last_epoch_id: EpochIdSchema.nullable(),
-  retained_candidate_ids: z.array(CandidateIdSchema)
+  retained_candidate_ids: z.array(CandidateIdSchema),
+  summary: GoalHistorySummarySchema.nullable()
 }).strict().superRefine((archive, context) => {
   const empty = archive.record_count === 0;
   if (empty !== (archive.last_record_sha256 === null)
@@ -225,6 +229,15 @@ const GoalDAGArchiveStateSchema = z.object({
       message: "Retained archived Goal candidates must be unique and sorted"
     });
   }
+  if (archive.summary
+    && (archive.summary.archived_epoch_count !== archive.record_count
+      || archive.summary.last_record_sha256 !== archive.last_record_sha256)) {
+    context.addIssue({
+      code: "custom",
+      path: ["summary"],
+      message: "Goal history summary does not match the archive head"
+    });
+  }
 });
 
 type GoalDAGArchiveState = z.infer<typeof GoalDAGArchiveStateSchema>;
@@ -233,7 +246,31 @@ const EmptyGoalDAGArchiveState: GoalDAGArchiveState = {
   record_count: 0,
   last_record_sha256: null,
   last_epoch_id: null,
-  retained_candidate_ids: []
+  retained_candidate_ids: [],
+  summary: {
+    version: 1,
+    archived_epoch_count: 0,
+    last_record_sha256: null,
+    records_without_alternate_history: 0,
+    outcomes: {
+      selected: {
+        total: 0,
+        completed: 0,
+        blocked: 0,
+        abandoned: 0,
+        superseded: 0,
+        expired: 0
+      },
+      not_selected: 0,
+      predicate_outcomes: [],
+      entity_outcomes: []
+    }
+  }
+};
+
+const LegacyEmptyGoalDAGArchiveState: GoalDAGArchiveState = {
+  ...EmptyGoalDAGArchiveState,
+  summary: null
 };
 
 const GoalDAGBaseSchema = z.object({
@@ -252,6 +289,8 @@ const GoalDAGBaseSchema = z.object({
 
 const ValidatedGoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
   if (dag.state_sha256 !== goalDAGStateSha256(dag)
+    && (dag.archive.summary !== null
+      || dag.state_sha256 !== goalDAGWithoutArchiveSummaryStateSha256(dag))
     && (!isLegacyCompatibleGoalDAG(dag)
       || dag.state_sha256 !== legacyGoalDAGStateSha256(dag))) {
     context.addIssue({
@@ -477,7 +516,7 @@ const ValidatedGoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
 });
 
 export const GoalDAGSchema = z.preprocess(
-  normalizeLegacyGoalDAG,
+  normalizePersistedGoalDAG,
   ValidatedGoalDAGSchema
 );
 
@@ -1033,19 +1072,40 @@ function legacyGoalDAGStateSha256(dag: z.infer<typeof GoalDAGBaseSchema>): strin
   return sha256(canonicalJson({ ...contents, version: 1 }));
 }
 
+function goalDAGWithoutArchiveSummaryStateSha256(
+  dag: z.infer<typeof GoalDAGBaseSchema>
+): string {
+  const {
+    state_sha256: _stateSha256,
+    archive,
+    ...contents
+  } = dag;
+  const { summary: _summary, ...legacyArchive } = archive;
+  return sha256(canonicalJson({ ...contents, archive: legacyArchive }));
+}
+
 function isLegacyCompatibleGoalDAG(dag: z.infer<typeof GoalDAGBaseSchema>): boolean {
   const expectedSequences = Object.fromEntries(
     Object.keys(dag.candidates).map((candidateId, index) => [candidateId, index + 1])
   );
   return dag.archive.record_count === 0
-    && canonicalJson(dag.archive) === canonicalJson(EmptyGoalDAGArchiveState)
+    && canonicalJson(dag.archive) === canonicalJson(LegacyEmptyGoalDAGArchiveState)
     && dag.next_candidate_sequence === Object.keys(dag.candidates).length + 1
     && canonicalJson(dag.candidate_sequences) === canonicalJson(expectedSequences);
 }
 
-function normalizeLegacyGoalDAG(value: unknown): unknown {
+function normalizePersistedGoalDAG(value: unknown): unknown {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
   const dag = value as Record<string, unknown>;
+  if (dag.version === 2) {
+    const archive = dag.archive;
+    if (archive === null || typeof archive !== "object" || Array.isArray(archive)
+      || Object.hasOwn(archive, "summary")) return value;
+    return {
+      ...dag,
+      archive: { ...archive, summary: null }
+    };
+  }
   if (dag.version !== 1) return value;
   const candidates = dag.candidates !== null
     && typeof dag.candidates === "object"
@@ -1061,7 +1121,9 @@ function normalizeLegacyGoalDAG(value: unknown): unknown {
     candidate_sequences: dag.candidate_sequences ?? candidateSequences,
     next_candidate_sequence: dag.next_candidate_sequence
       ?? Object.keys(candidates).length + 1,
-    archive: dag.archive ?? EmptyGoalDAGArchiveState
+    archive: dag.archive && typeof dag.archive === "object" && !Array.isArray(dag.archive)
+      ? { ...dag.archive, summary: null }
+      : LegacyEmptyGoalDAGArchiveState
   };
 }
 

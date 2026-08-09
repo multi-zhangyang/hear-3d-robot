@@ -1,5 +1,7 @@
 import type { GoalDAG } from "../../domain/goal-epoch.js";
 import type { GoalPredicate } from "../../domain/schema.js";
+import { goalHistoryLifetimeProjection } from
+  "../../domain/goal-history-summary.js";
 import type { GoalEvidenceArtifact } from "./goal-evidence.js";
 
 const HISTORY_WINDOW = 128;
@@ -104,6 +106,7 @@ export function createHumanoidAutonomyContext(input: {
     history: {
       total_epoch_count: input.goalDAG.next_epoch_index,
       analyzed_epoch_count: history.length,
+      lifetime_outcomes: goalHistoryLifetimeProjection(input.goalDAG),
       predicate_counts: Object.fromEntries(
         [...predicateCounts.entries()].sort(([left], [right]) => compare(left, right))
       ),

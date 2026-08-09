@@ -27,8 +27,23 @@ export function goalDAGContextView(goalDAG: GoalDAG) {
     const candidate = goalDAG.candidates[candidateId];
     const candidateSequence = goalCandidateSequence(goalDAG, candidateId);
     return candidate && candidateSequence
-      ? [[candidateId, { ...candidate, candidate_sequence: candidateSequence }] as const]
+      ? [[candidateId, {
+          ...candidate,
+          candidate_sequence: candidateSequence,
+          dependency_candidates: (candidate.dependency_candidate_ids ?? []).map((dependencyId) => {
+            const dependency = goalDAG.candidates[dependencyId];
+            return {
+              candidate_id: dependencyId,
+              candidate_sequence: goalCandidateSequence(goalDAG, dependencyId) ?? null,
+              status: dependency?.status ?? "unavailable"
+            };
+          })
+        }] as const]
       : [];
+  }));
+  const candidateSequences = Object.fromEntries([...candidateIds].flatMap((candidateId) => {
+    const sequence = goalDAG.candidate_sequences[candidateId];
+    return sequence === undefined ? [] : [[candidateId, sequence] as const];
   }));
   const evidenceRefs = new Set<string>();
   for (const candidate of Object.values(candidates)) {
@@ -51,10 +66,13 @@ export function goalDAGContextView(goalDAG: GoalDAG) {
     version: goalDAG.version,
     status: goalDAG.status,
     candidates,
+    candidate_sequences: candidateSequences,
+    next_candidate_sequence: goalDAG.next_candidate_sequence,
     epochs,
     current_epoch_id: goalDAG.current_epoch_id,
     next_epoch_index: goalDAG.next_epoch_index,
     evidence,
+    archive: structuredClone(goalDAG.archive),
     state_sha256: goalDAG.state_sha256,
     context_projection: {
       total_candidate_count: totalCandidateCount,
