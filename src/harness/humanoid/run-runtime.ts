@@ -463,6 +463,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         selection_evidence_refs: [evidence.ref],
         created_world_revision: evidence.artifact.evidence.world_revision
       }, this.#goalHarness());
+      const expiredCandidates = Object.values(next.candidates).flatMap((entry) => (
+        entry.status === "expired"
+          && this.#checkpoint.goal_dag.candidates[entry.candidate_id]?.status === "proposed"
+          ? [{
+              candidate_sequence: goalCandidateSequence(next, entry.candidate_id)!,
+              candidate_id: entry.candidate_id
+            }]
+          : []
+      ));
       await this.#refreshWorldPersistenceState();
       this.#checkpoint.goal_dag = next;
       this.#checkpoint.goal_progress = createHumanoidGoalProgress(
@@ -484,6 +493,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         epoch_id: next.current_epoch_id,
         cycle_id: cycle.cycle_id,
         candidate_id: candidate.candidate_id,
+        expired_candidates: expiredCandidates,
         goal: candidate.goal,
         goal_dag_state_sha256: next.state_sha256
       });

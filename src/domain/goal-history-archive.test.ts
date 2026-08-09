@@ -86,6 +86,73 @@ describe("Goal history archive", () => {
     }, state.harness)).not.toThrow();
   });
 
+  it("archives every unselected candidate with its model-selected slate", () => {
+    const state = fixture();
+    let dag = createGoalDAG();
+    const proposalEvidence = evidence("observation:slate", 1);
+    const proposalSource = source("propose:slate");
+    state.evidence.set(proposalEvidence.ref, proposalEvidence);
+    for (let index = 0; index < 3; index += 1) {
+      dag = proposeGoalCandidate(dag, {
+        proposal_id: `slate-${index}`,
+        source: proposalSource,
+        goal: {
+          summary: `批次候选 ${index}`,
+          predicates: [{
+            type: "robot_at",
+            target: { x: index + 1, y: 0, z: 1 },
+            tolerance: 0.3
+          }]
+        },
+        mission_link: "同一模型决策批次",
+        dependency_candidate_ids: [],
+        proposal_evidence_refs: [proposalEvidence.ref],
+        created_world_revision: 1
+      }, state.harness);
+    }
+    const selected = goalCandidateBySequence(dag, 2)!;
+    const selectionEvidence = evidence("selection:slate", 2);
+    state.evidence.set(selectionEvidence.ref, selectionEvidence);
+    dag = selectGoalCandidate(dag, {
+      candidate_id: selected.candidate_id,
+      selected_by: source("select:slate"),
+      selection_evidence_refs: [selectionEvidence.ref],
+      created_world_revision: 2
+    }, state.harness);
+    const completionEvidence = evidence(
+      "evaluation:slate",
+      3,
+      "goal_evaluation",
+      selected.content_sha256
+    );
+    state.evidence.set(completionEvidence.ref, completionEvidence);
+    dag = completeGoalEpoch(dag, {
+      resolution_evidence_refs: [completionEvidence.ref],
+      resolved_world_revision: 3
+    }, state.harness);
+    for (let index = 1; index <= 12; index += 1) {
+      dag = completeOneGoal(dag, state, index).dag;
+    }
+
+    const record = createGoalHistoryArchiveRecord(dag);
+    expect(record).toMatchObject({
+      version: 2,
+      kind: "epoch",
+      candidate_sequence: 2,
+      candidate: { candidate_id: selected.candidate_id },
+      alternate_candidates: [
+        { candidate_sequence: 1, candidate: { status: "expired" } },
+        { candidate_sequence: 3, candidate: { status: "expired" } }
+      ]
+    });
+    dag = applyGoalHistoryArchiveRecord(dag, record);
+    expect(dag.candidates[selected.candidate_id]).toBeUndefined();
+    for (const alternate of record.version === 2 ? record.alternate_candidates : []) {
+      expect(dag.candidates[alternate.candidate.candidate_id]).toBeUndefined();
+    }
+    expect(dag.next_candidate_sequence).toBe(16);
+  });
+
   it("replays an append-before-checkpoint crash window without changing identity", () => {
     const state = fixture();
     let checkpoint = createGoalDAG();

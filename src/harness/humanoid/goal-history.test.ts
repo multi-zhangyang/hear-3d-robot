@@ -119,6 +119,42 @@ describe("Goal history recall", () => {
     });
   });
 
+  it("recalls unselected model alternatives after their slate is archived", async () => {
+    let dag = createCompletedGoalDAG(15, 3);
+    const records: GoalHistoryArchiveRecord[] = [];
+    while (dag.epochs.length > 12) {
+      const record = createGoalHistoryArchiveRecord(dag);
+      records.push(record);
+      dag = applyGoalHistoryArchiveRecord(dag, record);
+    }
+    const first = records[0];
+    if (!first || first.version !== 2) {
+      throw new Error("Expected a version 2 Goal history slate");
+    }
+    const alternate = first.alternate_candidates[0]!;
+
+    await expect(recallGoalHistory({
+      goalDAG: dag,
+      journal: archiveJournal(records),
+      currentWorldRevision: 46,
+      request: {
+        candidate_ids: [alternate.candidate.candidate_id],
+        statuses: ["expired"],
+        limit: 1
+      }
+    })).resolves.toMatchObject({
+      total_candidate_count: 45,
+      total_matches: 1,
+      candidates: [{
+        sequence: alternate.candidate_sequence,
+        candidate_id: alternate.candidate.candidate_id,
+        status: "expired",
+        selection_outcome: "not_selected",
+        epoch: null
+      }]
+    });
+  });
+
   it("recalls world-space targets across archived and working Goal history", async () => {
     let dag = createCompletedGoalDAG(15);
     const records: GoalHistoryArchiveRecord[] = [];

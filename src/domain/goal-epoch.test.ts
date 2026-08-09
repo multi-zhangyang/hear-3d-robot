@@ -319,13 +319,61 @@ describe("persistent model goal epochs", () => {
     });
   });
 
+  it("resolves one model proposal slate as one transactional selection", () => {
+    const proposalEvidence = physicalEvidence("observation:slate", 7);
+    const selectionEvidence = physicalEvidence("checkpoint:slate", 8, "world_checkpoint");
+    const setup = testHarness({ evidence: [proposalEvidence, selectionEvidence] });
+    const slateSource = modelSource("call-propose-slate");
+    let dag = createGoalDAG();
+    for (const proposalId of ["slate-a", "slate-b", "slate-c"]) {
+      dag = propose({
+        dag,
+        harness: setup.harness,
+        proposalId,
+        source: slateSource,
+        evidenceRef: proposalEvidence.ref,
+        revision: 7
+      });
+    }
+    const selected = Object.values(dag.candidates).find(
+      (candidate) => candidate.proposal_id === "slate-b"
+    )!;
+    dag = selectGoalCandidate(dag, {
+      candidate_id: selected.candidate_id,
+      selected_by: modelSource("call-select-slate"),
+      selection_evidence_refs: [selectionEvidence.ref],
+      created_world_revision: 8
+    }, setup.harness);
+
+    expect(dag.candidates[selected.candidate_id]?.status).toBe("active");
+    expect(Object.values(dag.candidates).filter(
+      (candidate) => candidate.status === "expired"
+    )).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        proposal_id: "slate-a",
+        resolved_world_revision: 8,
+        physical_evidence_refs: expect.objectContaining({
+          resolution: [selectionEvidence.ref]
+        })
+      }),
+      expect.objectContaining({
+        proposal_id: "slate-c",
+        resolved_world_revision: 8,
+        physical_evidence_refs: expect.objectContaining({
+          resolution: [selectionEvidence.ref]
+        })
+      })
+    ]));
+    expect(restoreGoalDAG(dag, setup.harness)).toEqual(dag);
+  });
+
   it("waits for another model selection after completion instead of choosing a goal", () => {
     const evidence = [
       physicalEvidence("observation:first", 10),
       physicalEvidence("checkpoint:first", 11, "world_checkpoint"),
-      physicalEvidence("observation:next", 12),
+      physicalEvidence("observation:next", 14),
       physicalEvidence("receipt:first", 13, "action_receipt"),
-      physicalEvidence("checkpoint:next", 14, "world_checkpoint")
+      physicalEvidence("checkpoint:next", 15, "world_checkpoint")
     ];
     const setup = testHarness({ evidence });
     let dag = propose({
@@ -350,23 +398,11 @@ describe("persistent model goal epochs", () => {
       selection_evidence_refs: ["checkpoint:first"],
       created_world_revision: 11
     }, setup.harness);
-    dag = propose({
-      dag,
-      harness: setup.harness,
-      proposalId: "next",
-      modelCallId: "call-propose-next",
-      evidenceRef: "observation:next",
-      revision: 12,
-      dependencies: [firstCandidate.candidate_id]
-    });
-    const nextCandidate = Object.values(dag.candidates)
-      .find((candidate) => candidate.proposal_id === "next")!;
-
     expect(() => selectGoalCandidate(dag, {
-      candidate_id: nextCandidate.candidate_id,
+      candidate_id: firstCandidate.candidate_id,
       selected_by: modelSource("call-select-too-early"),
       selection_evidence_refs: ["observation:next"],
-      created_world_revision: 12
+      created_world_revision: 14
     }, setup.harness)).toThrowError(expect.objectContaining({ code: "goal_epoch_active" }));
 
     expect(() => completeGoalEpoch(dag, {
@@ -389,13 +425,24 @@ describe("persistent model goal epochs", () => {
       resolved_world_revision: 13,
       physical_evidence_refs: { resolution: ["evaluation:first"] }
     });
+    dag = propose({
+      dag,
+      harness: setup.harness,
+      proposalId: "next",
+      modelCallId: "call-propose-next",
+      evidenceRef: "observation:next",
+      revision: 14,
+      dependencies: [firstCandidate.candidate_id]
+    });
+    const nextCandidate = Object.values(dag.candidates)
+      .find((candidate) => candidate.proposal_id === "next")!;
     expect(dag.candidates[nextCandidate.candidate_id]?.status).toBe("proposed");
 
     dag = selectGoalCandidate(dag, {
       candidate_id: nextCandidate.candidate_id,
       selected_by: modelSource("call-select-next"),
       selection_evidence_refs: ["checkpoint:next"],
-      created_world_revision: 14
+      created_world_revision: 15
     }, setup.harness);
     expect(dag.epochs[1]).toMatchObject({
       epoch_index: 1,
@@ -406,7 +453,7 @@ describe("persistent model goal epochs", () => {
     });
   });
 
-  it("refuses to select a candidate until all of its dependencies completed", () => {
+  it("refuses to propose a candidate before all dependencies complete", () => {
     const evidence = [
       physicalEvidence("observation:parent", 20),
       physicalEvidence("observation:child", 20),
@@ -420,7 +467,7 @@ describe("persistent model goal epochs", () => {
       revision: 20
     });
     const parent = onlyCandidate(dag);
-    dag = propose({
+    expect(() => propose({
       dag,
       harness: setup.harness,
       proposalId: "child",
@@ -428,16 +475,7 @@ describe("persistent model goal epochs", () => {
       evidenceRef: "observation:child",
       revision: 20,
       dependencies: [parent.candidate_id]
-    });
-    const child = Object.values(dag.candidates)
-      .find((candidate) => candidate.proposal_id === "child")!;
-
-    expect(() => selectGoalCandidate(dag, {
-      candidate_id: child.candidate_id,
-      selected_by: modelSource("call-select-child"),
-      selection_evidence_refs: ["checkpoint:child"],
-      created_world_revision: 21
-    }, setup.harness)).toThrowError(expect.objectContaining({
+    })).toThrowError(expect.objectContaining({
       code: "dependency_not_completed"
     }));
   });

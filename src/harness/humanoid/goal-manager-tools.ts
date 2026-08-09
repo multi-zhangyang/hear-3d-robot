@@ -205,7 +205,7 @@ function goalHistoryTool(
   const inputRecovery = createToolInputRecovery();
   const historyTool = tool<typeof RecallGoalHistorySchema, unknown, string>({
     name,
-    description: "只读召回完整 Goal DAG 中未装入当前工作集的候选与结果。可按 candidate、状态、谓词、对象、方块、语义区域或世界空间范围检索；历史结果不能代替当前物理观察。",
+    description: "只读召回完整 Goal DAG 中未装入当前工作集的候选与结果，并区分 selected 与 not_selected。可按 candidate、状态、谓词、对象、方块、语义区域或世界空间范围检索；历史结果不能代替当前物理观察。",
     parameters: RecallGoalHistorySchema,
     strict: true,
     timeoutBehavior: "raise_exception",

@@ -414,11 +414,17 @@ const ValidatedGoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
     }
   });
   const retainedArchived = new Set(dag.archive.retained_candidate_ids);
+  const workingAlternates = new Set(Object.values(dag.candidates).flatMap((candidate) => (
+    dag.epochs.some((epoch) => isExpiredSlateAlternate(dag, candidate, epoch))
+      ? [candidate.candidate_id]
+      : []
+  )));
   for (const candidate of Object.values(dag.candidates)) {
     const activated = seenCandidates.has(candidate.candidate_id);
     const retained = retainedArchived.has(candidate.candidate_id);
+    const alternate = workingAlternates.has(candidate.candidate_id);
     if ((candidate.status === "proposed" && activated)
-      || (candidate.status !== "proposed" && !activated && !retained)
+      || (candidate.status !== "proposed" && !activated && !retained && !alternate)
       || (retained && (activated
         || candidate.status === "proposed"
         || candidate.status === "active"))) {
@@ -432,7 +438,8 @@ const ValidatedGoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
   const expectedRetained = Object.values(dag.candidates)
     .filter((candidate) => candidate.status !== "proposed"
       && candidate.status !== "active"
-      && !seenCandidates.has(candidate.candidate_id))
+      && !seenCandidates.has(candidate.candidate_id)
+      && !workingAlternates.has(candidate.candidate_id))
     .map((candidate) => candidate.candidate_id)
     .sort(compareCodePoints);
   if (canonicalJson(expectedRetained)
@@ -565,10 +572,19 @@ export function proposeGoalCandidate(
     );
   }
   for (const dependencyId of dependencies) {
-    if (!dag.candidates[dependencyId]) {
+    const dependency = dag.candidates[dependencyId];
+    if (!dependency) {
       throw new GoalDAGValidationError(
         "missing_dependency",
         `Model goal candidate references a missing dependency: ${dependencyId}`
+      );
+    }
+    if (dependency.status !== "completed"
+      || dependency.resolved_world_revision === null
+      || dependency.resolved_world_revision > proposal.created_world_revision) {
+      throw new GoalDAGValidationError(
+        "dependency_not_completed",
+        `Model goal candidate dependency is not complete: ${dependencyId}`
       );
     }
   }
@@ -732,13 +748,30 @@ export function selectGoalCandidate(
     },
     resolved_world_revision: null
   });
+  const candidates = Object.fromEntries(Object.entries(dag.candidates).map(([
+    candidateId,
+    entry
+  ]) => {
+    if (candidateId === candidate.candidate_id) {
+      return [candidateId, { ...entry, status: "active" as const }];
+    }
+    if (entry.status !== "proposed" || !sameCandidateSlate(entry, candidate)) {
+      return [candidateId, entry];
+    }
+    return [candidateId, {
+      ...entry,
+      status: "expired" as const,
+      physical_evidence_refs: {
+        ...entry.physical_evidence_refs,
+        resolution: selectionEvidenceRefs
+      },
+      resolved_world_revision: selection.created_world_revision
+    }];
+  }));
   return rehashGoalDAG({
     ...dag,
     status: "active",
-    candidates: {
-      ...dag.candidates,
-      [candidate.candidate_id]: { ...candidate, status: "active" }
-    },
+    candidates,
     epochs: [...dag.epochs, epoch],
     current_epoch_id: epoch.epoch_id,
     next_epoch_index: dag.next_epoch_index + 1,
@@ -876,7 +909,58 @@ export function restoreGoalDAG(
       );
     }
   }
-  return dag;
+  return normalizeSelectedSlateAlternates(dag);
+}
+
+function normalizeSelectedSlateAlternates(dag: GoalDAG): GoalDAG {
+  const latestEpochBySlate = new Map<string, GoalEpoch>();
+  for (const epoch of dag.epochs) {
+    const selected = dag.candidates[epoch.candidate_id];
+    if (selected) latestEpochBySlate.set(candidateSlateKey(selected), epoch);
+  }
+  let changed = false;
+  const candidates = Object.fromEntries(Object.entries(dag.candidates).map(([
+    candidateId,
+    candidate
+  ]) => {
+    if (candidate.status !== "proposed") return [candidateId, candidate];
+    const epoch = latestEpochBySlate.get(candidateSlateKey(candidate));
+    if (!epoch || epoch.candidate_id === candidateId) return [candidateId, candidate];
+    changed = true;
+    return [candidateId, {
+      ...candidate,
+      status: "expired" as const,
+      physical_evidence_refs: {
+        ...candidate.physical_evidence_refs,
+        resolution: epoch.physical_evidence_refs.selection
+      },
+      resolved_world_revision: epoch.created_world_revision
+    }];
+  }));
+  return changed ? rehashGoalDAG({ ...dag, candidates }) : dag;
+}
+
+function isExpiredSlateAlternate(
+  dag: GoalDAG,
+  candidate: GoalCandidate,
+  epoch: GoalEpoch
+): boolean {
+  const selected = dag.candidates[epoch.candidate_id];
+  return candidate.status === "expired"
+    && candidate.candidate_id !== epoch.candidate_id
+    && selected !== undefined
+    && sameCandidateSlate(candidate, selected)
+    && candidate.resolved_world_revision === epoch.created_world_revision
+    && canonicalJson(candidate.physical_evidence_refs.resolution)
+      === canonicalJson(epoch.physical_evidence_refs.selection);
+}
+
+function sameCandidateSlate(left: GoalCandidate, right: GoalCandidate): boolean {
+  return candidateSlateKey(left) === candidateSlateKey(right);
+}
+
+function candidateSlateKey(candidate: GoalCandidate): string {
+  return canonicalJson(candidate.source);
 }
 
 function candidateIdentitySha256(candidate: {

@@ -15,11 +15,14 @@ import {
 const MANIFEST_SHA256 = "a".repeat(64);
 const MANIFEST_EPOCH_ID = "00000000-0000-4000-8000-000000000001";
 
-export function createCompletedGoalDAG(count: number): GoalDAG {
+export function createCompletedGoalDAG(
+  count: number,
+  candidatesPerGoal = 1
+): GoalDAG {
   const state = goalHistoryFixture();
   let dag = createGoalDAG();
   for (let index = 0; index < count; index += 1) {
-    dag = completeFixtureGoal(dag, state, index).dag;
+    dag = completeFixtureGoal(dag, state, index, candidatesPerGoal).dag;
   }
   return dag;
 }
@@ -27,10 +30,17 @@ export function createCompletedGoalDAG(count: number): GoalDAG {
 function completeFixtureGoal(
   dag: GoalDAG,
   state: ReturnType<typeof goalHistoryFixture>,
-  index: number
+  index: number,
+  candidatesPerGoal: number
 ): { dag: GoalDAG; candidateId: string } {
-  let next = proposeFixtureGoal(dag, state, index, []);
-  const candidate = goalCandidateBySequence(next, next.next_candidate_sequence - 1)!;
+  let next = dag;
+  for (let variant = 0; variant < candidatesPerGoal; variant += 1) {
+    next = proposeFixtureGoal(next, state, index, variant, []);
+  }
+  const candidate = goalCandidateBySequence(
+    next,
+    next.next_candidate_sequence - candidatesPerGoal
+  )!;
   const selectionRevision = index * 3 + 2;
   const selectionEvidence = fixtureEvidence(`selection:${index}`, selectionRevision);
   state.evidence.set(selectionEvidence.ref, selectionEvidence);
@@ -59,19 +69,20 @@ function proposeFixtureGoal(
   dag: GoalDAG,
   state: ReturnType<typeof goalHistoryFixture>,
   index: number,
+  variant: number,
   dependencies: string[]
 ): GoalDAG {
   const revision = index * 3 + 1;
   const proposalEvidence = fixtureEvidence(`observation:${index}`, revision);
   state.evidence.set(proposalEvidence.ref, proposalEvidence);
   return proposeGoalCandidate(dag, {
-    proposal_id: `proposal-${index}`,
+    proposal_id: `proposal-${index}-${variant}`,
     source: fixtureModelSource(`propose:${index}`),
     goal: {
-      summary: `自主目标 ${index}`,
+      summary: `自主目标 ${index}-${variant}`,
       predicates: [{
         type: "robot_at",
-        target: { x: index + 1, y: 0, z: index + 2 },
+        target: { x: index + 1 + variant / 10, y: 0, z: index + 2 },
         tolerance: 0.3
       }]
     },

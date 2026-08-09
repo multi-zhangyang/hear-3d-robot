@@ -603,6 +603,9 @@ describe("humanoid agent hierarchy", () => {
     expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
       "选择或提交任何包含 robot_at、object_at 或 world-frame end_effector_at 的候选之前"
     ));
+    expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
+      "同一次 submit_goal_candidates 调用产生一个互斥决策批次"
+    ));
     expect(hierarchy.executor.instructions).toEqual(expect.stringContaining(
       "plan_humanoid_skill 必须调用 execute_humanoid_skill"
     ));

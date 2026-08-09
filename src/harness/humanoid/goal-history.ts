@@ -133,6 +133,14 @@ export async function recallGoalHistory(input: {
         sequence: record.candidate_sequence,
         epoch: record.epoch
       }, false);
+      if (record.version === 2) {
+        for (const alternate of record.alternate_candidates) {
+          consider({
+            candidate: alternate.candidate,
+            sequence: alternate.candidate_sequence
+          }, false);
+        }
+      }
       expectedRecordSha256 = record.previous_record_sha256;
     }
     before = from;
@@ -203,6 +211,9 @@ function projectHistoryEntry({ candidate, sequence, epoch }: HistoryEntry) {
     sequence,
     candidate_id: candidate.candidate_id,
     status: candidate.status,
+    selection_outcome: epoch ? "selected" : candidate.status === "expired"
+      ? "not_selected"
+      : null,
     goal: candidate.goal,
     mission_link: candidate.mission_link,
     dependency_candidate_ids: candidate.dependency_candidate_ids,
