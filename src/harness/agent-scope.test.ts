@@ -14,6 +14,10 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { ModelTelemetryRuntime } from "./context-runtime.js";
+import {
+  ModelDecisionProtocolRecovery,
+  withModelDecisionProtocolRecovery
+} from "./model-decision-protocol.js";
 import { withModelTelemetry } from "./model-telemetry.js";
 import { isTransportInterruption } from "../runtime/transport-recovery.js";
 import {
@@ -264,20 +268,30 @@ describe("agent invocation scope", () => {
       activeNode: () => ({}) as never,
       recordModelCallStarted: async () => undefined
     };
-    const workerModel = withModelTelemetry({
-      getResponse: async () => {
-        throw new Error("non-stream path is outside this test");
-      },
-      getStreamedResponse: async function* () {
-        workerCalls += 1;
-        yield responseDone(reasoningResponse(`worker-reasoning-${workerCalls}`));
-      }
-    } satisfies Model, runtime, "worker");
+    const workerModel = withModelDecisionProtocolRecovery(
+      withModelTelemetry({
+        getResponse: async () => {
+          throw new Error("non-stream path is outside this test");
+        },
+        getStreamedResponse: async function* () {
+          workerCalls += 1;
+          yield responseDone(reasoningResponse(`worker-reasoning-${workerCalls}`));
+        }
+      } satisfies Model, runtime, "worker"),
+      "worker",
+      new ModelDecisionProtocolRecovery(() => "authority")
+    );
     const worker = new Agent({
       name: "worker",
       instructions: `${agentInvocationMarker("worker")}\nCall a tool.`,
       model: workerModel,
-      modelSettings: { toolChoice: "required" }
+      modelSettings: { toolChoice: "required" },
+      tools: [tool({
+        name: "observe",
+        description: "Observe the live state",
+        parameters: z.object({}).strict(),
+        execute: async () => "observed"
+      })]
     });
     const delegate = scopeAgentToolInvocation("worker", worker.asTool({
       toolName: "delegate_stalled_worker",

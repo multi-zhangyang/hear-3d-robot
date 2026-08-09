@@ -16,6 +16,10 @@ import {
 } from "../config/load.js";
 import type { Goal } from "../domain/schema.js";
 import {
+  HUMANOID_ACTION_NAMES,
+  type HumanoidActionName
+} from "../domain/humanoid-action.js";
+import {
   humanoidRunShouldFinish,
   type HumanoidRunMode
 } from "../domain/run-mode.js";
@@ -385,8 +389,13 @@ async function executeHumanoidMission(input: {
       ),
       modelProgressRecoveryEpoch: () => modelProgressRecoveryEpoch
     };
+    const humanoidActionNames = new Set<string>(HUMANOID_ACTION_NAMES);
     const decisionProtocolRecovery = new ModelDecisionProtocolRecovery(
-      () => humanoidAgentStateFingerprint(input.runtime.checkpoint)
+      () => humanoidAgentStateFingerprint(input.runtime.checkpoint),
+      (agentId, exposedToolNames) => exposedToolNames.filter((toolName) => (
+        !humanoidActionNames.has(toolName)
+          || input.runtime.isActionAvailable(toolName as HumanoidActionName, agentId)
+      ))
     );
 
     const persistAgentEvent = async (
@@ -400,8 +409,8 @@ async function executeHumanoidMission(input: {
       }
     };
     const hierarchy = createHumanoidAgentHierarchy({
-      createModel: (agentId, provider) => withModelTelemetry(
-        withModelDecisionProtocolRecovery(createConfiguredModel(provider, {
+      createModel: (agentId, provider) => withModelDecisionProtocolRecovery(
+        withModelTelemetry(createConfiguredModel(provider, {
           promptCacheKey: promptCacheKeyFor(agentId, provider),
           onPromptCacheRequest: (event) => recordPromptCacheRequest(
             input.runtime,
@@ -414,7 +423,16 @@ async function executeHumanoidMission(input: {
             compatibility_retry: event.compatibilityRetry,
             automatic_actuation: false
           }, agentId)
-        }), agentId, decisionProtocolRecovery, (event) => (
+        }),
+        modelTelemetryRuntime,
+        agentId,
+        onModelResponseCompleted,
+        provider.streamEventIdleTimeoutMs
+          ?? DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS,
+        provider.requestTimeoutMs),
+        agentId,
+        decisionProtocolRecovery,
+        (event) => (
           input.runtime.recordProvider({
             status: event.mode === "named"
               ? "tool_choice_named_unsupported"
@@ -423,17 +441,23 @@ async function executeHumanoidMission(input: {
             configured_tool_choice: provider.toolChoice ?? "auto",
             rejected_tool_choice: event.mode,
             ...(event.toolName ? { rejected_tool_name: event.toolName } : {}),
+            ...(event.reason ? { negotiation_outcome: event.reason } : {}),
             continuation: "same_agent_model_and_session",
             thinking_preserved: true,
             automatic_actuation: false
           }, event.agentId)
-        )),
-        modelTelemetryRuntime,
-        agentId,
-        onModelResponseCompleted,
-        provider.streamEventIdleTimeoutMs
-          ?? DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS,
-        provider.requestTimeoutMs
+        ),
+        (event) => input.runtime.recordProvider({
+          status: "native_tool_decision_retry",
+          source: "model_decision_protocol",
+          completed_response_count: event.completedResponseCount,
+          available_tool_names: event.availableToolNames,
+          constraint: event.constraint,
+          same_request_context: true,
+          invalid_response_exposed_to_sdk: false,
+          model_selects_tool_and_arguments: true,
+          automatic_actuation: false
+        }, event.agentId)
       ),
       createSession: sessionForAgent,
       callModelInputFilter: contextManager.filter,

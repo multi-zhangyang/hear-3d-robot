@@ -20,8 +20,6 @@ import type {
 } from "./context-runtime.js";
 import { modelResponseDisposition } from "./sdk-events.js";
 
-const MAX_CONSECUTIVE_NO_DECISION_RESPONSES = 2;
-const MAX_ROOT_CONSECUTIVE_NO_DECISION_RESPONSES = 3;
 const MAX_DECISIONS_WITHOUT_AUTHORITY_CHANGE = 6;
 const MAX_REPEATED_NO_PROGRESS_RECEIPTS = 4;
 const MAX_DECISIONS_WITHOUT_PHYSICAL_PROGRESS = 18;
@@ -45,11 +43,6 @@ export function withModelTelemetry(
   streamEventIdleTimeoutMs?: number,
   requestTimeoutMs?: number
 ): Model {
-  const decisionGuard = new ModelDecisionGuard(
-    boundAgentId === runtime.rootAgentId
-      ? MAX_ROOT_CONSECUTIVE_NO_DECISION_RESPONSES
-      : MAX_CONSECUTIVE_NO_DECISION_RESPONSES
-  );
   const progressGuard = runtime.modelProgressSnapshot
     ? new AuthoritativeModelProgressGuard(runtime.modelProgressSnapshot(boundAgentId))
     : undefined;
@@ -93,8 +86,7 @@ export function withModelTelemetry(
         await runtime.recordModelCallFailed?.(modelCallId, agentId);
       }
       await onModelResponseCompleted?.(agentId, response.usage);
-      const hasDecision = decisionGuard.observe(
-        agentId,
+      const hasDecision = responseHasDecision(
         response.output,
         request.outputType !== "text"
       );
@@ -107,7 +99,6 @@ export function withModelTelemetry(
     getStreamedResponse: (request) => claimAndStream(
       model,
       runtime,
-      decisionGuard,
       observeProgress,
       boundAgentId,
       request,
@@ -155,7 +146,6 @@ async function modelResponseWithIdleTimeout(
 async function* claimAndStream(
   model: Model,
   runtime: ModelTelemetryRuntime,
-  decisionGuard: ModelDecisionGuard,
   observeProgress: ((agentId: string, snapshot: ModelProgressSnapshot) => void) | undefined,
   boundAgentId: string,
   request: Parameters<Model["getStreamedResponse"]>[0],
@@ -211,8 +201,7 @@ async function* claimAndStream(
         }
         clearAgentInvocationTransportInterruption();
         await onModelResponseCompleted?.(agentId, response.usage);
-        const hasDecision = decisionGuard.observe(
-          agentId,
+        const hasDecision = responseHasDecision(
           response.output,
           request.outputType !== "text"
         );
@@ -439,46 +428,11 @@ function assertModelBinding(boundAgentId: string, requestAgentId: string): void 
   }
 }
 
-/**
- * Every HEAR agent contract requires a real tool decision. Compatible endpoints
- * may expose that contract through either required or auto tool choice, and can
- * still return reasoning or prose without a call. This guard counts every such
- * response, never supplies a decision and never swaps models.
- */
-class ModelDecisionGuard {
-  readonly #consecutive = new Map<string, number>();
-
-  constructor(
-    readonly maximumConsecutiveResponses = MAX_CONSECUTIVE_NO_DECISION_RESPONSES
-  ) {
-    if (!Number.isInteger(maximumConsecutiveResponses) || maximumConsecutiveResponses < 1) {
-      throw new Error("Model decision threshold must be a positive integer");
-    }
-  }
-
-  observe(
-    agentId: string,
-    output: ModelResponse["output"],
-    structuredOutputDecision = false
-  ): boolean {
-    const { hasDecision: nativeToolDecision } = modelResponseDisposition(output);
-    const hasDecision = nativeToolDecision || structuredOutputDecision;
-    if (hasDecision) {
-      this.#consecutive.set(agentId, 0);
-      return true;
-    }
-    const consecutive = (this.#consecutive.get(agentId) ?? 0) + 1;
-    this.#consecutive.set(agentId, consecutive);
-    if (consecutive >= this.maximumConsecutiveResponses) {
-      this.#consecutive.set(agentId, 0);
-      throw new ModelDecisionStallError(
-        agentId,
-        `Configured model returned ${consecutive} consecutive responses `
-        + "without the required tool decision"
-      );
-    }
-    return false;
-  }
+function responseHasDecision(
+  output: ModelResponse["output"],
+  structuredOutputDecision: boolean
+): boolean {
+  return structuredOutputDecision || modelResponseDisposition(output).hasDecision;
 }
 
 export type ModelDecisionStallEvidence = {
