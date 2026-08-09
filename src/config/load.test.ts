@@ -87,6 +87,17 @@ describe("provider context budget", () => {
     })).toThrow("AI_TOOL_CHOICE must be auto, required, or none");
   });
 
+  it("rejects disabling formal tool decisions for any autonomous role", () => {
+    expect(() => loadProviderConfig({
+      ...required,
+      AI_TOOL_CHOICE: "none"
+    })).toThrow("cannot run an autonomous Harness");
+    expect(() => loadProviderConfig({
+      ...required,
+      AI_EXECUTOR_TOOL_CHOICE: "none"
+    })).toThrow("cannot run an autonomous Harness");
+  });
+
   it("rejects a trigger that conflicts with an explicitly configured output limit", () => {
     expect(() => loadProviderConfig({
       ...required,

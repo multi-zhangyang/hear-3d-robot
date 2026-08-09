@@ -231,7 +231,7 @@ HEAR_MJLAB_G1_POLICY_DIRECTORY=
 | `openai_responses` | OpenAI Responses API |
 | `anthropic_messages` | Anthropic Messages API |
 
-`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required`、`auto` 和 `none`，默认值为 `auto`。Harness 在业务节点没有产生正式工具结果时，会保留同一个 Agent、模型门面和 Session，在原会话继续恢复；恢复阶段会通过标准协议尝试要求正式工具决策，端点不支持时自动回到原配置，保留模型思考，不替模型选择工具或动作。恢复不使用固定次数终止，而由物理与 Goal 权威状态、上下文压缩生命周期和外部取消划分边界。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时固定取各智能体实际上下文窗口的 `85%`；角色覆盖自己的窗口后也会独立重算，不继承其他模型的低阈值。
+`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required` 和 `auto`，默认值为 `auto`；`none` 会在启动前被拒绝，因为所有业务节点和压缩节点都必须产生正式工具结果。当前阶段只有一个合法工具时，Harness 使用协议原生的命名工具约束；端点明确拒绝该能力时只协商一次并回到配置模式。业务节点没有产生正式工具结果时，会保留同一个 Agent、模型门面和 Session，在原会话继续恢复；多工具阶段的恢复通过标准 `required` 约束要求模型自行选择，端点不支持时自动回到原配置，保留模型思考，不替模型选择工具、参数或动作。恢复不使用固定次数终止，而由物理与 Goal 权威状态、上下文压缩生命周期和外部取消划分边界。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时固定取各智能体实际上下文窗口的 `85%`；角色覆盖自己的窗口后也会独立重算，不继承其他模型的低阈值。
 
 `AI_REQUEST_TIMEOUT_MS` 默认是 `300000`，表示 HTTP 建连或相邻响应数据之间允许的最长静默时间。`AI_STREAM_EVENT_IDLE_TIMEOUT_MS` 默认同为 `300000`，约束相邻 Agents SDK 模型事件之间的静默时间；只有真实模型事件会续期。两者均可按端点能力在 5 秒至 10 分钟之间调整，任务总时限、人工停止和进程恢复仍独立生效。
 

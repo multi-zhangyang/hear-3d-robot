@@ -333,6 +333,7 @@ type HumanoidHierarchyRuntime = HumanoidActionInvoker
   coordinatorPhase(): HumanoidCoordinatorPhase;
   executorDelegationAvailable(): boolean;
   goalRetirementDelegationAvailable(): boolean;
+  goalTransitionCompletionAvailable(): boolean;
   sentryDelegationAvailable?(): boolean;
   validateGoalTransition(): JsonValue;
   validateSatisfiedGoal(): JsonValue;
@@ -733,9 +734,11 @@ function coordinatorToolAvailable(
       && phase === "complete_cycle";
   }
   if (name === "complete_satisfied_goal") return phase === "complete_satisfied_goal";
-  if (name === "complete_goal_transition") return phase === "goal_selection";
+  if (name === "complete_goal_transition") {
+    return runtime.goalTransitionCompletionAvailable();
+  }
   if (name === "delegate_goal_manager") {
-    return phase === "goal_selection"
+    return (phase === "goal_selection" && !runtime.goalTransitionCompletionAvailable())
       || runtime.goalRetirementDelegationAvailable();
   }
   if (name === "delegate_humanoid_sentry") {

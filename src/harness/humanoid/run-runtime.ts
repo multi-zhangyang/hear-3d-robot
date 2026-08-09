@@ -558,11 +558,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   validateGoalTransition(): JsonValue {
     const latest = this.#checkpoint.goal_dag.epochs.at(-1);
-    if (this.#checkpoint.goal_dag.status !== "awaiting_model_selection"
-      || this.#checkpoint.goal_dag.current_epoch_id !== null
-      || !latest
-      || latest.status === "completed"
-      || latest.status === "active") {
+    if (!this.goalTransitionCompletionAvailable() || !latest) {
       throw new Error("No evidence-backed Goal retirement is ready to complete");
     }
     return json({
@@ -796,6 +792,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       predicate.type === "block_removed"
         && this.#checkpoint.checker?.checks[index]?.passed !== true
     )) ?? false;
+  }
+
+  goalTransitionCompletionAvailable(): boolean {
+    const latest = this.#checkpoint.goal_dag.epochs.at(-1);
+    return this.#checkpoint.goal_dag.status === "awaiting_model_selection"
+      && this.#checkpoint.goal_dag.current_epoch_id === null
+      && latest !== undefined
+      && latest.status !== "completed"
+      && latest.status !== "active";
   }
 
   goalRetirementDelegationAvailable(): boolean {

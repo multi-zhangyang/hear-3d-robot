@@ -540,7 +540,9 @@ describe("humanoid mission initialization recovery", () => {
       recovery_sequence: attempt,
       recovery_scope: "authority_state_and_context_lifecycle",
       tool_choice_protocol: "required",
-      invalid_response_retained: true,
+      invalid_response_logged: true,
+      invalid_response_retained_in_session: false,
+      session_branch_rolled_back: true,
       session_history_preserved: true,
       continuation: "same_agent_model_and_session",
       automatic_actuation: false
@@ -550,13 +552,7 @@ describe("humanoid mission initialization recovery", () => {
       manifest.epoch_id,
       HUMANOID_AGENT_IDS.coordinator
     ).getItems()).map((item) => item.content)).toEqual([
-      "durable-prefix",
-      "prose-only-response:1",
-      "prose-only-response:2",
-      "prose-only-response:3",
-      "prose-only-response:4",
-      "prose-only-response:5",
-      "prose-only-response:6"
+      "durable-prefix"
     ]);
   }, 30_000);
 

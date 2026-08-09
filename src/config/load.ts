@@ -85,6 +85,13 @@ function validateProviderBudget(
   config: z.infer<typeof ModelProviderConfigSchema>,
   context: z.RefinementCtx
 ): void {
+  if (config.toolChoice === "none") {
+    context.addIssue({
+      code: "custom",
+      path: ["toolChoice"],
+      message: "AI_TOOL_CHOICE=none cannot run an autonomous Harness that requires formal tool decisions"
+    });
+  }
   const fallbackReserve = defaultOutputTokenReserve(config.contextWindowTokens);
   const exceedsWindow = config.compactTriggerTokens >= config.contextWindowTokens;
   const exceedsConfiguredOutputHeadroom = config.maxOutputTokens !== undefined

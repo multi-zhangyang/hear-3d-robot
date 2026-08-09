@@ -414,15 +414,19 @@ async function executeHumanoidMission(input: {
             compatibility_retry: event.compatibilityRetry,
             automatic_actuation: false
           }, agentId)
-        }), agentId, decisionProtocolRecovery, (unsupportedAgentId) => (
+        }), agentId, decisionProtocolRecovery, (event) => (
           input.runtime.recordProvider({
-            status: "tool_choice_required_unsupported",
+            status: event.mode === "named"
+              ? "tool_choice_named_unsupported"
+              : "tool_choice_required_unsupported",
             source: "protocol_capability_negotiation",
             configured_tool_choice: provider.toolChoice ?? "auto",
+            rejected_tool_choice: event.mode,
+            ...(event.toolName ? { rejected_tool_name: event.toolName } : {}),
             continuation: "same_agent_model_and_session",
             thinking_preserved: true,
             automatic_actuation: false
-          }, unsupportedAgentId)
+          }, event.agentId)
         )),
         modelTelemetryRuntime,
         agentId,
@@ -440,13 +444,22 @@ async function executeHumanoidMission(input: {
         const protocolStrengthened = decisionProtocolRecovery.requireToolDecision(
           event.agentId
         );
+        const decisionBaseline = modelRequestSessionBaseline
+          ?? await captureHumanoidSessionBaseline(sessions);
+        const restoredAgentIds = await restoreHumanoidSessionBaseline(
+          sessions,
+          decisionBaseline
+        );
+        acceptRestoredSessions(restoredAgentIds, decisionBaseline);
         await input.runtime.recordProvider({
           status: "model_decision_follow_up",
           agent_id: event.agentId,
           follow_up_attempt: event.attempt,
           recovery_scope: "delegated_agent_session",
           reason: event.reason,
-          invalid_response_retained: true,
+          invalid_response_logged: true,
+          invalid_response_retained_in_session: false,
+          session_branch_rolled_back: restoredAgentIds.includes(event.agentId),
           session_history_preserved: true,
           prompt_cache_prefix_preserved: true,
           continuation: "same_specialist_model_and_session",
@@ -707,6 +720,12 @@ async function executeHumanoidMission(input: {
               `Physical execution recovery changed transaction identity: ${pendingPhysicalTransactionId}`
             );
           }
+          const decisionBaseline = modelRequestSessionBaseline ?? sessionBaseline;
+          const restoredAgentIds = await restoreHumanoidSessionBaseline(
+            sessions,
+            decisionBaseline
+          );
+          acceptRestoredSessions(restoredAgentIds, decisionBaseline);
           await input.runtime.store.clearAgentState();
           decisionFollowUps.clear();
           decisionProtocolRecovery.clear();
@@ -719,6 +738,7 @@ async function executeHumanoidMission(input: {
             accepted: receipt.accepted,
             code: receipt.code,
             world_revision: receipt.worldAfterRevision,
+            session_branch_rolled_back: restoredAgentIds.length > 0,
             automatic_actuation: false
           }, receipt.agentId);
           await input.runtime.setActiveAgent(input.runtime.rootAgentId);
@@ -752,6 +772,12 @@ async function executeHumanoidMission(input: {
             agentId: decisionStall.agentId,
             state: nextDecisionFollowUp
           };
+          const decisionBaseline = modelRequestSessionBaseline ?? sessionBaseline;
+          const restoredAgentIds = await restoreHumanoidSessionBaseline(
+            sessions,
+            decisionBaseline
+          );
+          acceptRestoredSessions(restoredAgentIds, decisionBaseline);
           await input.runtime.store.clearAgentState();
           await input.runtime.recordProvider({
             status: "model_decision_follow_up",
@@ -762,7 +788,11 @@ async function executeHumanoidMission(input: {
             recovery_scope: "authority_state_and_context_lifecycle",
             recovery_epoch_changed: recoveryEpochChanged,
             reason: decisionStall.message,
-            invalid_response_retained: true,
+            invalid_response_logged: true,
+            invalid_response_retained_in_session: false,
+            session_branch_rolled_back: restoredAgentIds.includes(
+              decisionStall.agentId
+            ),
             session_history_preserved: true,
             prompt_cache_prefix_preserved: true,
             continuation: "same_agent_model_and_session",

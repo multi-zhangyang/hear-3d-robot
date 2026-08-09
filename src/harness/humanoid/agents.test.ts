@@ -209,6 +209,7 @@ describe("humanoid agent hierarchy", () => {
       | "complete_cycle";
     let executorDelegationAvailable = false;
     let goalRetirementDelegationAvailable = false;
+    let goalTransitionCompletionAvailable = false;
     let sentryDelegationAvailable = true;
     const execution = receipt({
       transactionId: "execute-accepted",
@@ -247,6 +248,7 @@ describe("humanoid agent hierarchy", () => {
       coordinatorPhase: () => coordinatorPhase,
       executorDelegationAvailable: () => executorDelegationAvailable,
       goalRetirementDelegationAvailable: () => goalRetirementDelegationAvailable,
+      goalTransitionCompletionAvailable: () => goalTransitionCompletionAvailable,
       sentryDelegationAvailable: () => sentryDelegationAvailable,
       validateGoalTransition: () => ({ status: "superseded" }),
       validateSatisfiedGoal: () => ({
@@ -450,6 +452,12 @@ describe("humanoid agent hierarchy", () => {
     expect(await visibleCoordinatorTools()).toContain("delegate_goal_manager");
     coordinatorPhase = "goal_transition";
     expect(await visibleCoordinatorTools()).toEqual(["delegate_goal_manager"]);
+    coordinatorPhase = "goal_selection";
+    goalRetirementDelegationAvailable = false;
+    expect(await visibleCoordinatorTools()).toEqual(["delegate_goal_manager"]);
+    goalTransitionCompletionAvailable = true;
+    expect(await visibleCoordinatorTools()).toEqual(["complete_goal_transition"]);
+    goalTransitionCompletionAvailable = false;
     coordinatorPhase = "complete_satisfied_goal";
     goalRetirementDelegationAvailable = false;
     expect(await visibleCoordinatorTools()).toEqual(["complete_satisfied_goal"]);

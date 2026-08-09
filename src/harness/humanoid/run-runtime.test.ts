@@ -2246,6 +2246,7 @@ describe("HumanoidRunRuntime", () => {
         goal_progress: null,
         checker: null
       });
+      expect(runtime.goalTransitionCompletionAvailable()).toBe(true);
       expect(runtime.validateGoalTransition()).toMatchObject({
         status: "abandoned",
         reason: retirementInput.reason
