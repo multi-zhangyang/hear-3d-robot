@@ -10,6 +10,9 @@ overrides:
   fast-uri@4.1.1: 4.1.2
   hono@4.12.32: 4.12.34
 
+patchedDependencies:
+  '@openai/agents-core@0.14.3': 90a6eccde802a7a7a6bba8016fd7565759610f75fadad1a501f2447d559d79f3
+
 importers:
 
   .:
@@ -2242,7 +2245,7 @@ snapshots:
       '@tybys/wasm-util': 0.10.3
     optional: true
 
-  '@openai/agents-core@0.14.3(ws@8.21.3)(zod@4.4.3)':
+  '@openai/agents-core@0.14.3(patch_hash=90a6eccde802a7a7a6bba8016fd7565759610f75fadad1a501f2447d559d79f3)(ws@8.21.3)(zod@4.4.3)':
     dependencies:
       debug: 4.4.3
       openai: 6.49.0(ws@8.21.3)(zod@4.4.3)
@@ -2260,7 +2263,7 @@ snapshots:
   '@openai/agents-extensions@0.14.3(@ai-sdk/provider@4.0.6)(@openai/agents@0.14.3(ws@8.21.3)(zod@4.4.3))(ai@7.0.56(zod@4.4.3))(ws@8.21.3)(zod@4.4.3)':
     dependencies:
       '@openai/agents': 0.14.3(ws@8.21.3)(zod@4.4.3)
-      '@openai/agents-core': 0.14.3(ws@8.21.3)(zod@4.4.3)
+      '@openai/agents-core': 0.14.3(patch_hash=90a6eccde802a7a7a6bba8016fd7565759610f75fadad1a501f2447d559d79f3)(ws@8.21.3)(zod@4.4.3)
       '@types/ws': 8.18.1
       debug: 4.4.3
       ws: 8.21.3
@@ -2277,7 +2280,7 @@ snapshots:
 
   '@openai/agents-openai@0.14.3(ws@8.21.3)(zod@4.4.3)':
     dependencies:
-      '@openai/agents-core': 0.14.3(ws@8.21.3)(zod@4.4.3)
+      '@openai/agents-core': 0.14.3(patch_hash=90a6eccde802a7a7a6bba8016fd7565759610f75fadad1a501f2447d559d79f3)(ws@8.21.3)(zod@4.4.3)
       debug: 4.4.3
       openai: 6.49.0(ws@8.21.3)(zod@4.4.3)
       zod: 4.4.3
@@ -2291,7 +2294,7 @@ snapshots:
 
   '@openai/agents-realtime@0.14.3(zod@4.4.3)':
     dependencies:
-      '@openai/agents-core': 0.14.3(ws@8.21.3)(zod@4.4.3)
+      '@openai/agents-core': 0.14.3(patch_hash=90a6eccde802a7a7a6bba8016fd7565759610f75fadad1a501f2447d559d79f3)(ws@8.21.3)(zod@4.4.3)
       '@types/ws': 8.18.1
       debug: 4.4.3
       ws: 8.21.3
@@ -2307,7 +2310,7 @@ snapshots:
 
   '@openai/agents@0.14.3(ws@8.21.3)(zod@4.4.3)':
     dependencies:
-      '@openai/agents-core': 0.14.3(ws@8.21.3)(zod@4.4.3)
+      '@openai/agents-core': 0.14.3(patch_hash=90a6eccde802a7a7a6bba8016fd7565759610f75fadad1a501f2447d559d79f3)(ws@8.21.3)(zod@4.4.3)
       '@openai/agents-openai': 0.14.3(ws@8.21.3)(zod@4.4.3)
       '@openai/agents-realtime': 0.14.3(zod@4.4.3)
       debug: 4.4.3

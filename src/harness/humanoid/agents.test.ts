@@ -2,7 +2,8 @@ import {
   MemorySession,
   RunContext,
   Usage,
-  type Model
+  type Model,
+  type ModelRequest
 } from "@openai/agents";
 import { describe, expect, it } from "vitest";
 import type { ProviderConfig } from "../../config/load.js";
@@ -838,6 +839,202 @@ describe("humanoid agent hierarchy", () => {
     expect(filteredAgents).toEqual(["人形感知哨兵"]);
   });
 
+  it("continues a prose-only Motion result inside its own Session", async () => {
+    let worldRevision = 11;
+    const modelRequests: ModelRequest[] = [];
+    const followUps: Array<{ agentId: string; attempt: number; reason: string }> = [];
+    const invokedActions: string[] = [];
+    const sessions = new Map<string, MemorySession>();
+    let sessionItemsAtFollowUp: unknown[] = [];
+    let motionResponse = 0;
+    const hierarchy = createHumanoidAgentHierarchy({
+      provider,
+      runtime: delegatedMotionRuntime({
+        contextAnchor: () => ({
+          coordinator_phase: "plan",
+          active_cycle: { cycle_id: `cycle-${worldRevision}` },
+          planning_tool_state: { world_revision: worldRevision }
+        }),
+        invoke: async (action, _actionInput, transactionId, agentId) => {
+          invokedActions.push(action);
+          if (action === "observe_humanoid") worldRevision = 12;
+          return receipt({
+            transactionId,
+            agentId,
+            action: action as "observe_humanoid" | "plan_humanoid_skill",
+            code: action === "observe_humanoid"
+              ? "humanoid_observed"
+              : "humanoid_skill_planned"
+          });
+        }
+      }),
+      createModel: (agentId) => agentId === "humanoid-motion-reference"
+        ? {
+            getResponse: async (request) => {
+              modelRequests.push(request);
+              motionResponse += 1;
+              if (motionResponse === 1) return functionCallResponse("observe_humanoid");
+              if (motionResponse === 2) return textResponse("现在提交正式规划。");
+              return functionCallResponse(
+                "plan_humanoid_skill",
+                JSON.stringify({ skill_transaction_id: "skill-binding-12" })
+              );
+            },
+            getStreamedResponse: () => {
+              throw new Error("Streaming is outside this test");
+            }
+          } as Model
+        : modelStub(),
+      createSession: (agentId) => {
+        const session = new MemorySession({ sessionId: agentId });
+        sessions.set(agentId, session);
+        return session;
+      },
+      callModelInputFilter: ({ modelData }) => modelData,
+      onDelegatedDecisionFollowUp: async (event) => {
+        followUps.push(event);
+        sessionItemsAtFollowUp = await sessions.get(event.agentId)?.getItems() ?? [];
+      }
+    });
+    const delegate = hierarchy.coordinator.tools.find(
+      (entry) => entry.name === "delegate_motion_reference"
+    );
+    if (!delegate || delegate.type !== "function") {
+      throw new Error("Motion delegation tool is missing");
+    }
+
+    const output = await delegate.invoke(
+      new RunContext({ runId: "motion-same-session-continuation" }),
+      "{}",
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "delegate-motion-continuation",
+          name: "delegate_motion_reference",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    );
+
+    expect(JSON.parse(String(output))).toMatchObject({
+      agentId: "humanoid-motion-reference",
+      action: "plan_humanoid_skill",
+      accepted: true
+    });
+    expect(invokedActions).toEqual(["observe_humanoid", "plan_humanoid_skill"]);
+    expect(followUps).toEqual([expect.objectContaining({
+      agentId: "humanoid-motion-reference",
+      attempt: 1
+    })]);
+    expect(modelRequests).toHaveLength(3);
+    expect(JSON.stringify(modelRequests[2]?.input)).toContain(
+      "SPECIALIST DECISION RECOVERY V1"
+    );
+    expect(JSON.stringify(modelRequests[2]?.input)).toContain("world_revision\\\":12");
+    expect(JSON.stringify(sessionItemsAtFollowUp)).toContain("现在提交正式规划");
+    expect(hierarchy.session("humanoid-motion-reference")).toBe(
+      sessions.get("humanoid-motion-reference")
+    );
+  });
+
+  it("lets cancellation stop delegated continuation without another model call", async () => {
+    const controller = new AbortController();
+    let modelCalls = 0;
+    let actionCalls = 0;
+    const hierarchy = createHumanoidAgentHierarchy({
+      provider,
+      runtime: delegatedMotionRuntime({
+        invoke: async () => {
+          actionCalls += 1;
+          throw new Error("No action should be synthesized from prose");
+        }
+      }),
+      createModel: (agentId) => agentId === "humanoid-motion-reference"
+        ? {
+            getResponse: async () => {
+              modelCalls += 1;
+              return textResponse("我会规划动作，但这一轮不调用工具。");
+            },
+            getStreamedResponse: () => {
+              throw new Error("Streaming is outside this test");
+            }
+          } as Model
+        : modelStub(),
+      createSession: (agentId) => new MemorySession({ sessionId: agentId }),
+      callModelInputFilter: ({ modelData }) => modelData,
+      onDelegatedDecisionFollowUp: () => controller.abort(
+        new Error("operator paused delegated continuation")
+      )
+    });
+    const delegate = hierarchy.coordinator.tools.find(
+      (entry) => entry.name === "delegate_motion_reference"
+    );
+    if (!delegate || delegate.type !== "function") {
+      throw new Error("Motion delegation tool is missing");
+    }
+
+    await expect(delegate.invoke(
+      new RunContext({ runId: "cancel-motion-continuation" }),
+      "{}",
+      {
+        signal: controller.signal,
+        toolCall: {
+          type: "function_call",
+          callId: "delegate-motion-cancel",
+          name: "delegate_motion_reference",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    )).rejects.toThrow("operator paused delegated continuation");
+    expect(modelCalls).toBe(1);
+    expect(actionCalls).toBe(0);
+  });
+
+  it("does not classify a delegated transport failure as decision recovery", async () => {
+    const followUps: unknown[] = [];
+    const modelError = new TypeError("fetch failed");
+    const hierarchy = createHumanoidAgentHierarchy({
+      provider,
+      runtime: delegatedMotionRuntime(),
+      createModel: (agentId) => agentId === "humanoid-motion-reference"
+        ? {
+            getResponse: async () => { throw modelError; },
+            getStreamedResponse: () => {
+              throw new Error("Streaming is outside this test");
+            }
+          } as Model
+        : modelStub(),
+      createSession: (agentId) => new MemorySession({ sessionId: agentId }),
+      callModelInputFilter: ({ modelData }) => modelData,
+      onDelegatedDecisionFollowUp: (event) => {
+        followUps.push(event);
+      }
+    });
+    const delegate = hierarchy.coordinator.tools.find(
+      (entry) => entry.name === "delegate_motion_reference"
+    );
+    if (!delegate || delegate.type !== "function") {
+      throw new Error("Motion delegation tool is missing");
+    }
+
+    await expect(delegate.invoke(
+      new RunContext({ runId: "motion-transport-failure" }),
+      "{}",
+      {
+        toolCall: {
+          type: "function_call",
+          callId: "delegate-motion-transport",
+          name: "delegate_motion_reference",
+          arguments: "{}",
+          status: "completed"
+        }
+      }
+    )).rejects.toBe(modelError);
+    expect(followUps).toEqual([]);
+  });
+
   it("applies each resolved profile to only its owning Agent", () => {
     const { maxOutputTokens: _maxOutputTokens, ...unboundedProvider } = provider;
     const configured: ProviderConfig = {
@@ -930,6 +1127,65 @@ function functionCallModel(toolName: string, args = "{}"): Model {
       throw new Error("Streaming is outside this test");
     }
   } as unknown as Model;
+}
+
+function functionCallResponse(toolName: string, args = "{}") {
+  return {
+    responseId: `response-${toolName}`,
+    output: [{
+      type: "function_call" as const,
+      callId: `call-${toolName}`,
+      name: toolName,
+      arguments: args
+    }],
+    usage: new Usage({
+      requests: 1,
+      inputTokens: 100,
+      outputTokens: 10,
+      totalTokens: 110
+    })
+  };
+}
+
+function textResponse(text: string) {
+  return {
+    responseId: "response-prose",
+    output: [{
+      type: "message" as const,
+      role: "assistant" as const,
+      status: "completed" as const,
+      content: [{ type: "output_text" as const, text }]
+    }],
+    usage: new Usage({
+      requests: 1,
+      inputTokens: 100,
+      outputTokens: 10,
+      totalTokens: 110
+    })
+  };
+}
+
+function delegatedMotionRuntime(overrides: Record<string, unknown> = {}) {
+  return {
+    contextAnchor: () => ({ world_revision: 1 }),
+    invoke: async () => { throw new Error("Action invocation is outside this test"); },
+    recallEmbodiedHistory: async () => ({ historical_only: true }),
+    validateCycleEvidence: () => { throw new Error("Cycle completion is outside this test"); },
+    cycleCompletionReadiness: () => ({
+      status: "not_ready",
+      evidence_transaction_ids: [],
+      execution_transaction_id: null,
+      observed_after_execution: false,
+      reason: "no execution"
+    }),
+    coordinatorPhase: () => "observe_or_plan",
+    executorDelegationAvailable: () => false,
+    goalRetirementDelegationAvailable: () => false,
+    sentryDelegationAvailable: () => true,
+    validateGoalTransition: () => ({ status: "unchanged" }),
+    validateSatisfiedGoal: () => ({ status: "unsatisfied" }),
+    ...overrides
+  } as never;
 }
 
 function receipt(

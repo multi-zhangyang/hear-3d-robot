@@ -10,3 +10,6 @@ overrides:
 allowBuilds:
   esbuild: true
   protobufjs: false
+
+patchedDependencies:
+  '@openai/agents-core@0.14.3': patches/@openai__agents-core@0.14.3.patch

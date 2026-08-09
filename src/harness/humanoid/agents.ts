@@ -35,6 +35,7 @@ import {
 } from "../agent-scope.js";
 import { createToolInputRecovery } from "../tool-input-recovery.js";
 import { DelegatedDecisionRecovery } from "../delegated-decision-recovery.js";
+import { modelDecisionStallFrom } from "../model-telemetry.js";
 import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.js";
 import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
 import { GOAL_HISTORY_PREDICATE_TYPES } from "./goal-history.js";
@@ -348,6 +349,12 @@ export interface HumanoidAgentHierarchy {
   session(agentId: string): Session | undefined;
 }
 
+export interface DelegatedDecisionFollowUp {
+  agentId: string;
+  attempt: number;
+  reason: string;
+}
+
 export function createHumanoidAgentHierarchy(input: {
   createModel: (agentId: string, provider: ModelProviderConfig) => Model;
   createSession: (agentId: string) => Session;
@@ -355,6 +362,9 @@ export function createHumanoidAgentHierarchy(input: {
   provider: ProviderConfig;
   runtime: HumanoidHierarchyRuntime;
   onAgentStream?: (agentId: string, event: RunStreamEvent) => void | Promise<void>;
+  onDelegatedDecisionFollowUp?: (
+    event: DelegatedDecisionFollowUp
+  ) => void | Promise<void>;
 }): HumanoidAgentHierarchy {
   const models = new Set<Model>();
   const sessions = new Map<string, Session>();
@@ -509,6 +519,8 @@ export function createHumanoidAgentHierarchy(input: {
           goalManager.asTool({
         toolName: goalManagerContract.toolName,
         toolDescription: "让独立目标管理智能体基于当前物理证据提交 2–3 个候选并显式选择下一 Goal，或证据化退役当前不可达 Goal。",
+        customOutputExtractor: ({ finalOutput }) => serializeAgentToolOutput(finalOutput),
+        errorFunction: null,
         parameters: SpecialistDelegationSchema,
         inputBuilder: () => delegatedDecisionRecovery.invocationInput(
           HUMANOID_AGENT_IDS.goalManager,
@@ -537,7 +549,8 @@ export function createHumanoidAgentHierarchy(input: {
             }
           : {})
           }),
-          isFormalGoalManagerResult
+          isFormalGoalManagerResult,
+          input.onDelegatedDecisionFollowUp
         )
       ), SpecialistDelegationSchema),
       recoverAgentToolInput(scopeAgentToolInvocation(
@@ -548,6 +561,8 @@ export function createHumanoidAgentHierarchy(input: {
           sentry.asTool({
         toolName: sentryContract.toolName,
         toolDescription: "让独立感知智能体读取当前 MuJoCo 人形、接触、平衡、物体和导航状态。",
+        customOutputExtractor: ({ finalOutput }) => serializeAgentToolOutput(finalOutput),
+        errorFunction: null,
         parameters: SpecialistDelegationSchema,
         inputBuilder: () => delegatedDecisionRecovery.invocationInput(
           HUMANOID_AGENT_IDS.sentry,
@@ -569,7 +584,8 @@ export function createHumanoidAgentHierarchy(input: {
             output,
             HUMANOID_AGENT_IDS.sentry,
             ["observe_humanoid"]
-          )
+          ),
+          input.onDelegatedDecisionFollowUp
         )
       ), SpecialistDelegationSchema),
       recoverAgentToolInput(scopeAgentToolInvocation(
@@ -580,6 +596,8 @@ export function createHumanoidAgentHierarchy(input: {
           motion.asTool({
         toolName: motionContract.toolName,
         toolDescription: "让独立运动参考智能体读取当前状态，提出多个按偏好排序且分别经过完整物理预演的连续全身动作候选，或规划双足路线。",
+        customOutputExtractor: ({ finalOutput }) => serializeAgentToolOutput(finalOutput),
+        errorFunction: null,
         parameters: SpecialistDelegationSchema,
         inputBuilder: () => delegatedDecisionRecovery.invocationInput(
           HUMANOID_AGENT_IDS.motion,
@@ -603,13 +621,11 @@ export function createHumanoidAgentHierarchy(input: {
             output,
             HUMANOID_AGENT_IDS.motion,
             [
-              "observe_humanoid",
-              "submit_humanoid_skill_plan",
-              "begin_humanoid_skill",
               "plan_humanoid_skill",
               "plan_whole_body_motion_candidates"
             ]
-          )
+          ),
+          input.onDelegatedDecisionFollowUp
         )
       ), SpecialistDelegationSchema),
       recoverAgentToolInput(scopeAgentToolInvocation(
@@ -620,6 +636,8 @@ export function createHumanoidAgentHierarchy(input: {
           executor.asTool({
         toolName: executorContract.toolName,
         toolDescription: "让独立执行智能体消费已接受规划并在 MuJoCo 中真实执行，或用同周期稳定接触回执提交方块拆除事务。",
+        customOutputExtractor: ({ finalOutput }) => serializeAgentToolOutput(finalOutput),
+        errorFunction: null,
         parameters: ExecutionTaskSchema,
         inputBuilder: (details) => delegatedDecisionRecovery.invocationInput(
           HUMANOID_AGENT_IDS.executor,
@@ -645,7 +663,8 @@ export function createHumanoidAgentHierarchy(input: {
               "execute_whole_body_motion",
               "remove_world_block"
             ]
-          )
+          ),
+          input.onDelegatedDecisionFollowUp
         )
       ), ExecutionTaskSchema),
       cycleCompletionTool(input.runtime),
@@ -894,18 +913,39 @@ function requireDelegatedDecision<
   recovery: DelegatedDecisionRecovery,
   agentId: string,
   agentTool: TTool,
-  isFormalDecision: (output: unknown) => boolean
+  isFormalDecision: (output: unknown) => boolean,
+  onFollowUp?: (event: DelegatedDecisionFollowUp) => void | Promise<void>
 ): TTool {
   const invoke = agentTool.invoke;
   agentTool.invoke = async (context, input, details) => {
-    let output: Awaited<ReturnType<typeof invoke>>;
-    try {
-      output = await invoke(context, input, details);
-    } catch (error) {
-      recovery.recordFailure(agentId, error);
-      throw error;
+    for (;;) {
+      details?.signal?.throwIfAborted();
+      let output: Awaited<ReturnType<typeof invoke>>;
+      try {
+        output = await invoke(context, input, details);
+      } catch (error) {
+        const stall = modelDecisionStallFrom(error);
+        if (!stall || stall.agentId !== agentId || stall.evidence) throw error;
+        recovery.recordFailure(agentId, stall);
+        await onFollowUp?.({
+          agentId,
+          attempt: recovery.attempt(agentId),
+          reason: stall.message
+        });
+        continue;
+      }
+      try {
+        return recovery.accept(agentId, output, isFormalDecision);
+      } catch (error) {
+        const stall = modelDecisionStallFrom(error);
+        if (!stall || stall.agentId !== agentId || stall.evidence) throw error;
+        await onFollowUp?.({
+          agentId,
+          attempt: recovery.attempt(agentId),
+          reason: stall.message
+        });
+      }
     }
-    return recovery.accept(agentId, output, isFormalDecision);
   };
   return agentTool;
 }
@@ -942,6 +982,11 @@ function delegatedOutputObject(output: unknown): Record<string, unknown> | undef
   return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
     ? parsed as Record<string, unknown>
     : undefined;
+}
+
+function serializeAgentToolOutput(output: unknown): string {
+  if (typeof output === "string") return output;
+  return output === undefined ? "" : JSON.stringify(output);
 }
 
 function recoverAgentToolInput<

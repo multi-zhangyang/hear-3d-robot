@@ -430,7 +430,30 @@ async function executeHumanoidMission(input: {
       callModelInputFilter: contextManager.filter,
       provider: input.provider,
       runtime: input.runtime,
-      onAgentStream: persistAgentEvent
+      onAgentStream: persistAgentEvent,
+      onDelegatedDecisionFollowUp: async (event) => {
+        const protocolStrengthened = decisionProtocolRecovery.requireToolDecision(
+          event.agentId
+        );
+        await input.runtime.recordProvider({
+          status: "model_decision_follow_up",
+          agent_id: event.agentId,
+          follow_up_attempt: event.attempt,
+          recovery_scope: "delegated_agent_session",
+          reason: event.reason,
+          invalid_response_retained: true,
+          session_history_preserved: true,
+          prompt_cache_prefix_preserved: true,
+          continuation: "same_specialist_model_and_session",
+          tool_choice_protocol: decisionProtocolRecovery.requiresToolDecision(event.agentId)
+            ? "required"
+            : "configured",
+          stalled_agent_protocol_strengthened: protocolStrengthened,
+          context_compaction_count:
+            contextManager.snapshot.scopes[event.agentId]?.compaction_count ?? 0,
+          automatic_actuation: false
+        }, event.agentId);
+      }
     });
     const currentManifest = createHumanoidAgentManifest({
       hierarchy,
