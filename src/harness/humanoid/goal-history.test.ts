@@ -6,6 +6,7 @@ import {
 } from "../../domain/goal-history-archive.js";
 import { createCompletedGoalDAG } from "../../domain/goal-history.test-support.js";
 import type { GoalDAG } from "../../domain/goal-epoch.js";
+import type { Goal } from "../../domain/schema.js";
 import { recallGoalHistory } from "./goal-history.js";
 
 describe("Goal history recall", () => {
@@ -117,6 +118,116 @@ describe("Goal history recall", () => {
       next_before_candidate_sequence: 2
     });
   });
+
+  it("recalls world-space targets across archived and working Goal history", async () => {
+    let dag = createCompletedGoalDAG(15);
+    const records: GoalHistoryArchiveRecord[] = [];
+    while (dag.epochs.length > 12) {
+      const record = createGoalHistoryArchiveRecord(dag);
+      records.push(record);
+      dag = applyGoalHistoryArchiveRecord(dag, record);
+    }
+    const journal = archiveJournal(records);
+
+    const archived = await recallGoalHistory({
+      goalDAG: dag,
+      journal,
+      currentWorldRevision: 51,
+      request: {
+        statuses: ["completed"],
+        predicate_types: ["robot_at"],
+        world_region: {
+          center: { x: 2, y: 999, z: 3 },
+          horizontal_radius_m: 0.1,
+          vertical_radius_m: 0.01
+        },
+        limit: 4
+      }
+    });
+    expect(archived).toMatchObject({
+      total_matches: 1,
+      world_region_query: {
+        center: { x: 2, y: 999, z: 3 },
+        horizontal_radius_m: 0.1,
+        vertical_radius_m: 0.01
+      },
+      candidates: [{
+        sequence: 2,
+        goal: { predicates: [{ type: "robot_at", target: { x: 2, y: 0, z: 3 } }] }
+      }]
+    });
+
+    await expect(recallGoalHistory({
+      goalDAG: dag,
+      journal,
+      currentWorldRevision: 51,
+      request: {
+        world_region: {
+          center: { x: 14, y: 0, z: 15 },
+          horizontal_radius_m: 1.5
+        },
+        limit: 8
+      }
+    })).resolves.toMatchObject({
+      total_matches: 3,
+      candidates: [{ sequence: 15 }, { sequence: 14 }, { sequence: 13 }]
+    });
+  });
+
+  it("applies vertical bounds only to world-space object and end-effector targets", async () => {
+    const dag = goalDAG();
+    replaceGoal(dag, "candidate-1", {
+      summary: "移动物体",
+      predicates: [{
+        type: "object_at",
+        object_id: "crate",
+        target: { x: 4, y: 10, z: 7 },
+        tolerance: 0.2
+      }]
+    });
+    replaceGoal(dag, "candidate-2", {
+      summary: "移动右腕",
+      predicates: [{
+        type: "end_effector_at",
+        end_effector: "right_wrist",
+        frame: "world",
+        target: { x: 4.5, y: 10.2, z: 7 },
+        tolerance: 0.1,
+        stable_frames: 4
+      }]
+    });
+    replaceGoal(dag, "candidate-3", {
+      summary: "移动左腕",
+      predicates: [{
+        type: "end_effector_at",
+        end_effector: "left_wrist",
+        frame: "pelvis",
+        target: { x: 4, y: 10, z: 7 },
+        tolerance: 0.1,
+        stable_frames: 4
+      }]
+    });
+
+    await expect(recallGoalHistory({
+      goalDAG: dag,
+      journal: emptyJournal(),
+      currentWorldRevision: 52,
+      request: {
+        world_region: {
+          center: { x: 4, y: 10, z: 7 },
+          horizontal_radius_m: 1,
+          vertical_radius_m: 0.5
+        },
+        limit: 8
+      }
+    })).resolves.toMatchObject({
+      total_matches: 2,
+      candidates: [
+        { sequence: 2, goal: { predicates: [{ frame: "world" }] } },
+        { sequence: 1, goal: { predicates: [{ type: "object_at" }] } }
+      ]
+    });
+  });
 });
 
 function goalDAG(): GoalDAG {
@@ -168,6 +279,12 @@ function goalDAG(): GoalDAG {
     },
     state_sha256: "state-hash"
   } as unknown as GoalDAG;
+}
+
+function replaceGoal(dag: GoalDAG, candidateId: string, goal: Goal): void {
+  const entry = dag.candidates[candidateId];
+  if (!entry) throw new Error(`Missing Goal candidate: ${candidateId}`);
+  entry.goal = goal;
 }
 
 function emptyJournal() {

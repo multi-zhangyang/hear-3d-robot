@@ -6,7 +6,7 @@ import {
   type GoalDAG,
   type GoalEpoch
 } from "../../domain/goal-epoch.js";
-import type { JsonValue } from "../../domain/schema.js";
+import type { JsonValue, Vec3 } from "../../domain/schema.js";
 import type { JournalPage } from "../../persistence/run-store.js";
 
 export const GOAL_HISTORY_STATUSES = [
@@ -41,7 +41,14 @@ export interface GoalHistoryRecallRequest {
   object_ids?: string[];
   solid_ids?: string[];
   zone_ids?: string[];
+  world_region?: GoalHistoryWorldRegion;
   limit: number;
+}
+
+interface GoalHistoryWorldRegion {
+  center: Vec3;
+  horizontal_radius_m: number;
+  vertical_radius_m?: number;
 }
 
 export interface GoalHistoryJournalReader {
@@ -145,6 +152,7 @@ export async function recallGoalHistory(input: {
     total_candidate_count: input.goalDAG.next_candidate_sequence - 1,
     total_matches: totalMatches,
     returned: selected.length,
+    world_region_query: input.request.world_region ?? null,
     candidates: selected.map(projectHistoryEntry),
     missing_candidate_ids: [...requestedIds].filter((id) => !returnedIds.has(id)),
     next_before_candidate_sequence: requestedIds.size === 0
@@ -172,7 +180,12 @@ function matchesRequest(
   }
   if (!matchesAny(request.object_ids, predicates.flatMap(predicateObjectIds))) return false;
   if (!matchesAny(request.solid_ids, predicates.flatMap(predicateSolidIds))) return false;
-  return matchesAny(request.zone_ids, predicates.flatMap(predicateZoneIds));
+  if (!matchesAny(request.zone_ids, predicates.flatMap(predicateZoneIds))) return false;
+  return request.world_region === undefined
+    || predicates.some((predicate) => predicateMatchesWorldRegion(
+      predicate,
+      request.world_region!
+    ));
 }
 
 function insertLatest(
@@ -248,4 +261,26 @@ function predicateZoneIds(
     return [predicate.zone_id];
   }
   return [];
+}
+
+function predicateMatchesWorldRegion(
+  predicate: GoalCandidate["goal"]["predicates"][number],
+  region: GoalHistoryWorldRegion
+): boolean {
+  if (predicate.type === "robot_at") {
+    return horizontalDistance(predicate.target, region.center)
+      <= region.horizontal_radius_m;
+  }
+  if (predicate.type === "object_at"
+    || (predicate.type === "end_effector_at" && predicate.frame === "world")) {
+    return horizontalDistance(predicate.target, region.center)
+        <= region.horizontal_radius_m
+      && (region.vertical_radius_m === undefined
+        || Math.abs(predicate.target.y - region.center.y) <= region.vertical_radius_m);
+  }
+  return false;
+}
+
+function horizontalDistance(left: Vec3, right: Vec3): number {
+  return Math.hypot(left.x - right.x, left.z - right.z);
 }

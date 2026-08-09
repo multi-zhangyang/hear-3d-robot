@@ -5,7 +5,11 @@ import {
   modelPayloadSha256,
   modelToolArgumentsSha256
 } from "../../domain/model-call-authority.js";
-import { GoalSchema, type JsonValue } from "../../domain/schema.js";
+import {
+  GoalSchema,
+  Vec3Schema,
+  type JsonValue
+} from "../../domain/schema.js";
 import { GOAL_RETIREMENT_STATUSES } from "../../domain/goal-epoch-retirement.js";
 import {
   createToolInputRecovery,
@@ -97,6 +101,13 @@ const RecallGoalHistorySchema = z.object({
     .nullable().optional(),
   zone_ids: z.array(z.string().trim().min(1).max(160)).max(32)
     .nullable().optional(),
+  world_region: z.object({
+    center: Vec3Schema,
+    horizontal_radius_m: z.number().finite().positive().max(1_000_000),
+    vertical_radius_m: z.number().finite().positive().max(1_000_000)
+      .nullable().optional()
+  }).strict().nullable().optional()
+    .describe("按世界空间范围召回 robot_at、object_at 或 world-frame end_effector_at 历史"),
   limit: z.number().int().min(1).max(32)
 }).strict().superRefine((input, context) => {
   for (const field of [
@@ -194,7 +205,7 @@ function goalHistoryTool(
   const inputRecovery = createToolInputRecovery();
   const historyTool = tool<typeof RecallGoalHistorySchema, unknown, string>({
     name,
-    description: "只读召回完整 Goal DAG 中未装入当前工作集的候选与结果。可按 candidate、状态、谓词、对象、方块或区域检索；历史结果不能代替当前物理观察。",
+    description: "只读召回完整 Goal DAG 中未装入当前工作集的候选与结果。可按 candidate、状态、谓词、对象、方块、语义区域或世界空间范围检索；历史结果不能代替当前物理观察。",
     parameters: RecallGoalHistorySchema,
     strict: true,
     timeoutBehavior: "raise_exception",
@@ -211,6 +222,17 @@ function goalHistoryTool(
       ...(input.object_ids?.length ? { object_ids: input.object_ids } : {}),
       ...(input.solid_ids?.length ? { solid_ids: input.solid_ids } : {}),
       ...(input.zone_ids?.length ? { zone_ids: input.zone_ids } : {}),
+      ...(input.world_region
+        ? {
+            world_region: {
+              center: input.world_region.center,
+              horizontal_radius_m: input.world_region.horizontal_radius_m,
+              ...(input.world_region.vertical_radius_m == null
+                ? {}
+                : { vertical_radius_m: input.world_region.vertical_radius_m })
+            }
+          }
+        : {}),
       limit: input.limit
     }))
   });

@@ -600,6 +600,9 @@ describe("humanoid agent hierarchy", () => {
     expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
       "一个 active Goal 可以跨越多次观察、规划、抓取、导航和执行周期"
     ));
+    expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
+      "选择或提交任何包含 robot_at、object_at 或 world-frame end_effector_at 的候选之前"
+    ));
     expect(hierarchy.executor.instructions).toEqual(expect.stringContaining(
       "plan_humanoid_skill 必须调用 execute_humanoid_skill"
     ));
@@ -736,7 +739,15 @@ describe("humanoid agent hierarchy", () => {
     const candidateId = `goal-candidate:${"a".repeat(64)}`;
     const recalledGoal = await goalRecall.invoke(
       new RunContext({ runId: "goal-recall-test" }),
-      JSON.stringify({ candidate_ids: [candidateId], limit: 1 })
+      JSON.stringify({
+        candidate_ids: [candidateId],
+        world_region: {
+          center: { x: 4, y: 0, z: 7 },
+          horizontal_radius_m: 2,
+          vertical_radius_m: null
+        },
+        limit: 1
+      })
     );
     expect(JSON.parse(String(recalledGoal))).toMatchObject({
       historical_only: true,
@@ -744,6 +755,10 @@ describe("humanoid agent hierarchy", () => {
     });
     expect(goalRecallRequests).toEqual([{
       candidate_ids: [candidateId],
+      world_region: {
+        center: { x: 4, y: 0, z: 7 },
+        horizontal_radius_m: 2
+      },
       limit: 1
     }]);
 

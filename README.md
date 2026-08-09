@@ -309,7 +309,7 @@ pnpm hear operator [--host HOST] [--port PORT] [--dev]
 | `framework.jsonl` | Agents SDK 流事件 |
 | `context.jsonl` | 上下文压缩记录 |
 | `goal_evidence.jsonl` | Goal 物理证据 |
-| `goal_history.jsonl` | 已归档的 Goal 候选与 epoch 哈希链 |
+| `goal_history.jsonl` | 已归档的 Goal 候选与 epoch 哈希链；可按状态、实体、语义区域或世界空间范围召回 |
 | `checker.jsonl` | 任务谓词检查结果 |
 
 ## 开发与验证
