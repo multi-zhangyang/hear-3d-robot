@@ -37,6 +37,9 @@ import type { HumanoidSpatialBeliefObservation } from "./spatial-belief-map.js";
 import type {
   HumanoidWholeBodyControllerFactory
 } from "./whole-body-controller.js";
+import type {
+  HumanoidNavigationCollisionEvidence
+} from "./navigation-collision-evidence.js";
 
 export interface HumanoidWorldSnapshot {
   frame: number;
@@ -159,7 +162,9 @@ export interface HumanoidExecutionReceipt {
       accepted: boolean;
       reason: string | null;
       waypoint_count: number;
+      blocking_contacts?: HumanoidNavigationCollisionEvidence[];
     }>;
+    blocking_contacts?: HumanoidNavigationCollisionEvidence[];
     motion?: ReturnType<typeof humanoidMotionArtifactSummary>;
     physical_safety?: HumanoidPhysicalSafetyEvidence;
     revalidation?: {
@@ -214,6 +219,7 @@ export interface NavigationPlanReceipt {
   partialEndpoint?: Vec3;
   previewFrames?: number;
   previewTravelledDistance?: number;
+  blockingContacts?: HumanoidNavigationCollisionEvidence[];
   carry: {
     binding_set_sha256: string;
     bindings: Array<{

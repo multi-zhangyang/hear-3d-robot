@@ -171,6 +171,9 @@ import type {
 } from "./whole-body-controller.js";
 import { humanoidControllerTaskCapabilities } from
   "./controller-task-capabilities.js";
+import type {
+  HumanoidNavigationCollisionEvidence
+} from "./navigation-collision-evidence.js";
 
 export interface WholeBodyMotionPlanningOptions {
   retainTerminalJointTracking?: boolean;
@@ -228,6 +231,7 @@ interface NavigationIntentValidation {
   partialEndpoint?: Vec3;
   previewFrames?: number;
   previewTravelledDistance?: number;
+  blockingContacts?: HumanoidNavigationCollisionEvidence[];
   reason?: string;
 }
 
@@ -1532,7 +1536,10 @@ export class HumanoidWorld {
         ? {
             partialEndpoint: { ...preview.final.rootPosition },
             previewFrames: preview.frames,
-            previewTravelledDistance: preview.travelledDistance
+            previewTravelledDistance: preview.travelledDistance,
+            ...(preview.blockingContacts
+              ? { blockingContacts: structuredClone(preview.blockingContacts) }
+              : {})
           }
         : {}),
       ...(preview.completed
@@ -1646,6 +1653,9 @@ export class HumanoidWorld {
         ...(validation.previewTravelledDistance === undefined
           ? {}
           : { previewTravelledDistance: validation.previewTravelledDistance }),
+        ...(validation.blockingContacts
+          ? { blockingContacts: structuredClone(validation.blockingContacts) }
+          : {}),
         carry: navigationCarryReceipt(context.carriedObjectBindings),
         reason: validation.reason ?? "physical_preview_failed"
       };
@@ -1905,6 +1915,7 @@ export class HumanoidWorld {
       accepted: boolean;
       reason: string | null;
       waypoint_count: number;
+      blocking_contacts?: HumanoidNavigationCollisionEvidence[];
     }> = [];
     let handle: HumanoidAuthorityCommandHandle<HumanoidExecutionReceipt>;
     try {
@@ -2003,7 +2014,14 @@ export class HumanoidWorld {
               world_revision: context.worldRevision,
               accepted: replanned.accepted && replanned.plan !== null,
               reason: replanned.reason ?? null,
-              waypoint_count: replanned.plan?.waypoints.length ?? 0
+              waypoint_count: replanned.plan?.waypoints.length ?? 0,
+              ...(replanned.blockingContacts
+                ? {
+                    blocking_contacts: structuredClone(
+                      replanned.blockingContacts
+                    )
+                  }
+                : {})
             });
             if (replanned.accepted && replanned.plan) {
               validationRevision = context.worldRevision;
@@ -2076,6 +2094,13 @@ export class HumanoidWorld {
             result.frames,
             {
               ...(result.reason ? { reason: result.reason } : {}),
+              ...(result.blockingContacts
+                ? {
+                    blocking_contacts: structuredClone(
+                      result.blockingContacts
+                    )
+                  }
+                : {}),
               travelledDistance: result.travelledDistance,
               online_replans: onlineReplans,
               carry: {

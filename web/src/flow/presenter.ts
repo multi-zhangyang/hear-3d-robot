@@ -3,6 +3,7 @@ import {
   actionLabel,
   agentNameLabel,
   bodyChannelLabel,
+  entityLabel,
   modelOutputLabel,
   nodeResultLabel,
   resultCodeLabel
@@ -269,6 +270,8 @@ function toolFacts(payload: Record<string, unknown> | null): string[] {
   const removal = record(detail?.removal_transaction);
   const chunkRevision = numeric(removal?.projected_chunk_revision);
   if (chunkRevision !== null) facts.push(`区块 R${chunkRevision}`);
+  const collision = collisionFact(detail);
+  if (collision) facts.push(collision);
   return facts;
 }
 
@@ -313,6 +316,8 @@ function actionDetail(action: HumanoidActionReceipt): string {
     if (optionDetail) return optionDetail;
   }
   if (!action.accepted) {
+    const collision = collisionFact(record(action.detail));
+    if (collision) return `${collision}，正在重新规划。`;
     return `动作被拒绝：${resultCodeLabel(action.code)}。`;
   }
   const target = pointText(input?.target);
@@ -351,6 +356,30 @@ function actionDetail(action: HumanoidActionReceipt): string {
     return `使用${action.channels.map(bodyChannelLabel).join("、")}控制通道完成动作。`;
   }
   return resultCodeLabel(action.code);
+}
+
+function collisionFact(detail: Record<string, unknown> | null): string | null {
+  const direct = Array.isArray(detail?.blocking_contacts)
+    ? detail.blocking_contacts
+    : [];
+  const attempts = Array.isArray(detail?.attempts) ? detail.attempts : [];
+  const attemptContacts = attempts.flatMap((attempt) => {
+    const candidate = record(attempt);
+    return Array.isArray(candidate?.blocking_contacts)
+      ? candidate.blocking_contacts
+      : [];
+  });
+  const collision = record([...direct, ...attemptContacts][0]);
+  const surface = record(collision?.surface);
+  const target = record(collision?.target);
+  if (!surface || !target) return null;
+  const surfaceName = stringOf(surface.name);
+  const surfaceLabel = surface.kind === "hand_surface"
+    ? surfaceName?.startsWith("left_") ? "左手" : "右手"
+    : "身体";
+  const targetId = stringOf(target.id);
+  const targetLabel = targetId ? entityLabel(targetId) : "环境";
+  return `${surfaceLabel}接触${targetLabel}`;
 }
 
 function presentedModelOutput(value: unknown): string | null {

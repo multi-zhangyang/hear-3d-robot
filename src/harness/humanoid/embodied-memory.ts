@@ -206,6 +206,9 @@ export function rememberEmbodiedActionExperience(input: {
   }
   const detail = jsonRecord(input.execution.detail);
   const planningAction = detail?.planning_action;
+  const recoveryCollision = jsonRecord(detail?.recovery_collision);
+  const recoveryTargetKind = recoveryCollision?.target_kind;
+  const recoveryTargetId = recoveryCollision?.target_id;
   const outcome = input.execution.accepted
     ? "succeeded" as const
     : input.execution.frameCount > 0
@@ -233,10 +236,18 @@ export function rememberEmbodiedActionExperience(input: {
     goal_content_sha256: goalSha256(input.goal),
     goal_summary: input.goal.summary,
     predicate_types: uniqueSorted(predicates.map((predicate) => predicate.type)),
-    object_ids: uniqueSorted(predicates.flatMap(predicateObjectIds)),
+    object_ids: uniqueSorted([
+      ...predicates.flatMap(predicateObjectIds),
+      ...(recoveryTargetKind === "object" && typeof recoveryTargetId === "string"
+        ? [recoveryTargetId]
+        : [])
+    ]),
     solid_ids: uniqueSorted([
       ...predicates.flatMap(predicateSolidIds),
-      ...(typeof detail?.solid_id === "string" ? [detail.solid_id] : [])
+      ...(typeof detail?.solid_id === "string" ? [detail.solid_id] : []),
+      ...(recoveryTargetKind === "solid" && typeof recoveryTargetId === "string"
+        ? [recoveryTargetId]
+        : [])
     ]),
     zone_ids: uniqueSorted(predicates.flatMap(predicateZoneIds)),
     recorded_at: input.execution.committedAt
@@ -258,6 +269,11 @@ export function rememberEmbodiedActionExperience(input: {
     object_outcome_counts: incrementOutcomeIndex(
       state.object_outcome_counts,
       experience.object_ids,
+      outcome
+    ),
+    solid_outcome_counts: incrementOutcomeIndex(
+      state.solid_outcome_counts,
+      experience.solid_ids,
       outcome
     ),
     zone_outcome_counts: incrementOutcomeIndex(

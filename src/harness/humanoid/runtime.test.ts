@@ -1144,6 +1144,7 @@ describe("HumanoidActionRuntime", () => {
         status: "required",
         blocked_action: "plan_humanoid_skill",
         source_transaction_id: transactionId,
+        skill_transaction_id: "explore-skill",
         observed_world_revision: 42,
         collision_hand_surface: "left_hand_index_1_link",
         required_end_effector: "left_wrist",
@@ -1159,7 +1160,7 @@ describe("HumanoidActionRuntime", () => {
     });
   });
 
-  it("opens only the model-selected whole-body recovery path after a Skill route collision", async () => {
+  it("keeps model choice between alternate navigation and whole-body clearance", async () => {
     const collisionReason =
       "environment_contact:left_hand_index_1_link:stone-column; preview_frames=353";
     const lightweight = lightweightObservationWorld({
@@ -1290,27 +1291,101 @@ describe("HumanoidActionRuntime", () => {
     expect(runtime.isActionAvailable(
       "plan_humanoid_skill",
       "humanoid-motion-reference"
-    )).toBe(false);
+    )).toBe(true);
     expect(runtime.isActionAvailable(
       "plan_whole_body_motion_candidates",
       "humanoid-motion-reference"
     )).toBe(true);
     expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
       planning_actions: expect.arrayContaining([
-        { action: "plan_humanoid_skill", available: false },
+        { action: "plan_humanoid_skill", available: true },
+        { action: "plan_humanoid_navigation", available: true },
         { action: "plan_whole_body_motion_candidates", available: true }
       ]),
       transit_clearance: {
         status: "required",
         blocked_action: "plan_humanoid_skill",
-        required_end_effector: "left_wrist"
+        required_end_effector: "left_wrist",
+        recovery_options: {
+          strategy_selection: "model",
+          alternate_navigation: "available"
+        }
+      }
+    });
+
+    await expect(runtime.invoke(
+      "submit_humanoid_skill_plan",
+      {
+        objective: "continue inspecting the selected frontier",
+        strategies: [{
+          strategy_id: "rebound-frontier-route",
+          rationale: "retain the frontier objective after renewed perception",
+          nodes: [{
+            node_id: "rebound-reach-frontier",
+            invocation,
+            depends_on_node_ids: []
+          }]
+        }],
+        selected_strategy_id: "rebound-frontier-route"
+      },
+      "clearance-rebound-skill-plan",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({ accepted: true });
+    await expect(runtime.invoke(
+      "begin_humanoid_skill",
+      {
+        skill_plan_transaction_id: "clearance-rebound-skill-plan",
+        skill_node_id: "rebound-reach-frontier",
+        invocation,
+        phase: "route_to_frontier"
+      },
+      "clearance-rebound-skill",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({ accepted: true });
+    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+      transit_clearance: {
+        skill_transaction_id: "clearance-rebound-skill"
+      }
+    });
+    const persistedState = runtime.persistenceState() as Record<string, JsonValue>;
+    const persistedRequirements = persistedState
+      .navigation_transit_clearance_requirements as JsonValue[];
+    const persistedRequirement = (
+      persistedRequirements[0] as Record<string, JsonValue>
+    ).requirement as Record<string, JsonValue>;
+    persistedRequirement.skillTransactionId = "clearance-skill";
+    const restoredRuntime = new HumanoidActionRuntime(lightweight.world, {
+      requireSkillBinding: true,
+      state: persistedState
+    });
+    expect(restoredRuntime.planningToolState("humanoid-motion-reference"))
+      .toMatchObject({
+        transit_clearance: {
+          skill_transaction_id: "clearance-rebound-skill"
+        }
+      });
+
+    await expect(runtime.invoke(
+      "plan_humanoid_navigation",
+      {
+        skill_transaction_id: "clearance-rebound-skill",
+        target: { x: 2, y: 0, z: 3 },
+        arrival_heading: null
+      },
+      "clearance-alternate-route",
+      "humanoid-motion-reference"
+    )).resolves.toMatchObject({
+      accepted: false,
+      code: "humanoid_route_rejected",
+      detail: {
+        recovery_kind: "navigation_transit_clearance"
       }
     });
 
     await expect(runtime.invoke(
       "plan_whole_body_motion_candidates",
       {
-        skill_transaction_id: "clearance-skill",
+        skill_transaction_id: "clearance-rebound-skill",
         objective: "move the colliding wrist clear while keeping the base fixed",
         termination: {
           mode: "all",

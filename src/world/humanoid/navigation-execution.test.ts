@@ -152,7 +152,18 @@ describe("humanoid navigation execution progress", () => {
     expect((await blocked.step(blockedSimulation.asHumanoidSimulation())).done).toBe(true);
     expect(blocked.result()).toMatchObject({
       completed: false,
-      reason: "environment_contact:left_hand_index_1_link:crate"
+      reason: "environment_contact:left_hand_index_1_link:crate",
+      blockingContacts: [{
+        surface: {
+          kind: "hand_surface",
+          name: "left_hand_index_1_link"
+        },
+        target: { kind: "object", id: "crate" },
+        contact_point_world: { x: 0, y: 0.8, z: 0 },
+        separation_normal_world: { x: -1, y: 0, z: 0 },
+        separation_normal_robot: { x: -1, y: 0, z: 0 },
+        normal_force_n: 10
+      }]
     });
   });
 
@@ -563,6 +574,7 @@ class NavigationSimulation {
 
   snapshot(): HumanoidSimulationSnapshot {
     return {
+      simulatedTime: 0,
       rootPosition: { ...this.position },
       rootRotation: {
         x: 0,

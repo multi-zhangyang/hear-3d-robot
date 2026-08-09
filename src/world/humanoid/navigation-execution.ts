@@ -52,6 +52,10 @@ import {
 } from "./navigation-arrival.js";
 import { humanoidControllerTaskCapabilities } from
   "./controller-task-capabilities.js";
+import {
+  humanoidNavigationCollisionEvidence,
+  type HumanoidNavigationCollisionEvidence
+} from "./navigation-collision-evidence.js";
 
 const NAVIGATION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.05;
 const NAVIGATION_PRECISION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.01;
@@ -91,6 +95,7 @@ const CARRY_NOSLIP_SOLVER_ITERATIONS = 2;
 export interface HumanoidNavigationExecutionResult {
   completed: boolean;
   reason?: string;
+  blockingContacts?: HumanoidNavigationCollisionEvidence[];
   frames: number;
   reference: HumanoidReference;
   final: HumanoidSimulationSnapshot;
@@ -612,9 +617,13 @@ export class HumanoidNavigationExecution {
         ? this.#stopSettledFrames + 1
         : 0;
     }
+    const blockedContacts = blockedHumanoidContacts(
+      this.#final,
+      this.#contactConstraints
+    );
     const failure = this.#final.fallen
       ? pending.stopping ? "fallen_while_stopping" : "fallen"
-      : blockedHumanoidContacts(this.#final, this.#contactConstraints).length > 0
+      : blockedContacts.length > 0
         ? pending.stopping
           ? `contact_while_stopping:${environmentContact(
               this.#final,
@@ -622,7 +631,18 @@ export class HumanoidNavigationExecution {
             )}`
           : environmentContact(this.#final, this.#contactConstraints)
         : externalFailure;
-    if (failure) this.#finish(false, failure);
+    if (failure) {
+      this.#finish(
+        false,
+        failure,
+        blockedContacts.length > 0
+          ? humanoidNavigationCollisionEvidence(
+              this.#final,
+              this.#contactConstraints
+            )
+          : undefined
+      );
+    }
     if (!this.#result && pending.stopping) {
       if (!this.#resolveSettledStop()
         && this.#stopFrames >= this.#maximumStoppingFrames) {
@@ -749,11 +769,18 @@ export class HumanoidNavigationExecution {
     };
   }
 
-  #finish(completed: boolean, reason?: string): void {
+  #finish(
+    completed: boolean,
+    reason?: string,
+    blockingContacts?: HumanoidNavigationCollisionEvidence[]
+  ): void {
     if (completed) this.#reference = stationaryHumanoidReference(this.#reference);
     this.#result = {
       completed,
       ...(reason ? { reason } : {}),
+      ...(blockingContacts && blockingContacts.length > 0
+        ? { blockingContacts: structuredClone(blockingContacts) }
+        : {}),
       frames: this.#frames,
       reference: this.#reference,
       final: this.#final,
@@ -1072,7 +1099,7 @@ function environmentContact(
   const blocked = blockedHumanoidContacts(snapshot, constraints);
   const base = `environment_contact:${blocked.map((contact) => (
     `${"body" in contact ? contact.body : contact.handSurface}`
-      + `:${contact.objectId ?? "environment"}`
+      + `:${contact.objectId ?? contact.solidId ?? "environment"}`
   )).join(",")}`;
   const environmentBodies = new Set(blocked.flatMap((contact) => (
     "body" in contact && contact.objectId === null ? [contact.body] : []

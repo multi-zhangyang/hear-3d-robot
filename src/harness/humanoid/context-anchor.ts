@@ -126,6 +126,7 @@ export function createHumanoidContextAnchor(input: {
         outcomes: input.checkpoint.embodied_memory.outcome_counts,
         predicate_outcomes: input.checkpoint.embodied_memory.predicate_outcome_counts,
         object_outcomes: input.checkpoint.embodied_memory.object_outcome_counts,
+        solid_outcomes: input.checkpoint.embodied_memory.solid_outcome_counts,
         zone_outcomes: input.checkpoint.embodied_memory.zone_outcome_counts,
         recent: recentEmbodiedExperiences(
           input.checkpoint.embodied_memory

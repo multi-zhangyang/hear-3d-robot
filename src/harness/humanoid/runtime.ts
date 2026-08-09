@@ -32,6 +32,8 @@ import {
   navigationTransitClearanceContext,
   navigationTransitClearanceFromRejection,
   navigationTransitClearanceMotionRejection,
+  NavigationTransitClearanceRequirementSchema,
+  refreshNavigationTransitClearanceRequirement,
   type NavigationTransitClearanceRequirement
 } from "./navigation-transit-clearance.js";
 import {
@@ -101,7 +103,11 @@ const HumanoidActionRuntimeStateSchema = z.object({
   recovery_policies: z.array(z.object({
     agent_id: z.string().trim().min(1),
     policy: HumanoidRecoveryPolicyStateSchema
-  }).strict())
+  }).strict()),
+  navigation_transit_clearance_requirements: z.array(z.object({
+    agent_id: z.string().trim().min(1),
+    requirement: NavigationTransitClearanceRequirementSchema
+  }).strict()).default([])
 }).strict().superRefine((state, context) => {
   const planIds = new Set(state.skill_plans.map(({ transaction_id }) => transaction_id));
   if (planIds.size !== state.skill_plans.length) {
@@ -360,6 +366,9 @@ export class HumanoidActionRuntime {
         }
       }
     }
+    for (const agentId of this.#navigationTransitClearanceRequirementByAgent.keys()) {
+      this.#rebindNavigationTransitClearanceSkill(agentId);
+    }
     this.#pruneTransactionHistory();
   }
 
@@ -383,7 +392,13 @@ export class HumanoidActionRuntime {
         .map(([agentId, policy]) => ({
           agent_id: agentId,
           policy: structuredClone(policy)
-        }))
+        })),
+      navigation_transit_clearance_requirements: [
+        ...this.#navigationTransitClearanceRequirementByAgent
+      ].map(([agentId, requirement]) => ({
+        agent_id: agentId,
+        requirement: structuredClone(requirement)
+      }))
     }));
   }
 
@@ -419,6 +434,19 @@ export class HumanoidActionRuntime {
     for (const { agent_id: agentId, policy } of state.recovery_policies) {
       this.#recoveryPolicyByAgent.set(agentId, structuredClone(policy));
     }
+    for (const { agent_id: agentId, requirement } of (
+      state.navigation_transit_clearance_requirements
+    )) {
+      if (requirement.observedWorldRevision > currentWorldRevision) {
+        throw new Error(
+          "Persisted navigation clearance state is ahead of the authoritative world"
+        );
+      }
+      this.#navigationTransitClearanceRequirementByAgent.set(
+        agentId,
+        structuredClone(requirement)
+      );
+    }
   }
 
   snapshot(): HumanoidWorldSnapshot {
@@ -436,11 +464,6 @@ export class HumanoidActionRuntime {
     const transitClearance = this.#navigationTransitClearanceRequirementByAgent.has(
       normalizedAgentId
     );
-    if (transitClearance
-      && (name === "plan_humanoid_navigation"
-        || name === "plan_humanoid_skill")) {
-      return false;
-    }
     const observedRevision = this.#observationRevisionByAgent.get(
       normalizedAgentId
     );
@@ -489,11 +512,15 @@ export class HumanoidActionRuntime {
     }
     if (this.#requireSkillBinding) {
       const skill = this.#activeSkillByAgent.get(normalizedAgentId);
-      if (!skill
-        || skill.observed_world_revision < this.#latestPhysicalExecutionRevision
-        || (skill.planning_action !== name
-          && !(transitClearance
-            && name === "plan_whole_body_motion_candidates"))) return false;
+      const clearanceRecoveryAction = transitClearance
+        && (name === "plan_whole_body_motion_candidates"
+          || name === "plan_humanoid_navigation");
+      if (!skill && !clearanceRecoveryAction) return false;
+      if (skill
+        && (skill.observed_world_revision < this.#latestPhysicalExecutionRevision
+          || (skill.planning_action !== name && !clearanceRecoveryAction))) {
+        return false;
+      }
     }
     if (latestFailure?.action === name
       && latestFailure.physicalExecutionRevision
@@ -823,20 +850,42 @@ export class HumanoidActionRuntime {
     }
     if (receipt.agentId !== motionAgentId || receipt.accepted) return;
     const detail = jsonObject(receipt.detail);
-    const reasons = receipt.action === "plan_humanoid_navigation"
-      ? [detail?.reason]
+    const failures = receipt.action === "plan_humanoid_navigation"
+      ? [{
+          reason: detail?.reason,
+          blockingContacts: detail?.blocking_contacts
+        }]
       : receipt.action === "plan_humanoid_skill"
         && detail?.autonomous_plan_kind === "navigation"
         && Array.isArray(detail.attempts)
-        ? detail.attempts.map((attempt) => jsonObject(attempt)?.reason)
+        ? detail.attempts.map((attempt) => {
+            const failure = jsonObject(attempt);
+            return {
+              reason: failure?.reason,
+              blockingContacts: failure?.blocking_contacts
+            };
+          })
         : [];
-    for (const reason of reasons) {
+    if (failures.length === 0) return;
+    const worldWithObservation = this.#world as HumanoidWorld & {
+      observe?: () => HumanoidWorldObservation;
+    };
+    const solidTokens = typeof worldWithObservation.observe === "function"
+      ? worldWithObservation.observe().solidTokens
+      : [];
+    for (const failure of failures) {
       const requirement = navigationTransitClearanceFromRejection({
-        reason,
+        reason: failure.reason,
+        blockingContacts: failure.blockingContacts,
         transactionId: receipt.transactionId,
         blockedAction: receipt.action as "plan_humanoid_navigation" | "plan_humanoid_skill",
         worldRevision: receipt.worldAfterRevision,
-        snapshot: this.#world.snapshot()
+        snapshot: this.#world.snapshot(),
+        solidTokens,
+        skillTransactionId: navigationFailureSkillTransactionId(
+          receipt,
+          this.#activeSkillByAgent.get(motionAgentId)
+        )
       });
       if (requirement) {
         this.#navigationTransitClearanceRequirementByAgent.set(
@@ -1019,32 +1068,34 @@ export class HumanoidActionRuntime {
           }
         };
       }
-      const transitClearanceRecovery = name === "plan_whole_body_motion_candidates"
+      const transitClearanceRecovery = (
+        name === "plan_whole_body_motion_candidates"
+          || name === "plan_humanoid_navigation"
+      )
         && this.#navigationTransitClearanceRequirementByAgent.has(
           invocation.agentId
         );
       if (this.#requireSkillBinding && name !== "plan_whole_body_motion") {
-        const renewed = this.#renewPlanningSkillAuthority(invocation.agentId);
-        if (!renewed.accepted) {
-          return {
-            accepted: false,
-            code: renewed.code,
-            channels: [],
-            detail: renewed.detail
-          };
-        }
         const skillReference = transitClearanceRecovery
           ? transitClearanceSkillReference(
-              renewed.binding,
-              rawInput,
-              this.#world.snapshot().worldRevision
+              this.#navigationTransitClearanceRequirementByAgent.get(
+                invocation.agentId
+              )!,
+              this.#activeSkillByAgent.get(invocation.agentId),
+              name,
+              rawInput
             )
-          : validateSkillPlanningReference({
-              binding: renewed.binding,
-              action: name,
-              rawInput,
-              currentWorldRevision: this.#world.snapshot().worldRevision
-            });
+          : (() => {
+              const renewed = this.#renewPlanningSkillAuthority(invocation.agentId);
+              return renewed.accepted
+                ? validateSkillPlanningReference({
+                    binding: renewed.binding,
+                    action: name,
+                    rawInput,
+                    currentWorldRevision: this.#world.snapshot().worldRevision
+                  })
+                : renewed;
+            })();
         if (!skillReference.accepted) {
           return {
             accepted: false,
@@ -1104,7 +1155,22 @@ export class HumanoidActionRuntime {
         observation.worldRevision
       );
       this.#observationByAgent.set(invocation.agentId, observation);
-      this.#activeSkillByAgent.delete(invocation.agentId);
+      const clearance = this.#navigationTransitClearanceRequirementByAgent.get(
+        invocation.agentId
+      );
+      if (clearance) {
+        this.#navigationTransitClearanceRequirementByAgent.set(
+          invocation.agentId,
+          refreshNavigationTransitClearanceRequirement({
+            requirement: clearance,
+            worldRevision: observation.worldRevision,
+            snapshot: this.#world.snapshot(),
+            solidTokens: observation.solidTokens
+          })
+        );
+      } else {
+        this.#activeSkillByAgent.delete(invocation.agentId);
+      }
       const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
       if (recovery && recovery.world_revision !== observation.worldRevision) {
         this.#recoveryPolicyByAgent.delete(invocation.agentId);
@@ -1248,6 +1314,7 @@ export class HumanoidActionRuntime {
         };
       }
       this.#activeSkillByAgent.set(invocation.agentId, result.binding);
+      this.#rebindNavigationTransitClearanceSkill(invocation.agentId);
       return {
         accepted: true,
         code: "humanoid_skill_bound",
@@ -1261,20 +1328,6 @@ export class HumanoidActionRuntime {
     }
     if (name === "plan_humanoid_skill") {
       HumanoidActionInputs.plan_humanoid_skill.parse(rawInput);
-      const transitClearance = this.#navigationTransitClearanceRequirementByAgent.get(
-        invocation.agentId
-      );
-      if (transitClearance) {
-        return {
-          accepted: false,
-          code: "navigation_transit_clearance_required",
-          channels: [],
-          detail: {
-            ...navigationTransitClearanceContext(transitClearance) as Record<string, JsonValue>,
-            recovery: "Submit a short model-selected fixed-base whole-body candidate that moves the collision-side wrist, execute it, and observe before replanning the Skill."
-          }
-        };
-      }
       const binding = this.#activeSkillByAgent.get(invocation.agentId);
       const observation = this.#observationByAgent.get(invocation.agentId);
       if (!binding || !observation) {
@@ -1356,6 +1409,9 @@ export class HumanoidActionRuntime {
         score: number;
         accepted: boolean;
         reason: string | null;
+        blocking_contacts?: NonNullable<
+          Awaited<ReturnType<HumanoidWorld["planNavigation"]>>["blockingContacts"]
+        >;
       }> = [];
       let selected: Awaited<ReturnType<HumanoidWorld["planNavigation"]>> | null = null;
       for (const candidate of plan.targets.slice(0, 8)) {
@@ -1370,7 +1426,12 @@ export class HumanoidActionRuntime {
             candidate.acceptedPositionToleranceMeters ?? null,
           score: candidate.score,
           accepted: result.accepted,
-          reason: result.reason ?? null
+          reason: result.reason ?? null,
+          ...(result.blockingContacts
+            ? {
+                blocking_contacts: structuredClone(result.blockingContacts)
+              }
+            : {})
         });
         if (result.accepted) {
           selected = result;
@@ -1605,7 +1666,7 @@ export class HumanoidActionRuntime {
         detail: {
           ...this.#planningSkillDetail(invocation.agentId),
           ...(transitClearance
-            ? { recovery_kind: "navigation_transit_clearance" }
+            ? navigationClearanceRecoveryDetail(transitClearance)
             : {}),
           plan_id: result.planId,
           objective: batch.objective,
@@ -1697,6 +1758,7 @@ export class HumanoidActionRuntime {
           planning_transaction_id: input.planning_transaction_id,
           planning_action: reference.planningAction,
           ...reference.candidateSelection,
+          ...reference.recovery,
           plan_id: reference.planId,
           frames: result.frames,
           ...(result.terminalResultSha256
@@ -1712,17 +1774,6 @@ export class HumanoidActionRuntime {
       const transitClearance = this.#navigationTransitClearanceRequirementByAgent.get(
         invocation.agentId
       );
-      if (transitClearance) {
-        return {
-          accepted: false,
-          code: "navigation_transit_clearance_required",
-          channels: [],
-          detail: {
-            ...navigationTransitClearanceContext(transitClearance) as Record<string, JsonValue>,
-            recovery: "Plan, execute, and observe a model-selected collision-side arm-clearance posture before requesting another navigation preview."
-          }
-        };
-      }
       const placementRequirement = this.#manipulationBasePlacementRequirementByAgent.get(
         invocation.agentId
       );
@@ -1741,6 +1792,9 @@ export class HumanoidActionRuntime {
         channels: ["locomotion"],
         detail: {
           ...this.#planningSkillDetail(invocation.agentId),
+          ...(transitClearance
+            ? navigationClearanceRecoveryDetail(transitClearance)
+            : {}),
           plan_id: result.planId,
           created_revision: result.createdRevision,
           expires_revision: result.expiresRevision,
@@ -1755,6 +1809,7 @@ export class HumanoidActionRuntime {
           partial_endpoint: result.partialEndpoint ?? null,
           preview_frames: result.previewFrames ?? null,
           preview_travelled_m: result.previewTravelledDistance ?? null,
+          blocking_contacts: result.blockingContacts ?? [],
           carry: result.carry,
           ...(!result.accepted && placementRequirement
             ? {
@@ -1860,6 +1915,7 @@ export class HumanoidActionRuntime {
       detail: {
         planning_transaction_id: input.planning_transaction_id,
         planning_action: reference.planningAction,
+        ...reference.recovery,
         plan_id: reference.planId,
         frames: result.frames,
         ...(result.terminalResultSha256
@@ -1882,6 +1938,10 @@ export class HumanoidActionRuntime {
       candidate_count: number;
       selected_rank: number;
       selected_candidate_id: string;
+    } | undefined;
+    recovery: {
+      recovery_kind: "navigation_transit_clearance";
+      recovery_collision: JsonValue;
     } | undefined;
   } | {
     accepted: false;
@@ -1953,12 +2013,36 @@ export class HumanoidActionRuntime {
           selected_candidate_id: selectedCandidateId
         }
       : undefined;
+    const recoveryCollision = detail?.recovery_collision;
+    const recovery = detail?.recovery_kind === "navigation_transit_clearance"
+      && recoveryCollision !== undefined
+      ? {
+          recovery_kind: "navigation_transit_clearance" as const,
+          recovery_collision: jsonValue(recoveryCollision)
+        }
+      : undefined;
     return {
       accepted: true,
       planId,
       planningAction: receipt.action as HumanoidPlanningActionName,
-      candidateSelection
+      candidateSelection,
+      recovery
     };
+  }
+
+  #rebindNavigationTransitClearanceSkill(agentId: string): void {
+    const requirement = this.#navigationTransitClearanceRequirementByAgent.get(
+      agentId
+    );
+    const activeSkill = this.#activeSkillByAgent.get(agentId);
+    if (!requirement || !activeSkill
+      || requirement.skillTransactionId === activeSkill.transaction_id) {
+      return;
+    }
+    this.#navigationTransitClearanceRequirementByAgent.set(agentId, {
+      ...requirement,
+      skillTransactionId: activeSkill.transaction_id
+    });
   }
 }
 
@@ -1970,9 +2054,10 @@ function isPlanningAction(action: HumanoidActionName): action is HumanoidPlannin
 }
 
 function transitClearanceSkillReference(
-  binding: ActiveHumanoidSkillBinding,
-  rawInput: unknown,
-  currentWorldRevision: number
+  requirement: NavigationTransitClearanceRequirement,
+  activeSkill: ActiveHumanoidSkillBinding | undefined,
+  action: "plan_whole_body_motion_candidates" | "plan_humanoid_navigation",
+  rawInput: unknown
 ): { accepted: true } | { accepted: false; code: string; detail: JsonValue } {
   const suppliedValue = rawInput !== null
     && typeof rawInput === "object"
@@ -1980,33 +2065,59 @@ function transitClearanceSkillReference(
     ? (rawInput as Record<string, unknown>).skill_transaction_id
     : undefined;
   const supplied = typeof suppliedValue === "string" ? suppliedValue : null;
-  if (supplied !== binding.transaction_id) {
+  const authoritativeSkillTransactionId = activeSkill?.transaction_id
+    ?? requirement.skillTransactionId;
+  if (authoritativeSkillTransactionId === null
+    || supplied !== authoritativeSkillTransactionId) {
     return {
       accepted: false,
       code: "skill_reference_mismatch",
       detail: jsonValue({
-        action: "plan_whole_body_motion_candidates",
+        action,
         supplied_skill_transaction_id: supplied ?? null,
-        active_skill_transaction_id: binding.transaction_id,
+        active_skill_transaction_id: authoritativeSkillTransactionId,
         automatic_actuation: false
       })
     };
   }
-  if (binding.observed_world_revision !== currentWorldRevision) {
-    return {
-      accepted: false,
-      code: "skill_world_revision_stale",
-      detail: jsonValue({
-        action: "plan_whole_body_motion_candidates",
-        skill: binding.invocation.skill,
-        skill_world_revision: binding.observed_world_revision,
-        current_world_revision: currentWorldRevision,
-        automatic_actuation: false,
-        recovery: "Observe the changed world before planning another transit-clearance posture"
-      })
-    };
-  }
   return { accepted: true };
+}
+
+function navigationFailureSkillTransactionId(
+  receipt: HumanoidActionReceipt,
+  activeSkill: ActiveHumanoidSkillBinding | undefined
+): string | null {
+  const detail = jsonObject(receipt.detail);
+  const binding = detail?.skill_binding === undefined
+    ? undefined
+    : jsonObject(detail.skill_binding);
+  const input = jsonObject(receipt.input);
+  const candidate = binding?.transaction_id
+    ?? input?.skill_transaction_id
+    ?? activeSkill?.transaction_id;
+  return typeof candidate === "string" && candidate.trim()
+    ? candidate
+    : null;
+}
+
+function navigationClearanceRecoveryDetail(
+  requirement: NavigationTransitClearanceRequirement
+): {
+  recovery_kind: "navigation_transit_clearance";
+  recovery_collision: JsonValue;
+} {
+  return {
+    recovery_kind: "navigation_transit_clearance",
+    recovery_collision: jsonValue({
+      hand_surface: requirement.handSurface,
+      target_kind: requirement.collisionTargetKind,
+      target_id: requirement.collisionTargetKind === "environment"
+        ? null
+        : requirement.collisionTargetId,
+      contact_point_world: requirement.contactPointWorld,
+      separation_normal_world: requirement.separationNormalWorld
+    })
+  };
 }
 
 function humanoidSkillObservationCompatible(

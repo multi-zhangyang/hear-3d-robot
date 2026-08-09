@@ -434,6 +434,10 @@ const HumanoidEmbodiedMemoryStateV2Schema = z.object({
     z.string().trim().min(1),
     HumanoidExperienceOutcomeCountsSchema
   ),
+  solid_outcome_counts: z.record(
+    z.string().trim().min(1),
+    HumanoidExperienceOutcomeCountsSchema
+  ).default({}),
   zone_outcome_counts: z.record(
     z.string().trim().min(1),
     HumanoidExperienceOutcomeCountsSchema
@@ -466,6 +470,7 @@ export const HumanoidEmbodiedMemoryStateSchema = z.union([
   outcome_counts: emptyExperienceOutcomeCounts(),
   predicate_outcome_counts: {},
   object_outcome_counts: {},
+  solid_outcome_counts: {},
   zone_outcome_counts: {}
 }));
 
@@ -488,6 +493,7 @@ export const EmptyHumanoidEmbodiedMemoryState: HumanoidEmbodiedMemoryState = {
   outcome_counts: emptyExperienceOutcomeCounts(),
   predicate_outcome_counts: {},
   object_outcome_counts: {},
+  solid_outcome_counts: {},
   zone_outcome_counts: {}
 };
 

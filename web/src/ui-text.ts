@@ -79,6 +79,7 @@ const RESULT_CODES: Record<string, string> = {
   humanoid_skill_bound: "技能阶段已绑定",
   autonomous_skill_route_validated: "技能路线已通过物理预演",
   autonomous_skill_route_rejected: "技能路线未通过物理预演",
+  navigation_transit_clearance_required: "正在规划碰撞净空动作",
   fresh_skill_observation_required: "技能规划需要最新感知",
   plan_revalidation_failed: "执行前物理复验未通过",
   skill_plan_node_unknown: "技能计划中不存在该节点",

@@ -2,6 +2,39 @@ import { describe, expect, it } from "vitest";
 import { presentAction, presentEmbodiedEpisode, presentFramework } from "./presenter";
 
 describe("agent timeline presenter", () => {
+  it("presents structured navigation collisions without exposing raw protocol text", () => {
+    const presented = presentAction({
+      transactionId: "collision-plan",
+      agentId: "humanoid-motion-reference",
+      action: "plan_humanoid_navigation",
+      input: { target: { x: 4, y: 0, z: 5 } },
+      fingerprint: "collision-plan-fingerprint",
+      accepted: false,
+      code: "humanoid_route_rejected",
+      worldBeforeRevision: 42,
+      worldAfterRevision: 42,
+      frameCount: 0,
+      channels: ["locomotion"],
+      detail: {
+        blocking_contacts: [{
+          surface: {
+            kind: "hand_surface",
+            name: "right_hand_index_1_link"
+          },
+          target: { kind: "solid", id: "stone_column" },
+          contact_point_world: { x: 1, y: 0.8, z: 1 },
+          separation_normal_world: { x: -1, y: 0, z: 0 },
+          separation_normal_robot: { x: 0, y: 0, z: -1 },
+          normal_force_n: 12,
+          simulated_time: 3
+        }]
+      },
+      committedAt: "2026-08-09T00:00:00.000Z"
+    });
+
+    expect(presented.detail).toBe("右手接触石柱，正在重新规划。");
+    expect(presented.detail).not.toContain("right_hand_index_1_link");
+  });
   it("presents the semantic Skill pipeline without unknown-action placeholders", () => {
     const planned = presentAction({
       transactionId: "skill-route",

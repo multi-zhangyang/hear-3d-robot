@@ -10,18 +10,24 @@ import {
 
 const requirement: NavigationTransitClearanceRequirement = {
   sourceTransactionId: "nav-rejected",
+  skillTransactionId: null,
   blockedAction: "plan_humanoid_navigation",
   observedWorldRevision: 42,
   handSurface: "right_hand_index_1_link",
   hand: "right",
   endEffector: "right_wrist",
   collisionTargetId: "workpiece",
+  collisionTargetKind: "object",
   currentWristWorld: { x: 1, y: 0.8, z: 1 },
   currentFeetWorld: {
     left: { x: 0.9, y: 0.05, z: 1 },
     right: { x: 1.1, y: 0.05, z: 1 }
   },
-  collisionTargetWorld: { x: 1.2, y: 0.7, z: 1.3 }
+  collisionTargetWorld: { x: 1.2, y: 0.7, z: 1.3 },
+  contactPointWorld: null,
+  separationNormalWorld: null,
+  separationNormalRobot: null,
+  normalForceN: null
 };
 
 function plan(overrides: Partial<HumanoidMotionPlan> = {}): HumanoidMotionPlan {
@@ -170,6 +176,64 @@ describe("navigation transit clearance", () => {
           "collision_target_contact_authorized"
         ]
       }]
+    });
+  });
+
+  it("uses structured MuJoCo solid geometry before legacy reason parsing", () => {
+    const snapshot = {
+      robot: {
+        links: {
+          right_wrist_yaw_link: {
+            position: { x: 1, y: 0.8, z: 1 },
+            rotation: { x: 0, y: 0, z: 0, w: 1 }
+          },
+          left_ankle_roll_link: {
+            position: { x: 0.9, y: 0.05, z: 1 },
+            rotation: { x: 0, y: 0, z: 0, w: 1 }
+          },
+          right_ankle_roll_link: {
+            position: { x: 1.1, y: 0.05, z: 1 },
+            rotation: { x: 0, y: 0, z: 0, w: 1 }
+          }
+        },
+        objects: {}
+      }
+    } as unknown as HumanoidWorldSnapshot;
+    const result = navigationTransitClearanceFromRejection({
+      reason: "environment_contact:right_hand_index_1_link:environment",
+      blockingContacts: [{
+        surface: {
+          kind: "hand_surface",
+          name: "right_hand_index_1_link"
+        },
+        target: { kind: "solid", id: "stone_column" },
+        contact_point_world: { x: 1.12, y: 0.79, z: 1.18 },
+        separation_normal_world: { x: -1, y: 0, z: 0 },
+        separation_normal_robot: { x: 0, y: 0, z: -1 },
+        normal_force_n: 18.5,
+        simulated_time: 4.2
+      }],
+      solidTokens: [{
+        id: "stone_column",
+        sourceId: "stone_column",
+        kind: "fixed_object",
+        center: { x: 1.3, y: 0.8, z: 1.2 },
+        size: { x: 0.5, y: 1.6, z: 0.5 },
+        currentContacts: []
+      }],
+      transactionId: "structured-collision",
+      worldRevision: 43,
+      snapshot
+    });
+
+    expect(result).toMatchObject({
+      collisionTargetId: "stone_column",
+      collisionTargetKind: "solid",
+      collisionTargetWorld: { x: 1.3, y: 0.8, z: 1.2 },
+      contactPointWorld: { x: 1.12, y: 0.79, z: 1.18 },
+      separationNormalWorld: { x: -1, y: 0, z: 0 },
+      separationNormalRobot: { x: 0, y: 0, z: -1 },
+      normalForceN: 18.5
     });
   });
 

@@ -343,6 +343,7 @@ export function embodiedMemoryFrom(value: unknown): HumanoidEmbodiedMemoryState 
       outcome_counts: emptyExperienceOutcomeCounts(),
       predicate_outcome_counts: {},
       object_outcome_counts: {},
+      solid_outcome_counts: {},
       zone_outcome_counts: {}
     };
   }
@@ -352,6 +353,8 @@ export function embodiedMemoryFrom(value: unknown): HumanoidEmbodiedMemoryState 
     || !experienceOutcomeCounts(record.outcome_counts)
     || !experienceOutcomeIndex(record.predicate_outcome_counts)
     || !experienceOutcomeIndex(record.object_outcome_counts)
+    || (record.solid_outcome_counts !== undefined
+      && !experienceOutcomeIndex(record.solid_outcome_counts))
     || !experienceOutcomeIndex(record.zone_outcome_counts)) return null;
   const outcomeCounts = record.outcome_counts;
   if (outcomeCounts.succeeded + outcomeCounts.rejected
@@ -374,7 +377,10 @@ export function embodiedMemoryFrom(value: unknown): HumanoidEmbodiedMemoryState 
       || !Array.isArray(candidate.zone_ids)
       || typeof candidate.recorded_at !== "string") return null;
   }
-  return structuredClone(record) as unknown as HumanoidEmbodiedMemoryState;
+  return structuredClone({
+    ...record,
+    solid_outcome_counts: record.solid_outcome_counts ?? {}
+  }) as unknown as HumanoidEmbodiedMemoryState;
 }
 
 function emptyExperienceOutcomeCounts() {

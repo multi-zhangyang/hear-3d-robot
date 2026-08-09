@@ -544,6 +544,7 @@ export interface HumanoidEmbodiedMemoryState {
   outcome_counts: HumanoidExperienceOutcomeCounts;
   predicate_outcome_counts: Record<string, HumanoidExperienceOutcomeCounts>;
   object_outcome_counts: Record<string, HumanoidExperienceOutcomeCounts>;
+  solid_outcome_counts: Record<string, HumanoidExperienceOutcomeCounts>;
   zone_outcome_counts: Record<string, HumanoidExperienceOutcomeCounts>;
 }
 

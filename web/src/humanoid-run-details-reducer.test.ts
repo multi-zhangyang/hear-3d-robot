@@ -236,6 +236,7 @@ describe("reduceHumanoidRunDetails", () => {
         robot_at: { succeeded: 1, rejected: 0, physically_failed: 0 }
       },
       object_outcome_counts: {},
+      solid_outcome_counts: {},
       zone_outcome_counts: {}
     };
     const next = reduce(details(), event("embodied_episode_recorded", { embodied_memory }));
@@ -331,6 +332,7 @@ function details(): HumanoidRunDetails {
         outcome_counts: { succeeded: 0, rejected: 0, physically_failed: 0 },
         predicate_outcome_counts: {},
         object_outcome_counts: {},
+        solid_outcome_counts: {},
         zone_outcome_counts: {}
       },
       total_model_calls: 0,

@@ -1,29 +1,52 @@
-import type { HumanoidEndEffector, JsonValue, Vec3 } from "../../domain/schema.js";
+import { z } from "zod";
+import {
+  Vec3Schema,
+  type JsonValue,
+  type Vec3
+} from "../../domain/schema.js";
 import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.js";
 import type { HumanoidMotionPlan } from "../../world/humanoid/motion-plan.js";
 import type { HumanoidMotionOptionContract } from "../../world/humanoid/motion-option.js";
+import {
+  HumanoidNavigationCollisionEvidenceSchema,
+  type HumanoidNavigationCollisionEvidence
+} from "../../world/humanoid/navigation-collision-evidence.js";
 import {
   G1_HAND_CONTACT_SURFACE_NAMES,
   g1HandContactSurfaceHand,
   type G1HandContactSurfaceName
 } from "../../world/humanoid/morphology.js";
 import type { HumanoidWorldSnapshot } from "../../world/humanoid/world.js";
+import type { HumanoidSolidToken } from "../../world/humanoid/solid-observation.js";
 
-export interface NavigationTransitClearanceRequirement {
-  sourceTransactionId: string;
-  blockedAction: "plan_humanoid_navigation" | "plan_humanoid_skill";
-  observedWorldRevision: number;
-  handSurface: G1HandContactSurfaceName;
-  hand: "left" | "right";
-  endEffector: Extract<HumanoidEndEffector, "left_wrist" | "right_wrist">;
-  collisionTargetId: string;
-  currentWristWorld: Vec3;
-  currentFeetWorld: {
-    left: Vec3;
-    right: Vec3;
-  };
-  collisionTargetWorld: Vec3 | null;
-}
+export const NavigationTransitClearanceRequirementSchema = z.object({
+  sourceTransactionId: z.string().trim().min(1),
+  skillTransactionId: z.string().trim().min(1).nullable().default(null),
+  blockedAction: z.enum([
+    "plan_humanoid_navigation",
+    "plan_humanoid_skill"
+  ]),
+  observedWorldRevision: z.number().int().nonnegative(),
+  handSurface: z.enum(G1_HAND_CONTACT_SURFACE_NAMES),
+  hand: z.enum(["left", "right"]),
+  endEffector: z.enum(["left_wrist", "right_wrist"]),
+  collisionTargetId: z.string().trim().min(1),
+  collisionTargetKind: z.enum(["object", "solid", "environment"]),
+  currentWristWorld: Vec3Schema,
+  currentFeetWorld: z.object({
+    left: Vec3Schema,
+    right: Vec3Schema
+  }).strict(),
+  collisionTargetWorld: Vec3Schema.nullable(),
+  contactPointWorld: Vec3Schema.nullable(),
+  separationNormalWorld: Vec3Schema.nullable(),
+  separationNormalRobot: Vec3Schema.nullable(),
+  normalForceN: z.number().finite().nonnegative().nullable()
+}).strict();
+
+export type NavigationTransitClearanceRequirement = z.infer<
+  typeof NavigationTransitClearanceRequirementSchema
+>;
 
 const HAND_SURFACES = new Set<string>(G1_HAND_CONTACT_SURFACE_NAMES);
 const ENVIRONMENT_CONTACT_REASON = /(?:^|;)environment_contact:([^:;]+):([^;]+)/;
@@ -35,11 +58,16 @@ export function navigationTransitClearanceFromRejection(input: {
   blockedAction?: "plan_humanoid_navigation" | "plan_humanoid_skill";
   worldRevision: number;
   snapshot: HumanoidWorldSnapshot;
+  blockingContacts?: unknown;
+  solidTokens?: readonly HumanoidSolidToken[];
+  skillTransactionId?: string | null;
 }): NavigationTransitClearanceRequirement | null {
-  if (typeof input.reason !== "string") return null;
-  const match = ENVIRONMENT_CONTACT_REASON.exec(input.reason);
-  const handSurface = match?.[1];
-  const collisionTargetId = match?.[2]?.trim();
+  const structured = structuredHandCollision(input.blockingContacts);
+  const match = typeof input.reason === "string"
+    ? ENVIRONMENT_CONTACT_REASON.exec(input.reason)
+    : null;
+  const handSurface = structured?.surface.name ?? match?.[1];
+  const collisionTargetId = structured?.target.id ?? match?.[2]?.trim();
   if (!handSurface || !collisionTargetId || !HAND_SURFACES.has(handSurface)) {
     return null;
   }
@@ -62,14 +90,22 @@ export function navigationTransitClearanceFromRejection(input: {
     "world"
   );
   if (!currentWristWorld || !leftFootWorld || !rightFootWorld) return null;
+  const collisionTargetKind = structured?.target.kind
+    ?? inferCollisionTargetKind(
+      input.snapshot,
+      input.solidTokens ?? [],
+      collisionTargetId
+    );
   return {
     sourceTransactionId: input.transactionId,
+    skillTransactionId: input.skillTransactionId ?? null,
     blockedAction: input.blockedAction ?? "plan_humanoid_navigation",
     observedWorldRevision: input.worldRevision,
     handSurface: typedSurface,
     hand,
     endEffector,
     collisionTargetId,
+    collisionTargetKind,
     currentWristWorld,
     currentFeetWorld: {
       left: leftFootWorld,
@@ -77,8 +113,20 @@ export function navigationTransitClearanceFromRejection(input: {
     },
     collisionTargetWorld: collisionTargetPosition(
       input.snapshot,
+      input.solidTokens ?? [],
+      collisionTargetKind,
       collisionTargetId
-    )
+    ),
+    contactPointWorld: structured
+      ? { ...structured.contact_point_world }
+      : null,
+    separationNormalWorld: structured
+      ? { ...structured.separation_normal_world }
+      : null,
+    separationNormalRobot: structured
+      ? { ...structured.separation_normal_robot }
+      : null,
+    normalForceN: structured?.normal_force_n ?? null
   };
 }
 
@@ -89,23 +137,82 @@ export function navigationTransitClearanceContext(
     status: "required",
     blocked_action: requirement.blockedAction,
     source_transaction_id: requirement.sourceTransactionId,
+    skill_transaction_id: requirement.skillTransactionId,
     observed_world_revision: requirement.observedWorldRevision,
     collision_hand_surface: requirement.handSurface,
     required_end_effector: requirement.endEffector,
+    collision_target: {
+      kind: requirement.collisionTargetKind,
+      id: requirement.collisionTargetKind === "environment"
+        ? null
+        : requirement.collisionTargetId,
+      center_world: requirement.collisionTargetWorld
+    },
     collision_target_id: requirement.collisionTargetId,
+    collision_target_world: requirement.collisionTargetWorld,
+    collision_contact: {
+      point_world: requirement.contactPointWorld,
+      separation_normal_world: requirement.separationNormalWorld,
+      separation_normal_robot: requirement.separationNormalRobot,
+      normal_force_n: requirement.normalForceN
+    },
     current_wrist_world: requirement.currentWristWorld,
     fixed_foot_world_targets: requirement.currentFeetWorld,
-    collision_target_world: requirement.collisionTargetWorld,
-    constraints: {
-      root_translation: "forbidden",
-      support_foot_motion: "forbidden",
-      collision_target_contact: "forbidden",
-      future_wrist_world_target: "required",
-      minimum_wrist_displacement_m: MINIMUM_WRIST_CLEARANCE_DISPLACEMENT_METERS,
-      matching_end_effector_terminal: "required"
+    recovery_options: {
+      strategy_selection: "model",
+      alternate_navigation: "available",
+      whole_body_clearance: {
+        root_translation: "forbidden",
+        support_foot_motion: "forbidden",
+        collision_target_contact: "forbidden",
+        future_wrist_world_target: "required",
+        minimum_wrist_displacement_m: MINIMUM_WRIST_CLEARANCE_DISPLACEMENT_METERS,
+        matching_end_effector_terminal: "required"
+      }
     },
     automatic_actuation: false
   };
+}
+
+export function refreshNavigationTransitClearanceRequirement(input: {
+  requirement: NavigationTransitClearanceRequirement;
+  worldRevision: number;
+  snapshot: HumanoidWorldSnapshot;
+  solidTokens: readonly HumanoidSolidToken[];
+}): NavigationTransitClearanceRequirement {
+  const currentWristWorld = humanoidEndEffectorPosition(
+    input.snapshot.robot,
+    input.requirement.endEffector,
+    "world"
+  );
+  const leftFootWorld = humanoidEndEffectorPosition(
+    input.snapshot.robot,
+    "left_ankle",
+    "world"
+  );
+  const rightFootWorld = humanoidEndEffectorPosition(
+    input.snapshot.robot,
+    "right_ankle",
+    "world"
+  );
+  if (!currentWristWorld || !leftFootWorld || !rightFootWorld) {
+    throw new Error("Navigation collision recovery requires current humanoid geometry");
+  }
+  return NavigationTransitClearanceRequirementSchema.parse({
+    ...input.requirement,
+    observedWorldRevision: input.worldRevision,
+    currentWristWorld,
+    currentFeetWorld: {
+      left: leftFootWorld,
+      right: rightFootWorld
+    },
+    collisionTargetWorld: collisionTargetPosition(
+      input.snapshot,
+      input.solidTokens,
+      input.requirement.collisionTargetKind,
+      input.requirement.collisionTargetId
+    ) ?? input.requirement.collisionTargetWorld
+  });
 }
 
 export function navigationTransitClearanceMotionRejection(
@@ -184,7 +291,7 @@ export function navigationTransitClearanceMotionRejection(
     detail: {
       ...navigationTransitClearanceContext(requirement) as Record<string, JsonValue>,
       rejected_candidates: failures,
-      recovery: "Submit a short arm-clearance posture chosen by the model: keep the base fixed, move the collision-side wrist to a new task-space target, and do not authorize contact with the collision target. Execute and observe that posture before replanning navigation."
+      recovery: "This whole-body recovery path requires a model-selected collision-side wrist target while the support base remains fixed. The model may instead choose a materially different navigation strategy."
     }
   };
 }
@@ -199,8 +306,38 @@ function pointDistance(left: Vec3, right: Vec3): number {
 
 function collisionTargetPosition(
   snapshot: HumanoidWorldSnapshot,
+  solidTokens: readonly HumanoidSolidToken[],
+  kind: HumanoidNavigationCollisionEvidence["target"]["kind"],
   targetId: string
 ): Vec3 | null {
-  const object = snapshot.robot.objects[targetId];
-  return object ? { ...object.position } : null;
+  if (kind === "object") {
+    const object = snapshot.robot.objects[targetId];
+    return object ? { ...object.position } : null;
+  }
+  if (kind === "solid") {
+    const solid = solidTokens.find((candidate) => candidate.id === targetId);
+    return solid ? { ...solid.center } : null;
+  }
+  return null;
+}
+
+function structuredHandCollision(
+  value: unknown
+): HumanoidNavigationCollisionEvidence | null {
+  const parsed = HumanoidNavigationCollisionEvidenceSchema.array().safeParse(value);
+  if (!parsed.success) return null;
+  const collision = parsed.data.find((candidate) => (
+    candidate.surface.kind === "hand_surface"
+  ));
+  return collision?.surface.kind === "hand_surface" ? collision : null;
+}
+
+function inferCollisionTargetKind(
+  snapshot: HumanoidWorldSnapshot,
+  solidTokens: readonly HumanoidSolidToken[],
+  targetId: string
+): HumanoidNavigationCollisionEvidence["target"]["kind"] {
+  if (snapshot.robot.objects[targetId]) return "object";
+  if (solidTokens.some((candidate) => candidate.id === targetId)) return "solid";
+  return "environment";
 }

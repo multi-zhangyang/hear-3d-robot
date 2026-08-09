@@ -23,12 +23,14 @@ const MODEL_RECEIPT_DETAIL_KEYS = [
   "physical_execution_revision",
   "preview_frames",
   "preview_travelled_m",
+  "blocking_contacts",
   "selected_candidate_id",
   "selected_rank",
   "candidate_count",
   "autonomous_plan_kind",
   "failure_class",
   "recovery_kind",
+  "recovery_collision",
   "termination",
   "frames",
   "travelledDistance",
@@ -85,7 +87,13 @@ export function modelReceiptDetail(value: JsonValue): Record<string, unknown> {
     projected.attempts = source.attempts.slice(0, 8).map((attempt) => {
       const attemptRecord = record(attempt);
       return attemptRecord
-        ? projectRecord(attemptRecord, ["target", "score", "accepted", "reason"])
+        ? projectRecord(attemptRecord, [
+            "target",
+            "score",
+            "accepted",
+            "reason",
+            "blocking_contacts"
+          ])
         : {};
     });
   }
@@ -123,6 +131,7 @@ export function modelReceiptDetail(value: JsonValue): Record<string, unknown> {
       "travelledDistance",
       "terminationReason",
       "reason",
+      "blocking_contacts",
       "carry",
       "revalidation"
     ]);

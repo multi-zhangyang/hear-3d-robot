@@ -259,6 +259,43 @@ describe("humanoid multi-scale embodied memory", () => {
       solid_ids: ["block-a"]
     });
   });
+
+  it("indexes successful collision recovery by the contacted solid", () => {
+    const execution = episodeInput(1).execution;
+    execution.detail = {
+      planning_action: "plan_whole_body_motion_candidates",
+      planning_transaction_id: "planning-1",
+      recovery_kind: "navigation_transit_clearance",
+      recovery_collision: {
+        hand_surface: "right_hand_index_1_link",
+        target_kind: "solid",
+        target_id: "stone_column",
+        contact_point_world: { x: 1, y: 0.8, z: 1 },
+        separation_normal_world: { x: -1, y: 0, z: 0 }
+      }
+    };
+    const remembered = rememberEmbodiedActionExperience({
+      state: structuredClone(EmptyHumanoidEmbodiedMemoryState),
+      execution,
+      goal: {
+        summary: "继续探索当前区域",
+        predicates: [{
+          type: "robot_at",
+          target: { x: 4, y: 0, z: 5 },
+          tolerance: 0.2
+        }]
+      }
+    });
+
+    expect(remembered.experience.solid_ids).toEqual(["stone_column"]);
+    expect(remembered.state.solid_outcome_counts).toEqual({
+      stone_column: {
+        succeeded: 1,
+        rejected: 0,
+        physically_failed: 0
+      }
+    });
+  });
 });
 
 function episodeInput(sequence: number): Parameters<typeof appendEmbodiedEpisode>[0] {
