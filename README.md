@@ -120,7 +120,7 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 
 ## 长期运行
 
-每个层级节点拥有独立的 Agents SDK Session。稳定指令和历史位于请求前缀，实时世界权限位于末尾；缓存亲和键按凭证、协议、模型和 Agent 角色保持稳定，因此完全一致的公共前缀可以跨任务复用。亲和键只影响供应商缓存路由，不承载对话内容；不同 Run 的 Session 和物理状态始终隔离。端点明确拒绝缓存扩展参数时，该节点的 Model facade 只协商一次并继续使用协议自身的自动前缀缓存。界面和日志中的缓存读取量直接来自模型服务返回的 usage，不使用本地估算。活动上下文接近配置阈值时，系统调用模型生成结构化压缩记录，并保留近期原始轮次。压缩结果必须引用真实动作回执；完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。每次模型请求只装载 Goal DAG 的当前工作集和近期 epoch，完整 DAG 仍保留在检查点；目标管理智能体可按状态、谓词、对象、方块、区域或候选标识分页召回更早的 Goal。模型生成的经历摘要不会进入权威状态块。协调与运动智能体可以按 `episode:N` 或 `action:<transactionId>` 精确召回成功、拒绝、漂移、约束违规和停滞记录；所有召回结果均标记为历史信息，不能代替当前传感。
+每个层级节点拥有独立的 Agents SDK Session。稳定指令和历史位于请求前缀，实时世界权限位于末尾；缓存亲和键按凭证、协议、模型和 Agent 角色保持稳定，因此完全一致的公共前缀可以跨任务复用。亲和键只影响供应商缓存路由，不承载对话内容；不同 Run 的 Session 和物理状态始终隔离。端点明确拒绝缓存扩展参数时，该节点的 Model facade 只协商一次并继续使用协议自身的自动前缀缓存。界面和日志中的缓存读取量直接来自模型服务返回的 usage，不使用本地估算。活动上下文接近配置阈值时，系统调用模型生成结构化压缩记录，并保留近期原始轮次。压缩结果必须引用真实动作回执；完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。Goal DAG 在检查点中只保留当前工作集、仍被依赖的已完成候选和近期 epoch；更早的终态 epoch 会先写入哈希链式追加日志，再从检查点裁剪，进程中断后可幂等恢复。目标管理智能体可按状态、谓词、对象、方块、区域或候选标识分页召回归档 Goal。模型生成的经历摘要不会进入权威状态块。协调与运动智能体可以按 `episode:N` 或 `action:<transactionId>` 精确召回成功、拒绝、漂移、约束违规和停滞记录；所有召回结果均标记为历史信息，不能代替当前传感。
 
 运行时按权威世界版本、真实物理帧和动作回执检测长期无进展循环。守卫只中断并重建停滞的模型上下文，不生成默认动作，也不替模型选择行为。目标稳定进度随检查点持久化；恢复时只接受与 Goal 哈希、世界快照和 MuJoCo 检查点一致的证据。
 
@@ -229,7 +229,7 @@ HEAR_MJLAB_G1_POLICY_DIRECTORY=
 | `openai_responses` | OpenAI Responses API |
 | `anthropic_messages` | Anthropic Messages API |
 
-`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required`、`auto` 和 `none`，默认使用兼容思考模式的 `auto`。Harness 在业务节点没有产生正式工具结果时，会保留同一个 Agent、模型门面和 Session，在原会话继续下一轮决策；不会关闭思考、替模型选择动作或切换成供应商专用协议。端点明确支持强制工具选择时也可以设为 `required`。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时固定取各智能体实际上下文窗口的 `85%`；角色覆盖自己的窗口后也会独立重算，不继承其他模型的低阈值。
+`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required`、`auto` 和 `none`，默认值为 `auto`。Harness 在业务节点没有产生正式工具结果时，会保留同一个 Agent、模型门面和 Session，在原会话继续恢复；恢复阶段会通过标准协议尝试要求正式工具决策，端点不支持时自动回到原配置，保留模型思考，不替模型选择工具或动作。恢复不使用固定次数终止，而由物理与 Goal 权威状态、上下文压缩生命周期和外部取消划分边界。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时固定取各智能体实际上下文窗口的 `85%`；角色覆盖自己的窗口后也会独立重算，不继承其他模型的低阈值。
 
 `AI_REQUEST_TIMEOUT_MS` 默认是 `300000`，表示 HTTP 建连或相邻响应数据之间允许的最长静默时间。`AI_STREAM_EVENT_IDLE_TIMEOUT_MS` 默认同为 `300000`，约束相邻 Agents SDK 模型事件之间的静默时间；只有真实模型事件会续期。两者均可按端点能力在 5 秒至 10 分钟之间调整，任务总时限、人工停止和进程恢复仍独立生效。
 
@@ -306,6 +306,8 @@ pnpm hear operator [--host HOST] [--port PORT] [--dev]
 | `provider.jsonl` | 模型调用生命周期 |
 | `framework.jsonl` | Agents SDK 流事件 |
 | `context.jsonl` | 上下文压缩记录 |
+| `goal_evidence.jsonl` | Goal 物理证据 |
+| `goal_history.jsonl` | 已归档的 Goal 候选与 epoch 哈希链 |
 | `checker.jsonl` | 任务谓词检查结果 |
 
 ## 开发与验证

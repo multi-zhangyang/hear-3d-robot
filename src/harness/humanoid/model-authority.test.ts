@@ -24,6 +24,25 @@ const cycle: AutonomousCycleRef = {
 };
 
 describe("HumanoidModelAuthority", () => {
+  it("bounds completed authority memory while retaining referenced calls", () => {
+    const secondModelCallId = "44444444-4444-4444-8444-444444444444";
+    const records: ModelCallLifecycleRecord[] = [
+      lifecycleStart(MODEL_CALL_ID, "2026-08-04T00:00:00.000Z"),
+      lifecycleCompletion(MODEL_CALL_ID, "2026-08-04T00:00:01.000Z"),
+      lifecycleStart(secondModelCallId, "2026-08-04T00:00:02.000Z"),
+      lifecycleCompletion(secondModelCallId, "2026-08-04T00:00:03.000Z")
+    ];
+    const recentOnly = createAuthority(records);
+    recentOnly.prune(new Set(), 1);
+    expect(recentOnly.cycleForModelCall(MODEL_CALL_ID)).toBeUndefined();
+    expect(recentOnly.cycleForModelCall(secondModelCallId)).toEqual(cycle);
+
+    const referenced = createAuthority(records);
+    referenced.prune(new Set([MODEL_CALL_ID]), 1);
+    expect(referenced.cycleForModelCall(MODEL_CALL_ID)).toEqual(cycle);
+    expect(referenced.cycleForModelCall(secondModelCallId)).toEqual(cycle);
+  });
+
   it("binds an action decision to one durable model response and autonomous cycle", async () => {
     const records: ModelCallLifecycleRecord[] = [];
     const authority = createAuthority(records);
@@ -341,6 +360,37 @@ describe("HumanoidModelAuthority", () => {
     })).toThrow("decision is not authoritative");
   });
 });
+
+function lifecycleStart(
+  modelCallId: string,
+  at: string
+): ModelCallLifecycleRecord {
+  return {
+    version: 1,
+    lifecycle: "started",
+    model_call_id: modelCallId,
+    agent_id: HUMANOID_AGENT_IDS.motion,
+    cycle,
+    at
+  };
+}
+
+function lifecycleCompletion(
+  modelCallId: string,
+  at: string
+): ModelCallLifecycleRecord {
+  return {
+    version: 1,
+    lifecycle: "completed",
+    model_call_id: modelCallId,
+    agent_id: HUMANOID_AGENT_IDS.motion,
+    response_id: `response-${modelCallId}`,
+    response_output_sha256: RESPONSE_SHA256,
+    tool_calls: [],
+    cycle,
+    at
+  };
+}
 
 function createAuthority(
   records: ModelCallLifecycleRecord[],

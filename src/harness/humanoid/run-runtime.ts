@@ -18,6 +18,8 @@ import {
 } from "../../domain/autonomous-cycle.js";
 import {
   completeGoalEpoch,
+  goalCandidateBySequence,
+  goalCandidateSequence,
   proposeGoalCandidate,
   restoreGoalDAG,
   selectGoalCandidate as selectDomainGoalCandidate
@@ -102,6 +104,7 @@ import {
   recallGoalHistory as recallDurableGoalHistory,
   type GoalHistoryRecallRequest
 } from "./goal-history.js";
+import { reconcileAndCompactGoalHistory } from "./goal-history-store.js";
 import {
   recoverableBlockedGoalActionReceipt,
   recoverableBlockedGoalEvidence
@@ -148,6 +151,14 @@ import {
 } from "./cycle-causal-evidence.js";
 import { HumanoidModelAuthority } from "./model-authority.js";
 import { HumanoidPhysicalExecutionRuntime } from "./physical-execution-runtime.js";
+import {
+  loadGoalEvidenceWorkingSet,
+  loadModelAuthorityWorkingSet,
+  optionalGoalEvidenceRefs,
+  optionalModelCallIds,
+  requiredGoalEvidenceRefs,
+  requiredModelCallIds
+} from "./autonomy-history-loader.js";
 
 export type HumanoidCoordinatorPhase =
   | "goal_selection"
@@ -291,28 +302,31 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#store.definition.scenario,
       await this.#store.readScenarioChunkDeltaState()
     );
+    const goalEvidenceRefs = requiredGoalEvidenceRefs(this.#checkpoint);
+    const optionalEvidenceRefs = optionalGoalEvidenceRefs(this.#checkpoint);
+    const modelCallIds = requiredModelCallIds(this.#checkpoint);
+    const optionalAuthorityIds = optionalModelCallIds(this.#checkpoint);
     const [
-      rawEvidence,
+      evidence,
       rawModelCalls,
       rawActionIdentities,
       providerModelUsage,
       archivedManifests
     ] = await Promise.all([
-      this.#store.readJournal("goal_evidence"),
-      this.#store.readJournal("model_calls"),
+      loadGoalEvidenceWorkingSet(
+        this.#store,
+        goalEvidenceRefs,
+        optionalEvidenceRefs
+      ),
+      loadModelAuthorityWorkingSet(
+        this.#store,
+        modelCallIds,
+        optionalAuthorityIds
+      ),
       this.#store.readJournal("action_identities"),
       latestProviderModelUsage(this.#store),
       this.#store.readArchivedAgentManifests()
     ]);
-    const evidence = new Map<string, GoalEvidenceArtifact>();
-    for (const rawArtifact of rawEvidence) {
-      const artifact = GoalEvidenceArtifactSchema.parse(rawArtifact);
-      const ref = artifact.evidence.ref;
-      if (evidence.has(ref)) {
-        throw new Error(`Duplicate durable Goal evidence reference: ${ref}`);
-      }
-      evidence.set(ref, artifact);
-    }
     const actionTransactionIdentities = rebuildActionTransactionIdentities(
       rawActionIdentities,
       this.runId
@@ -338,12 +352,17 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#checkpoint.goal_dag,
       this.#goalHarness()
     );
+    this.#checkpoint.goal_dag = await reconcileAndCompactGoalHistory({
+      store: this.#store,
+      goalDAG: this.#checkpoint.goal_dag
+    });
     for (const receipt of Object.values(this.#checkpoint.committed_actions)) {
       if (physicalExecutionReceipt(receipt) || receipt.action === "remove_world_block") {
         this.#rememberEmbodiedActionExperience(receipt, false);
       }
     }
     this.#assertActiveGoalProgress();
+    this.#pruneRuntimeAuthority();
   }
 
   async submitGoalCandidates(
@@ -393,7 +412,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         if (!created) throw new Error("Goal candidate proposal produced no durable identity");
         candidateIds.push(created);
         candidateReferences.push({
-          candidate_sequence: Object.keys(next.candidates).indexOf(created) + 1,
+          candidate_sequence: goalCandidateSequence(next, created)!,
           proposal_id: candidate.proposal_id,
           candidate_id: created
         });
@@ -423,9 +442,10 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         "select_goal_candidate",
         input
       );
-      const candidate = Object.values(this.#checkpoint.goal_dag.candidates)[
-        input.candidate_sequence - 1
-      ];
+      const candidate = goalCandidateBySequence(
+        this.#checkpoint.goal_dag,
+        input.candidate_sequence
+      );
       if (!candidate || candidate.status !== "proposed") {
         throw new Error(
           `Goal candidate sequence is unavailable: ${input.candidate_sequence}`
@@ -497,19 +517,24 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       }
       const resolvedWorldRevision = artifacts[0]!.evidence.world_revision;
       const activeEpochId = this.#checkpoint.goal_dag.current_epoch_id;
-      const next = retireDomainGoalEpoch(this.#checkpoint.goal_dag, {
+      const retiredGoalDAG = retireDomainGoalEpoch(this.#checkpoint.goal_dag, {
         status: input.status,
         retired_by: retiredBy,
         reason: input.reason,
         resolution_evidence_refs: input.evidence_refs,
         resolved_world_revision: resolvedWorldRevision
       }, this.#goalHarness());
+      const next = await reconcileAndCompactGoalHistory({
+        store: this.#store,
+        goalDAG: retiredGoalDAG
+      });
       await this.#refreshWorldPersistenceState();
       const interruptedCycle = this.#checkpoint.active_cycle;
       this.#checkpoint.goal_dag = next;
       this.#checkpoint.goal_progress = null;
       this.#checkpoint.checker = null;
       this.#checkpoint.active_cycle = null;
+      this.#pruneRuntimeAuthority();
       await this.#persist();
       await this.#emitGoalState("epoch_retired");
       if (interruptedCycle) {
@@ -693,6 +718,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#assertRunAcceptsDecisions();
     return recallDurableGoalHistory({
       goalDAG: this.#checkpoint.goal_dag,
+      journal: this.#store,
       currentWorldRevision: this.#world.snapshot().worldRevision,
       request
     });
@@ -900,6 +926,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
     this.#rememberGoalEvidence(result.worldEvidence);
     this.#contextGoalEvidenceRefs.set(agentId, result.worldEvidence.evidence.ref);
+    this.#pruneGoalEvidence();
     if (agentId !== "humanoid-motion-reference") return result.anchor;
     return json({
       ...(object(result.anchor) ?? {}),
@@ -1202,10 +1229,14 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         this.#rememberGoalEvidence(evaluation);
         await this.#persistGoalEvidence([evaluation.evidence.ref]);
         goalEvidenceRefs.push(evaluation.evidence.ref);
-        completedGoalDAG = completeGoalEpoch(this.#checkpoint.goal_dag, {
+        const resolvedGoalDAG = completeGoalEpoch(this.#checkpoint.goal_dag, {
           resolution_evidence_refs: [evaluation.evidence.ref],
           resolved_world_revision: world.worldRevision
         }, this.#goalHarness());
+        completedGoalDAG = await reconcileAndCompactGoalHistory({
+          store: this.#store,
+          goalDAG: resolvedGoalDAG
+        });
       }
 
       const memory = appendEmbodiedEpisode({
@@ -1238,6 +1269,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#checkpoint.embodied_memory = memory.state;
       this.#checkpoint.active_cycle = null;
       this.#checkpoint.committed_actions = actionWindow.receipts;
+      this.#pruneRuntimeAuthority();
 
       const missionCompleted = checker.success
         && this.#store.definition.run_mode === "mission"
@@ -1324,15 +1356,20 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       });
       this.#rememberGoalEvidence(evaluation);
       await this.#persistGoalEvidence([evaluation.evidence.ref]);
-      this.#checkpoint.goal_dag = completeGoalEpoch(this.#checkpoint.goal_dag, {
+      const resolvedGoalDAG = completeGoalEpoch(this.#checkpoint.goal_dag, {
         resolution_evidence_refs: [evaluation.evidence.ref],
         resolved_world_revision: captured.world.worldRevision
       }, this.#goalHarness());
+      this.#checkpoint.goal_dag = await reconcileAndCompactGoalHistory({
+        store: this.#store,
+        goalDAG: resolvedGoalDAG
+      });
       this.#checkpoint.goal_progress = null;
       this.#checkpoint.checker = null;
       this.#checkpoint.cycle_index = activeCycle.cycle_index;
       this.#checkpoint.last_cycle = cycleOutput;
       this.#checkpoint.active_cycle = null;
+      this.#pruneRuntimeAuthority();
 
       const missionCompleted = this.#store.definition.run_mode === "mission"
         && this.missionGoalCompleted();
@@ -2165,6 +2202,39 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       throw new Error(`Goal evidence reference was rebound: ${ref}`);
     }
     if (!existing) this.#goalEvidence.set(ref, artifact);
+  }
+
+  #pruneRuntimeAuthority(): void {
+    this.#pruneGoalEvidence();
+    const retainedModelCalls = new Set<string>();
+    for (const candidate of Object.values(this.#checkpoint.goal_dag.candidates)) {
+      retainedModelCalls.add(candidate.source.model_call_id);
+    }
+    for (const epoch of this.#checkpoint.goal_dag.epochs) {
+      retainedModelCalls.add(epoch.selected_by.model_call_id);
+      if (epoch.retired_by) retainedModelCalls.add(epoch.retired_by.model_call_id);
+    }
+    for (const receipt of Object.values(this.#checkpoint.committed_actions)) {
+      if (receipt.decision) retainedModelCalls.add(receipt.decision.model_call_id);
+    }
+    this.#modelAuthority?.prune(retainedModelCalls);
+  }
+
+  #pruneGoalEvidence(): void {
+    const retained = new Set(Object.keys(this.#checkpoint.goal_dag.evidence));
+    for (const ref of this.#contextGoalEvidenceRefs.values()) retained.add(ref);
+    for (const transactionId of Object.keys(this.#checkpoint.committed_actions)) {
+      retained.add(`action:${transactionId}`);
+    }
+    for (const pending of Object.values(this.#checkpoint.action_commit_outbox.pending)) {
+      retained.add(pending.goal_evidence_ref);
+    }
+    for (const ref of this.#goalEvidence.keys()) {
+      if (!retained.has(ref)) this.#goalEvidence.delete(ref);
+    }
+    for (const ref of this.#persistedGoalEvidenceRefs) {
+      if (!retained.has(ref)) this.#persistedGoalEvidenceRefs.delete(ref);
+    }
   }
 
   #rememberActionTransactionIdentity(identity: ActionTransactionIdentity): void {

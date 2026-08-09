@@ -1,4 +1,7 @@
-import type { GoalDAG } from "../../domain/goal-epoch.js";
+import {
+  goalCandidateSequence,
+  type GoalDAG
+} from "../../domain/goal-epoch.js";
 
 export const CONTEXT_GOAL_EPOCH_LIMIT = 12;
 export const CONTEXT_PROPOSED_GOAL_LIMIT = 12;
@@ -9,9 +12,6 @@ export const CONTEXT_PROPOSED_GOAL_LIMIT = 12;
  * recall and append-only storage; they are not replayed into every request.
  */
 export function goalDAGContextView(goalDAG: GoalDAG) {
-  const candidateSequences = new Map(
-    Object.keys(goalDAG.candidates).map((candidateId, index) => [candidateId, index + 1])
-  );
   const epochs = goalDAG.epochs.slice(-CONTEXT_GOAL_EPOCH_LIMIT);
   const candidateIds = new Set(epochs.map((epoch) => epoch.candidate_id));
   const proposed = Object.values(goalDAG.candidates)
@@ -25,7 +25,7 @@ export function goalDAGContextView(goalDAG: GoalDAG) {
 
   const candidates = Object.fromEntries([...candidateIds].flatMap((candidateId) => {
     const candidate = goalDAG.candidates[candidateId];
-    const candidateSequence = candidateSequences.get(candidateId);
+    const candidateSequence = goalCandidateSequence(goalDAG, candidateId);
     return candidate && candidateSequence
       ? [[candidateId, { ...candidate, candidate_sequence: candidateSequence }] as const]
       : [];
@@ -44,7 +44,8 @@ export function goalDAGContextView(goalDAG: GoalDAG) {
     return artifact ? [[ref, artifact] as const] : [];
   }));
 
-  const totalCandidateCount = Object.keys(goalDAG.candidates).length;
+  const totalCandidateCount = (goalDAG.next_candidate_sequence
+    ?? Object.keys(goalDAG.candidates).length + 1) - 1;
   const totalEvidenceCount = Object.keys(goalDAG.evidence).length;
   return {
     version: goalDAG.version,
@@ -58,11 +59,12 @@ export function goalDAGContextView(goalDAG: GoalDAG) {
     context_projection: {
       total_candidate_count: totalCandidateCount,
       visible_candidate_count: Object.keys(candidates).length,
-      total_epoch_count: goalDAG.epochs.length,
+      total_epoch_count: goalDAG.next_epoch_index,
       visible_epoch_count: epochs.length,
       total_evidence_count: totalEvidenceCount,
       visible_evidence_count: Object.keys(evidence).length,
-      history_truncated: goalDAG.epochs.length > epochs.length
+      history_truncated: (goalDAG.archive?.record_count ?? 0) > 0
+        || goalDAG.epochs.length > epochs.length
         || totalCandidateCount > Object.keys(candidates).length
         || totalEvidenceCount > Object.keys(evidence).length
     }

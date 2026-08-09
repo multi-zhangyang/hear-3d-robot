@@ -886,6 +886,15 @@ describe("humanoid agent hierarchy", () => {
     expect(hierarchy.motion.modelSettings.temperature).toBe(0.3);
     expect(hierarchy.executor.modelSettings.temperature).toBe(0.4);
     expect(hierarchy.executor.modelSettings.reasoning).toEqual({ effort: "high" });
+    for (const agent of [
+      hierarchy.goalManager,
+      hierarchy.coordinator,
+      hierarchy.sentry,
+      hierarchy.motion,
+      hierarchy.executor
+    ]) {
+      expect(agent.modelSettings.toolChoice).toBe("auto");
+    }
   });
 });
 

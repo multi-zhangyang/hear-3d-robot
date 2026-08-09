@@ -47,6 +47,10 @@ import {
   modelTransportInterruptionAgentIdFrom,
   withModelTelemetry
 } from "../harness/model-telemetry.js";
+import {
+  ModelDecisionProtocolRecovery,
+  withModelDecisionProtocolRecovery
+} from "../harness/model-decision-protocol.js";
 import { providerEventJson, sdkEventJson } from "../harness/sdk-events.js";
 import {
   createConfiguredModel,
@@ -87,7 +91,6 @@ setTracingDisabled(true);
 
 const MAX_TRANSPORT_RECOVERIES = 8;
 const SERVER_ERROR_CONTEXT_RECOVERY_ATTEMPT = 3;
-const MAX_MODEL_DECISION_FOLLOW_UPS = 3;
 const HUMANOID_PROMPT_CACHE_NAMESPACE = "hear-humanoid-agent-profile-v1";
 
 export interface HumanoidMissionRunResult {
@@ -377,6 +380,9 @@ async function executeHumanoidMission(input: {
       ),
       modelProgressRecoveryEpoch: () => modelProgressRecoveryEpoch
     };
+    const decisionProtocolRecovery = new ModelDecisionProtocolRecovery(
+      () => humanoidAgentStateFingerprint(input.runtime.checkpoint)
+    );
 
     const persistAgentEvent = async (
       agentId: string,
@@ -390,7 +396,7 @@ async function executeHumanoidMission(input: {
     };
     const hierarchy = createHumanoidAgentHierarchy({
       createModel: (agentId, provider) => withModelTelemetry(
-        createConfiguredModel(provider, {
+        withModelDecisionProtocolRecovery(createConfiguredModel(provider, {
           promptCacheKey: promptCacheKeyFor(agentId, provider),
           onPromptCacheRequest: (event) => recordPromptCacheRequest(
             input.runtime,
@@ -403,7 +409,16 @@ async function executeHumanoidMission(input: {
             compatibility_retry: event.compatibilityRetry,
             automatic_actuation: false
           }, agentId)
-        }),
+        }), agentId, decisionProtocolRecovery, (unsupportedAgentId) => (
+          input.runtime.recordProvider({
+            status: "tool_choice_required_unsupported",
+            source: "protocol_capability_negotiation",
+            configured_tool_choice: provider.toolChoice ?? "auto",
+            continuation: "same_agent_model_and_session",
+            thinking_preserved: true,
+            automatic_actuation: false
+          }, unsupportedAgentId)
+        )),
         modelTelemetryRuntime,
         agentId,
         onModelResponseCompleted,
@@ -637,6 +652,7 @@ async function executeHumanoidMission(input: {
         if (result) return result;
         await input.runtime.store.clearAgentState();
         decisionFollowUps.clear();
+        decisionProtocolRecovery.clear();
         pendingDecisionFollowUp = undefined;
         await input.runtime.setActiveAgent(input.runtime.rootAgentId);
       } catch (error) {
@@ -648,13 +664,23 @@ async function executeHumanoidMission(input: {
         const nextDecisionFollowUp = decisionStall
           ? nextModelDecisionFollowUpState(
               previousDecisionFollowUp,
-              humanoidAgentStateFingerprint(input.runtime.checkpoint)
+              humanoidAgentStateFingerprint(input.runtime.checkpoint),
+              contextManager.snapshot.scopes[decisionStall.agentId]?.compaction_count ?? 0
             )
-          : null;
+          : undefined;
         if (decisionStall && nextDecisionFollowUp) {
-          const followUpBudgetReset = previousDecisionFollowUp !== undefined
-            && previousDecisionFollowUp.authorityFingerprint
-              !== nextDecisionFollowUp.authorityFingerprint;
+          const recoveryEpochChanged = previousDecisionFollowUp !== undefined
+            && (previousDecisionFollowUp.authorityFingerprint
+                !== nextDecisionFollowUp.authorityFingerprint
+              || previousDecisionFollowUp.contextCompactionCount
+                !== nextDecisionFollowUp.contextCompactionCount);
+          const stalledAgentToolChoiceStrengthened =
+            decisionProtocolRecovery.requireToolDecision(decisionStall.agentId);
+          const coordinatorToolChoiceStrengthened =
+            decisionProtocolRecovery.requireToolDecision(input.runtime.rootAgentId);
+          const requiredToolChoiceActive =
+            decisionProtocolRecovery.requiresToolDecision(decisionStall.agentId)
+            || decisionProtocolRecovery.requiresToolDecision(input.runtime.rootAgentId);
           decisionFollowUps.set(decisionStall.agentId, nextDecisionFollowUp);
           pendingDecisionFollowUp = {
             agentId: decisionStall.agentId,
@@ -665,14 +691,18 @@ async function executeHumanoidMission(input: {
             status: "model_decision_follow_up",
             agent_id: decisionStall.agentId,
             follow_up_attempt: nextDecisionFollowUp.attempt,
-            maximum_follow_ups: MAX_MODEL_DECISION_FOLLOW_UPS,
-            follow_up_scope: "unchanged_authoritative_harness_state",
-            follow_up_budget_reset: followUpBudgetReset,
+            recovery_sequence: nextDecisionFollowUp.sequence,
+            context_compaction_count: nextDecisionFollowUp.contextCompactionCount,
+            recovery_scope: "authority_state_and_context_lifecycle",
+            recovery_epoch_changed: recoveryEpochChanged,
             reason: decisionStall.message,
             invalid_response_retained: true,
             session_history_preserved: true,
             prompt_cache_prefix_preserved: true,
             continuation: "same_agent_model_and_session",
+            tool_choice_protocol: requiredToolChoiceActive ? "required" : "configured",
+            stalled_agent_protocol_strengthened: stalledAgentToolChoiceStrengthened,
+            coordinator_protocol_strengthened: coordinatorToolChoiceStrengthened,
             ...(decisionStall.evidence
               ? { stall_evidence: decisionStall.evidence }
               : {}),
@@ -972,7 +1002,7 @@ function autonomousDecisionFollowUpInput(
   return [
     "继续当前人形自主闭环。上一次模型分支没有产生 Harness 可验收的正式工具决策。",
     `未完成正式决策的节点：${stalledAgentId}`,
-    `续行轮次：${followUpAttempt}`,
+    `当前恢复周期内的续行轮次：${followUpAttempt}`,
     `当前循环：${runtime.checkpoint.cycle_index + 1}`,
     "保留此前已完成的各 Agent 会话、工具回执和物理证据；根据末尾 CURRENT HARNESS AUTHORITY 直接选择当前阶段允许的正式工具。",
     "若上一条完整响应只用普通文字描述了选择，现在必须把该选择改为真正的 function_call；不要把工具名或参数继续写在普通 content 中。",
@@ -982,19 +1012,27 @@ function autonomousDecisionFollowUpInput(
 
 export interface ModelDecisionFollowUpState {
   authorityFingerprint: string;
+  contextCompactionCount: number;
   attempt: number;
+  sequence: number;
 }
 
 export function nextModelDecisionFollowUpState(
   previous: ModelDecisionFollowUpState | undefined,
-  authorityFingerprint: string
-): ModelDecisionFollowUpState | null {
-  const attempt = previous?.authorityFingerprint === authorityFingerprint
+  authorityFingerprint: string,
+  contextCompactionCount = 0
+): ModelDecisionFollowUpState {
+  const sameRecoveryEpoch = previous?.authorityFingerprint === authorityFingerprint
+    && previous.contextCompactionCount === contextCompactionCount;
+  const attempt = sameRecoveryEpoch
     ? previous.attempt + 1
     : 1;
-  return attempt > MAX_MODEL_DECISION_FOLLOW_UPS
-    ? null
-    : { authorityFingerprint, attempt };
+  return {
+    authorityFingerprint,
+    contextCompactionCount,
+    attempt,
+    sequence: (previous?.sequence ?? 0) + 1
+  };
 }
 
 class CompletedResponseDecisionStallError extends ModelDecisionStallError {}

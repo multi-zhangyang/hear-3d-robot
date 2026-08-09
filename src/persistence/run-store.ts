@@ -112,6 +112,7 @@ export type JournalName =
   | "experiences"
   | "context"
   | "goal_evidence"
+  | "goal_history"
   | "model_calls"
   | "action_identities";
 

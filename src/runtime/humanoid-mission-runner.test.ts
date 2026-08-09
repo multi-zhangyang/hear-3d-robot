@@ -459,6 +459,7 @@ describe("humanoid mission initialization recovery", () => {
     await coordinatorSession.addItems([{ role: "user", content: "durable-prefix" }]);
     const inputs: unknown[] = [];
     let activeSession: FileSession | undefined;
+    const inspectionComplete = new Error("unbounded decision recovery inspected");
     runnerControl.run.mockImplementation(async (
       agent: { name: string },
       runInput,
@@ -470,6 +471,7 @@ describe("humanoid mission initialization recovery", () => {
       if (activeSession) expect(options.session).toBe(activeSession);
       else activeSession = options.session;
       const attempt = runnerControl.run.mock.calls.length;
+      if (attempt === 7) throw inspectionComplete;
       await options.session?.addItems([{
         role: "assistant",
         content: `prose-only-response:${attempt}`
@@ -482,11 +484,9 @@ describe("humanoid mission initialization recovery", () => {
       };
     });
 
-    await expect(resume(store, config)).rejects.toThrow(
-      "Humanoid coordinator did not return a formal tool result"
-    );
+    await expect(resume(store, config)).rejects.toBe(inspectionComplete);
 
-    expect(runnerControl.run).toHaveBeenCalledTimes(4);
+    expect(runnerControl.run).toHaveBeenCalledTimes(7);
     expect(String(inputs[0])).toContain("继续下一次人形自主闭环");
     for (const input of inputs.slice(1)) {
       expect(String(input)).toContain("上一次模型分支没有产生 Harness 可验收的正式工具决策");
@@ -494,9 +494,12 @@ describe("humanoid mission initialization recovery", () => {
     const followUps = (await store.readJournal("provider")).filter((entry) => (
       isRecord(entry) && entry.status === "model_decision_follow_up"
     ));
-    expect(followUps).toEqual([1, 2, 3].map((attempt) => expect.objectContaining({
+    expect(followUps).toEqual([1, 2, 3, 4, 5, 6].map((attempt) => expect.objectContaining({
       agent_id: HUMANOID_AGENT_IDS.coordinator,
       follow_up_attempt: attempt,
+      recovery_sequence: attempt,
+      recovery_scope: "authority_state_and_context_lifecycle",
+      tool_choice_protocol: "required",
       invalid_response_retained: true,
       session_history_preserved: true,
       continuation: "same_agent_model_and_session",
@@ -511,7 +514,9 @@ describe("humanoid mission initialization recovery", () => {
       "prose-only-response:1",
       "prose-only-response:2",
       "prose-only-response:3",
-      "prose-only-response:4"
+      "prose-only-response:4",
+      "prose-only-response:5",
+      "prose-only-response:6"
     ]);
   }, 30_000);
 
@@ -565,7 +570,7 @@ describe("humanoid mission initialization recovery", () => {
     ]);
   }, 30_000);
 
-  it("keeps decision follow-up budgets independent for each hierarchy node", async () => {
+  it("keeps decision recovery epochs independent for each hierarchy node", async () => {
     const store = await createCheckpointedRun();
     const config = provider();
     const manifest = createManifest(config);
@@ -631,17 +636,52 @@ describe("humanoid mission initialization recovery", () => {
     const first = nextModelDecisionFollowUpState(undefined, "authority-a");
     const second = nextModelDecisionFollowUpState(first ?? undefined, "authority-a");
     const third = nextModelDecisionFollowUpState(second ?? undefined, "authority-a");
-    expect(first).toEqual({ authorityFingerprint: "authority-a", attempt: 1 });
-    expect(second).toEqual({ authorityFingerprint: "authority-a", attempt: 2 });
-    expect(third).toEqual({ authorityFingerprint: "authority-a", attempt: 3 });
+    expect(first).toEqual({
+      authorityFingerprint: "authority-a",
+      contextCompactionCount: 0,
+      attempt: 1,
+      sequence: 1
+    });
+    expect(second).toEqual({
+      authorityFingerprint: "authority-a",
+      contextCompactionCount: 0,
+      attempt: 2,
+      sequence: 2
+    });
+    expect(third).toEqual({
+      authorityFingerprint: "authority-a",
+      contextCompactionCount: 0,
+      attempt: 3,
+      sequence: 3
+    });
     expect(nextModelDecisionFollowUpState(
       third ?? undefined,
       "authority-a"
-    )).toBeNull();
+    )).toEqual({
+      authorityFingerprint: "authority-a",
+      contextCompactionCount: 0,
+      attempt: 4,
+      sequence: 4
+    });
     expect(nextModelDecisionFollowUpState(
       third ?? undefined,
       "authority-b"
-    )).toEqual({ authorityFingerprint: "authority-b", attempt: 1 });
+    )).toEqual({
+      authorityFingerprint: "authority-b",
+      contextCompactionCount: 0,
+      attempt: 1,
+      sequence: 4
+    });
+    expect(nextModelDecisionFollowUpState(
+      third ?? undefined,
+      "authority-a",
+      1
+    )).toEqual({
+      authorityFingerprint: "authority-a",
+      contextCompactionCount: 1,
+      attempt: 1,
+      sequence: 4
+    });
   });
 
   it("restores Sessions to the last persisted RunState before retrying", async () => {

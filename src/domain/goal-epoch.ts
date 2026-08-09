@@ -70,7 +70,7 @@ const GoalCandidateBaseSchema = z.object({
   resolved_world_revision: z.number().int().nonnegative().nullable()
 }).strict();
 
-const GoalCandidateSchema = GoalCandidateBaseSchema.superRefine(
+export const GoalCandidateSchema = GoalCandidateBaseSchema.superRefine(
   (candidate, context) => {
     if (candidate.identity_sha256 !== candidateIdentitySha256(candidate)) {
       context.addIssue({
@@ -156,7 +156,7 @@ const GoalEpochBaseSchema = z.object({
   resolved_world_revision: z.number().int().nonnegative().nullable()
 }).strict();
 
-const GoalEpochSchema = GoalEpochBaseSchema.superRefine((epoch, context) => {
+export const GoalEpochSchema = GoalEpochBaseSchema.superRefine((epoch, context) => {
   const identity = epochIdentitySha256(epoch);
   if (epoch.identity_sha256 !== identity
     || epoch.epoch_id !== `goal-epoch:${identity}`) {
@@ -203,23 +203,81 @@ const GoalEpochSchema = GoalEpochBaseSchema.superRefine((epoch, context) => {
   }
 });
 
+const GoalDAGArchiveStateSchema = z.object({
+  record_count: z.number().int().nonnegative(),
+  last_record_sha256: Sha256Schema.nullable(),
+  last_epoch_id: EpochIdSchema.nullable(),
+  retained_candidate_ids: z.array(CandidateIdSchema)
+}).strict().superRefine((archive, context) => {
+  const empty = archive.record_count === 0;
+  if (empty !== (archive.last_record_sha256 === null)
+    || empty !== (archive.last_epoch_id === null)) {
+    context.addIssue({
+      code: "custom",
+      path: ["record_count"],
+      message: "Goal history archive head is inconsistent"
+    });
+  }
+  if (!isUniqueSorted(archive.retained_candidate_ids)) {
+    context.addIssue({
+      code: "custom",
+      path: ["retained_candidate_ids"],
+      message: "Retained archived Goal candidates must be unique and sorted"
+    });
+  }
+});
+
+type GoalDAGArchiveState = z.infer<typeof GoalDAGArchiveStateSchema>;
+
+const EmptyGoalDAGArchiveState: GoalDAGArchiveState = {
+  record_count: 0,
+  last_record_sha256: null,
+  last_epoch_id: null,
+  retained_candidate_ids: []
+};
+
 const GoalDAGBaseSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   status: z.enum(["awaiting_model_selection", "active"]),
   candidates: z.record(CandidateIdSchema, GoalCandidateSchema),
+  candidate_sequences: z.record(CandidateIdSchema, z.number().int().positive()),
+  next_candidate_sequence: z.number().int().positive(),
   epochs: z.array(GoalEpochSchema),
   current_epoch_id: EpochIdSchema.nullable(),
   next_epoch_index: z.number().int().nonnegative(),
   evidence: z.record(z.string().trim().min(1), GoalPhysicalEvidenceSchema),
+  archive: GoalDAGArchiveStateSchema,
   state_sha256: Sha256Schema
 }).strict();
 
-export const GoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
-  if (dag.state_sha256 !== goalDAGStateSha256(dag)) {
+const ValidatedGoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
+  if (dag.state_sha256 !== goalDAGStateSha256(dag)
+    && (!isLegacyCompatibleGoalDAG(dag)
+      || dag.state_sha256 !== legacyGoalDAGStateSha256(dag))) {
     context.addIssue({
       code: "custom",
       path: ["state_sha256"],
       message: "Goal DAG state hash does not match its persisted contents"
+    });
+  }
+
+  const candidateIds = Object.keys(dag.candidates);
+  const sequenceIds = Object.keys(dag.candidate_sequences);
+  if (canonicalJson(candidateIds.sort(compareCodePoints))
+    !== canonicalJson(sequenceIds.sort(compareCodePoints))) {
+    context.addIssue({
+      code: "custom",
+      path: ["candidate_sequences"],
+      message: "Goal candidate sequences must cover the working candidate set"
+    });
+  }
+  const sequences = Object.values(dag.candidate_sequences);
+  if (new Set(sequences).size !== sequences.length
+    || sequences.some((sequence) => sequence >= dag.next_candidate_sequence)) {
+    context.addIssue({
+      code: "custom",
+      path: ["candidate_sequences"],
+      message: "Goal candidate sequences must be unique and precede the next sequence"
     });
   }
 
@@ -270,7 +328,7 @@ export const GoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
     }
   }
 
-  if (dag.next_epoch_index !== dag.epochs.length) {
+  if (dag.next_epoch_index !== dag.archive.record_count + dag.epochs.length) {
     context.addIssue({
       code: "custom",
       path: ["next_epoch_index"],
@@ -281,8 +339,11 @@ export const GoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
   const seenCandidates = new Set<string>();
   dag.epochs.forEach((epoch, index) => {
     const candidate = dag.candidates[epoch.candidate_id];
-    if (epoch.epoch_index !== index
-      || epoch.previous_epoch_id !== (dag.epochs[index - 1]?.epoch_id ?? null)) {
+    const expectedIndex = dag.archive.record_count + index;
+    const expectedPreviousEpochId = dag.epochs[index - 1]?.epoch_id
+      ?? dag.archive.last_epoch_id;
+    if (epoch.epoch_index !== expectedIndex
+      || epoch.previous_epoch_id !== expectedPreviousEpochId) {
       context.addIssue({
         code: "custom",
         path: ["epochs", index],
@@ -352,15 +413,35 @@ export const GoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
       );
     }
   });
+  const retainedArchived = new Set(dag.archive.retained_candidate_ids);
   for (const candidate of Object.values(dag.candidates)) {
     const activated = seenCandidates.has(candidate.candidate_id);
-    if ((candidate.status === "proposed") === activated) {
+    const retained = retainedArchived.has(candidate.candidate_id);
+    if ((candidate.status === "proposed" && activated)
+      || (candidate.status !== "proposed" && !activated && !retained)
+      || (retained && (activated
+        || candidate.status === "proposed"
+        || candidate.status === "active"))) {
       context.addIssue({
         code: "custom",
         path: ["candidates", candidate.candidate_id, "status"],
         message: "Goal candidate lifecycle does not match the epoch chain"
       });
     }
+  }
+  const expectedRetained = Object.values(dag.candidates)
+    .filter((candidate) => candidate.status !== "proposed"
+      && candidate.status !== "active"
+      && !seenCandidates.has(candidate.candidate_id))
+    .map((candidate) => candidate.candidate_id)
+    .sort(compareCodePoints);
+  if (canonicalJson(expectedRetained)
+    !== canonicalJson(dag.archive.retained_candidate_ids)) {
+    context.addIssue({
+      code: "custom",
+      path: ["archive", "retained_candidate_ids"],
+      message: "Goal history archive retention does not match working dependencies"
+    });
   }
 
   const activeEpochs = dag.epochs.filter((epoch) => epoch.status === "active");
@@ -388,9 +469,15 @@ export const GoalDAGSchema = GoalDAGBaseSchema.superRefine((dag, context) => {
   }
 });
 
+export const GoalDAGSchema = z.preprocess(
+  normalizeLegacyGoalDAG,
+  ValidatedGoalDAGSchema
+);
+
 export type GoalModelSource = z.infer<typeof GoalModelSourceSchema>;
 export type GoalPhysicalEvidence = z.infer<typeof GoalPhysicalEvidenceSchema>;
-type GoalEpoch = z.infer<typeof GoalEpochSchema>;
+export type GoalCandidate = z.infer<typeof GoalCandidateSchema>;
+export type GoalEpoch = z.infer<typeof GoalEpochSchema>;
 export type GoalDAG = z.infer<typeof GoalDAGSchema>;
 
 export interface GoalHarnessValidation {
@@ -449,13 +536,16 @@ export class GoalDAGValidationError extends Error {
 
 export function createGoalDAG(): GoalDAG {
   return rehashGoalDAG({
-    version: 1,
+    version: 2,
     status: "awaiting_model_selection",
     candidates: {},
+    candidate_sequences: {},
+    next_candidate_sequence: 1,
     epochs: [],
     current_epoch_id: null,
     next_epoch_index: 0,
-    evidence: {}
+    evidence: {},
+    archive: EmptyGoalDAGArchiveState
   });
 }
 
@@ -556,6 +646,11 @@ export function proposeGoalCandidate(
   return rehashGoalDAG({
     ...dag,
     candidates: { ...dag.candidates, [candidateId]: candidate },
+    candidate_sequences: {
+      ...dag.candidate_sequences,
+      [candidateId]: dag.next_candidate_sequence
+    },
+    next_candidate_sequence: dag.next_candidate_sequence + 1,
     evidence
   });
 }
@@ -613,7 +708,7 @@ export function selectGoalCandidate(
   );
   const epochImmutable = {
     epoch_index: dag.next_epoch_index,
-    previous_epoch_id: dag.epochs.at(-1)?.epoch_id ?? null,
+    previous_epoch_id: dag.epochs.at(-1)?.epoch_id ?? dag.archive.last_epoch_id,
     candidate_id: candidate.candidate_id,
     candidate_source: candidate.source,
     selected_by: selection.selected_by,
@@ -841,6 +936,67 @@ function epochIdentitySha256(epoch: {
 function goalDAGStateSha256(dag: { state_sha256?: string } & Record<string, unknown>): string {
   const { state_sha256: _stateSha256, ...contents } = dag;
   return sha256(canonicalJson(contents));
+}
+
+function legacyGoalDAGStateSha256(dag: z.infer<typeof GoalDAGBaseSchema>): string {
+  const {
+    state_sha256: _stateSha256,
+    candidate_sequences: _candidateSequences,
+    next_candidate_sequence: _nextCandidateSequence,
+    archive: _archive,
+    ...contents
+  } = dag;
+  return sha256(canonicalJson({ ...contents, version: 1 }));
+}
+
+function isLegacyCompatibleGoalDAG(dag: z.infer<typeof GoalDAGBaseSchema>): boolean {
+  const expectedSequences = Object.fromEntries(
+    Object.keys(dag.candidates).map((candidateId, index) => [candidateId, index + 1])
+  );
+  return dag.archive.record_count === 0
+    && canonicalJson(dag.archive) === canonicalJson(EmptyGoalDAGArchiveState)
+    && dag.next_candidate_sequence === Object.keys(dag.candidates).length + 1
+    && canonicalJson(dag.candidate_sequences) === canonicalJson(expectedSequences);
+}
+
+function normalizeLegacyGoalDAG(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const dag = value as Record<string, unknown>;
+  if (dag.version !== 1) return value;
+  const candidates = dag.candidates !== null
+    && typeof dag.candidates === "object"
+    && !Array.isArray(dag.candidates)
+    ? dag.candidates as Record<string, unknown>
+    : {};
+  const candidateSequences = Object.fromEntries(
+    Object.keys(candidates).map((candidateId, index) => [candidateId, index + 1])
+  );
+  return {
+    ...dag,
+    version: 2,
+    candidate_sequences: dag.candidate_sequences ?? candidateSequences,
+    next_candidate_sequence: dag.next_candidate_sequence
+      ?? Object.keys(candidates).length + 1,
+    archive: dag.archive ?? EmptyGoalDAGArchiveState
+  };
+}
+
+export function goalCandidateSequence(
+  goalDAG: GoalDAG,
+  candidateId: string
+): number | undefined {
+  return goalDAG.candidate_sequences?.[candidateId]
+    ?? (Object.keys(goalDAG.candidates).indexOf(candidateId) + 1 || undefined);
+}
+
+export function goalCandidateBySequence(
+  goalDAG: GoalDAG,
+  sequence: number
+): GoalCandidate | undefined {
+  const candidateId = Object.entries(goalDAG.candidate_sequences).find(
+    ([, candidateSequence]) => candidateSequence === sequence
+  )?.[0];
+  return candidateId ? goalDAG.candidates[candidateId] : undefined;
 }
 
 export function rehashGoalDAG(

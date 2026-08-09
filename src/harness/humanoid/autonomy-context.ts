@@ -102,7 +102,7 @@ export function createHumanoidAutonomyContext(input: {
       supported_goal_predicates: ["robot_in_zone", "object_in_zone", "object_placed"]
     })),
     history: {
-      total_epoch_count: input.goalDAG.epochs.length,
+      total_epoch_count: input.goalDAG.next_epoch_index,
       analyzed_epoch_count: history.length,
       predicate_counts: Object.fromEntries(
         [...predicateCounts.entries()].sort(([left], [right]) => compare(left, right))

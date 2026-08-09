@@ -19,7 +19,7 @@ import type {
   GoalHarnessValidation,
   GoalModelSource
 } from "../../domain/goal-epoch.js";
-import type { JsonValue, Scenario, TaskNode } from "../../domain/schema.js";
+import type { Scenario, TaskNode } from "../../domain/schema.js";
 import {
   goalPredicateIsObservable,
   type GoalEvidenceArtifact
@@ -86,7 +86,7 @@ export class HumanoidModelAuthority {
     manifest: AgentManifest;
     archivedManifests?: readonly AgentManifest[];
     nodes: Readonly<Record<string, TaskNode>>;
-    records: readonly JsonValue[];
+    records: readonly unknown[];
     appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
   }): HumanoidModelAuthority {
     const goalManager = input.manifest.agents.goal_manager;
@@ -419,6 +419,22 @@ export class HumanoidModelAuthority {
   cycleForModelCall(modelCallId: string): AutonomousCycleRef | undefined {
     const cycle = this.#authorities.get(modelCallId)?.cycle;
     return cycle ? structuredClone(cycle) : undefined;
+  }
+
+  prune(retainModelCallIds: ReadonlySet<string>, recentTerminalLimit = 256): void {
+    if (!Number.isSafeInteger(recentTerminalLimit) || recentTerminalLimit < 1) {
+      throw new Error("Model authority retention limit must be positive");
+    }
+    const retained = new Set(retainModelCallIds);
+    for (const modelCallId of this.#started.keys()) retained.add(modelCallId);
+    const recentTerminalIds = [...this.#terminalIds].slice(-recentTerminalLimit);
+    for (const modelCallId of recentTerminalIds) retained.add(modelCallId);
+    for (const modelCallId of this.#authorities.keys()) {
+      if (!retained.has(modelCallId)) this.#authorities.delete(modelCallId);
+    }
+    for (const modelCallId of this.#terminalIds) {
+      if (!retained.has(modelCallId)) this.#terminalIds.delete(modelCallId);
+    }
   }
 
   #requiredStarted(modelCallId: string, agentId: string): StartedModelCall {

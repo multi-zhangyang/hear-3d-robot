@@ -413,13 +413,21 @@ interface GoalEpoch {
 }
 
 export interface GoalDAG {
-  version: 1;
+  version: 2;
   status: "awaiting_model_selection" | "active";
   candidates: Record<string, GoalCandidate>;
+  candidate_sequences: Record<string, number>;
+  next_candidate_sequence: number;
   epochs: GoalEpoch[];
   current_epoch_id: string | null;
   next_epoch_index: number;
   evidence: Record<string, unknown>;
+  archive: {
+    record_count: number;
+    last_record_sha256: string | null;
+    last_epoch_id: string | null;
+    retained_candidate_ids: string[];
+  };
   state_sha256: string;
 }
 
@@ -733,7 +741,7 @@ function isGoalEpochCheckpoint(checkpoint: Record<string, unknown>): boolean {
   const missionGoal = checkpoint.mission_goal as Record<string, unknown> | null;
   const dag = checkpoint.goal_dag as Record<string, unknown> | null;
   if (!missionGoal || typeof missionGoal.summary !== "string" || !Array.isArray(missionGoal.predicates)
-    || !dag || dag.version !== 1 || !Array.isArray(dag.epochs)
+    || !dag || (dag.version !== 1 && dag.version !== 2) || !Array.isArray(dag.epochs)
     || typeof dag.candidates !== "object" || dag.candidates === null
     || (dag.status !== "awaiting_model_selection" && dag.status !== "active")) return false;
   if (dag.status === "awaiting_model_selection") {

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { modelPayloadSha256 } from "./model-call-authority.js";
 import {
   GoalDAGSchema,
   GoalDAGValidationError,
@@ -133,6 +134,32 @@ function onlyCandidate(dag: GoalDAG) {
 }
 
 describe("persistent model goal epochs", () => {
+  it("upgrades the complete v1 DAG into the bounded v2 working format", () => {
+    const current = createGoalDAG();
+    const {
+      candidate_sequences: _candidateSequences,
+      next_candidate_sequence: _nextCandidateSequence,
+      archive: _archive,
+      state_sha256: _stateSha256,
+      ...legacyContents
+    } = current;
+    const legacy = { ...legacyContents, version: 1 as const };
+    expect(GoalDAGSchema.parse({
+      ...legacy,
+      state_sha256: modelPayloadSha256(legacy)
+    })).toMatchObject({
+      version: 2,
+      candidate_sequences: {},
+      next_candidate_sequence: 1,
+      archive: {
+        record_count: 0,
+        last_record_sha256: null,
+        last_epoch_id: null,
+        retained_candidate_ids: []
+      }
+    });
+  });
+
   it("persists model provenance, candidate hashes, dependencies and physical evidence", () => {
     const proposalEvidence = physicalEvidence("observation:12", 12);
     const { harness } = testHarness({ evidence: [proposalEvidence] });
