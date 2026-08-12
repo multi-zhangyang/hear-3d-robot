@@ -53,6 +53,7 @@ export class RunManager {
   readonly #providerError: string | undefined;
   readonly #mutationFence: MutationFence | undefined;
   readonly #controllerSource: HumanoidControllerSource | undefined;
+  readonly #densePolicyRolloutDir: string | undefined;
   readonly #subscribers = new Map<string, Set<Subscriber>>();
   readonly #controllers = new Map<string, AbortController>();
   readonly #operations = new Map<string, Promise<void>>();
@@ -68,6 +69,7 @@ export class RunManager {
     providerError?: string;
     mutationFence?: MutationFence;
     controllerSource?: HumanoidControllerSource;
+    densePolicyRolloutDir?: string;
   }) {
     this.#runsDir = input.runsDir;
     this.#catalog = input.catalog;
@@ -75,6 +77,7 @@ export class RunManager {
     this.#providerError = input.providerError;
     this.#mutationFence = input.mutationFence;
     this.#controllerSource = input.controllerSource;
+    this.#densePolicyRolloutDir = input.densePolicyRolloutDir;
   }
 
   /** Converts process-owned nonterminal checkpoints left by a prior operator into resumable state. */
@@ -146,6 +149,9 @@ export class RunManager {
       runMode: input.runMode ?? "continuous",
       catalog: this.#catalog,
       provider,
+      ...(this.#densePolicyRolloutDir
+        ? { densePolicyRolloutDir: this.#densePolicyRolloutDir }
+        : {}),
       ...(input.seed === undefined ? {} : { seed: input.seed }),
       eventSink: sink,
       signal: controller.signal,
@@ -170,6 +176,9 @@ export class RunManager {
       runDir,
       catalog: this.#catalog,
       provider,
+      ...(this.#densePolicyRolloutDir
+        ? { densePolicyRolloutDir: this.#densePolicyRolloutDir }
+        : {}),
       eventSink: sink,
       signal: controller.signal,
       ...(this.#controllerSource

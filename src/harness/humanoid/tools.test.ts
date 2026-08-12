@@ -198,6 +198,17 @@ describe("humanoid Agents SDK tools", () => {
     ])).toThrow("Duplicate humanoid action grant");
   });
 
+  it("rejects raw dense-motion authority for the production Motion Agent", () => {
+    const runtime = {
+      invoke: vi.fn()
+    } as unknown as HumanoidActionInvoker;
+    expect(() => createHumanoidActionTools(
+      runtime,
+      "humanoid-motion-reference",
+      ["plan_whole_body_motion"]
+    )).toThrow("cannot receive raw dense-motion authoring authority");
+  });
+
   it("exposes bounded read-only embodied recall and forces historical provenance", async () => {
     const recallEmbodiedHistory = vi.fn(async () => ({
       historical_only: false,

@@ -973,6 +973,7 @@ describe("humanoid whole-body motion", () => {
         .toBeCloseTo(0.3, 12);
 
       const stored: StoredHumanoidMotionPlan = {
+        skillCallIdentity: null,
         plan,
         artifact: prepared.artifact,
         rollout: null,

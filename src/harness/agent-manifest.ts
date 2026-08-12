@@ -18,6 +18,7 @@ import {
 import {
   AgentManifestSchema,
   type AgentManifest,
+  type AgentDeterministicServiceIdentity,
   type AgentModelIdentity
 } from "../domain/agent-manifest.js";
 import { configuredOutputTokenLimit } from "../runtime/context-budget.js";
@@ -30,12 +31,18 @@ import {
 
 const COMPACTOR_AGENT_ID = "humanoid-context-compactor";
 const COMPACTOR_AGENT_NAME = "Context Compactor";
-const HUMANOID_HARNESS_CONTRACT_VERSION = 13;
+const HUMANOID_HARNESS_CONTRACT_VERSION = 18;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
   "ai"
 ] as const;
+const MODEL_RUNTIME_ROLES = [
+  "goal_manager",
+  "coordinator",
+  "motion",
+  "compactor"
+] as const satisfies readonly AgentModelRole[];
 const PROTOCOL_ADAPTER_PACKAGE = {
   openai_compatible: "@ai-sdk/openai-compatible",
   openai_responses: "@ai-sdk/openai",
@@ -45,7 +52,8 @@ const RECEIPT_TERMINAL_TOOLS = {
   sentry: ["observe_humanoid"],
   motion: [
     "plan_humanoid_skill",
-    "plan_whole_body_motion_candidates"
+    "plan_whole_body_motion_candidates",
+    "plan_humanoid_navigation"
   ],
   executor: [
     "execute_humanoid_skill",
@@ -56,11 +64,11 @@ const RECEIPT_TERMINAL_TOOLS = {
 const VERIFIED_STATUS_TERMINAL_TOOLS = {
   goal_manager: {
     select_goal_candidate: "goal_candidate_selected",
-    retire_goal_epoch: "goal_epoch_retired"
+    retire_goal_epoch: "goal_epoch_retired",
+    continue_goal_epoch: "goal_epoch_continued"
   },
   coordinator: {
     complete_autonomous_cycle: "cycle_completed",
-    complete_goal_transition: "goal_transition_completed",
     complete_satisfied_goal: "satisfied_goal_completed"
   }
 } as const;
@@ -91,31 +99,15 @@ export function createHumanoidAgentManifest(input: {
   createdAt?: string;
   runtimeSdkIdentity?: Record<string, string>;
 }): AgentManifest {
-  const sources: Record<Exclude<AgentModelRole, "compactor">, {
-    agentId: string;
-    source: AgentIdentitySource;
-  }> = {
-    goal_manager: {
-      agentId: HUMANOID_AGENT_IDS.goalManager,
-      source: sourceFromAgent(input.hierarchy.goalManager, "goal_manager")
-    },
-    coordinator: {
-      agentId: HUMANOID_AGENT_IDS.coordinator,
-      source: sourceFromAgent(input.hierarchy.coordinator, "coordinator")
-    },
-    sentry: {
-      agentId: HUMANOID_AGENT_IDS.sentry,
-      source: sourceFromAgent(input.hierarchy.sentry, "sentry")
-    },
-    motion: {
-      agentId: HUMANOID_AGENT_IDS.motion,
-      source: sourceFromAgent(input.hierarchy.motion, "motion")
-    },
-    executor: {
-      agentId: HUMANOID_AGENT_IDS.executor,
-      source: sourceFromAgent(input.hierarchy.executor, "executor")
-    }
-  };
+  const goalManagerSource = sourceFromAgent(
+    input.hierarchy.goalManager,
+    "goal_manager"
+  );
+  const coordinatorSource = sourceFromAgent(
+    input.hierarchy.coordinator,
+    "coordinator"
+  );
+  const motionSource = sourceFromAgent(input.hierarchy.motion, "motion");
   const compactorProvider = providerConfigForRole(input.provider, "compactor");
   const compactorIdentity = contextCompactorIdentitySource();
   const compactorTool = compactorIdentity.tools[0];
@@ -151,33 +143,29 @@ export function createHumanoidAgentManifest(input: {
   const agents = {
     goal_manager: modelIdentity(
       "goal_manager",
-      sources.goal_manager.agentId,
-      sources.goal_manager.source,
+      HUMANOID_AGENT_IDS.goalManager,
+      goalManagerSource,
       providerConfigForRole(input.provider, "goal_manager")
     ),
     coordinator: modelIdentity(
       "coordinator",
-      sources.coordinator.agentId,
-      sources.coordinator.source,
+      HUMANOID_AGENT_IDS.coordinator,
+      coordinatorSource,
       providerConfigForRole(input.provider, "coordinator")
     ),
-    sentry: modelIdentity(
+    sentry: deterministicServiceIdentity(
       "sentry",
-      sources.sentry.agentId,
-      sources.sentry.source,
-      providerConfigForRole(input.provider, "sentry")
+      input.hierarchy.sentry
     ),
     motion: modelIdentity(
       "motion",
-      sources.motion.agentId,
-      sources.motion.source,
+      HUMANOID_AGENT_IDS.motion,
+      motionSource,
       providerConfigForRole(input.provider, "motion")
     ),
-    executor: modelIdentity(
+    executor: deterministicServiceIdentity(
       "executor",
-      sources.executor.agentId,
-      sources.executor.source,
-      providerConfigForRole(input.provider, "executor")
+      input.hierarchy.executor
     ),
     compactor: modelIdentity(
       "compactor",
@@ -228,6 +216,7 @@ export function assertAgentManifestCompatible(
     const before = persisted.agents[role];
     const after = current.agents[role];
     for (const field of [
+      "execution_kind",
       "agent_id",
       "agent_name",
       "protocol",
@@ -238,9 +227,13 @@ export function assertAgentManifestCompatible(
       "sdk_model_settings",
       "reset_tool_choice",
       "tool_use_behavior",
-      "settings"
+      "settings",
+      "implementation_contract",
+      "decision_authority_role"
     ] as const) {
-      if (canonicalJson(before[field]) !== canonicalJson(after[field])) {
+      const beforeValue = (before as unknown as Record<string, unknown>)[field];
+      const afterValue = (after as unknown as Record<string, unknown>)[field];
+      if (canonicalJson(beforeValue) !== canonicalJson(afterValue)) {
         changes.push(`agents.${role}.${field}`);
       }
     }
@@ -304,6 +297,20 @@ function modelIdentity(
         ? {}
         : { compact_max_output_tokens: provider.compactMaxOutputTokens })
     }
+  };
+}
+
+function deterministicServiceIdentity(
+  role: "sentry" | "executor",
+  service: HumanoidAgentHierarchy["sentry"] | HumanoidAgentHierarchy["executor"]
+): AgentDeterministicServiceIdentity {
+  return {
+    execution_kind: "deterministic_service",
+    agent_id: service.id,
+    agent_name: service.name,
+    role,
+    implementation_contract: service.implementationContract,
+    decision_authority_role: "coordinator"
   };
 }
 
@@ -465,7 +472,7 @@ function createAgentToolContracts(
 ): AgentToolContract[] {
   const definitions = Object.values(HUMANOID_AGENT_TOOL_CONTRACTS);
   return definitions.map((definition) => {
-    const targetAgent = definition.targetRole === "goal_manager"
+    const target = definition.targetRole === "goal_manager"
       ? hierarchy.goalManager
       : hierarchy[definition.targetRole];
     const matches = hierarchy.coordinator.tools.filter(
@@ -476,30 +483,43 @@ function createAgentToolContracts(
         `Expected exactly one Agent-as-tool function named ${definition.toolName}`
       );
     }
-    if (!hierarchy.session(definition.runOptions.sessionAgentId)) {
-      throw new Error(
-        `Agent-as-tool ${definition.toolName} requires an owned Session for `
-        + definition.runOptions.sessionAgentId
-      );
-    }
+    if (definition.dispatchKind === "model_agent"
+      && !hierarchy.session(definition.runOptions.sessionAgentId)) {
+        throw new Error(
+          `Agent-as-tool ${definition.toolName} requires an owned Session for `
+          + definition.runOptions.sessionAgentId
+        );
+      }
     const toolSchema = functionToolSchemaIdentity(matches[0], definition.toolName);
     return {
+      dispatch_kind: definition.dispatchKind,
       tool_name: definition.toolName,
       target_role: definition.targetRole,
       target_agent_id: definition.targetAgentId,
-      target_agent_name: targetAgent.name,
+      target_agent_name: target.name,
       tool_schema_sha256: sha256(canonicalJson(toolSchema)),
       input_builder_contract: definition.inputBuilderContract,
       input_builder_sha256: sha256(canonicalJson({
         tool_name: definition.toolName,
-        contract: definition.inputBuilderContract
+        contract: definition.inputBuilderContract,
+        dispatch_kind: definition.dispatchKind,
+        ...(definition.dispatchKind === "deterministic_service"
+          ? { implementation_contract: definition.implementationContract }
+          : {})
       })),
-      run_options: {
-        session_agent_id: definition.runOptions.sessionAgentId,
-        context_source: definition.runOptions.contextSource,
-        max_turns: definition.runOptions.maxTurns
-      },
-      resume_context_strategy: definition.resumeContextStrategy,
+      ...(definition.dispatchKind === "deterministic_service"
+        ? { implementation_contract: definition.implementationContract }
+        : {}),
+      ...(definition.dispatchKind === "model_agent"
+        ? {
+            run_options: {
+              session_agent_id: definition.runOptions.sessionAgentId,
+              context_source: definition.runOptions.contextSource,
+              max_turns: definition.runOptions.maxTurns
+            },
+            resume_context_strategy: definition.resumeContextStrategy
+          }
+        : {}),
       include_input_schema: definition.includeInputSchema,
       needs_approval: definition.needsApproval,
       output_contract: definition.outputContract
@@ -560,7 +580,7 @@ function assertManifestIntegrity(
 
 function installedRuntimeSdkIdentity(provider: ProviderConfig): Record<string, string> {
   const packages = new Set<string>(CORE_SDK_PACKAGES);
-  for (const role of AGENT_MODEL_ROLES) {
+  for (const role of MODEL_RUNTIME_ROLES) {
     const selected = providerConfigForRole(provider, role);
     packages.add(PROTOCOL_ADAPTER_PACKAGE[selected.protocol]);
   }

@@ -208,6 +208,9 @@ function cloneSimulationState(
     ...(state.handCommandTargets
       ? { handCommandTargets: state.handCommandTargets.slice() }
       : {}),
+    handPolicyAuthority: state.handPolicyAuthority
+      ? structuredClone(state.handPolicyAuthority)
+      : null,
     controller: structuredClone(state.controller)
   };
 }

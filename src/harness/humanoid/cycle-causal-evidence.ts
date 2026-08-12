@@ -4,6 +4,7 @@ import {
 } from "../../domain/autonomous-cycle.js";
 import { ScenarioBlockRemovalTransactionSchema } from "../../domain/scenario-block-removal.js";
 import type { JsonValue } from "../../domain/schema.js";
+import { humanoidActionReceiptsInCommitOrder } from "../../domain/humanoid-run.js";
 import type { HumanoidActionReceipt } from "./runtime.js";
 import {
   completedPhysicalExecution,
@@ -41,7 +42,7 @@ export function resolveHumanoidCycleCompletionReadiness(
 ): HumanoidCycleCompletionReadiness {
   const activeCycle = input.activeCycle;
   if (!activeCycle) return notReady("No autonomous cycle is active");
-  const receipts = Object.values(input.committedActions);
+  const receipts = humanoidActionReceiptsInCommitOrder(input.committedActions);
   const executionIndex = receipts.findLastIndex((receipt) => (
     completedPhysicalExecution(receipt)
       && sameAutonomousCycle(receipt.cycle, activeCycle)
@@ -79,7 +80,12 @@ export function resolveHumanoidCycleCompletionReadiness(
   const observedAfterExecution = receipts.slice(observationBarrierIndex + 1).some((receipt) => (
     receipt.accepted
       && receipt.action === "observe_humanoid"
+      && receipt.agentId === "humanoid-sentry"
       && sameAutonomousCycle(receipt.cycle, activeCycle)
+      && receipt.worldAfterRevision >= (
+        mutations.at(-1)?.receipt.worldAfterRevision ?? execution.worldAfterRevision
+      )
+      && receipt.worldAfterRevision <= input.currentWorld.worldRevision
   ));
   return {
     status: "ready",
@@ -105,6 +111,10 @@ function validateHumanoidCycleCausalEvidenceCore(
     if (!receipt) throw new Error(`Unknown humanoid cycle evidence: ${transactionId}`);
     return receipt;
   });
+  if (new Set(input.evidenceTransactionIds).size
+    !== input.evidenceTransactionIds.length) {
+    throw new Error("Autonomous cycle evidence transaction identifiers must be unique");
+  }
   const previouslyConsumed = previousCycleEvidence(input.previousCycle);
   const repeated = evidence.find((receipt) => previouslyConsumed.has(receipt.transactionId));
   if (repeated) {
@@ -125,7 +135,7 @@ function validateHumanoidCycleCausalEvidenceCore(
     );
   }
 
-  const receipts = Object.values(input.committedActions);
+  const receipts = humanoidActionReceiptsInCommitOrder(input.committedActions);
   const latestActuation = receipts.findLast(physicalActuationReceipt);
   if (latestActuation?.transactionId !== execution.transactionId) {
     throw new Error("Autonomous cycle evidence was superseded by later physical actuation");
@@ -194,16 +204,44 @@ function validateHumanoidCycleCausalEvidenceCore(
       `Autonomous cycle references invalid world mutation evidence: ${invalidMutation.transactionId}`
     );
   }
+  const authorizedEvidenceIds = new Set([
+    execution.transactionId,
+    ...authorizedMutationIds
+  ]);
+  const unrelatedEvidence = evidence.find((receipt) => (
+    !authorizedEvidenceIds.has(receipt.transactionId)
+  ));
+  if (unrelatedEvidence) {
+    throw new Error(
+      `Autonomous cycle references unrelated evidence: ${unrelatedEvidence.transactionId}`
+    );
+  }
+  const canonicalEvidenceIds = [
+    execution.transactionId,
+    ...worldMutations.map((receipt) => receipt.transactionId)
+  ];
+  if (canonicalEvidenceIds.some((transactionId, index) => (
+    input.evidenceTransactionIds[index] !== transactionId
+  ))) {
+    throw new Error("Autonomous cycle evidence is not in canonical causal order");
+  }
 
   if (requirePostExecutionObservation) {
     const mutationIndexes = worldMutations.map((mutation) => receipts.findIndex((receipt) => (
       receipt.transactionId === mutation.transactionId
     )));
     const observationBarrierIndex = Math.max(executionIndex, ...mutationIndexes);
+    const observationBarrierRevision = Math.max(
+      execution.worldAfterRevision,
+      ...worldMutations.map((mutation) => mutation.worldAfterRevision)
+    );
     const observation = receipts.slice(observationBarrierIndex + 1).find((receipt) => (
       receipt.accepted
         && receipt.action === "observe_humanoid"
+        && receipt.agentId === "humanoid-sentry"
         && sameAutonomousCycle(receipt.cycle, activeCycle)
+        && receipt.worldAfterRevision >= observationBarrierRevision
+        && receipt.worldAfterRevision <= currentRevision
     ));
     if (!observation) {
       throw new Error(

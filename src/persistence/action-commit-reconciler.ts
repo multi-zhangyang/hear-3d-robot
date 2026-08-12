@@ -38,6 +38,14 @@ interface ActionCommitReconciliationIndex {
   events: Map<string, IndexedActionEvent>;
 }
 
+const REASSERTABLE_STATE_ANCHOR_EVENTS = new Set([
+  "humanoid_physical_state_anchored",
+  "humanoid_goal_state_anchored",
+  "humanoid_embodied_memory_state_anchored",
+  "humanoid_context_memory_state_anchored",
+  "humanoid_execution_ledger_state_anchored"
+]);
+
 const reconciliationIndexes = new WeakMap<
   object,
   Promise<ActionCommitReconciliationIndex>
@@ -202,11 +210,19 @@ async function buildReconciliationIndex(
     const cursor = event?.cursor;
     if (!event || typeof eventId !== "string" || typeof cursor !== "string") return;
     const { cursor: _cursor, ...withoutCursor } = event;
-    if (index.events.has(eventId)) {
+    const sha256 = actionCommitPayloadSha256(withoutCursor);
+    const existing = index.events.get(eventId);
+    if (existing) {
+      if (existing.sha256 === sha256
+        && typeof event.type === "string"
+        && REASSERTABLE_STATE_ANCHOR_EVENTS.has(event.type)) {
+        index.events.set(eventId, { sha256, cursor });
+        return;
+      }
       throw new Error(`Duplicate durable action event identity: ${eventId}`);
     }
     index.events.set(eventId, {
-      sha256: actionCommitPayloadSha256(withoutCursor),
+      sha256,
       cursor
     });
   });

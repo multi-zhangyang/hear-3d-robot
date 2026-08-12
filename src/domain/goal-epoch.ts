@@ -538,6 +538,7 @@ export interface GoalHarnessValidation {
       | "submit_goal_candidates"
       | "select_goal_candidate"
       | "retire_goal_epoch"
+      | "continue_goal_epoch"
   ): boolean;
   evidence_by_ref(ref: string): unknown;
   is_predicate_observable(input: {
@@ -1163,6 +1164,7 @@ export function assertGoalModelSource(
     | "submit_goal_candidates"
     | "select_goal_candidate"
     | "retire_goal_epoch"
+    | "continue_goal_epoch"
 ): void {
   const authorized = harness.authorized_model_sources.some((entry) => (
     entry.agent_id === source.agent_id

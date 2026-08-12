@@ -12,6 +12,7 @@ import {
   type HumanoidReference
 } from "./reference.js";
 import type {
+  HumanoidPolicyFrameSink,
   HumanoidSimulation,
   HumanoidSimulationSnapshot
 } from "./simulation.js";
@@ -56,6 +57,12 @@ import {
   humanoidNavigationCollisionEvidence,
   type HumanoidNavigationCollisionEvidence
 } from "./navigation-collision-evidence.js";
+import {
+  HumanoidEmbodiedSkillCallSchema,
+  legacyHumanoidEmbodiedSkillIdentity,
+  type HumanoidEmbodiedSkillIdentity
+} from "./embodied-skill-call.js";
+import type { HumanoidSkillProgressEvidence } from "./skill-event-stream.js";
 
 const NAVIGATION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.05;
 const NAVIGATION_PRECISION_PROGRESS_BUDGET_SPEED_METERS_PER_SECOND = 0.01;
@@ -167,6 +174,9 @@ export class HumanoidNavigationExecution {
   readonly #arrivalHeading: HumanoidNavigationArrivalHeading | null;
   readonly #requestedPositionToleranceMeters: number | null;
   readonly #onlineReplanCount: number;
+  readonly #skillIdentity: HumanoidEmbodiedSkillIdentity;
+  readonly #policyFrameSink: HumanoidPolicyFrameSink | undefined;
+  readonly #initialTargetDistance: number;
   #reference: HumanoidReference;
   #final: HumanoidSimulationSnapshot;
   #waypointIndex: number;
@@ -187,8 +197,11 @@ export class HumanoidNavigationExecution {
     carryTaskSpaceTargets?: readonly HumanoidCarryTaskSpaceTarget[];
     arrivalHeading?: HumanoidNavigationArrivalHeading | null;
     acceptedPositionToleranceMeters?: number | null;
+    skillIdentity?: HumanoidEmbodiedSkillIdentity;
+    policyFrameSink?: HumanoidPolicyFrameSink;
   }) {
     this.#plan = structuredClone(input.plan);
+    this.#policyFrameSink = input.policyFrameSink;
     this.#reference = input.reference;
     const progress = input.progress
       ? HumanoidNavigationExecutionProgressSchema.parse(input.progress)
@@ -200,6 +213,15 @@ export class HumanoidNavigationExecution {
       input.simulation.resetController(input.reference);
     }
     this.#final = input.simulation.snapshot();
+    this.#skillIdentity = input.skillIdentity
+      ? structuredClone(input.skillIdentity)
+      : legacyHumanoidEmbodiedSkillIdentity({
+          callId: "navigation-execution",
+          runtimeKind: "navigation",
+          phase: "navigate",
+          observedFrame: progress?.committed_frame_count ?? 0,
+          observedWorldRevision: progress?.committed_frame_count ?? 0
+        });
     this.#arrivalHeading = input.arrivalHeading === null
       || input.arrivalHeading === undefined
       ? null
@@ -256,6 +278,10 @@ export class HumanoidNavigationExecution {
       ? { ...progress.segment_start_root_position }
       : { ...this.#final.rootPosition };
     const finalTarget = this.#plan.waypoints.at(-1)!;
+    this.#initialTargetDistance = Math.hypot(
+      finalTarget.x - this.#startRootPosition.x,
+      finalTarget.z - this.#startRootPosition.z
+    );
     const initialFinalDistance = Math.hypot(
       finalTarget.x - this.#segmentStartRootPosition.x,
       finalTarget.z - this.#segmentStartRootPosition.z
@@ -312,6 +338,27 @@ export class HumanoidNavigationExecution {
     return this.#reference;
   }
 
+  skillProgressEvidence(): HumanoidSkillProgressEvidence {
+    const physicalCompletionRatio = this.#initialTargetDistance <= 1e-9
+      ? this.#finalWaypointSatisfied() ? 1 : 0
+      : Math.min(1, Math.max(
+          0,
+          1 - this.#finalWaypointDistance() / this.#initialTargetDistance
+        ));
+    const maximumFrames = Math.max(
+      1,
+      this.#maximumTravelFrames + this.#maximumStoppingFrames
+    );
+    return {
+      elapsedRatio: Math.min(1, this.#frames / maximumFrames),
+      physicalCompletionRatio,
+      satisfiedPredicateRatio: this.#result?.completed ? 1 : 0,
+      stableSteps: this.#stopSettledFrames,
+      requiredStableSteps: NAVIGATION_STOP_SETTLED_STEPS,
+      confidence: 1
+    };
+  }
+
   checkpoint(): HumanoidNavigationExecutionProgress {
     if (this.#pendingFrame) {
       throw new Error("Cannot checkpoint an uncommitted humanoid navigation frame");
@@ -329,15 +376,19 @@ export class HumanoidNavigationExecution {
     });
   }
 
-  async step(simulation: HumanoidSimulation): Promise<HumanoidNavigationExecutionStep> {
-    const prepared = await this.prepareFrame(simulation);
+  async step(
+    simulation: HumanoidSimulation,
+    authority?: { worldFrame: number; worldRevision: number }
+  ): Promise<HumanoidNavigationExecutionStep> {
+    const prepared = await this.prepareFrame(simulation, authority);
     return prepared
       ? this.commitPreparedFrame()
       : this.#terminalStep();
   }
 
   async prepareFrame(
-    simulation: HumanoidSimulation
+    simulation: HumanoidSimulation,
+    authority?: { worldFrame: number; worldRevision: number }
   ): Promise<HumanoidNavigationPreparedFrame | null> {
     if (this.#result) throw new Error("Humanoid navigation execution is already complete");
     if (this.#pendingFrame) {
@@ -515,7 +566,7 @@ export class HumanoidNavigationExecution {
           yawStep
         )
       });
-      return this.#preparePhysicalFrame(simulation, false);
+      return this.#preparePhysicalFrame(simulation, false, authority);
     }
 
     const stoppingVelocity = this.#stoppingStationKeepingVelocityTarget();
@@ -539,7 +590,7 @@ export class HumanoidNavigationExecution {
         this.#yawAcceleration * this.#controlStepSeconds
       )
     });
-    return this.#preparePhysicalFrame(simulation, true);
+    return this.#preparePhysicalFrame(simulation, true, authority);
   }
 
   #stoppingStationKeepingVelocityTarget(): readonly [number, number] {
@@ -670,7 +721,8 @@ export class HumanoidNavigationExecution {
 
   async #preparePhysicalFrame(
     simulation: HumanoidSimulation,
-    stopping: boolean
+    stopping: boolean,
+    authority?: { worldFrame: number; worldRevision: number }
   ): Promise<HumanoidNavigationPreparedFrame> {
     this.#reference = applyHumanoidCarryTaskSpaceServo({
       simulation,
@@ -695,10 +747,33 @@ export class HumanoidNavigationExecution {
         snapshot: simulation.snapshot(),
         targets: this.#graspTargets
       }) ? CARRY_NOSLIP_SOLVER_ITERATIONS : 0,
-      taskCommand: {
-        protocol: "humanoid-controller-task-v1" as const,
-        taskId: this.#carrying ? "carry-navigation" : "navigation",
-        source: this.#carrying ? "carry_navigation" as const : "motion_option" as const,
+      taskCommand: HumanoidEmbodiedSkillCallSchema.parse({
+        protocol: "humanoid-embodied-skill-call-v2",
+        identity: this.#skillIdentity,
+        authority: {
+          source: this.#skillIdentity.runtimeKind === "semantic_skill"
+            ? "agent_harness"
+            : "deterministic_runtime",
+          ...(authority ?? {
+            worldFrame: this.#skillIdentity.observedFrame + this.#frames,
+            worldRevision:
+              this.#skillIdentity.observedWorldRevision + this.#frames
+          })
+        },
+        window: {
+          mode: "autonomous_closed_loop",
+          replanPolicy: "event_driven",
+          controlStepSeconds: this.#controlStepSeconds,
+          maximumSteps: Math.max(
+            1,
+            this.#maximumTravelFrames + this.#maximumStoppingFrames
+          ),
+          stepIndex: this.#frames,
+          remainingSteps: Math.max(
+            0,
+            this.#maximumTravelFrames + this.#maximumStoppingFrames - this.#frames
+          )
+        },
         requestedCapabilities: humanoidControllerTaskCapabilities(
           this.#reference,
           [
@@ -709,8 +784,41 @@ export class HumanoidNavigationExecution {
               : [])
           ]
         ),
-        goal: {
-          protocol: "humanoid-controller-navigation-goal-v1" as const,
+        command: {
+          baseTwist: {
+            forwardMetersPerSecond: this.#reference.rootVelocity[0],
+            lateralMetersPerSecond: this.#reference.rootVelocity[1],
+            yawRadiansPerSecond: this.#reference.rootYawVelocity
+          },
+          rootHeightMeters: this.#reference.rootHeight,
+          leftWristPositionPelvis: navigationWristCommandInPelvis(
+            this.#carryTaskSpaceTargets,
+            "left_wrist_yaw_link",
+            this.#final
+          ),
+          rightWristPositionPelvis: navigationWristCommandInPelvis(
+            this.#carryTaskSpaceTargets,
+            "right_wrist_yaw_link",
+            this.#final
+          ),
+          endEffectors: this.#carryTaskSpaceTargets.map((target) => ({
+            body: target.body,
+            frame: target.frame,
+            position: { ...target.position },
+            tolerance: target.tolerance,
+            orientation: { ...target.orientation },
+            orientationTolerance: target.orientationTolerance
+          })),
+          grasps: this.#graspTargets.map((target) => ({
+            objectId: target.objectId,
+            hand: target.hand,
+            minimumNormalForceN: target.minimumNormalForceN,
+            minimumDistinctContactSurfaces:
+              target.minimumDistinctContactSurfaces ?? 1
+          }))
+        },
+        contract: {
+          protocol: "humanoid-embodied-navigation-contract-v1",
           target: { ...this.#plan.waypoints.at(-1)! },
           positionTolerance: this.#finalAcceptedPositionTolerance(),
           heading: this.#arrivalHeading?.type === "face_point"
@@ -727,22 +835,30 @@ export class HumanoidNavigationExecution {
                 }
               : null
         },
-        endEffectors: this.#carryTaskSpaceTargets.map((target) => ({
-          body: target.body,
-          frame: target.frame,
-          position: { ...target.position },
-          tolerance: target.tolerance,
-          orientation: { ...target.orientation },
-          orientationTolerance: target.orientationTolerance
-        })),
-        grasps: this.#graspTargets.map((target) => ({
-          objectId: target.objectId,
-          hand: target.hand,
-          minimumNormalForceN: target.minimumNormalForceN,
-          minimumDistinctContactSurfaces:
-            target.minimumDistinctContactSurfaces ?? 1
-        }))
-      }
+        safety: {
+          authorizedContacts: this.#contactConstraints.map((contact) => ({
+            ...contact
+          })),
+          stopOnFall: true,
+          stopOnUnauthorizedContact: true,
+          stopOnContractViolation: true
+        },
+        feedback: {
+          mode: "event_driven",
+          progressDelta: 0.1,
+          events: [
+            "accepted",
+            "progress",
+            "succeeded",
+            "failed",
+            "interrupted",
+            "environment_changed"
+          ]
+        }
+      }),
+      ...(this.#policyFrameSink
+        ? { policyFrameSink: this.#policyFrameSink }
+        : {})
     });
     const prepared = {
       snapshot,
@@ -1090,6 +1206,20 @@ export function carryNavigationFailure(
   return collision
     ? `carried_object_collision:${collision.object_id}:${collision.counterpart_kind}`
     : undefined;
+}
+
+function navigationWristCommandInPelvis(
+  targets: readonly HumanoidCarryTaskSpaceTarget[],
+  body: "left_wrist_yaw_link" | "right_wrist_yaw_link",
+  snapshot: HumanoidSimulationSnapshot
+): Vec3 | null {
+  const target = targets.find((candidate) => candidate.body === body);
+  if (!target || target.frame === "torso") return null;
+  if (target.frame === "pelvis") return { ...target.position };
+  return rotateVector(
+    inverseQuaternion(snapshot.rootRotation),
+    subtract(target.position, snapshot.rootPosition)
+  );
 }
 
 function environmentContact(

@@ -4,6 +4,7 @@ import {
   AutonomousCycleRefSchema,
   sameAutonomousCycle
 } from "./autonomous-cycle.js";
+import { HumanoidReplanModelCallSchema } from "./humanoid-replan-budget.js";
 
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 
@@ -33,8 +34,21 @@ const ModelCallStartedSchema = z.object({
   model_call_id: z.string().uuid(),
   agent_id: z.string().trim().min(1),
   cycle: AutonomousCycleRefSchema.optional(),
+  replan_budget_call: HumanoidReplanModelCallSchema.optional(),
   at: z.string().datetime()
-}).strict();
+}).strict().superRefine((record, context) => {
+  const call = record.replan_budget_call;
+  if (call && (call.model_call_id !== record.model_call_id
+    || call.agent_id !== record.agent_id
+    || call.started_at !== record.at
+    || call.status !== "started")) {
+    context.addIssue({
+      code: "custom",
+      path: ["replan_budget_call"],
+      message: "Model call replan budget evidence does not match its lifecycle start"
+    });
+  }
+});
 
 const ModelCallCompletedSchema = z.object({
   version: z.literal(1),

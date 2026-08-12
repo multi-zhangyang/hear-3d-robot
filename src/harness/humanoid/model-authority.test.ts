@@ -144,19 +144,19 @@ describe("HumanoidModelAuthority", () => {
     const actionInput = {};
     const argumentsSha256 = modelPayloadSha256(actionInput);
     await authority.recordStarted(
-      HUMANOID_AGENT_IDS.sentry,
+      HUMANOID_AGENT_IDS.motion,
       cycle,
       MODEL_CALL_ID,
       STARTED_AT
     );
     const completion = {
       modelCallId: MODEL_CALL_ID,
-      agentId: HUMANOID_AGENT_IDS.sentry,
+      agentId: HUMANOID_AGENT_IDS.motion,
       responseId: "response-durable",
       responseOutputSha256: RESPONSE_SHA256,
       toolCalls: [{
         toolCallId: transactionId,
-        toolName: "observe_humanoid",
+        toolName: "plan_humanoid_navigation",
         argumentsSha256
       }],
       at: COMPLETED_AT
@@ -168,26 +168,26 @@ describe("HumanoidModelAuthority", () => {
     expect(() => authority.actionModelSource({
       toolAuthority: {
         tool_call_id: transactionId,
-        tool_name: "observe_humanoid",
+        tool_name: "plan_humanoid_navigation",
         arguments_sha256: argumentsSha256
       },
-      expectedToolName: "observe_humanoid",
+      expectedToolName: "plan_humanoid_navigation",
       actionInput,
       transactionId,
-      agentId: HUMANOID_AGENT_IDS.sentry
+      agentId: HUMANOID_AGENT_IDS.motion
     })).toThrow("no completed model response authority");
 
     await authority.recordCompleted(completion);
     expect(authority.actionModelSource({
       toolAuthority: {
         tool_call_id: transactionId,
-        tool_name: "observe_humanoid",
+        tool_name: "plan_humanoid_navigation",
         arguments_sha256: argumentsSha256
       },
-      expectedToolName: "observe_humanoid",
+      expectedToolName: "plan_humanoid_navigation",
       actionInput,
       transactionId,
-      agentId: HUMANOID_AGENT_IDS.sentry
+      agentId: HUMANOID_AGENT_IDS.motion
     }).model_call_id).toBe(MODEL_CALL_ID);
   });
 
@@ -235,6 +235,101 @@ describe("HumanoidModelAuthority", () => {
       transactionId: toolCallId,
       agentId: HUMANOID_AGENT_IDS.goalManager
     })).toThrow("tool authority mismatch");
+  });
+
+  it("attributes deterministic execution to the Coordinator decision and Executor actor", async () => {
+    const records: ModelCallLifecycleRecord[] = [];
+    const authority = createAuthority(records);
+    const transactionId = "delegate-execution-gate";
+    const sourceInput = {
+      objective: "执行已接受导航",
+      execution: {
+        kind: "execute_plan",
+        planning_action: "plan_humanoid_navigation",
+        planning_transaction_id: "planning-call-41"
+      }
+    };
+    const actionInput = { planning_transaction_id: "planning-call-41" };
+    const sourceArgumentsSha256 = modelPayloadSha256(sourceInput);
+    const actionInputSha256 = modelPayloadSha256(actionInput);
+    await authority.recordStarted(
+      HUMANOID_AGENT_IDS.coordinator,
+      cycle,
+      MODEL_CALL_ID,
+      STARTED_AT
+    );
+    await authority.recordCompleted({
+      modelCallId: MODEL_CALL_ID,
+      agentId: HUMANOID_AGENT_IDS.coordinator,
+      responseId: "coordinator-execution-response",
+      responseOutputSha256: RESPONSE_SHA256,
+      toolCalls: [{
+        toolCallId: transactionId,
+        toolName: "delegate_physics_executor",
+        argumentsSha256: sourceArgumentsSha256
+      }],
+      at: COMPLETED_AT
+    });
+
+    const decision = authority.actionModelSource({
+      toolAuthority: {
+        tool_call_id: transactionId,
+        tool_name: "delegate_physics_executor",
+        arguments_sha256: sourceArgumentsSha256,
+        deterministic_delegation: {
+          contract_id: "execution_gate_v1",
+          source_input: sourceInput,
+          action_input_sha256: actionInputSha256
+        }
+      },
+      expectedToolName: "execute_humanoid_navigation",
+      actionInput,
+      transactionId,
+      agentId: HUMANOID_AGENT_IDS.executor
+    });
+
+    expect(decision).toMatchObject({
+      agent_id: HUMANOID_AGENT_IDS.coordinator,
+      tool_call_id: transactionId,
+      tool_arguments_sha256: sourceArgumentsSha256,
+      normalized_tool_arguments_sha256: actionInputSha256
+    });
+    expect(() => authority.assertActionDecision({
+      rawDecision: decision,
+      expectedToolName: "execute_humanoid_navigation",
+      actionInput,
+      transactionId,
+      agentId: HUMANOID_AGENT_IDS.executor,
+      cycle,
+      toolAuthority: {
+        tool_call_id: transactionId,
+        tool_name: "delegate_physics_executor",
+        arguments_sha256: sourceArgumentsSha256,
+        deterministic_delegation: {
+          contract_id: "execution_gate_v1",
+          source_input: sourceInput,
+          action_input_sha256: actionInputSha256
+        }
+      }
+    })).not.toThrow();
+    expect(() => authority.assertActionDecision({
+      rawDecision: decision,
+      expectedToolName: "execute_humanoid_navigation",
+      actionInput: { planning_transaction_id: "another-plan" },
+      transactionId,
+      agentId: HUMANOID_AGENT_IDS.executor,
+      cycle,
+      toolAuthority: {
+        tool_call_id: transactionId,
+        tool_name: "delegate_physics_executor",
+        arguments_sha256: sourceArgumentsSha256,
+        deterministic_delegation: {
+          contract_id: "execution_gate_v1",
+          source_input: sourceInput,
+          action_input_sha256: actionInputSha256
+        }
+      }
+    })).toThrow("no durable deterministic delegation");
   });
 
   it("keeps a durably verified Goal source authorized across an archived Agent epoch", async () => {
@@ -294,6 +389,62 @@ describe("HumanoidModelAuthority", () => {
       harness,
       "submit_goal_candidates"
     )).toThrowError(expect.objectContaining({ code: "unauthorized_model_source" }));
+  });
+
+  it("revalidates durable action receipts from an archived model epoch", () => {
+    const archived = {
+      ...manifest(),
+      epoch_id: "55555555-5555-4555-8555-555555555555",
+      identity_sha256: "e".repeat(64)
+    } as AgentManifest;
+    const transactionId = "archived-motion-action";
+    const actionInput = { target: { x: 1, y: 0, z: 2 } };
+    const argumentsSha256 = modelPayloadSha256(actionInput);
+    const records: ModelCallLifecycleRecord[] = [{
+      version: 1,
+      lifecycle: "started",
+      model_call_id: MODEL_CALL_ID,
+      agent_id: HUMANOID_AGENT_IDS.motion,
+      cycle,
+      at: STARTED_AT
+    }, {
+      version: 1,
+      lifecycle: "completed",
+      model_call_id: MODEL_CALL_ID,
+      agent_id: HUMANOID_AGENT_IDS.motion,
+      response_id: "archived-motion-response",
+      response_output_sha256: RESPONSE_SHA256,
+      tool_calls: [{
+        tool_call_id: transactionId,
+        tool_name: "plan_humanoid_navigation",
+        arguments_sha256: argumentsSha256
+      }],
+      cycle,
+      at: COMPLETED_AT
+    }];
+    const authority = createAuthority(
+      records,
+      async (record) => { records.push(structuredClone(record)); },
+      [archived]
+    );
+
+    expect(() => authority.assertActionDecision({
+      rawDecision: {
+        agent_id: HUMANOID_AGENT_IDS.motion,
+        agent_manifest_sha256: archived.identity_sha256,
+        agent_manifest_epoch_id: archived.epoch_id,
+        model_call_id: MODEL_CALL_ID,
+        response_id: "archived-motion-response",
+        response_output_sha256: RESPONSE_SHA256,
+        tool_call_id: transactionId,
+        tool_arguments_sha256: argumentsSha256
+      },
+      expectedToolName: "plan_humanoid_navigation",
+      actionInput,
+      transactionId,
+      agentId: HUMANOID_AGENT_IDS.motion,
+      cycle
+    })).not.toThrow();
   });
 
   it("binds raw model arguments and normalized SDK input without weakening authority", async () => {

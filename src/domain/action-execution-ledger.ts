@@ -5,7 +5,11 @@ import {
   actionCommitReceiptSha256,
   type PendingActionCommit
 } from "./action-commit-outbox.js";
-import type { JsonValue } from "./schema.js";
+import { JsonValueSchema, type JsonValue } from "./schema.js";
+import {
+  ModelDecisionRefSchema,
+  type ModelDecisionRef
+} from "./model-call-authority.js";
 import {
   PhysicalTrajectorySummarySchema,
   type PhysicalTrajectorySummary
@@ -15,6 +19,10 @@ import {
   sameAutonomousCycle,
   type AutonomousCycleRef
 } from "./autonomous-cycle.js";
+import {
+  HumanoidGroundingReceiptSchema,
+  type HumanoidGroundingReceipt
+} from "./humanoid-grounding.js";
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
@@ -24,13 +32,65 @@ const PhysicalHumanoidActionSchema = z.enum([
   "execute_humanoid_navigation"
 ]);
 
+export const ExecutionGateToolCallAuthoritySchema = z.object({
+  tool_call_id: z.string().trim().min(1),
+  tool_name: z.literal("delegate_physics_executor"),
+  arguments_sha256: z.string().regex(SHA256_PATTERN),
+  normalized_arguments_sha256: z.string().regex(SHA256_PATTERN).optional(),
+  deterministic_delegation: z.object({
+    contract_id: z.literal("execution_gate_v1"),
+    source_input: JsonValueSchema,
+    action_input_sha256: z.string().regex(SHA256_PATTERN)
+  }).strict()
+}).strict();
+
+export type ExecutionGateToolCallAuthority = z.infer<
+  typeof ExecutionGateToolCallAuthoritySchema
+>;
+
 const ActionExecutionAdmissionSchema = z.object({
   planning_transaction_id: z.string().trim().min(1),
   plan_id: z.string().trim().min(1),
   world_frame: z.number().int().nonnegative(),
   world_revision: z.number().int().nonnegative(),
   authority_state_sha256: z.string().regex(SHA256_PATTERN),
-  physical_checkpoint_sha256: z.string().regex(SHA256_PATTERN)
+  physical_checkpoint_sha256: z.string().regex(SHA256_PATTERN),
+  decision: ModelDecisionRefSchema.optional(),
+  tool_call_authority: ExecutionGateToolCallAuthoritySchema.optional(),
+  grounding_receipt: HumanoidGroundingReceiptSchema.optional()
+}).strict().superRefine((admission, context) => {
+  if ((admission.decision === undefined)
+    !== (admission.tool_call_authority === undefined)) {
+    context.addIssue({
+      code: "custom",
+      path: ["decision"],
+      message: "Physical admission authority envelope is incomplete"
+    });
+    return;
+  }
+  const decision = admission.decision;
+  const authority = admission.tool_call_authority;
+  if (decision && authority && (
+    decision.tool_call_id !== authority.tool_call_id
+      || decision.tool_arguments_sha256 !== authority.arguments_sha256
+      || (decision.normalized_tool_arguments_sha256
+        ?? decision.tool_arguments_sha256)
+        !== authority.deterministic_delegation.action_input_sha256
+  )) {
+    context.addIssue({
+      code: "custom",
+      path: ["tool_call_authority"],
+      message: "Physical admission authority is not bound to its model decision"
+    });
+  }
+});
+
+const ActionExecutionPlanTerminalSchema = z.object({
+  kind: z.enum(["motion", "navigation"]),
+  plan_id: z.string().trim().min(1),
+  result_sha256: z.string().regex(SHA256_PATTERN),
+  final_frame: z.number().int().nonnegative(),
+  final_world_revision: z.number().int().nonnegative()
 }).strict();
 
 const ActionExecutionProgressSchema = z.object({
@@ -39,7 +99,8 @@ const ActionExecutionProgressSchema = z.object({
   world_revision: z.number().int().nonnegative(),
   authority_state_sha256: z.string().regex(SHA256_PATTERN),
   physical_checkpoint_sha256: z.string().regex(SHA256_PATTERN),
-  physical_trajectory: PhysicalTrajectorySummarySchema.nullable().default(null)
+  physical_trajectory: PhysicalTrajectorySummarySchema.nullable().default(null),
+  completed_plan_terminals: z.array(ActionExecutionPlanTerminalSchema).default([])
 }).strict();
 
 const ActionExecutionTerminalIdentitySchema = z.object({
@@ -83,6 +144,24 @@ const ActionExecutionLedgerEntrySchema = z.object({
     });
   }
   const trajectory = entry.progress.physical_trajectory;
+  const terminalPlanIds = new Set<string>();
+  let previousTerminalRevision = entry.admission.world_revision;
+  for (const [index, terminal] of entry.progress.completed_plan_terminals.entries()) {
+    if (terminalPlanIds.has(terminal.plan_id)
+      || terminal.final_frame > entry.progress.world_frame
+      || terminal.final_world_revision > entry.progress.world_revision
+      || terminal.final_frame - entry.admission.world_frame
+        !== terminal.final_world_revision - entry.admission.world_revision
+      || terminal.final_world_revision < previousTerminalRevision) {
+      context.addIssue({
+        code: "custom",
+        path: ["progress", "completed_plan_terminals", index],
+        message: "Completed physical plan terminals are not a valid execution prefix"
+      });
+    }
+    terminalPlanIds.add(terminal.plan_id);
+    previousTerminalRevision = terminal.final_world_revision;
+  }
   if (trajectory && (
     trajectory.end_frame !== entry.progress.world_frame
       || trajectory.end_world_revision !== entry.progress.world_revision
@@ -203,7 +282,10 @@ export function stageActionExecutionIntent(
     worldRevision: number;
     authorityStateSha256: string;
     physicalCheckpointSha256: string;
+    decision: ModelDecisionRef;
+    toolCallAuthority: ExecutionGateToolCallAuthority;
     physicalTrajectory?: PhysicalTrajectorySummary;
+    groundingReceipt?: HumanoidGroundingReceipt;
     admittedAt?: string;
   }
 ): ActionExecutionLedger {
@@ -224,7 +306,16 @@ export function stageActionExecutionIntent(
       world_frame: input.worldFrame,
       world_revision: input.worldRevision,
       authority_state_sha256: input.authorityStateSha256,
-      physical_checkpoint_sha256: input.physicalCheckpointSha256
+      physical_checkpoint_sha256: input.physicalCheckpointSha256,
+      decision: ModelDecisionRefSchema.parse(input.decision),
+      tool_call_authority: input.toolCallAuthority,
+      ...(input.groundingReceipt
+        ? {
+            grounding_receipt: HumanoidGroundingReceiptSchema.parse(
+              input.groundingReceipt
+            )
+          }
+        : {})
     }
   };
   const entry = ActionExecutionLedgerEntrySchema.parse({
@@ -236,7 +327,8 @@ export function stageActionExecutionIntent(
       world_revision: input.worldRevision,
       authority_state_sha256: input.authorityStateSha256,
       physical_checkpoint_sha256: input.physicalCheckpointSha256,
-      physical_trajectory: input.physicalTrajectory ?? null
+      physical_trajectory: input.physicalTrajectory ?? null,
+      completed_plan_terminals: []
     },
     status: "admitted",
     terminal: null,
@@ -274,6 +366,9 @@ export function recordActionExecutionProgress(
     authorityStateSha256: string;
     physicalCheckpointSha256: string;
     physicalTrajectory?: PhysicalTrajectorySummary;
+    completedPlanTerminals?: z.infer<
+      typeof ActionExecutionProgressSchema
+    >["completed_plan_terminals"];
     updatedAt?: string;
   }
 ): ActionExecutionLedger {
@@ -296,7 +391,9 @@ export function recordActionExecutionProgress(
     authority_state_sha256: input.authorityStateSha256,
     physical_checkpoint_sha256: input.physicalCheckpointSha256,
     physical_trajectory: input.physicalTrajectory
-      ?? entry.progress.physical_trajectory
+      ?? entry.progress.physical_trajectory,
+    completed_plan_terminals: input.completedPlanTerminals
+      ?? entry.progress.completed_plan_terminals
   });
   if (sameProgress(entry.progress, progress)) return ledger;
   if (progress.committed_frame_count === entry.progress.committed_frame_count) {

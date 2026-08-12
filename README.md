@@ -8,7 +8,7 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 ## 核心能力
 
-- OpenAI Agents SDK 层级编排，每个智能体拥有独立 Model、持久 Session、缓存亲和键和上下文生命周期
+- OpenAI Agents SDK 层级编排：Goal Manager、Coordinator、Motion 各有独立 Model 与持久 Session；Grounding Monitor 和 Execution Gate 为零模型调用的确定性服务
 - 遮挡感知的持久空间信念、未知区域 frontier、对象中心世界模型、可供性目录与模型提交的 Skill DAG
 - G1 29 个全身关节与 14 个手部关节、双足接触、质心、支撑面和跌倒检测
 - 模型选择 Goal、Skill、对象、手、交互点和策略；通用求解层自动生成可达站位与任务空间轨迹
@@ -37,9 +37,9 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
        │ Goal
        ▼
 人形自主协调智能体
-  ├─ 人形感知哨兵
+  ├─ 异步物理 Grounding Monitor（确定性）
   ├─ 全身运动参考智能体
-  └─ 人形物理执行智能体
+  └─ 物理 Execution Gate（确定性）
        │
        ▼
 模型选择的 Goal → 局部 Skill DAG
@@ -57,7 +57,7 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 权威世界帧与动作回执 → 目标检查 / 滚动重规划
 ```
 
-目标管理、协调、感知、运动参考和物理执行是五个边界明确的智能体，而不是一个模型扮演多个名称。协调智能体不能直接修改世界；目标管理智能体负责提出并选择当前 Goal；运动参考智能体只能提交规划；执行智能体只能消费当前世界版本中已接受规划的原始回执。
+层级中只有目标管理、协调和运动参考三个节点调用模型。Grounding Monitor 直接从 MuJoCo、本体感觉、接触与头部传感器生成受限观察；Execution Gate 只把 Coordinator 已签名的委派确定性映射到唯一正式执行动作。协调模型不能直接修改世界，两个服务也不能生成目标、重写规划或制造新的模型 authority。动作回执保留服务 actor 身份，同时把 Coordinator 的外层工具调用保存为真实决策来源。
 
 一次动作需要同时满足以下条件才会改变世界：
 
@@ -98,7 +98,9 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 YAHMP 参考控制器声明 `balance`、`locomotion` 和 `joint_reference_tracking`。任务空间 IK、接触柔顺和抓取检查器是参考生成与物理验收组件，不代表策略已经学会接触式操作或双手操作。后续可以接入强化学习、模仿学习或其他已训练策略；新控制器只有在真实支持时才应声明 `contact_rich_manipulation` 或 `bimanual_manipulation`，Harness 仍会用同一 MuJoCo 预演和执行回执验证结果。只运行参考控制器时可设置 `HEAR_HUMANOID_CONTROLLER_MODULE=hear/controllers/yahmp`。
 
-外接学习策略缺少平衡、移动或关节参考跟踪中的任一基础能力时，模拟器会把它作为主控制器，并创建独立 YAHMP 参考控制器组成能力路由。站立、普通导航、持物导航和全身运动的每个控制步都会声明实际能力需求与任务目标；路由从当前 MuJoCo 状态选择覆盖该阶段的控制器。分支切换不会直接跳变电机目标，而是按控制器声明的响应周期连续插值关节目标、刚度和阻尼；正在进行的交接与两个控制器的内部状态共同保存到物理检查点。主策略的 `learnedPolicy.capabilities` 保持原值，参考控制不会被合并或冒充为训练能力。已经完整实现能力路由的外接控制器可以通过 `capabilityRouting` 描述自身边界，运行时不会再次包装。
+外接学习策略缺少平衡、移动或关节参考跟踪中的任一基础能力时，模拟器会把它作为主控制器，并创建独立 YAHMP 参考控制器组成能力路由。声明能力只是第一层筛选；路由还按控制器实现与语义 Skill 家族保存真实成功后验、近期结果、成功入口状态分布、命令分布和策略切换结果。冷启动允许有界探索，积累足够真实终态后，低置信成功后验、入口状态 OOD 或命令 OOD 都会拒绝学习策略并使用参考回退。预演不会写入能力经验，未完成准入与能力证据会随物理检查点精确恢复。
+
+站立、普通导航、持物导航和全身运动的每个控制步都会声明实际能力需求与任务目标。分支切换不会直接跳变电机目标，而是按控制器声明的响应周期连续插值关节目标、刚度和阻尼。终态归因分别统计主策略、完整回退和上身叠加控制步；只有回退接管后才完成的任务不会被伪记为学习策略成功。准入理由、置信区间、OOD 分数、控制段归因与切换结果进入物理轨迹、执行回执和 benchmark。主策略的 `learnedPolicy.capabilities` 保持原值，参考控制不会被合并或冒充为训练能力。已经完整实现能力路由的外接控制器可以通过 `capabilityRouting` 描述自身边界，运行时不会再次包装。
 
 控制器协议同时提供可声明的策略观察特征与逐控制步任务命令。训练策略可按自身编码消费根运动、手部状态、末端状态、MuJoCo 接触、对象与关节状态，以及当前任务空间目标和抓取约束；YAHMP 仍只读取原有本体状态与命令历史。语义 Skill 不会被展开成模型供应商或训练框架专用格式，因此本地 ONNX、远程策略服务和后续训练产物可以共用同一控制器边界。
 
@@ -120,13 +122,13 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 
 ## 长期运行
 
-每个层级节点拥有独立的 Agents SDK Session。稳定指令和历史位于请求前缀，实时世界权限位于末尾；缓存亲和键按凭证、协议、模型和 Agent 角色保持稳定，因此完全一致的公共前缀可以跨任务复用。亲和键只影响供应商缓存路由，不承载对话内容；不同 Run 的 Session 和物理状态始终隔离。端点明确拒绝缓存扩展参数时，该节点的 Model facade 只协商一次并继续使用协议自身的自动前缀缓存。界面和日志中的缓存读取量直接来自模型服务返回的 usage，不使用本地估算。活动上下文接近配置阈值时，系统调用模型生成结构化压缩记录，并保留近期原始轮次。压缩结果必须引用真实动作回执；完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。Goal DAG 把同一次模型调用产生的候选视为一个决策批次：显式选择一个候选时，其余候选以未采用结果绑定同一选择证据。检查点只保留当前工作集、仍被依赖的已完成候选和近期 epoch；更早的完整决策批次会先写入哈希链式追加日志，再从检查点裁剪，进程中断后可幂等恢复。检查点还原子维护按谓词、对象、区域、方块和末端聚合的终身 Goal 结果，目标管理智能体在每次选择时都能看到归档与当前工作集的真实终态；旧版日志会在恢复时从完整哈希链重建，未保存候选批次的早期记录会明确标记为不完整，而不会补造数据。目标管理智能体可按状态、谓词、对象、方块、语义区域、世界空间范围或候选标识分页召回归档 Goal。模型生成的经历摘要不会进入权威状态块。协调与运动智能体可以按 `episode:N` 或 `action:<transactionId>` 精确召回成功、拒绝、漂移、约束违规和停滞记录，也可以按 Goal 谓词、对象、静态实体、区域和真实结果检索具身经验；所有召回结果均标记为历史信息，不能代替当前传感。
+三个推理节点各自拥有独立的 Agents SDK Session。Grounding Monitor 与 Execution Gate 不创建 Model facade、Session 或上下文压缩状态。稳定指令和历史位于请求前缀，实时世界权限位于末尾；缓存亲和键按凭证、协议、模型和 Agent 角色保持稳定，因此完全一致的公共前缀可以跨任务复用。亲和键只影响供应商缓存路由，不承载对话内容；不同 Run 的 Session 和物理状态始终隔离。端点明确拒绝缓存扩展参数时，该节点的 Model facade 只协商一次并继续使用协议自身的自动前缀缓存。界面和日志中的缓存读取量直接来自模型服务返回的 usage，不使用本地估算。活动上下文接近配置阈值时，系统调用模型生成结构化压缩记录，并保留近期原始轮次。压缩结果必须引用真实动作回执；完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。Goal DAG 把同一次模型调用产生的候选视为一个决策批次：显式选择一个候选时，其余候选以未采用结果绑定同一选择证据。检查点只保留当前工作集、仍被依赖的已完成候选和近期 epoch；更早的完整决策批次会先写入哈希链式追加日志，再从检查点裁剪，进程中断后可幂等恢复。检查点还原子维护按谓词、对象、区域、方块和末端聚合的终身 Goal 结果，目标管理智能体在每次选择时都能看到归档与当前工作集的真实终态；旧版日志会在恢复时从完整哈希链重建，未保存候选批次的早期记录会明确标记为不完整，而不会补造数据。目标管理智能体可按状态、谓词、对象、方块、语义区域、世界空间范围或候选标识分页召回归档 Goal。模型生成的经历摘要不会进入权威状态块。协调与运动智能体可以按 `episode:N` 或 `action:<transactionId>` 精确召回成功、拒绝、漂移、约束违规和停滞记录，也可以按 Goal 谓词、对象、静态实体、区域和真实结果检索具身经验；所有召回结果均标记为历史信息，不能代替当前传感。
 
 上下文压缩本身由独立模型完成。无效输出可以在同一压缩回合内重新生成；网络中断会立即交还原业务 Agent 的标准传输恢复流程，原始历史和 Session 不会被替代摘要覆盖。只有通过 schema、来源引用和当前世界权限校验的压缩记录才会成为新基线；基线提交后的业务请求若中断，恢复只保留该基线和真实热历史，不会重新灌入已经裁剪的旧前缀。配置窗口不足属于明确的容量错误，不会无限重试。
 
 运行时按权威世界版本、真实物理帧和动作回执检测长期无进展循环。守卫只中断并重建停滞的模型上下文，不生成默认动作，也不替模型选择行为。目标稳定进度随检查点持久化；恢复时只接受与 Goal 哈希、世界快照和 MuJoCo 检查点一致的证据。
 
-模型传输中断时，可序列化的 Agents SDK RunState 只在 Goal、动作账本、上下文压缩和自主循环身份仍兼容时继续使用。每份 RunState 同时绑定五个独立 Session 的精确历史前缀；恢复会先核验全部前缀，再统一移除断线后未形成新状态的会话后缀。任一前缀分歧都会拒绝该 RunState，已经提交的物理动作、Goal 证据和追加式日志不会回滚。OpenAI-compatible 传输还会在请求边界清理进程中断留下的半边工具协议片段，完整工具调用与结果保持原顺序，动作事实继续由当前 Harness 权威块提供。
+模型传输中断时，可序列化的 Agents SDK RunState 只在 Goal、动作账本、上下文压缩和自主循环身份仍兼容时继续使用。每份 RunState 绑定三个推理 Session 的精确历史前缀；恢复会先核验全部前缀，再统一移除断线后未形成新状态的会话后缀。任一前缀分歧都会拒绝该 RunState，已经提交的物理动作、Goal 证据和追加式日志不会回滚。OpenAI-compatible 传输还会在请求边界清理进程中断留下的半边工具协议片段，完整工具调用与结果保持原顺序，动作事实继续由当前 Harness 权威块提供。
 
 运行检查点包含：
 
@@ -136,7 +138,7 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 - 具名末端目标的逐帧稳定进度与 Goal 身份校验
 - 已提交动作回执、候选筛选证据和待处理生命周期事件
 - 不可变运动制品、物理预演轨迹、Option 监控状态与执行游标
-- 每个智能体的独立 Session 与可恢复 SDK 状态
+- 三个推理智能体的独立 Session、确定性服务身份与可恢复 SDK 状态
 
 Operator 异常退出后，未完成任务会转为可恢复状态。恢复操作从持久化物理状态和上下文继续，不播放录制动画。尚未完成的物理动作使用原 transaction ID 和原规划制品续接，完成后才恢复上层模型循环；正常暂停会把不足周期的执行尾帧一并写入账本。旧检查点若已保存更靠后的精确 MuJoCo 状态，只在规划进度与世界版本完全一致时从该状态继续，无法重建的中间轨迹明确标记为不完整。有限任务的最终 Goal 验收、Run 成功状态和生命周期事件在同一检查点事务中提交，恢复后不会继续创建多余 Goal。
 
@@ -221,8 +223,12 @@ HEAR_HOST=127.0.0.1
 HEAR_PORT=8765
 HEAR_OPERATOR_PASSWORD=
 HEAR_RUNS_DIR=./runs
+HEAR_DENSE_POLICY_ROLLOUT_DIR=./artifacts/training/harness-rollouts/dense
 HEAR_HUMANOID_CONTROLLER_MODULE=
 HEAR_MJLAB_G1_POLICY_DIRECTORY=
+HEAR_WORKYARD_REACH_POLICY_DIRECTORY=
+HEAR_WORKYARD_CONTACT_POLICY_DIRECTORY=
+HEAR_WORKYARD_CONTACT_TARGET_ZONE_ID=assembly_bay
 ```
 
 可用传输协议：
@@ -237,20 +243,20 @@ HEAR_MJLAB_G1_POLICY_DIRECTORY=
 
 `AI_REQUEST_TIMEOUT_MS` 默认是 `300000`，表示 HTTP 建连或相邻响应数据之间允许的最长静默时间。`AI_STREAM_EVENT_IDLE_TIMEOUT_MS` 默认同为 `300000`，约束相邻 Agents SDK 模型事件之间的静默时间；只有真实模型事件会续期。两者均可按端点能力在 5 秒至 10 分钟之间调整，任务总时限、人工停止和进程恢复仍独立生效。
 
-目标管理、协调、感知、运动、执行和压缩可以使用彼此独立的模型配置。未设置的角色变量继承同名 `AI_*` 默认值；设置时使用 `AI_<ROLE>_<SETTING>`：
+目标管理、协调、运动和压缩可以使用彼此独立的模型配置。未设置的角色变量继承同名 `AI_*` 默认值；设置时使用 `AI_<ROLE>_<SETTING>`。`SENTRY` 与 `EXECUTOR` 配置键仅为旧运行配置解析兼容而保留，新 Harness 不会为这两个确定性服务创建模型请求：
 
 | `ROLE` | 运行职责 |
 |---|---|
 | `GOAL_MANAGER` | 自主 Goal 候选与选择 |
 | `COORDINATOR` | 自主循环协调 |
-| `SENTRY` | 实时感知 |
+| `SENTRY` | 旧版兼容；当前为确定性 Grounding Monitor |
 | `MOTION` | 全身运动规划 |
-| `EXECUTOR` | 物理执行 |
+| `EXECUTOR` | 旧版兼容；当前为确定性 Execution Gate |
 | `COMPACTOR` | 长期上下文压缩 |
 
 `SETTING` 支持 `PROVIDER`、`BASE_URL`、`MODEL`、`API_KEY`、`REQUEST_TIMEOUT_MS`、`STREAM_EVENT_IDLE_TIMEOUT_MS`、`TEMPERATURE`、`REASONING_EFFORT`、`TOOL_CHOICE`、`MAX_OUTPUT_TOKENS`、`CONTEXT_WINDOW_TOKENS`、`COMPACT_TRIGGER_TOKENS`、`COMPACT_RECENT_MODEL_TURNS` 和 `COMPACT_MAX_OUTPUT_TOKENS`。例如 `AI_MOTION_MODEL` 只覆盖运动节点，`AI_COMPACTOR_CONTEXT_WINDOW_TOKENS` 只描述压缩模型的真实上下文上限。配置仍基于协议能力，不绑定服务商或模型名称。
 
-五个业务层级节点各自持有独立 Model facade 与持久 Session；压缩器使用独立模型配置和无历史污染的有界 SDK 回合。每个 Run 会写入不含凭证和端点明文的 Agent 身份清单。恢复时会核验模型、协议、端点身份哈希、模型参数、指令、工具 Schema 和 Agents SDK 版本；不兼容配置会被明确拒绝，不会静默复用旧 Session。
+三个推理节点各自持有独立 Model facade 与持久 Session；两个确定性服务只持有实现合约和工具 Schema 身份；压缩器使用独立模型配置和无历史污染的有界 SDK 回合。每个 Run 会写入不含凭证和端点明文的 Harness 身份清单。恢复时会同时核验模型配置、服务实现合约、工具 Schema 和 Agents SDK 版本；不兼容配置会被明确拒绝，不会静默复用旧 Session。
 
 ## 启动
 
@@ -273,12 +279,52 @@ pnpm start
 
 ```text
 pnpm hear scenarios
+pnpm hear benchmark --runs-dir PATH [--output FILE]
+
+pnpm hear export-harness-rollouts --runs-dir PATH [--dense-rollouts-dir PATH] [--output FILE]
 pnpm hear run --scenario ID --mission TEXT --goal JSON [--mode mission|continuous] [--seed N] --confirm
 pnpm hear resume --run RUN_ID [--fresh-agent-epoch] --confirm
 pnpm hear operator [--host HOST] [--port PORT] [--dev]
 ```
 
 `mission` 在模型选择并经物理验收完成与任务约束完全一致的 Goal 后结束；`continuous` 在每个 Goal 完成后继续自主选择下一目标，直到操作者暂停。命令行默认使用 `mission`，Web Operator 默认使用 `continuous`。
+
+`benchmark` 可以读取单个 Run 目录或包含多个 Run 的根目录，汇总任务成功率、跌倒率、规划与执行结果、模型调用与 token、真实运动路径、物理安全极值，以及学习策略、参考控制和混合控制各自实际执行的帧数。旧运行缺少控制权或安全证据时，对应比例和极值保持为 `null`，不会补造为零。`--output` 会另外写出同一份 JSON 报告；`artifacts/benchmarks/` 默认不进入 Git。
+
+`export-harness-rollouts` 把追加式 Run 日志按语义 Skill Call 聚合为 JSONL：保留 typed Skill binding、规划尝试、执行终态、恢复来源、稀疏 Skill 事件、控制器路由和物理轨迹哈希，并将规划拒绝、物理失败、环境变化以及恢复成败分开标注。最多 64 帧的审计轨迹不会冒充 50 Hz 模仿学习数据。权威 Skill 执行会另行逐控制步同步写入带 SHA-256 链的 observation/action/teacher JSONL；导出器按 run ID 与 call ID 校验并关联这组数据，损坏的中间记录会拒绝，进程崩溃留下的末尾半行可安全修剪。默认输出位于 `artifacts/training/harness-rollouts/`，不会进入 Git。
+
+Workyard 任务条件化策略的训练契约可以在不创建 GPU 会话的情况下验证：
+
+```sh
+pnpm validate:workyard-training
+```
+
+验证会将 29 个 G1 身体关节、14 个手部关节、221 维 observation、37 维动作（29 个身体参考残差与 8 个手部协同增量）、`reach → contact → grasp → lift → carry → place` teacher 课程、奖励证据来源、训练/验证/留出种子和最终验收阈值，与真实 `humanoid_workyard` 场景交叉核对。部署 student 不读取 teacher 阶段，而是消费 capability multi-hot、Skill 窗口进度以及 base、wrist、grasp 命令。报告只有在 Python 环境与 v2 合约同时完整时才返回 `colab_smoke_ready: true`；否则不会启动 Colab 训练。
+
+v2 保留为 whole-body cold-start 基线，不再作为主要训练路线。v4 使用经身份校验的 G1 velocity policy 作为同 GPU、动态 batch、零梯度 locomotion teacher；第一阶段 student 只有 14 维 arm/wrist residual，双手固定为 neutral open pose，12 个下肢关节与 3 个腰部关节逐帧保持 teacher authority。GPU batched DLS 教师根据 pelvis-relative wrist target 产生在线 DAgger 标签，但不进入 231 维 actor observation、没有执行权，也不能扩张 Harness Skill 窗口。actor observation 新增 4 维 support-relative Dynamic-CoM；奖励与报告分别记录 wrist signed progress、capture point、support margin、脚底位移、接触丢失和 slip。正式创建 Colab 会话前可验证合约和两条教师边界：
+
+```sh
+pnpm validate:workyard-residual-training
+pnpm smoke:workyard:residual:colab
+pnpm teacher:workyard:residual:colab
+pnpm train:workyard:residual:colab -- --iterations 1000 --num-envs 2048
+```
+
+smoke 报告会检查两条 teacher 路径是否始终在 CUDA 上批量执行、是否存在梯度参数或逐控制步 CPU round-trip，以及 frozen joint、upper-body residual 和固定 open hand 三条组合恒等式。`teacher` 模式先验证解析 IK 能否真实缩短 wrist error；正式训练先把同一个 deployable actor 用在线 DAgger/Smooth-L1 warm-start，再原位交给 PPO。Dynamic-CoM 报告同时保留 reset-inclusive 原始证据、前 16 步瞬态轨迹和固定 10 步 settling 后的门控指标，门槛不会为了通过而放宽。smoke、teacher 和短训练都不会自行声明 deployment acceptance。只有独立 held-out seeds 同时达到 reach 与 Dynamic-CoM 阈值后，才允许把 action head 从 14 维扩展为带 8 维 hand synergy 的 22 维 contact/grasp phase；腰部 residual 必须再通过 contact/grasp 与 Dynamic-CoM gate，不能由 phase one 直接授权。训练 checkpoint、曲线和报告均写入 `artifacts/training/`，不会进入 Git。
+
+contact/grasp 阶段继续冻结 locomotion、腰部和 14 维 reach actor，只训练经过 typed contact authority 与 closure geometry latch 授权的 8 维主动手协同策略。解析式 pocket/DLS executor 只承担 terminal alignment teacher、提前接触回撤和 6 N/12 N 力反射，不把 teacher 私有阶段暴露给 student，也不让模型逐控制帧操作关节。正式流水线为：
+
+```sh
+pnpm validate:workyard-contact-training
+pnpm teacher:workyard:contact:colab
+pnpm pilot:workyard:contact:colab
+pnpm train:workyard:contact:colab -- --output artifacts/training/workyard-contact/formal-v2 --timeout-seconds 21600
+pnpm export:workyard:reach:colab
+pnpm export:workyard:contact:colab
+pnpm install:workyard:policies
+```
+
+`teacher` 必须先通过左右手独立成功率、30 N 峰值接触力、对向接触、零丢物、零跌倒、零数值恢复和零越权门禁。`pilot` 实际运行在线 DAgger、PPO retention、checkpoint 回滚选择与短规模独立评估；正式 `formal-v2` 的规模由合同锁死，不能通过命令行缩小，并用 500 个 held-out seeds 作最终验收。只有最终门禁通过的 checkpoint 才能导出；安装命令再次校验报告、文件大小和 SHA-256，再把 reach/contact ONNX 复制为仓库运行资产。使用完整 Workyard 组合控制器时设置 `HEAR_HUMANOID_CONTROLLER_MODULE=hear/controllers/workyard-contact`；三个 `*_POLICY_DIRECTORY` 变量只用于显式替换随附资产。
 
 恢复默认要求原 Agent 配置、指令、工具与 SDK 身份完全一致。明确升级这些边界后，可使用 `--fresh-agent-epoch` 将旧 Manifest、RunState 和各节点 Session 原样归档，再从同一物理检查点、Goal DAG、动作账本和长期记忆创建新的 Agent epoch；该选项不会重置世界或回放动作。
 
@@ -309,7 +355,9 @@ pnpm hear operator [--host HOST] [--port PORT] [--dev]
 | `actions.jsonl` | 规划和执行回执 |
 | `episodes.jsonl` | 可按来源标识召回的长期具身经历 |
 | `events.jsonl` | 实时与恢复事件 |
-| `provider.jsonl` | 模型调用生命周期 |
+| `provider.jsonl` | 模型提供方用量、缓存与传输状态 |
+| `model_calls.jsonl` | Agent 决策模型调用的 started/completed/failed 权威日志 |
+| `compaction_model_calls.jsonl` | 上下文压缩模型请求的持久计量日志 |
 | `framework.jsonl` | Agents SDK 流事件 |
 | `context.jsonl` | 上下文压缩记录 |
 | `goal_evidence.jsonl` | Goal 物理证据 |

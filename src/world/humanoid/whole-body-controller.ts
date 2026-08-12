@@ -3,8 +3,22 @@ import type {
   HumanoidLearnedPolicyCapability
 } from "../../domain/humanoid-policy.js";
 import type {
-  HumanoidMotionOptionPredicate
-} from "./motion-option-contract.js";
+  HumanoidEmbodiedSkillCall,
+  HumanoidEmbodiedSkillContract,
+  HumanoidEmbodiedSkillIdentity
+} from "./embodied-skill-call.js";
+import type {
+  HumanoidPolicyAdmissionAssessment,
+  HumanoidPolicyCapabilityPosterior,
+  HumanoidPolicySkillFamily
+} from "./policy-capability-evidence.js";
+import type {
+  G1HandCoordination
+} from "./hand-coordination.js";
+import type {
+  HumanoidHandPolicyAuthorityAssessment,
+  HumanoidHandPolicyAuthorityState
+} from "./hand-policy-authority.js";
 import type { HumanoidReference } from "./reference.js";
 
 export const HUMANOID_POLICY_OBSERVATION_FEATURES = [
@@ -29,9 +43,12 @@ interface HumanoidPolicyEnvironmentState {
   rootVelocityFrame: "pelvis_imu";
   rootLinearVelocity: readonly [x: number, y: number, z: number];
   rootAngularVelocity: readonly [x: number, y: number, z: number];
+  rootPosition?: Vec3 | undefined;
   endEffectors: Readonly<Record<string, {
     position: Vec3;
     rotation: Quaternion;
+    linearVelocity?: Vec3 | undefined;
+    angularVelocity?: Vec3 | undefined;
   }>>;
   hands: Readonly<Record<string, {
     position: number;
@@ -53,6 +70,14 @@ interface HumanoidPolicyEnvironmentState {
   }>;
   objects: ReadonlyArray<{
     id: string;
+    shape?: "box" | "sphere" | "cylinder" | "capsule" | undefined;
+    size?: Vec3 | undefined;
+    massKg?: number | undefined;
+    friction?: {
+      sliding: number;
+      torsional: number;
+      rolling: number;
+    } | undefined;
     position: Vec3;
     rotation: Quaternion;
     linearVelocity: Vec3;
@@ -65,50 +90,27 @@ interface HumanoidPolicyEnvironmentState {
       maximum: number;
     } | undefined;
   }>;
-}
-
-export interface HumanoidControllerTaskCommand {
-  protocol: "humanoid-controller-task-v1";
-  taskId: string;
-  source: "motion_option" | "carry_navigation";
-  requestedCapabilities: HumanoidLearnedPolicyCapability[];
-  goal: HumanoidControllerTaskGoal | null;
-  endEffectors: ReadonlyArray<{
-    body: string;
-    frame: "world" | "pelvis" | "torso";
-    position: Vec3;
-    tolerance: number;
-    orientation?: Quaternion | undefined;
-    orientationTolerance?: number | undefined;
-  }>;
-  grasps: ReadonlyArray<{
-    objectId: string;
-    hand: "left" | "right";
-    minimumNormalForceN: number;
-    minimumDistinctContactSurfaces: number;
-  }>;
-}
-
-export type HumanoidControllerTaskGoal =
-  | {
-      protocol: "humanoid-controller-motion-goal-v1";
-      predicates: HumanoidMotionOptionPredicate[];
-      stableSteps: number;
-    }
-  | {
-      protocol: "humanoid-controller-navigation-goal-v1";
-      target: Vec3;
-      positionTolerance: number;
-      heading: null | {
-        type: "face_point";
-        target: Vec3;
-        toleranceRadians: number;
-      } | {
-        type: "yaw";
-        yawRadians: number;
-        toleranceRadians: number;
-      };
+  zones?: ReadonlyArray<{
+    id: string;
+    center: Vec3;
+    size: Vec3;
+  }> | undefined;
+  feet?: {
+    left: {
+      touching: boolean;
+      normalForce: number;
     };
+    right: {
+      touching: boolean;
+      normalForce: number;
+    };
+  } | undefined;
+  centerOfMass?: Vec3 | undefined;
+  centerOfMassVelocity?: Vec3 | undefined;
+}
+
+export type HumanoidControllerTaskCommand = HumanoidEmbodiedSkillCall;
+export type HumanoidControllerTaskGoal = HumanoidEmbodiedSkillContract;
 
 export interface HumanoidPolicyState {
   jointPositions: ArrayLike<number>;
@@ -144,7 +146,7 @@ export interface HumanoidControllerDescriptor {
   learnedPolicy?: HumanoidLearnedPolicyDescriptor | undefined;
   capabilityRouting?: {
     protocol: "humanoid-controller-capability-routing-v1";
-    strategy: "declared_capabilities";
+    strategy: "declared_capabilities" | "capability_evidence";
     fallback: {
       mode: "reference_control";
       implementation: string;
@@ -157,6 +159,36 @@ export interface HumanoidJointPositionCommand {
   positions: Float64Array;
   stiffness: Float64Array;
   damping: Float64Array;
+  handSynergy?: HumanoidHandSynergyCommand | undefined;
+}
+
+export interface HumanoidHandSynergyCommand {
+  protocol: "humanoid-authorized-hand-synergy-command-v1";
+  authority: HumanoidHandPolicyAuthorityState;
+  action: Float64Array;
+  coordination: G1HandCoordination;
+  maximumClosingJointLeadRadians: 0.25;
+}
+
+export interface HumanoidControllerTensorTrace {
+  protocol: "humanoid-controller-tensor-trace-v1";
+  role: "direct" | "primary" | "fallback";
+  implementation: string;
+  observation: {
+    protocol: string;
+    values: number[];
+  };
+  action: {
+    protocol: string;
+    values: number[];
+  };
+}
+
+export interface HumanoidControllerInferenceTrace {
+  protocol: "humanoid-controller-inference-trace-v1";
+  implementation: string;
+  route: "direct" | "primary" | "fallback" | "upper_body_overlay";
+  components: HumanoidControllerTensorTrace[];
 }
 
 export interface HumanoidControllerState {
@@ -176,16 +208,57 @@ export interface HumanoidControllerExecutionState {
     progress: number;
     durationSeconds: number;
   } | null;
+  routing?: {
+    callId: string;
+    route: "primary" | "fallback" | "upper_body_overlay";
+    assessment: HumanoidPolicyAdmissionAssessment | null;
+    attribution: {
+      primarySteps: number;
+      fallbackSteps: number;
+      upperBodyOverlaySteps: number;
+      memoryBridgeSteps: number;
+    };
+    memoryBridge: {
+      protocol: "humanoid-policy-memory-bridge-v1";
+      phase: "guiding" | "completed" | "timed_out" | "aborted";
+      trigger: "entry_state_ood";
+      completedSteps: number;
+      maximumSteps: number;
+      stableSteps: number;
+      requiredStableSteps: number;
+      progress: number;
+      entryStateOodScore: number;
+      jointPrototypeRmsError: number;
+      maximumJointVelocity: number;
+    } | null;
+  } | undefined;
+}
+
+export interface HumanoidControllerSkillOutcome {
+  protocol: "humanoid-controller-skill-outcome-v1";
+  identity: HumanoidEmbodiedSkillIdentity;
+  outcome: "succeeded" | "failed" | "interrupted";
+  terminalReason: string;
+}
+
+export interface HumanoidControllerCapabilityEvidenceSummary {
+  implementation: string;
+  skillFamily: HumanoidPolicySkillFamily;
+  posterior: HumanoidPolicyCapabilityPosterior;
 }
 
 export interface HumanoidControllerInferenceOptions {
   trackedJointPolicyCommand?: "measured" | "neutral";
-  taskCommand?: HumanoidControllerTaskCommand | undefined;
+  taskCommand?: HumanoidEmbodiedSkillCall | undefined;
+  handPolicyAuthority?: HumanoidHandPolicyAuthorityAssessment | undefined;
 }
 
 export interface HumanoidWholeBodyController {
   readonly descriptor: HumanoidControllerDescriptor;
   executionState?(): HumanoidControllerExecutionState;
+  inferenceTrace?(): HumanoidControllerInferenceTrace | null;
+  capabilityEvidence?(): readonly HumanoidControllerCapabilityEvidenceSummary[];
+  recordSkillOutcome?(outcome: HumanoidControllerSkillOutcome): void;
   reset(
     state: HumanoidPolicyState,
     reference: HumanoidReference,

@@ -22,6 +22,7 @@
   },
   "exports": {
     "./controllers/mjlab-g1-velocity": "./dist/controllers/mjlab-g1-velocity-module.js",
+    "./controllers/workyard-contact": "./dist/controllers/workyard-contact-module.js",
     "./controllers/yahmp": "./dist/controllers/yahmp-module.js"
   },
   "scripts": {
@@ -42,13 +43,36 @@
     "test:live:manipulation": "pnpm run build:server && node tests/live-manipulation.mjs",
     "test:live:endurance": "pnpm run build:server && node tests/live-endurance.mjs",
     "test:browser": "pnpm run build:web && playwright test",
+    "benchmark:humanoid": "tsx src/cli.ts benchmark",
+    "export:harness-rollouts": "tsx src/cli.ts export-harness-rollouts --runs-dir runs",
+    "validate:workyard-training": "tsx src/training/workyard-contract-cli.ts",
+    "validate:workyard-residual-training": "tsx src/training/workyard-residual-contract-cli.ts",
+    "validate:workyard-contact-training": "tsx src/training/workyard-contact-contract-cli.ts",
+    "validate:workyard-observation-parity": "tsx src/training/workyard-observation-parity-cli.ts",
+    "smoke:workyard:colab": "node training/run-workyard-colab-smoke.mjs",
+    "smoke:workyard:residual:colab": "node training/run-workyard-colab-residual.mjs --mode smoke",
+    "teacher:workyard:residual:colab": "node training/run-workyard-colab-residual.mjs --mode teacher",
+    "smoke:workyard:residual:local": "node training/run-workyard-colab-residual.mjs --backend local --mode smoke",
+    "teacher:workyard:residual:local": "node training/run-workyard-colab-residual.mjs --backend local --mode teacher",
+    "smoke:workyard:contact:local": "node training/run-workyard-colab-contact.mjs --backend local --mode smoke",
+    "teacher:workyard:contact:local": "node training/run-workyard-colab-contact.mjs --backend local --mode teacher",
+    "smoke:workyard:contact:colab": "node training/run-workyard-colab-contact.mjs --mode smoke",
+    "teacher:workyard:contact:colab": "node training/run-workyard-colab-contact.mjs --mode teacher",
+    "pilot:workyard:contact:colab": "node training/run-workyard-colab-contact.mjs --mode pilot",
+    "train:workyard:contact:colab": "node training/run-workyard-colab-contact.mjs --mode train",
+    "export:workyard:contact:colab": "node training/run-workyard-contact-export-colab.mjs",
+    "export:workyard:reach:colab": "node training/run-workyard-reach-export-colab.mjs",
+    "install:workyard:policies": "node training/install-workyard-policy-assets.mjs",
+    "train:workyard:colab": "node training/run-workyard-colab-ppo.mjs",
+    "train:workyard:residual:colab": "node training/run-workyard-colab-residual.mjs --mode train",
     "train:g1:colab": "node training/run-colab.mjs",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit && tsc -p tsconfig.browser.json --noEmit",
     "check": "pnpm run check:dead && pnpm run typecheck && pnpm run test && pnpm run test:production"
   },
   "knip": {
     "ignoreBinaries": [
-      "colab"
+      "wsl.exe",
+      "taskkill.exe"
     ]
   },
   "dependencies": {

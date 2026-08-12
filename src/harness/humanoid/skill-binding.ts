@@ -19,6 +19,10 @@ import {
 } from "../../domain/humanoid-policy.js";
 import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import type { HumanoidWorldObservation } from "../../world/humanoid/world.js";
+import {
+  HumanoidEmbodiedSkillIdentitySchema,
+  type HumanoidEmbodiedSkillIdentity
+} from "../../world/humanoid/embodied-skill-call.js";
 import type { HumanoidObjectWorldModelEntry } from "../../world/humanoid/object-world-model.js";
 import type { HumanoidSolidToken } from "../../world/humanoid/solid-observation.js";
 import {
@@ -46,6 +50,8 @@ export interface ActiveHumanoidSkillBinding {
   observed_frame: number;
   observed_world_revision: number;
   skill_catalog_sha256: string;
+  active_goal_sha256?: string;
+  recovery_authorized?: boolean;
   target_position: Vec3 | null;
   target_solid: Omit<HumanoidSolidToken, "currentContacts"> | null;
   target_articulation: HumanoidObjectWorldModelEntry["articulation"];
@@ -111,6 +117,8 @@ export const ActiveHumanoidSkillBindingSchema = z.object({
     observed_frame: z.number().int().nonnegative(),
     observed_world_revision: z.number().int().nonnegative(),
     skill_catalog_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    active_goal_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    recovery_authorized: z.boolean().optional(),
     target_position: Vec3Schema.nullable(),
     target_solid: PersistedSolidSchema.nullable().default(null),
     target_articulation: PersistedArticulationSchema.nullable(),
@@ -153,6 +161,31 @@ export type HumanoidSkillBindingResult =
       code: string;
       detail: JsonValue;
     };
+
+export function humanoidEmbodiedSkillIdentity(
+  binding: ActiveHumanoidSkillBinding
+): HumanoidEmbodiedSkillIdentity {
+  return HumanoidEmbodiedSkillIdentitySchema.parse({
+    protocol: "humanoid-embodied-skill-identity-v1",
+    callId: [
+      "skill-call",
+      binding.transaction_id,
+      binding.phase
+    ].join(":"),
+    runtimeKind: "semantic_skill",
+    agentId: binding.agent_id,
+    bindingTransactionId: binding.transaction_id,
+    skillPlanTransactionId: binding.skill_plan_transaction_id,
+    skillNodeId: binding.skill_node_id,
+    skillId: binding.invocation.skill,
+    phase: binding.phase,
+    invocation: structuredClone(binding.invocation),
+    invocationSha256: binding.invocation_sha256,
+    skillCatalogSha256: binding.skill_catalog_sha256,
+    observedFrame: binding.observed_frame,
+    observedWorldRevision: binding.observed_world_revision
+  });
+}
 
 type InteractionPointValidation =
   | {
@@ -332,6 +365,10 @@ export function bindHumanoidSkill(input: {
       observed_world_revision: input.observation.worldRevision,
       skill_catalog_sha256:
         input.observation.interaction.skill_catalog.contract_sha256,
+      ...(input.activeGoal
+        ? { active_goal_sha256: modelPayloadSha256(input.activeGoal) }
+        : {}),
+      ...(input.recoveryAuthorized ? { recovery_authorized: true } : {}),
       target_position: target
         ? { ...target.pose.position }
         : targetZone ? { ...targetZone.center }

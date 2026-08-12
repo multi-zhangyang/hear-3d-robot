@@ -114,6 +114,7 @@ export type JournalName =
   | "goal_evidence"
   | "goal_history"
   | "model_calls"
+  | "compaction_model_calls"
   | "action_identities";
 
 export interface JournalPage {

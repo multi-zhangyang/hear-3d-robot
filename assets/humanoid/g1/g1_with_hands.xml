@@ -18,6 +18,9 @@
         </default>
       </default>
     </default>
+    <default class="hand_pd">
+      <position kp="2.5" kv="0.3" inheritrange="1"/>
+    </default>
   </default>
 
   <asset>
@@ -460,13 +463,13 @@
     <position class="g1" name="left_wrist_roll_joint" joint="left_wrist_roll_joint"/>
     <position class="g1" name="left_wrist_pitch_joint" joint="left_wrist_pitch_joint"/>
     <position class="g1" name="left_wrist_yaw_joint" joint="left_wrist_yaw_joint"/>
-    <position class="g1" name="left_hand_thumb_0_joint" joint="left_hand_thumb_0_joint"/>
-    <position class="g1" name="left_hand_thumb_1_joint" joint="left_hand_thumb_1_joint"/>
-    <position class="g1" name="left_hand_thumb_2_joint" joint="left_hand_thumb_2_joint"/>
-    <position class="g1" name="left_hand_middle_0_joint" joint="left_hand_middle_0_joint"/>
-    <position class="g1" name="left_hand_middle_1_joint" joint="left_hand_middle_1_joint"/>
-    <position class="g1" name="left_hand_index_0_joint" joint="left_hand_index_0_joint"/>
-    <position class="g1" name="left_hand_index_1_joint" joint="left_hand_index_1_joint"/>
+    <position class="hand_pd" name="left_hand_thumb_0_joint" joint="left_hand_thumb_0_joint"/>
+    <position class="hand_pd" name="left_hand_thumb_1_joint" joint="left_hand_thumb_1_joint"/>
+    <position class="hand_pd" name="left_hand_thumb_2_joint" joint="left_hand_thumb_2_joint"/>
+    <position class="hand_pd" name="left_hand_middle_0_joint" joint="left_hand_middle_0_joint"/>
+    <position class="hand_pd" name="left_hand_middle_1_joint" joint="left_hand_middle_1_joint"/>
+    <position class="hand_pd" name="left_hand_index_0_joint" joint="left_hand_index_0_joint"/>
+    <position class="hand_pd" name="left_hand_index_1_joint" joint="left_hand_index_1_joint"/>
 
     <position class="g1" name="right_shoulder_pitch_joint" joint="right_shoulder_pitch_joint"/>
     <position class="g1" name="right_shoulder_roll_joint" joint="right_shoulder_roll_joint"/>
@@ -475,13 +478,13 @@
     <position class="g1" name="right_wrist_roll_joint" joint="right_wrist_roll_joint"/>
     <position class="g1" name="right_wrist_pitch_joint" joint="right_wrist_pitch_joint"/>
     <position class="g1" name="right_wrist_yaw_joint" joint="right_wrist_yaw_joint"/>
-    <position class="g1" name="right_hand_thumb_0_joint" joint="right_hand_thumb_0_joint"/>
-    <position class="g1" name="right_hand_thumb_1_joint" joint="right_hand_thumb_1_joint"/>
-    <position class="g1" name="right_hand_thumb_2_joint" joint="right_hand_thumb_2_joint"/>
-    <position class="g1" name="right_hand_index_0_joint" joint="right_hand_index_0_joint"/>
-    <position class="g1" name="right_hand_index_1_joint" joint="right_hand_index_1_joint"/>
-    <position class="g1" name="right_hand_middle_0_joint" joint="right_hand_middle_0_joint"/>
-    <position class="g1" name="right_hand_middle_1_joint" joint="right_hand_middle_1_joint"/>
+    <position class="hand_pd" name="right_hand_thumb_0_joint" joint="right_hand_thumb_0_joint"/>
+    <position class="hand_pd" name="right_hand_thumb_1_joint" joint="right_hand_thumb_1_joint"/>
+    <position class="hand_pd" name="right_hand_thumb_2_joint" joint="right_hand_thumb_2_joint"/>
+    <position class="hand_pd" name="right_hand_index_0_joint" joint="right_hand_index_0_joint"/>
+    <position class="hand_pd" name="right_hand_index_1_joint" joint="right_hand_index_1_joint"/>
+    <position class="hand_pd" name="right_hand_middle_0_joint" joint="right_hand_middle_0_joint"/>
+    <position class="hand_pd" name="right_hand_middle_1_joint" joint="right_hand_middle_1_joint"/>
   </actuator>
 
   <sensor>

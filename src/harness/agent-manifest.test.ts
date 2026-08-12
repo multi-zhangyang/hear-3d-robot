@@ -89,7 +89,25 @@ describe("agent manifest", () => {
       "@openai/agents": "test-sdk",
       "@openai/agents-extensions": "test-bridge"
     });
-    expect(manifest.harness_contract_version).toBe(13);
+    expect(manifest.harness_contract_version).toBe(16);
+    expect(manifest.agents.sentry).toMatchObject({
+      execution_kind: "deterministic_service",
+      agent_id: "humanoid-sentry",
+      agent_name: "异步物理 Grounding Monitor",
+      implementation_contract: "observe_humanoid_from_coordinator_tool_call_v1",
+      decision_authority_role: "coordinator"
+    });
+    expect(manifest.agents.executor).toMatchObject({
+      execution_kind: "deterministic_service",
+      agent_id: "humanoid-executor",
+      agent_name: "确定性物理 Execution Gate",
+      implementation_contract: "accepted_plan_to_runtime_action_v1",
+      decision_authority_role: "coordinator"
+    });
+    expect(manifest.agents.sentry).not.toHaveProperty("model");
+    expect(manifest.agents.sentry).not.toHaveProperty("protocol");
+    expect(manifest.agents.sentry).not.toHaveProperty("settings");
+    expect(manifest.agents.executor).not.toHaveProperty("model");
     expect(manifest.agents.goal_manager.tool_use_behavior).toEqual({
       kind: "harness_callback",
       contract_id: "verified_harness_terminal_status_v1",
@@ -112,17 +130,13 @@ describe("agent manifest", () => {
         input_builder_contract: "goal_manager_authority_envelope_v2"
       }),
       expect.objectContaining({
+        dispatch_kind: "deterministic_service",
         tool_name: "delegate_humanoid_sentry",
         target_role: "sentry",
         target_agent_id: "humanoid-sentry",
-        input_builder_contract: "live_authority_delegation_v1",
+        input_builder_contract: "grounding_monitor_direct_v1",
         input_builder_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
-        run_options: {
-          session_agent_id: "humanoid-sentry",
-          context_source: "parent_run_context",
-          max_turns: "unbounded"
-        },
-        resume_context_strategy: "merge"
+        output_contract: "formal_action_receipt"
       }),
       expect.objectContaining({
         tool_name: "delegate_motion_reference",
@@ -130,9 +144,11 @@ describe("agent manifest", () => {
         input_builder_contract: "motion_authority_envelope_v1"
       }),
       expect.objectContaining({
+        dispatch_kind: "deterministic_service",
         tool_name: "delegate_physics_executor",
         target_role: "executor",
-        input_builder_contract: "validated_execution_task_json_v1"
+        input_builder_contract: "validated_execution_gate_v1",
+        output_contract: "formal_action_receipt"
       })
     ]);
     expect(manifest.agents.coordinator.instructions_sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -284,7 +300,7 @@ describe("agent manifest", () => {
       .toThrow("runtime_sdk_identity");
 
     const tampered = structuredClone(base);
-    tampered.agents.executor.model = "tampered-without-rehash";
+    tampered.agents.coordinator.model = "tampered-without-rehash";
     expect(() => assertAgentManifestCompatible(tampered, base))
       .toThrow("persisted agent manifest identity hash is invalid");
   });
@@ -334,24 +350,21 @@ describe("agent manifest", () => {
       })
     );
 
-    const behaviorChanged = createHumanoidAgentManifest({
+    const serviceRenamed = createHumanoidAgentManifest({
       hierarchy: {
         ...hierarchy,
-        executor: hierarchy.executor.clone({
-          resetToolChoice: true,
-          toolUseBehavior: "run_llm_again"
-        })
+        executor: {
+          ...hierarchy.executor,
+          name: "改名后的确定性执行门"
+        }
       },
       provider,
       epochId: base.epoch_id,
       runtimeSdkIdentity: base.runtime_sdk_identity
     });
-    expect(() => assertAgentManifestCompatible(base, behaviorChanged)).toThrowError(
+    expect(() => assertAgentManifestCompatible(base, serviceRenamed)).toThrowError(
       expect.objectContaining({
-        changedFields: [
-          "agents.executor.reset_tool_choice",
-          "agents.executor.tool_use_behavior"
-        ]
+        changedFields: expect.arrayContaining(["agents.executor.agent_name"])
       })
     );
   });
@@ -370,61 +383,41 @@ describe("agent manifest", () => {
       .toThrow("persisted agent manifest identity hash is invalid");
   });
 
-  it("uses stable declared Agent-as-tool contracts across runtime compilation", () => {
+  it("binds deterministic service dispatch contracts without model Sessions", () => {
     const base = createManifest(provider, "11111111-1111-4111-8111-111111111111");
     const sentryContract = HUMANOID_AGENT_TOOL_CONTRACTS.sentry as unknown as {
-      inputBuilder: () => string;
-      inputBuilderContract: "live_authority_delegation_v1"
-        | "validated_execution_task_json_v1";
-      resumeContextStrategy: "merge" | "replace" | "preferSerialized";
-      runOptions: {
-        sessionAgentId: string;
-      };
+      inputBuilderContract: "grounding_monitor_direct_v1"
+        | "validated_execution_gate_v1";
+      implementationContract: string;
     };
-    const originalInputBuilder = sentryContract.inputBuilder;
     const originalInputBuilderContract = sentryContract.inputBuilderContract;
-    const originalResumeStrategy = sentryContract.resumeContextStrategy;
-    const originalSessionAgentId = sentryContract.runOptions.sessionAgentId;
+    const originalImplementationContract = sentryContract.implementationContract;
     try {
-      sentryContract.inputBuilder = () => "changed input builder implementation";
-      const recompiledBuilder = createManifest(
-        provider,
-        "22222222-2222-4222-8222-222222222222"
-      );
-      expect(recompiledBuilder.agent_tool_contracts).toEqual(base.agent_tool_contracts);
-      expect(() => assertAgentManifestCompatible(base, recompiledBuilder)).not.toThrow();
-
-      sentryContract.inputBuilderContract = "validated_execution_task_json_v1";
+      sentryContract.inputBuilderContract = "validated_execution_gate_v1";
       const changedContract = createManifest(
         provider,
         "33333333-3333-4333-8333-333333333333"
       );
       expect(() => assertAgentManifestCompatible(base, changedContract)).toThrowError(
-        expect.objectContaining({ changedFields: ["agent_tool_contracts"] })
+        expect.objectContaining({
+          changedFields: expect.arrayContaining(["agent_tool_contracts"])
+        })
       );
 
-      sentryContract.inputBuilder = originalInputBuilder;
       sentryContract.inputBuilderContract = originalInputBuilderContract;
-      sentryContract.resumeContextStrategy = "replace";
-      const changedResumeStrategy = createManifest(
+      sentryContract.implementationContract = "changed_grounding_monitor_v2";
+      const changedImplementation = createManifest(
         provider,
         "44444444-4444-4444-8444-444444444444"
       );
-      expect(() => assertAgentManifestCompatible(base, changedResumeStrategy)).toThrowError(
-        expect.objectContaining({ changedFields: ["agent_tool_contracts"] })
+      expect(() => assertAgentManifestCompatible(base, changedImplementation)).toThrowError(
+        expect.objectContaining({
+          changedFields: expect.arrayContaining(["agent_tool_contracts"])
+        })
       );
-
-      sentryContract.resumeContextStrategy = originalResumeStrategy;
-      sentryContract.runOptions.sessionAgentId = "humanoid-motion-reference";
-      expect(() => createManifest(
-        provider,
-        "55555555-5555-4555-8555-555555555555"
-      )).toThrow("Session owner does not match its target role");
     } finally {
-      sentryContract.inputBuilder = originalInputBuilder;
       sentryContract.inputBuilderContract = originalInputBuilderContract;
-      sentryContract.resumeContextStrategy = originalResumeStrategy;
-      sentryContract.runOptions.sessionAgentId = originalSessionAgentId;
+      sentryContract.implementationContract = originalImplementationContract;
     }
   });
 
@@ -478,7 +471,7 @@ describe("agent manifest", () => {
     });
     expect(first.identity_sha256).toBe(second.identity_sha256);
     expect(first.identity_sha256).toBe(
-      "652c8cd1d786dabca9310e2a7b7c023a70880b605b2c245c92b60a9c2b567f2f"
+      "b65c7eddcc08c92ba8ffabcc3ff5e818b2541bfc94194cded6589255b9036e84"
     );
   });
 

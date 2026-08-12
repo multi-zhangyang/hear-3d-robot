@@ -7,6 +7,7 @@ import {
   RunStatusSchema,
   TaskNodeSchema,
   Vec3Schema,
+  type ContextMemoryState,
   type JsonValue
 } from "./schema.js";
 import { HUMANOID_ACTION_NAMES } from "./humanoid-action.js";
@@ -47,6 +48,64 @@ import type { HumanoidWorldSnapshot } from "../world/humanoid/world-contract.js"
 
 const HumanoidActionNameSchema = z.enum(HUMANOID_ACTION_NAMES);
 
+export const HumanoidPhysicalStateAnchorSchema = z.object({
+  version: z.literal(1),
+  event_id: z.string().trim().min(1),
+  world_frame: z.number().int().nonnegative(),
+  world_revision: z.number().int().nonnegative(),
+  world_checkpoint_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  anchored_at: z.string().datetime()
+}).strict();
+
+export type HumanoidPhysicalStateAnchor = z.infer<
+  typeof HumanoidPhysicalStateAnchorSchema
+>;
+
+export const HumanoidGoalStateAnchorSchema = z.object({
+  version: z.literal(1),
+  event_id: z.string().trim().min(1),
+  goal_dag_state_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  control_state_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  anchored_at: z.string().datetime()
+}).strict();
+
+export type HumanoidGoalStateAnchor = z.infer<
+  typeof HumanoidGoalStateAnchorSchema
+>;
+
+export const HumanoidEmbodiedMemoryStateAnchorSchema = z.object({
+  version: z.literal(1),
+  event_id: z.string().trim().min(1),
+  embodied_memory_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  anchored_at: z.string().datetime()
+}).strict();
+
+export type HumanoidEmbodiedMemoryStateAnchor = z.infer<
+  typeof HumanoidEmbodiedMemoryStateAnchorSchema
+>;
+
+export const HumanoidContextMemoryStateAnchorSchema = z.object({
+  version: z.literal(1),
+  event_id: z.string().trim().min(1),
+  context_memory_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  anchored_at: z.string().datetime()
+}).strict();
+
+export type HumanoidContextMemoryStateAnchor = z.infer<
+  typeof HumanoidContextMemoryStateAnchorSchema
+>;
+
+export const HumanoidExecutionLedgerStateAnchorSchema = z.object({
+  version: z.literal(1),
+  event_id: z.string().trim().min(1),
+  execution_ledger_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  anchored_at: z.string().datetime()
+}).strict();
+
+export type HumanoidExecutionLedgerStateAnchor = z.infer<
+  typeof HumanoidExecutionLedgerStateAnchorSchema
+>;
+
 const HumanoidBodyChannelSchema = z.enum([
   "locomotion",
   "left_leg",
@@ -71,8 +130,40 @@ export const PersistedHumanoidActionReceiptSchema = z.object({
   frameCount: z.number().int().nonnegative(),
   channels: z.array(HumanoidBodyChannelSchema),
   detail: JsonValueSchema,
+  commitSequence: z.number().int().positive().optional(),
   committedAt: z.string().datetime()
 }).strict();
+
+export function humanoidActionReceiptEntriesInCommitOrder<
+  T extends { commitSequence?: number | undefined }
+>(receipts: Readonly<Record<string, T>>): Array<[string, T]> {
+  const entries = Object.entries(receipts);
+  const sequenced = entries.filter(([, receipt]) => (
+    receipt.commitSequence !== undefined
+  ));
+  if (sequenced.length === 0) return entries;
+  if (sequenced.length !== entries.length) {
+    throw new Error("Humanoid action commit sequence is incomplete");
+  }
+  const seen = new Set<number>();
+  for (const [, receipt] of entries) {
+    const sequence = receipt.commitSequence!;
+    if (!Number.isSafeInteger(sequence) || sequence < 1 || seen.has(sequence)) {
+      throw new Error("Humanoid action commit sequence is invalid");
+    }
+    seen.add(sequence);
+  }
+  return entries.sort((left, right) => (
+    left[1].commitSequence! - right[1].commitSequence!
+  ));
+}
+
+export function humanoidActionReceiptsInCommitOrder<
+  T extends { commitSequence?: number | undefined }
+>(receipts: Readonly<Record<string, T>>): T[] {
+  return humanoidActionReceiptEntriesInCommitOrder(receipts)
+    .map(([, receipt]) => receipt);
+}
 
 export const HumanoidCheckerResultSchema = z.object({
   success: z.boolean(),
@@ -519,6 +610,14 @@ const HumanoidRunCheckpointBaseShape = {
   nodes: z.record(z.string().min(1), TaskNodeSchema),
   world: HumanoidWorldSnapshotSchema,
   world_checkpoint: HumanoidWorldCheckpointSchema,
+  physical_state_anchor: HumanoidPhysicalStateAnchorSchema.nullable().default(null),
+  goal_state_anchor: HumanoidGoalStateAnchorSchema.nullable().default(null),
+  embodied_memory_state_anchor:
+    HumanoidEmbodiedMemoryStateAnchorSchema.nullable().default(null),
+  context_memory_state_anchor:
+    HumanoidContextMemoryStateAnchorSchema.nullable().default(null),
+  execution_ledger_state_anchor:
+    HumanoidExecutionLedgerStateAnchorSchema.nullable().default(null),
   committed_actions: z.record(z.string().min(1), PersistedHumanoidActionReceiptSchema),
   action_runtime_state: JsonValueSchema.nullable().default(null),
   context_memory: ContextMemoryStateSchema,
@@ -632,6 +731,60 @@ const HumanoidRunCheckpointV6Schema = z.object({
   action_commit_outbox: ActionCommitOutboxSchema.default(EmptyActionCommitOutbox),
   action_execution_ledger: ActionExecutionLedgerSchema.default(EmptyActionExecutionLedger)
 }).strict().superRefine((checkpoint, context) => {
+  const physicalAnchor = checkpoint.physical_state_anchor;
+  if (physicalAnchor && (
+    physicalAnchor.world_frame !== checkpoint.world.frame
+      || physicalAnchor.world_revision !== checkpoint.world.worldRevision
+      || physicalAnchor.world_checkpoint_sha256
+        !== actionCommitPayloadSha256(checkpoint.world_checkpoint as JsonValue)
+  )) {
+    context.addIssue({
+      code: "custom",
+      path: ["physical_state_anchor"],
+      message: "Physical state anchor does not match the authoritative world checkpoint"
+    });
+  }
+  const goalAnchor = checkpoint.goal_state_anchor;
+  if (goalAnchor
+    && (goalAnchor.goal_dag_state_sha256 !== checkpoint.goal_dag.state_sha256
+      || goalAnchor.control_state_sha256
+        !== humanoidGoalControlStateSha256(checkpoint))) {
+    context.addIssue({
+      code: "custom",
+      path: ["goal_state_anchor"],
+      message: "Goal state anchor does not match the persisted Goal DAG"
+    });
+  }
+  const memoryAnchor = checkpoint.embodied_memory_state_anchor;
+  if (memoryAnchor
+    && memoryAnchor.embodied_memory_sha256
+      !== humanoidEmbodiedMemoryStateSha256(checkpoint.embodied_memory)) {
+    context.addIssue({
+      code: "custom",
+      path: ["embodied_memory_state_anchor"],
+      message: "Embodied memory state anchor does not match the persisted memory"
+    });
+  }
+  const contextAnchor = checkpoint.context_memory_state_anchor;
+  if (contextAnchor
+    && contextAnchor.context_memory_sha256
+      !== humanoidContextMemoryStateSha256(checkpoint.context_memory)) {
+    context.addIssue({
+      code: "custom",
+      path: ["context_memory_state_anchor"],
+      message: "Context memory state anchor does not match the persisted memory"
+    });
+  }
+  const executionLedgerAnchor = checkpoint.execution_ledger_state_anchor;
+  if (executionLedgerAnchor
+    && executionLedgerAnchor.execution_ledger_sha256
+      !== humanoidExecutionLedgerStateSha256(checkpoint.action_execution_ledger)) {
+    context.addIssue({
+      code: "custom",
+      path: ["execution_ledger_state_anchor"],
+      message: "Execution ledger state anchor does not match the persisted ledger"
+    });
+  }
   if (checkpoint.active_cycle) {
     if (checkpoint.goal_dag.status !== "active"
       || checkpoint.goal_dag.current_epoch_id !== checkpoint.active_cycle.goal_epoch_id
@@ -653,6 +806,20 @@ const HumanoidRunCheckpointV6Schema = z.object({
         message: "Committed action key does not match its transaction identity"
       });
     }
+  }
+  const commitSequences = Object.values(checkpoint.committed_actions).flatMap(
+    (receipt) => receipt.commitSequence === undefined
+      ? []
+      : [receipt.commitSequence]
+  );
+  if (commitSequences.length !== 0
+    && (commitSequences.length !== Object.keys(checkpoint.committed_actions).length
+      || new Set(commitSequences).size !== commitSequences.length)) {
+    context.addIssue({
+      code: "custom",
+      path: ["committed_actions"],
+      message: "Committed actions require a complete unique commit sequence"
+    });
   }
   for (const [transactionId, pending] of Object.entries(
     checkpoint.action_commit_outbox.pending
@@ -683,6 +850,14 @@ const HumanoidRunCheckpointV6Schema = z.object({
         code: "custom",
         path: ["action_execution_ledger", "active", transactionId, "run_id"],
         message: "Active action execution does not belong to the checkpoint run"
+      });
+    }
+    if (!execution.admission.decision
+      || !execution.admission.tool_call_authority) {
+      context.addIssue({
+        code: "custom",
+        path: ["action_execution_ledger", "active", transactionId, "admission"],
+        message: "Active physical execution requires durable Coordinator delegation"
       });
     }
     if (execution.status !== "terminal") {
@@ -749,6 +924,63 @@ const HumanoidRunCheckpointV6Schema = z.object({
     });
   }
 });
+
+export function humanoidGoalControlState(
+  checkpoint: Pick<
+    HumanoidRunCheckpoint,
+    "goal_dag" | "goal_progress" | "checker" | "active_cycle" | "cycle_index"
+  >
+): JsonValue {
+  const checker = checkpoint.checker;
+  return {
+    goal_dag_state_sha256: checkpoint.goal_dag.state_sha256,
+    goal_progress: checkpoint.goal_progress,
+    // checkedAt is observation telemetry, not Goal-control authority. Including
+    // it would create a new durable state identity when the same physical cut
+    // is inspected twice during an append-before-checkpoint recovery window.
+    checker: checker
+      ? {
+          success: checker.success,
+          goal: checker.goal,
+          worldFrame: checker.worldFrame,
+          worldRevision: checker.worldRevision,
+          checks: checker.checks
+        }
+      : null,
+    active_cycle: checkpoint.active_cycle,
+    cycle_index: checkpoint.cycle_index
+  } as JsonValue;
+}
+
+export function humanoidGoalControlStateSha256(
+  checkpoint: Parameters<typeof humanoidGoalControlState>[0]
+): string {
+  return actionCommitPayloadSha256(humanoidGoalControlState(checkpoint));
+}
+
+export function humanoidEmbodiedMemoryStateSha256(
+  memory: HumanoidEmbodiedMemoryState
+): string {
+  return actionCommitPayloadSha256(
+    HumanoidEmbodiedMemoryStateSchema.parse(memory) as JsonValue
+  );
+}
+
+export function humanoidContextMemoryStateSha256(
+  memory: ContextMemoryState
+): string {
+  return actionCommitPayloadSha256(
+    ContextMemoryStateSchema.parse(memory) as JsonValue
+  );
+}
+
+export function humanoidExecutionLedgerStateSha256(
+  ledger: z.input<typeof ActionExecutionLedgerSchema>
+): string {
+  return actionCommitPayloadSha256(
+    ActionExecutionLedgerSchema.parse(ledger) as JsonValue
+  );
+}
 
 export type HumanoidRunCheckpoint = z.infer<
   typeof HumanoidRunCheckpointV6Schema

@@ -18,6 +18,142 @@ const PhysicalObjectSampleSchema = z.object({
   position: Vec3Schema
 }).strict();
 
+const ControllerExecutionModeSchema = z.enum([
+  "learned_policy",
+  "reference_control",
+  "hybrid_control"
+]);
+
+const ControllerRoutingSampleSchema = z.object({
+  call_id: z.string().trim().min(1),
+  route: z.enum(["primary", "fallback", "upper_body_overlay"]),
+  implementation: z.string().trim().min(1),
+  skill_family: z.string().trim().min(1),
+  admitted: z.boolean(),
+  reason: z.enum([
+    "cold_start",
+    "capability_supported",
+    "insufficient_success_posterior",
+    "entry_state_ood",
+    "command_ood",
+    "memory_bridge_completed",
+    "memory_bridge_timeout"
+  ]),
+  cold_start: z.boolean(),
+  entry_state_ood_score: z.number().finite().nonnegative().nullable(),
+  command_ood_score: z.number().finite().nonnegative().nullable(),
+  attribution: z.object({
+    primary_steps: z.number().int().nonnegative(),
+    fallback_steps: z.number().int().nonnegative(),
+    upper_body_overlay_steps: z.number().int().nonnegative(),
+    memory_bridge_steps: z.number().int().nonnegative().default(0)
+  }).strict(),
+  memory_bridge: z.object({
+    protocol: z.literal("humanoid-policy-memory-bridge-v1"),
+    phase: z.enum(["guiding", "completed", "timed_out", "aborted"]),
+    trigger: z.literal("entry_state_ood"),
+    completed_steps: z.number().int().nonnegative(),
+    maximum_steps: z.number().int().positive(),
+    stable_steps: z.number().int().nonnegative(),
+    required_stable_steps: z.number().int().positive(),
+    progress: z.number().finite().min(0).max(1),
+    entry_state_ood_score: z.number().finite().nonnegative(),
+    joint_prototype_rms_error: z.number().finite().nonnegative(),
+    maximum_joint_velocity: z.number().finite().nonnegative()
+  }).strict().nullable().default(null),
+  posterior: z.object({
+    outcomes: z.number().int().nonnegative(),
+    successes: z.number().int().nonnegative(),
+    failures: z.number().int().nonnegative(),
+    mean: z.number().finite().min(0).max(1),
+    lower_bound: z.number().finite().min(0).max(1),
+    upper_bound: z.number().finite().min(0).max(1),
+    recent_success_rate: z.number().finite().min(0).max(1).nullable(),
+    transition_attempts: z.number().int().nonnegative(),
+    transition_successes: z.number().int().nonnegative()
+  }).strict()
+}).strict();
+
+const ControllerExecutionSampleSchema = z.object({
+  mode: ControllerExecutionModeSchema,
+  active_implementation: z.string().trim().min(1),
+  transition: z.object({
+    from_implementation: z.string().trim().min(1),
+    to_implementation: z.string().trim().min(1),
+    progress: z.number().finite().min(0).max(1),
+    duration_seconds: z.number().finite().nonnegative()
+  }).strict().nullable(),
+  routing: ControllerRoutingSampleSchema.optional()
+}).strict();
+
+const ControllerUsageEvidenceSchema = z.object({
+  protocol: z.literal("humanoid-controller-usage-v1"),
+  complete_from_admission: z.boolean(),
+  observed_frame_count: z.number().int().positive(),
+  mode_frame_counts: z.object({
+    learned_policy: z.number().int().nonnegative(),
+    reference_control: z.number().int().nonnegative(),
+    hybrid_control: z.number().int().nonnegative()
+  }).strict(),
+  implementation_frame_counts: z.record(
+    z.string().trim().min(1),
+    z.number().int().positive()
+  ),
+  transition_frame_count: z.number().int().nonnegative(),
+  routing: z.object({
+    last_call_id: z.string().trim().min(1),
+    decision_count: z.number().int().positive(),
+    admitted_count: z.number().int().nonnegative(),
+    rejected_count: z.number().int().nonnegative(),
+    cold_start_count: z.number().int().nonnegative(),
+    rejection_reason_counts: z.object({
+      insufficient_success_posterior: z.number().int().nonnegative(),
+      entry_state_ood: z.number().int().nonnegative(),
+      command_ood: z.number().int().nonnegative(),
+      memory_bridge_timeout: z.number().int().nonnegative().default(0)
+    }).strict(),
+    memory_bridge_attempt_count: z.number().int().nonnegative().default(0),
+    memory_bridge_completed_count: z.number().int().nonnegative().default(0),
+    memory_bridge_timeout_count: z.number().int().nonnegative().default(0),
+    memory_bridge_aborted_count: z.number().int().nonnegative().default(0),
+    last_memory_bridge_phase: z.enum([
+      "guiding",
+      "completed",
+      "timed_out",
+      "aborted"
+    ]).nullable().default(null)
+  }).strict().optional()
+}).strict().superRefine((usage, context) => {
+  const modeFrames = Object.values(usage.mode_frame_counts).reduce(
+    (total, count) => total + count,
+    0
+  );
+  const implementationFrames = Object.values(
+    usage.implementation_frame_counts
+  ).reduce((total, count) => total + count, 0);
+  if (modeFrames !== usage.observed_frame_count
+    || implementationFrames !== usage.observed_frame_count
+    || usage.transition_frame_count > usage.observed_frame_count) {
+    context.addIssue({
+      code: "custom",
+      message: "Controller usage counts must cover exactly the observed frames"
+    });
+  }
+  if (usage.routing
+    && (usage.routing.admitted_count + usage.routing.rejected_count
+      !== usage.routing.decision_count
+      || usage.routing.cold_start_count > usage.routing.admitted_count
+      || Object.values(usage.routing.rejection_reason_counts).reduce(
+        (total, count) => total + count,
+        0
+      ) !== usage.routing.rejected_count)) {
+    context.addIssue({
+      code: "custom",
+      message: "Controller routing counts must cover exactly the decisions"
+    });
+  }
+});
+
 const EndEffectorPositionSchema = z.object(Object.fromEntries(
   HUMANOID_END_EFFECTORS.map((name) => [name, Vec3Schema])
 ) as Record<typeof HUMANOID_END_EFFECTORS[number], typeof Vec3Schema>).strict();
@@ -33,6 +169,7 @@ export const PhysicalTrajectoryFrameSchema = z.object({
   objects: z.array(PhysicalObjectSampleSchema),
   support: z.enum(["none", "left", "right", "double"]),
   fallen: z.boolean(),
+  controller_execution: ControllerExecutionSampleSchema.optional(),
   frame_sha256: z.string().regex(SHA256_PATTERN)
 }).strict().superRefine((sample, context) => {
   if (sample.frame_sha256 !== physicalTrajectoryFrameSha256(sample)) {
@@ -70,6 +207,7 @@ export const PhysicalTrajectorySummarySchema = z.object({
     z.number().finite().nonnegative()
   ),
   contact_transition_count: z.number().int().nonnegative(),
+  controller_usage: ControllerUsageEvidenceSchema.optional(),
   trajectory_sha256: z.string().regex(SHA256_PATTERN)
 }).strict().superRefine((summary, context) => {
   const first = summary.samples[0];
@@ -118,6 +256,15 @@ export const PhysicalTrajectorySummarySchema = z.object({
     }
   }
   assertSortedUnique(summary.joint_names, "joint_names", context, false);
+  if (summary.controller_usage
+    && summary.controller_usage.complete_from_admission
+    && summary.controller_usage.observed_frame_count !== summary.observed_frame_count) {
+    context.addIssue({
+      code: "custom",
+      path: ["controller_usage", "observed_frame_count"],
+      message: "Complete controller usage must cover the full physical trajectory"
+    });
+  }
 });
 
 export type PhysicalTrajectoryFrame = z.infer<typeof PhysicalTrajectoryFrameSchema>;

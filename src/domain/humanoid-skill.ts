@@ -27,7 +27,7 @@ export const HUMANOID_SKILL_IDS = [
   "retreat"
 ] as const;
 
-const HumanoidSkillIdSchema = z.enum(HUMANOID_SKILL_IDS);
+export const HumanoidSkillIdSchema = z.enum(HUMANOID_SKILL_IDS);
 export type HumanoidSkillId = z.infer<typeof HumanoidSkillIdSchema>;
 
 const HandSchema = z.enum(["left", "right"]);

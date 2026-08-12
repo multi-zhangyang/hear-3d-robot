@@ -47,6 +47,28 @@ describe("humanoid Cycle causal evidence", () => {
     expect(input.committedActions["execute-a"]?.code).toBe("motion_option_succeeded");
   });
 
+  it("uses the durable commit sequence after checkpoint key reordering", () => {
+    const input = validInput();
+    input.committedActions["execute-a"]!.commitSequence = 1;
+    input.committedActions["remove-a"]!.commitSequence = 2;
+    input.committedActions["observe-after"]!.commitSequence = 3;
+    input.committedActions = {
+      "observe-after": input.committedActions["observe-after"]!,
+      "remove-a": input.committedActions["remove-a"]!,
+      "execute-a": input.committedActions["execute-a"]!
+    };
+
+    expect(validateHumanoidCycleCausalEvidence(input)).toMatchObject({
+      execution: { transactionId: "execute-a" },
+      worldMutations: [{ transactionId: "remove-a" }]
+    });
+    const { evidenceTransactionIds: _evidenceTransactionIds, ...state } = input;
+    expect(resolveHumanoidCycleCompletionReadiness(state)).toMatchObject({
+      status: "ready",
+      observed_after_execution: true
+    });
+  });
+
   it("publishes the exact completion evidence and detects post-execution observation", () => {
     const input = validInput();
     const { evidenceTransactionIds: _evidenceTransactionIds, ...state } = input;
@@ -165,6 +187,41 @@ describe("humanoid Cycle causal evidence", () => {
       status: "ready",
       observed_after_execution: false
     });
+
+    const motionObservation = validInput();
+    motionObservation.committedActions["observe-after"] = {
+      ...motionObservation.committedActions["observe-after"]!,
+      agentId: "humanoid-motion-reference"
+    };
+    expect(() => validateHumanoidCycleCausalEvidence(motionObservation)).toThrow(
+      "requires an accepted Sentry observation"
+    );
+    expect(resolveHumanoidCycleCompletionReadiness({
+      committedActions: motionObservation.committedActions,
+      previousCycle: motionObservation.previousCycle,
+      activeCycle: motionObservation.activeCycle,
+      currentWorld: motionObservation.currentWorld
+    })).toMatchObject({ observed_after_execution: false });
+  });
+
+  it("accepts only the exact unique evidence chain in causal order", () => {
+    const unrelated = validInput();
+    unrelated.evidenceTransactionIds = ["execute-a", "observe-after", "remove-a"];
+    expect(() => validateHumanoidCycleCausalEvidence(unrelated)).toThrow(
+      "unrelated evidence"
+    );
+
+    const reversed = validInput();
+    reversed.evidenceTransactionIds = ["remove-a", "execute-a"];
+    expect(() => validateHumanoidCycleCausalEvidence(reversed)).toThrow(
+      "canonical causal order"
+    );
+
+    const duplicate = validInput();
+    duplicate.evidenceTransactionIds = ["execute-a", "remove-a", "remove-a"];
+    expect(() => validateHumanoidCycleCausalEvidence(duplicate)).toThrow(
+      "must be unique"
+    );
   });
 
   it("does not complete a Cycle from consumed evidence or a fallen world", () => {

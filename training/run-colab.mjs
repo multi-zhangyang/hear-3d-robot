@@ -6,6 +6,8 @@ import { extract } from "tar";
 
 const options = parseOptions(process.argv.slice(2));
 const session = options.session ?? `hear-g1-${randomUUID().slice(0, 8)}`;
+const distro = options.distro ?? "HEAR-Linux";
+const colabPath = options.colabPath ?? "/home/hear/.local/bin/colab";
 const localArchive = resolve(
   options.output ?? `artifacts/training/${session}.tar.gz`
 );
@@ -27,7 +29,7 @@ try {
     String(options.timeoutSeconds ?? 14_400),
     "--session",
     session,
-    resolve("training/colab_mjlab_g1.py"),
+    toWslPath(resolve("training/colab_mjlab_g1.py")),
     "--iterations",
     String(options.iterations ?? 1000),
     "--num-envs",
@@ -46,7 +48,7 @@ try {
       "--session",
       session,
       remoteArchive,
-      localArchive
+      toWslPath(localArchive)
     ]);
     if (downloadExit !== 0) process.exitCode = downloadExit;
     if (downloadExit === 0) {
@@ -62,7 +64,13 @@ try {
 }
 
 function command(args, tolerateFailure = false) {
-  const result = spawnSync("colab", args, {
+  const result = spawnSync("wsl.exe", [
+    "-d",
+    distro,
+    "--",
+    colabPath,
+    ...args
+  ], {
     cwd: process.cwd(),
     stdio: "inherit",
     shell: false
@@ -78,6 +86,8 @@ function parseOptions(args) {
   if (args[0] === "--") args = args.slice(1);
   const parsed = {};
   const names = new Map([
+    ["--distro", ["distro", String]],
+    ["--colab-path", ["colabPath", String]],
     ["--gpu", ["gpu", String]],
     ["--session", ["session", String]],
     ["--output", ["output", String]],
@@ -113,6 +123,7 @@ async function extractTrainingBundle(archive, destination) {
     "hear-g1-training/env.yaml",
     "hear-g1-training/g1_velocity.onnx",
     "hear-g1-training/g1_velocity.pt",
+    "hear-g1-training/g1_velocity_teacher.jit.pt",
     "hear-g1-training/training-report.json"
   ]);
   mkdirSync(destination);
@@ -134,4 +145,11 @@ function trainingBundlePath(archive) {
   return archive.endsWith(".tar.gz")
     ? archive.slice(0, -".tar.gz".length)
     : `${archive}.bundle`;
+}
+
+function toWslPath(path) {
+  const absolute = resolve(path).replaceAll("\\", "/");
+  const match = /^([A-Za-z]):\/(.*)$/.exec(absolute);
+  if (!match) throw new Error(`Cannot map Windows path into WSL: ${path}`);
+  return `/mnt/${match[1].toLowerCase()}/${match[2]}`;
 }

@@ -17,6 +17,7 @@ import {
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
+const MODEL_CALL_ID = "00000000-0000-4000-8000-000000000099";
 const CYCLE = {
   cycle_id: "autonomous-cycle:00000000-0000-4000-8000-000000000001",
   cycle_index: 1,
@@ -169,6 +170,20 @@ describe("action execution ledger", () => {
     changedProgress.active["execute-1"]!.progress.world_revision += 1;
     expect(() => restoreActionExecutionLedger(changedProgress)).toThrow(/committed frame count/);
 
+    const changedDelegation = structuredClone(executing);
+    changedDelegation.active["execute-1"]!.admission
+      .tool_call_authority!.deterministic_delegation.source_input = {
+        objective: "execute a different plan"
+      };
+    expect(() => restoreActionExecutionLedger(changedDelegation))
+      .toThrow(/intent integrity/);
+
+    const unboundDelegation = structuredClone(executing);
+    unboundDelegation.active["execute-1"]!.admission
+      .tool_call_authority!.deterministic_delegation.action_input_sha256 = HASH_A;
+    expect(() => restoreActionExecutionLedger(unboundDelegation))
+      .toThrow(/not bound to its model decision/);
+
     expect(ActionExecutionLedgerSchema.safeParse({
       version: 1,
       active: { other: executing.active["execute-1"] }
@@ -197,6 +212,34 @@ function stageIntent(
     worldRevision: 10,
     authorityStateSha256: HASH_A,
     physicalCheckpointSha256: HASH_A,
+    decision: {
+      agent_id: "humanoid-coordinator",
+      agent_manifest_sha256: HASH_A,
+      agent_manifest_epoch_id: "00000000-0000-4000-8000-000000000098",
+      model_call_id: MODEL_CALL_ID,
+      response_id: "response-execute-1",
+      response_output_sha256: HASH_B,
+      tool_call_id: "execute-1",
+      tool_arguments_sha256: HASH_C,
+      normalized_tool_arguments_sha256: HASH_B
+    },
+    toolCallAuthority: {
+      tool_call_id: "execute-1",
+      tool_name: "delegate_physics_executor",
+      arguments_sha256: HASH_C,
+      deterministic_delegation: {
+        contract_id: "execution_gate_v1",
+        source_input: {
+          objective: "execute accepted plan",
+          execution: {
+            kind: "execute_plan",
+            planning_action: "plan_whole_body_motion",
+            planning_transaction_id: "plan-1"
+          }
+        },
+        action_input_sha256: HASH_B
+      }
+    },
     admittedAt: "2026-08-03T10:00:00.000Z",
     ...override
   });

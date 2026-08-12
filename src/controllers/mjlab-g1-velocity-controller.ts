@@ -15,6 +15,7 @@ import type {
 import type {
   HumanoidControllerDescriptor,
   HumanoidControllerInferenceOptions,
+  HumanoidControllerInferenceTrace,
   HumanoidControllerState,
   HumanoidJointPositionCommand,
   HumanoidPolicyState,
@@ -58,6 +59,14 @@ const TrainingReportSchema = z.object({
     maximum_absolute_action: z.number().finite().nonnegative()
   }).strict(),
   checkpoint: TrainingArtifactSchema,
+  teacher_jit: TrainingArtifactSchema.extend({
+    input: z.literal("obs"),
+    input_size: z.literal(99),
+    output: z.literal("actions"),
+    output_size: z.literal(29),
+    batch_dynamic: z.literal(true),
+    runtime: z.literal("torchscript_cuda")
+  }).optional(),
   onnx: TrainingArtifactSchema.extend({
     inputs: z.tuple([z.literal("obs")]),
     outputs: z.tuple([z.literal("actions")]),
@@ -85,7 +94,7 @@ const ControllerStatePayloadSchema = z.object({
   previous_action: z.array(z.number().finite()).length(HUMANOID_JOINT_NAMES.length)
 }).strict();
 
-interface MjlabG1VelocityPolicy {
+export interface MjlabG1VelocityPolicy {
   readonly policySha256: string;
   readonly defaultJointPositions: readonly number[];
   readonly actionScale: readonly number[];
@@ -98,7 +107,7 @@ export async function createMjlabG1VelocityController(
 ): Promise<MjlabG1VelocityController> {
   const policyAsset = requiredAsset(context, POLICY_ASSET_ID);
   const reportAsset = requiredAsset(context, REPORT_ASSET_ID);
-  const policy = parseTrainingBundle(policyAsset, reportAsset);
+  const policy = parseMjlabG1VelocityTrainingBundle(policyAsset, reportAsset);
   ort.env.wasm.numThreads = 1;
   const session = await ort.InferenceSession.create(policyAsset.bytes, {
     executionProviders: ["wasm"]
@@ -134,7 +143,8 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
       },
       observationFeatures: [
         "proprioception",
-        "root_kinematics"
+        "root_kinematics",
+        "task_space_command"
       ],
       capabilities: ["balance", "locomotion"]
     }
@@ -142,6 +152,7 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
   readonly #session: ort.InferenceSession;
   readonly #policy: MjlabG1VelocityPolicy;
   #previousAction = new Float32Array(HUMANOID_JOINT_NAMES.length);
+  #lastInferenceTrace: HumanoidControllerInferenceTrace | null = null;
 
   constructor(session: ort.InferenceSession, policy: MjlabG1VelocityPolicy) {
     this.#session = session;
@@ -151,15 +162,16 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
   reset(state: HumanoidPolicyState, reference: HumanoidReference): void {
     assertPolicyInput(state, reference);
     this.#previousAction.fill(0);
+    this.#lastInferenceTrace = null;
   }
 
   async infer(
     state: HumanoidPolicyState,
     reference: HumanoidReference,
-    _options: HumanoidControllerInferenceOptions = {}
+    options: HumanoidControllerInferenceOptions = {}
   ): Promise<HumanoidJointPositionCommand> {
     assertPolicyInput(state, reference);
-    const observation = this.#observation(state, reference);
+    const observation = this.#observation(state, reference, options);
     const input = new ort.Tensor("float32", observation, [1, OBSERVATION_SIZE]);
     let result: Awaited<ReturnType<ort.InferenceSession["run"]>> | undefined;
     try {
@@ -180,7 +192,31 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
       for (const tensor of Object.values(result ?? {})) tensor.dispose();
       input.dispose();
     }
+    this.#lastInferenceTrace = {
+      protocol: "humanoid-controller-inference-trace-v1",
+      implementation: this.descriptor.implementation,
+      route: "direct",
+      components: [{
+        protocol: "humanoid-controller-tensor-trace-v1",
+        role: "direct",
+        implementation: this.descriptor.implementation,
+        observation: {
+          protocol: this.descriptor.learnedPolicy!.observationSpace.protocol,
+          values: [...observation]
+        },
+        action: {
+          protocol: this.descriptor.learnedPolicy!.actionSpace.protocol,
+          values: [...this.#previousAction]
+        }
+      }]
+    };
     return this.#command();
+  }
+
+  inferenceTrace(): HumanoidControllerInferenceTrace | null {
+    return this.#lastInferenceTrace
+      ? structuredClone(this.#lastInferenceTrace)
+      : null;
   }
 
   advanceHistory(): void {}
@@ -209,6 +245,7 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
       throw new Error("Invalid mjlab G1 controller state");
     }
     this.#previousAction = Float32Array.from(payload.data.previous_action);
+    this.#lastInferenceTrace = null;
   }
 
   async dispose(): Promise<void> {
@@ -217,10 +254,12 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
 
   #observation(
     state: HumanoidPolicyState,
-    reference: HumanoidReference
+    reference: HumanoidReference,
+    options: HumanoidControllerInferenceOptions
   ): Float32Array {
     const environment = state.environment!;
     const projectedGravity = inverseRotate(state.rootQuaternion, [0, 0, -1]);
+    const baseTwist = options.taskCommand?.command.baseTwist;
     const observation = Float32Array.from([
       ...environment.rootLinearVelocity,
       ...environment.rootAngularVelocity,
@@ -230,9 +269,9 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
       )),
       ...Array.from(state.jointVelocities),
       ...this.#previousAction,
-      reference.rootVelocity[0],
-      reference.rootVelocity[1],
-      reference.rootYawVelocity
+      baseTwist?.forwardMetersPerSecond ?? reference.rootVelocity[0],
+      baseTwist?.lateralMetersPerSecond ?? reference.rootVelocity[1],
+      baseTwist?.yawRadiansPerSecond ?? reference.rootYawVelocity
     ]);
     if (observation.length !== OBSERVATION_SIZE
       || !observation.every(Number.isFinite)) {
@@ -255,7 +294,7 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
   }
 }
 
-function parseTrainingBundle(
+export function parseMjlabG1VelocityTrainingBundle(
   policyAsset: HumanoidControllerModuleAsset,
   reportAsset: HumanoidControllerModuleAsset
 ): MjlabG1VelocityPolicy {

@@ -2,6 +2,7 @@ import type { Goal, TaskNode } from "../../domain/schema.js";
 import { EmptyContextMemoryState } from "../../domain/schema.js";
 import {
   EmptyHumanoidEmbodiedMemoryState,
+  humanoidActionReceiptEntriesInCommitOrder,
   type HumanoidRunCheckpoint
 } from "../../domain/humanoid-run.js";
 import type { RunStore } from "../../persistence/run-store.js";
@@ -37,6 +38,11 @@ export function createHumanoidRunCheckpoint(input: {
     nodes: hierarchyNodes(input.store.definition.mission, input.goal, at),
     world,
     world_checkpoint: input.world.checkpoint(),
+    physical_state_anchor: null,
+    goal_state_anchor: null,
+    embodied_memory_state_anchor: null,
+    context_memory_state_anchor: null,
+    execution_ledger_state_anchor: null,
     goal_dag: createGoalDAG(),
     goal_progress: null,
     active_cycle: null,
@@ -63,6 +69,15 @@ export function reconcileHumanoidHierarchyCapabilities(
   source: HumanoidRunCheckpoint
 ): HumanoidRunCheckpoint {
   const checkpoint = structuredClone(source);
+  const actionEntries = humanoidActionReceiptEntriesInCommitOrder(
+    checkpoint.committed_actions
+  );
+  if (actionEntries.length > 0
+    && actionEntries.every(([, receipt]) => receipt.commitSequence === undefined)) {
+    for (const [index, [, receipt]] of actionEntries.entries()) {
+      receipt.commitSequence = index + 1;
+    }
+  }
   checkpoint.capability_catalog = [...HUMANOID_CAPABILITIES];
   const coordinator = checkpoint.nodes[HUMANOID_AGENT_IDS.coordinator];
   if (coordinator) coordinator.capabilities = [...HUMANOID_CAPABILITIES];
@@ -84,14 +99,18 @@ export function reconcileHumanoidHierarchyCapabilities(
     "recall_goal_history",
     "submit_goal_candidates",
     "select_goal_candidate",
-    "retire_goal_epoch"
+    "retire_goal_epoch",
+    "continue_goal_epoch"
   ];
   checkpoint.nodes[goalManager.id] = goalManager;
   if (coordinator && !coordinator.child_ids.includes(goalManager.id)) {
     coordinator.child_ids = [goalManager.id, ...coordinator.child_ids];
   }
   const sentry = checkpoint.nodes[HUMANOID_AGENT_IDS.sentry];
-  if (sentry) sentry.capabilities = ["observe_humanoid"];
+  if (sentry) {
+    sentry.name = "异步物理 Grounding Monitor";
+    sentry.capabilities = ["observe_humanoid"];
+  }
   const motion = checkpoint.nodes[HUMANOID_AGENT_IDS.motion];
   if (motion) motion.capabilities = [
     "observe_humanoid",
@@ -102,11 +121,15 @@ export function reconcileHumanoidHierarchyCapabilities(
     "plan_humanoid_navigation"
   ];
   const executor = checkpoint.nodes[HUMANOID_AGENT_IDS.executor];
-  if (executor) executor.capabilities = [
-    "execute_whole_body_motion",
-    "execute_humanoid_navigation",
-    "remove_world_block"
-  ];
+  if (executor) {
+    executor.name = "确定性物理 Execution Gate";
+    executor.capabilities = [
+      "execute_humanoid_skill",
+      "execute_whole_body_motion",
+      "execute_humanoid_navigation",
+      "remove_world_block"
+    ];
+  }
   return checkpoint;
 }
 
@@ -140,7 +163,8 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
       "recall_goal_history",
       "submit_goal_candidates",
       "select_goal_candidate",
-      "retire_goal_epoch"
+      "retire_goal_epoch",
+      "continue_goal_epoch"
     ],
     mayDelegate: false,
     status: "ready",
@@ -149,7 +173,7 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
   });
   const sentry = node({
     id: HUMANOID_AGENT_IDS.sentry,
-    name: "人形感知哨兵",
+    name: "异步物理 Grounding Monitor",
     parentId: coordinator.id,
     childIds: [],
     objective: "从当前头部传感器、本体感觉和接触状态建立受限观察。",
@@ -182,12 +206,13 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
   });
   const executor = node({
     id: HUMANOID_AGENT_IDS.executor,
-    name: "人形物理执行智能体",
+    name: "确定性物理 Execution Gate",
     parentId: coordinator.id,
     childIds: [],
     objective: "消费已接受规划回执并在 YAHMP 与 MuJoCo 闭环中执行。",
     criteria: ["返回包含世界版本增长与物理终态的执行回执。"],
     capabilities: [
+      "execute_humanoid_skill",
       "execute_whole_body_motion",
       "execute_humanoid_navigation",
       "remove_world_block"

@@ -15,6 +15,7 @@ import {
   type RuntimeCatalog
 } from "../config/load.js";
 import type { Goal } from "../domain/schema.js";
+import { humanoidActionReceiptsInCommitOrder } from "../domain/humanoid-run.js";
 import {
   HUMANOID_ACTION_NAMES,
   type HumanoidActionName
@@ -46,6 +47,8 @@ import {
 } from "../harness/humanoid/agents.js";
 import { createHumanoidRunCheckpoint } from "../harness/humanoid/run-checkpoint.js";
 import { HumanoidRunRuntime } from "../harness/humanoid/run-runtime.js";
+import { DensePolicyRolloutWriter } from
+  "../training/dense-policy-rollout-files.js";
 import { assertHumanoidPhysicalWorldDeltaRecovery } from "../harness/humanoid/physical-world-delta.js";
 import {
   ModelDecisionStallError,
@@ -94,6 +97,8 @@ import type {
 import { drawSeed } from "../world/world-generator.js";
 
 setTracingDisabled(true);
+
+const MAX_MODEL_DECISION_FOLLOW_UPS_PER_AUTHORITY = 2;
 
 const MAX_TRANSPORT_RECOVERIES = 8;
 const SERVER_ERROR_CONTEXT_RECOVERY_ATTEMPT = 3;
@@ -145,6 +150,7 @@ export async function startHumanoidMission(input: {
   signal?: AbortSignal;
   mutationFence?: MutationFence;
   controllerSource?: HumanoidControllerSource;
+  densePolicyRolloutDir?: string;
 }): Promise<HumanoidMissionRunResult> {
   const scenario = input.catalog.materialize(
     input.scenarioId,
@@ -170,6 +176,12 @@ export async function startHumanoidMission(input: {
       ? { controllerFactory: input.controllerSource.controllerFactory }
       : {})
   });
+  const densePolicyWriter = input.densePolicyRolloutDir
+    ? new DensePolicyRolloutWriter({
+        rootDir: input.densePolicyRolloutDir,
+        runId: store.definition.run_id
+      })
+    : undefined;
   try {
     const checkpoint = createHumanoidRunCheckpoint({
       store,
@@ -182,6 +194,9 @@ export async function startHumanoidMission(input: {
       goal: input.goal,
       world,
       checkpoint,
+      ...(densePolicyWriter
+        ? { policyFrameSink: densePolicyWriter.recordFrame }
+        : {}),
       ...(input.eventSink ? { eventSink: input.eventSink } : {}),
       ...(input.signal ? { signal: input.signal } : {})
     });
@@ -192,7 +207,10 @@ export async function startHumanoidMission(input: {
       ...(input.signal ? { signal: input.signal } : {})
     });
   } finally {
-    await world.dispose();
+    await Promise.all([
+      densePolicyWriter?.flush() ?? Promise.resolve(),
+      world.dispose()
+    ]);
   }
 }
 
@@ -205,6 +223,7 @@ export async function resumeHumanoidMission(input: {
   signal?: AbortSignal;
   mutationFence?: MutationFence;
   controllerSource?: HumanoidControllerSource;
+  densePolicyRolloutDir?: string;
 }): Promise<HumanoidMissionRunResult> {
   const store = await RunStore.open(
     input.runDir,
@@ -238,12 +257,21 @@ export async function resumeHumanoidMission(input: {
         : {})
     }
   );
+  const densePolicyWriter = input.densePolicyRolloutDir
+    ? new DensePolicyRolloutWriter({
+        rootDir: input.densePolicyRolloutDir,
+        runId: store.definition.run_id
+      })
+    : undefined;
   try {
     const runtime = new HumanoidRunRuntime({
       store,
       goal: store.definition.goal,
       world,
       checkpoint,
+      ...(densePolicyWriter
+        ? { policyFrameSink: densePolicyWriter.recordFrame }
+        : {}),
       ...(input.eventSink ? { eventSink: input.eventSink } : {}),
       ...(input.signal ? { signal: input.signal } : {})
     });
@@ -254,7 +282,10 @@ export async function resumeHumanoidMission(input: {
       ...(input.signal ? { signal: input.signal } : {})
     });
   } finally {
-    await world.dispose();
+    await Promise.all([
+      densePolicyWriter?.flush() ?? Promise.resolve(),
+      world.dispose()
+    ]);
   }
 }
 
@@ -546,17 +577,25 @@ async function executeHumanoidMission(input: {
     await input.runtime.recordProvider({
       status: "configured",
       ...providerIdentity(coordinatorProvider),
-      hierarchy: "one_model_facade_and_session_per_agent",
+      hierarchy: "three_reasoning_agents_plus_deterministic_grounding_and_execution_services",
       prompt_cache_affinity: "stable_per_credential_agent_protocol_native",
       agent_manifest_epoch: currentManifest.epoch_id,
       agent_profiles: Object.fromEntries(Object.entries(currentManifest.agents).map(
-        ([role, profile]) => [role, {
-          agent_id: profile.agent_id,
-          protocol: profile.protocol,
-          model: profile.model,
-          context_window_tokens: profile.settings.context_window_tokens,
-          compact_trigger_tokens: profile.settings.compact_trigger_tokens
-        }]
+        ([role, profile]) => [role, profile.execution_kind === "deterministic_service"
+          ? {
+              agent_id: profile.agent_id,
+              execution_kind: profile.execution_kind,
+              implementation_contract: profile.implementation_contract,
+              decision_authority_role: profile.decision_authority_role
+            }
+          : {
+              agent_id: profile.agent_id,
+              execution_kind: "model",
+              protocol: profile.protocol,
+              model: profile.model,
+              context_window_tokens: profile.settings.context_window_tokens,
+              compact_trigger_tokens: profile.settings.compact_trigger_tokens
+            }]
       )),
       physics: `mujoco_${formatFrequency(controller.physicsStepSeconds)}hz`,
       controller: `${controller.implementation}_${formatFrequency(
@@ -593,7 +632,8 @@ async function executeHumanoidMission(input: {
     const acceptVerifiedTransition = async (
       output: string
     ): Promise<HumanoidMissionRunResult | undefined> => {
-      const completion = assertCycleOutput(output);
+      const completion = assertCoordinatorStepOutput(output);
+      if (completion.status === "step_completed") return undefined;
       await contextManager.compactSessionHistories(sessionForAgent);
       if (completion.status === "cycle_completed") {
         const activeGoalCompleted = await input.runtime.completeCycle(output);
@@ -637,8 +677,6 @@ async function executeHumanoidMission(input: {
             output
           };
         }
-      } else {
-        input.runtime.validateGoalTransition();
       }
       return undefined;
     };
@@ -1089,7 +1127,9 @@ export function humanoidModelProgressSnapshot(
   agentId: string
 ): ModelProgressSnapshot {
   const checkpoint = runtime.checkpoint;
-  const receipts = Object.values(checkpoint.committed_actions).filter((receipt) => (
+  const receipts = humanoidActionReceiptsInCommitOrder(
+    checkpoint.committed_actions
+  ).filter((receipt) => (
     agentId === runtime.rootAgentId || receipt.agentId === agentId
   ));
   return {
@@ -1152,7 +1192,7 @@ function autonomousCycleInput(runtime: HumanoidRunRuntime): string {
     ? "当前没有 active Goal；先委派目标管理智能体提交 2–3 个真实模型候选并由其另一次响应显式选择，然后再规划物理行动。"
     : "只围绕 goal_dag 当前 epoch 的 active Goal 规划物理行动。";
   return [
-    "继续下一次人形自主闭环。",
+    "推进人形自主闭环的下一个层级步骤。每次只选择当前 coordinator_phase 对应的一项正式委派或完成动作；工具返回后由 Harness 重新观察阶段，再决定下一步。",
     "必须根据当前传感、目标、历史回执和物理反馈自主决定动作；不得使用固定动作表、预设路径或假执行。",
     goalDirection,
     runtime.store.definition.run_mode === "mission"
@@ -1195,12 +1235,13 @@ export function nextModelDecisionFollowUpState(
   previous: ModelDecisionFollowUpState | undefined,
   authorityFingerprint: string,
   contextCompactionCount = 0
-): ModelDecisionFollowUpState {
+): ModelDecisionFollowUpState | undefined {
   const sameRecoveryEpoch = previous?.authorityFingerprint === authorityFingerprint
     && previous.contextCompactionCount === contextCompactionCount;
   const attempt = sameRecoveryEpoch
     ? previous.attempt + 1
     : 1;
+  if (attempt > MAX_MODEL_DECISION_FOLLOW_UPS_PER_AUTHORITY) return undefined;
   return {
     authorityFingerprint,
     contextCompactionCount,
@@ -1211,8 +1252,8 @@ export function nextModelDecisionFollowUpState(
 
 class CompletedResponseDecisionStallError extends ModelDecisionStallError {}
 
-function assertCycleOutput(output: string | undefined): {
-  status: "cycle_completed" | "goal_transition_completed" | "satisfied_goal_completed";
+function assertCoordinatorStepOutput(output: string | undefined): {
+  status: "cycle_completed" | "satisfied_goal_completed" | "step_completed";
 } {
   if (!output?.trim()) {
     throw new CompletedResponseDecisionStallError(
@@ -1229,11 +1270,21 @@ function assertCycleOutput(output: string | undefined): {
       "Humanoid coordinator did not return a formal tool result"
     );
   }
-  const status = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-    ? (parsed as Record<string, unknown>).status
+  const record = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
     : undefined;
+  const status = record?.status;
+  if (status === "goal_candidate_selected"
+    || status === "goal_epoch_retired"
+    || status === "goal_epoch_continued") {
+    return { status: "step_completed" };
+  }
+  if (typeof record?.transactionId === "string"
+    && typeof record.action === "string"
+    && typeof record.accepted === "boolean") {
+    return { status: "step_completed" };
+  }
   if (status !== "cycle_completed"
-    && status !== "goal_transition_completed"
     && status !== "satisfied_goal_completed") {
     throw new CompletedResponseDecisionStallError(
       HUMANOID_AGENT_IDS.coordinator,

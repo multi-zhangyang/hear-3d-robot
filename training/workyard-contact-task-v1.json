@@ -1,0 +1,202 @@
+{
+  "protocol": "hear-workyard-contact-training-contract-v1",
+  "scenario_id": "humanoid_workyard",
+  "parent_contract": "training/workyard-task-v4.json",
+  "environment": {
+    "framework": "mjlab",
+    "task_id": "Hear-Workyard-Frozen-Reach-Hand-Synergy-G1-v1",
+    "module": "training/workyard_contact_mjlab_env.py",
+    "implementation_status": "implemented",
+    "terminal_stage": "grasp",
+    "excluded_stages": ["lift", "carry", "place"]
+  },
+  "timing": {
+    "physics_step_seconds": 0.005,
+    "control_step_seconds": 0.02,
+    "episode_seconds": 8
+  },
+  "qualified_inputs": {
+    "locomotion_teacher": {
+      "protocol": "hear-frozen-locomotion-teacher-v1",
+      "root": "artifacts/training/g1-residual-teacher",
+      "jit": "g1_velocity_teacher.jit.pt",
+      "report": "training-report.json",
+      "gradient_parameter_count": 0,
+      "authority": ["lower_body", "waist"]
+    },
+    "reach_policy": {
+      "protocol": "hear-frozen-reach-policy-export-v1",
+      "root": "artifacts/training/workyard-reach-frozen-v15",
+      "jit": "workyard_reach_selected.jit.pt",
+      "report": "reach-policy-report.json",
+      "jit_sha256": "c90cdf1c5ee6090b03a1fa48d584d09fd66de27e8e7e77eab9ac42ede3d27bfc",
+      "source_checkpoint_sha256": "a39169baa2ae2514165dc76a1b862ec6dd398c9cace81d3754867e82c99539e4",
+      "gradient_parameter_count": 0,
+      "action_size": 14,
+      "authority": "frozen_active_arm_reach"
+    },
+    "analytic_teacher_preflight": {
+      "protocol": "hear-workyard-contact-analytic-teacher-preflight-v1",
+      "report": "artifacts/training/workyard-contact-teacher/colab-seed42-v38-hand-guard.json",
+      "must_pass": true,
+      "minimum_environment_count": 16,
+      "minimum_success_rate": 0.9,
+      "minimum_success_rate_per_active_hand": 0.85,
+      "maximum_contact_force_n": 30,
+      "minimum_opposing_normal_dot_maximum": -0.15,
+      "both_active_hands_must_succeed": true
+    }
+  },
+  "harness_executor": {
+    "protocol": "hear-contact-pocket-dls-executor-v1",
+    "runtime": "deterministic_no_gradient",
+    "authority": "active_arm_terminal_alignment_only",
+    "learner_can_change_executor_state": false,
+    "base_assist_enabled": false,
+    "sequence": [
+      "open_hand",
+      "retreat",
+      "near_pocket_alignment",
+      "open_hand_insertion",
+      "closure_geometry_latch",
+      "finger_closure",
+      "thumb_flexion",
+      "verified_opposing_contact"
+    ],
+    "closure_authority_latch": "episode_local_after_first_geometry_gate",
+    "pose_hold": "closure_gate_then_measured_contact_pose",
+    "force_release_threshold_n": 6,
+    "emergency_force_release_threshold_n": 12,
+    "maximum_closing_joint_lead_rad": 0.25,
+    "opposing_support_coordination": 0.4
+  },
+  "learner": {
+    "phase": "hand_synergy_contact_grasp",
+    "role": "contact_conditioned_8d_hand_policy",
+    "observation": {
+      "protocol": "hear-workyard-contact-observation-v1",
+      "size": 247,
+      "terms": [
+        { "name": "frozen_reach_observation", "size": 231 },
+        { "name": "hand_coordination", "size": 8 },
+        { "name": "previous_authorized_hand_action", "size": 8 }
+      ],
+      "forbidden_terms": [
+        "teacher_stage",
+        "teacher_target_stage",
+        "analytic_teacher_action",
+        "closure_authority_latch_private_state"
+      ]
+    },
+    "action": {
+      "protocol": "hear-active-hand-synergy-action-v1",
+      "size": 8,
+      "names": [
+        "left_opposition",
+        "left_thumb",
+        "left_index",
+        "left_middle",
+        "right_opposition",
+        "right_thumb",
+        "right_index",
+        "right_middle"
+      ],
+      "range": [-1, 1],
+      "coordination_step": 0.0075
+    },
+    "authority": {
+      "active_hand_only": true,
+      "requires_typed_contact_capability": true,
+      "requires_closure_geometry_latch": true,
+      "inactive_hand_forced_zero": true,
+      "locomotion_gradient": false,
+      "waist_gradient": false,
+      "reach_gradient": false,
+      "checkpoint_mutation_outside_hand_actor": false
+    }
+  },
+  "composition": {
+    "protocol": "hear-frozen-reach-hand-synergy-composition-v1",
+    "learned_action_size": 8,
+    "frozen_reach_action_size": 14,
+    "logical_composed_action_size": 22,
+    "body_joint_command": "frozen_locomotion_plus_frozen_reach_or_harness_terminal_executor",
+    "hand_joint_command": "authorized_active_hand_synergy_only"
+  },
+  "training": {
+    "protocol": "hear-contact-dagger-ppo-retention-v1",
+    "accelerator": "colab_pro_gpu",
+    "local_training_permitted": false,
+    "numerical_guard": {
+      "protocol": "hear-vector-env-numerical-recovery-v1",
+      "scope": "single_environment_reset",
+      "maximum_recovery_count": 128,
+      "maximum_recovery_rate": 0.000001,
+      "evaluation_recovery_permitted": false
+    },
+    "dagger": {
+      "steps": 400,
+      "learning_rate": 0.0003,
+      "teacher_beta_initial": 1,
+      "teacher_beta_final": 0.1,
+      "loss": "authority_weighted_smooth_l1_plus_excess_std_penalty",
+      "maximum_action_std": 0.15,
+      "label_scope": "authorized_8d_hand_action",
+      "minimum_label_coverage": 1
+    },
+    "ppo": {
+      "iterations": 256,
+      "environments": 2048,
+      "steps_per_environment": 32,
+      "critic_warmup_iterations": 5,
+      "actor_learning_rate": 0.00001,
+      "critic_learning_rate": 0.0003,
+      "rollout_teacher_coefficient": 1,
+      "teacher_supervision": "every_stored_learner_rollout_state",
+      "checkpoint_selection": "rollback_to_dagger_if_retention_gate_fails"
+    },
+    "checkpoint_selection": {
+      "comparison_episodes": 128,
+      "control_steps_per_episode": 400,
+      "held_out_seed_first": 9000,
+      "held_out_seed_last": 9127,
+      "ppo_success_rate_delta_minimum": -0.02,
+      "ppo_success_count_per_active_hand_minimum": 1,
+      "ppo_success_rate_per_active_hand_minimum": 0.65,
+      "ppo_maximum_contact_force_n": 30,
+      "ppo_object_lost_count_maximum": 0,
+      "ppo_fall_count_maximum": 0,
+      "ppo_non_foot_ground_count_maximum": 0,
+      "ppo_numerical_instability_count_maximum": 0,
+      "ppo_precontact_object_contact_count_maximum": 0,
+      "ppo_unauthorized_hand_action_maximum": 0,
+      "ppo_inactive_hand_coordination_maximum": 0,
+      "ppo_base_assist_environment_count_maximum": 0,
+      "ppo_rollout_teacher_label_coverage_minimum": 1,
+      "ppo_mean_action_std_maximum": 0.15
+    }
+  },
+  "evaluation": {
+    "episodes": 500,
+    "control_steps_per_episode": 400,
+    "held_out_seed_protocol": "per_environment_deterministic_v1",
+    "held_out_seed_first": 10000,
+    "held_out_seed_last": 10499,
+    "verified_grasp_success_rate_minimum": 0.75,
+    "verified_grasp_success_rate_per_active_hand_minimum": 0.70,
+    "success_count_per_active_hand_minimum": 1,
+    "maximum_contact_force_n": 30,
+    "minimum_opposing_normal_dot_maximum": -0.15,
+    "object_lost_count_maximum": 0,
+    "fall_count_maximum": 0,
+    "non_foot_ground_count_maximum": 0,
+    "numerical_instability_count_maximum": 0,
+    "precontact_object_contact_count_maximum": 0,
+    "unauthorized_hand_action_maximum": 0,
+    "inactive_hand_coordination_maximum": 0,
+    "frozen_gradient_parameter_count": 0,
+    "base_assist_environment_count_maximum": 0,
+    "finite_required": true,
+    "environment_closed_required": true
+  }
+}

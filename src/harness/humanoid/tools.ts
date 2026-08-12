@@ -22,6 +22,7 @@ import {
 import type {
   HumanoidActionInvoker,
   HumanoidActionReceipt,
+  HumanoidActionToolCallAuthority,
 } from "./runtime.js";
 import {
   HUMANOID_EXPERIENCE_OUTCOMES,
@@ -129,12 +130,86 @@ export function createHumanoidActionTools(
   if (unique.size !== allowedActions.length) {
     throw new Error(`Duplicate humanoid action grant for ${agentId}`);
   }
+  if (agentId === "humanoid-motion-reference"
+    && unique.has("plan_whole_body_motion")) {
+    throw new Error(
+      "Production Motion Agent cannot receive raw dense-motion authoring authority"
+    );
+  }
   return allowedActions.map((name) => humanoidActionTool(
     runtime,
     agentId,
     name,
     options.availability ?? "dynamic"
   ));
+}
+
+/**
+ * Execute a physical/runtime action directly from a coordinator tool call.
+ *
+ * The outer coordinator call remains the model decision authority. The
+ * deterministic service is only the actor: it cannot invent a second model
+ * response, rewrite the accepted plan, or manufacture a tool-call identity.
+ */
+export async function invokeDeterministicHumanoidAction(input: {
+  runtime: HumanoidActionInvoker;
+  actorAgentId: string;
+  sourceToolName: string;
+  sourceInput: unknown;
+  action: HumanoidActionName;
+  actionInput: unknown;
+  contractId: NonNullable<
+    HumanoidActionToolCallAuthority["deterministic_delegation"]
+  >["contract_id"];
+  details?: {
+    toolCall?: {
+      callId?: string;
+      name?: string;
+      arguments: string;
+    };
+    signal?: AbortSignal;
+  };
+}): Promise<string> {
+  const toolCall = input.details?.toolCall;
+  const transactionId = toolCall?.callId;
+  if (!transactionId) {
+    throw new Error(`SDK did not provide a call ID for ${input.sourceToolName}`);
+  }
+  if (toolCall.name !== input.sourceToolName) {
+    throw new Error(`SDK tool identity mismatch for ${input.sourceToolName}`);
+  }
+  const argumentsSha256 = modelToolArgumentsSha256(toolCall.arguments);
+  const normalizedArgumentsSha256 = modelPayloadSha256(input.sourceInput);
+  const authority: HumanoidActionToolCallAuthority = {
+    tool_call_id: transactionId,
+    tool_name: input.sourceToolName,
+    arguments_sha256: argumentsSha256,
+    ...(normalizedArgumentsSha256 === argumentsSha256
+      ? {}
+      : { normalized_arguments_sha256: normalizedArgumentsSha256 }),
+    deterministic_delegation: {
+      contract_id: input.contractId,
+      source_input: input.sourceInput as JsonValue,
+      action_input_sha256: modelPayloadSha256(input.actionInput)
+    }
+  };
+  const receipt = input.details?.signal
+    ? await input.runtime.invoke(
+        input.action,
+        input.actionInput,
+        transactionId,
+        input.actorAgentId,
+        authority,
+        { signal: input.details.signal }
+      )
+    : await input.runtime.invoke(
+        input.action,
+        input.actionInput,
+        transactionId,
+        input.actorAgentId,
+        authority
+      );
+  return humanoidActionReceiptModelOutput(receipt);
 }
 
 export function createHumanoidEmbodiedRecallTool(

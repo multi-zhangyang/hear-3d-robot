@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { JsonValue } from "../../domain/schema.js";
+import { createHumanoidReplanBudget } from "../../domain/humanoid-replan-budget.js";
 import type { JournalName, JournalPage, RunStore } from "../../persistence/run-store.js";
 import { createActionGoalEvidence } from "./goal-evidence.js";
 import {
   loadGoalEvidenceWorkingSet,
-  loadModelAuthorityWorkingSet
+  loadModelAuthorityWorkingSet,
+  optionalModelCallIds,
+  requiredModelCallIds
 } from "./autonomy-history-loader.js";
 
 describe("autonomy history loading", () => {
@@ -74,6 +77,68 @@ describe("autonomy history loading", () => {
       lifecycle: "started",
       model_call_id: pendingId
     });
+  });
+
+  it("retains every model authority referenced by the active recovery budget", () => {
+    const budget = createHumanoidReplanBudget();
+    budget.model_calls = [{
+      model_call_id: uuid(42),
+      agent_id: "humanoid-coordinator",
+      recovery_tier: "compact_replan",
+      role: "replan_decision",
+      status: "completed",
+      started_at: "2026-08-08T00:00:00.000Z",
+      completed_at: "2026-08-08T00:00:01.000Z",
+      latency_ms: 1_000,
+      slo_ms: 30_000,
+      slo_violated: false
+    }];
+    budget.compact_replans_started = 1;
+
+    expect(optionalModelCallIds({
+      committed_actions: {},
+      active_cycle: { replan_budget: budget }
+    } as never)).toEqual(new Set([uuid(42)]));
+  });
+
+  it("treats hot committed action decisions as required recovery authority", () => {
+    expect(requiredModelCallIds({
+      goal_dag: { candidates: {}, epochs: [] },
+      action_execution_ledger: { active: {} },
+      committed_actions: {
+        "action-1": {
+          decision: { model_call_id: uuid(7) }
+        }
+      }
+    } as never)).toEqual(new Set([uuid(7)]));
+    expect(optionalModelCallIds({
+      committed_actions: {
+        "action-1": {
+          decision: { model_call_id: uuid(7) }
+        }
+      },
+      active_cycle: null
+    } as never)).toEqual(new Set());
+  });
+
+  it("does not evict an explicitly retained pending call behind the recent window", async () => {
+    const records = Array.from({ length: 400 }, (_, index) => ({
+      version: 1 as const,
+      lifecycle: "started" as const,
+      model_call_id: uuid(index),
+      agent_id: "humanoid-coordinator",
+      at: "2026-08-08T00:00:00.000Z"
+    }));
+    const loaded = await loadModelAuthorityWorkingSet(
+      journalStore({ model_calls: records }),
+      new Set([uuid(0)]),
+      new Set([uuid(1)])
+    );
+
+    expect(loaded).toHaveLength(258);
+    expect(loaded.map((record) => record.model_call_id)).toEqual(
+      expect.arrayContaining([uuid(0), uuid(1), uuid(144), uuid(399)])
+    );
   });
 });
 

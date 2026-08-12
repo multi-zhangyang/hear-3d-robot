@@ -8,6 +8,7 @@ import {
   validateSkillPlanningReference
 } from "./skill-binding.js";
 import { planAutonomousHumanoidSkill } from "./autonomous-skill-planner.js";
+import { groundHumanoidPhysicalExecution } from "./dispatch-grounding.js";
 
 const door = {
   id: "cabinet-door",
@@ -188,6 +189,70 @@ function dynamicWorkpiece(): HumanoidObjectWorldModelEntry {
 }
 
 describe("humanoid skill binding", () => {
+  it("revalidates localized grounding obligations at physical dispatch", () => {
+    const current = observation();
+    const result = bindHumanoidSkill({
+      transactionId: "open-grounding",
+      agentId: "humanoid-motion-reference",
+      request: {
+        invocation: {
+          skill: "open",
+          object_id: "cabinet-door",
+          interaction_point_id: "door-handle",
+          joint_id: "cabinet-hinge",
+          hand: "right",
+          minimum_open_fraction: 0.8
+        },
+        phase: "actuate_joint"
+      },
+      observation: current
+    });
+    if (!result.accepted) throw new Error("Expected grounded open binding");
+    const base = {
+      planningReceipt: {
+        transactionId: "planning-open",
+        accepted: true,
+        worldAfterRevision: current.worldRevision,
+        detail: {
+          plan_id: "motion-open",
+          skill_binding: result.binding
+        }
+      },
+      intent: {
+        transactionId: "execution-open",
+        planningTransactionId: "planning-open",
+        planId: "motion-open"
+      },
+      authorityStateSha256: "b".repeat(64)
+    } as const;
+    const accepted = groundHumanoidPhysicalExecution({
+      ...base,
+      observation: current
+    });
+    expect(accepted).toMatchObject({
+      accepted: true,
+      failed_obligation_ids: [],
+      world_frame: 12,
+      world_revision: 7
+    });
+
+    const changed = observation();
+    const moved = changed.interaction.object_world_model.objects[0]!;
+    moved.pose.position.x += 0.1;
+    moved.interaction_points[0]!.world_position.x += 0.1;
+    const rejected = groundHumanoidPhysicalExecution({
+      ...base,
+      observation: changed
+    });
+    expect(rejected.accepted).toBe(false);
+    expect(rejected.failed_obligation_ids).toEqual([
+      "target_evidence",
+      "interaction_evidence"
+    ]);
+    expect(rejected.obligations.find(({ id }) => id === "semantic_preconditions"))
+      .toMatchObject({ status: "satisfied" });
+  });
+
   it("grounds a model-selected semantic zone in its live world geometry", () => {
     const current = observation();
     const result = bindHumanoidSkill({

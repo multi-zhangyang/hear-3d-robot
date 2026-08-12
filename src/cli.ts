@@ -1,6 +1,11 @@
 #!/usr/bin/env node
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
+import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  loadHumanoidCapabilityBenchmark,
+  writeHumanoidCapabilityBenchmark
+} from "./benchmark/humanoid-capability-files.js";
 import {
   loadEnvironment,
   loadProviderConfig,
@@ -8,6 +13,10 @@ import {
   loadServerConfig,
   type ProviderConfig
 } from "./config/load.js";
+import {
+  loadHarnessRolloutDataset,
+  writeHarnessRolloutDataset
+} from "./training/harness-rollout-dataset-files.js";
 import { GoalSchema } from "./domain/schema.js";
 import { HumanoidRunModeSchema } from "./domain/run-mode.js";
 import type { MutationFence } from "./persistence/mutation-fence.js";
@@ -43,7 +52,12 @@ export async function isMainModule(
       realpath(entryPath),
       realpath(fileURLToPath(moduleUrl))
     ]);
-    return entryRealPath === moduleRealPath;
+    if (entryRealPath === moduleRealPath) return true;
+    const [entryStat, moduleStat] = await Promise.all([
+      stat(entryRealPath),
+      stat(moduleRealPath)
+    ]);
+    return entryStat.dev === moduleStat.dev && entryStat.ino === moduleStat.ino;
   } catch {
     return moduleUrl === pathToFileURL(entryPath).href;
   }
@@ -61,6 +75,35 @@ async function main(argv: string[]): Promise<void> {
           : "authored";
         process.stdout.write(`${id}\t${template.title}\t${shape}\n`);
       }
+      return;
+    }
+    if (command === "benchmark") {
+      const report = await loadHumanoidCapabilityBenchmark(
+        required(options, "runs-dir")
+      );
+      if (options.output) {
+        await writeHumanoidCapabilityBenchmark(options.output, report);
+      }
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      return;
+    }
+    if (command === "export-harness-rollouts") {
+      const dataset = await loadHarnessRolloutDataset(
+        required(options, "runs-dir"),
+        {
+          denseRolloutsPath: options["dense-rollouts-dir"]
+            ?? process.env.HEAR_DENSE_POLICY_ROLLOUT_DIR
+            ?? resolve("artifacts", "training", "harness-rollouts", "dense")
+        }
+      );
+      const output = options.output ?? resolve(
+        "artifacts",
+        "training",
+        "harness-rollouts",
+        `harness-rollouts-${fileTimestamp(new Date())}.jsonl`
+      );
+      const summary = await writeHarnessRolloutDataset(output, dataset);
+      process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
       return;
     }
     if (command === "run") {
@@ -84,6 +127,9 @@ async function main(argv: string[]): Promise<void> {
         catalog,
         provider,
         runMode,
+        ...(server.densePolicyRolloutDir
+          ? { densePolicyRolloutDir: server.densePolicyRolloutDir }
+          : {}),
         ...(seed === undefined ? {} : { seed }),
         signal,
         mutationFence,
@@ -106,6 +152,9 @@ async function main(argv: string[]): Promise<void> {
         catalog,
         provider,
         freshAgentEpoch: options["fresh-agent-epoch"] === "true",
+        ...(server.densePolicyRolloutDir
+          ? { densePolicyRolloutDir: server.densePolicyRolloutDir }
+          : {}),
         signal,
         mutationFence,
         ...(controllerSource ? { controllerSource } : {})
@@ -205,6 +254,10 @@ function requireConfirmation(options: Record<string, string>): void {
   if (options.confirm !== "true") throw new Error("--confirm is required");
 }
 
+function fileTimestamp(date: Date): string {
+  return date.toISOString().replace(/[:.]/g, "-");
+}
+
 export async function withMissionSignals<T>(
   runsDir: string,
   operation: (signal: AbortSignal, mutationFence: MutationFence) => Promise<T>,
@@ -233,6 +286,8 @@ function printHelp(): void {
     "HEAR",
     "",
     "  hear scenarios",
+    "  hear benchmark --runs-dir PATH [--output FILE]",
+    "  hear export-harness-rollouts --runs-dir PATH [--dense-rollouts-dir PATH] [--output FILE]",
     "  hear run --scenario ID --mission TEXT --goal JSON [--mode mission|continuous] [--seed N] --confirm",
     "  hear resume --run RUN_ID [--fresh-agent-epoch] --confirm",
     "  hear operator [--host HOST] [--port PORT] [--dev]",

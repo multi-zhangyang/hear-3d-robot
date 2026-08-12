@@ -17,6 +17,14 @@ import {
   type AutonomousCycleRef
 } from "../../domain/autonomous-cycle.js";
 import {
+  beginHumanoidReplanModelCall,
+  finishHumanoidReplanModelCall,
+  humanoidReplanBudgetAuthority,
+  restoreHumanoidReplanModelCall,
+  type HumanoidReplanBudget,
+  type HumanoidReplanModelCall
+} from "../../domain/humanoid-replan-budget.js";
+import {
   completeGoalEpoch,
   goalCandidateBySequence,
   goalCandidateSequence,
@@ -28,7 +36,9 @@ import {
   retireGoalEpoch as retireDomainGoalEpoch
 } from "../../domain/goal-epoch-retirement.js";
 import {
+  ModelCallLifecycleRecordSchema,
   modelPayloadSha256,
+  type ModelCallLifecycleRecord,
   type ModelDecisionRef
 } from "../../domain/model-call-authority.js";
 import {
@@ -46,6 +56,7 @@ import {
   acknowledgeTerminalActionExecution,
   actionExecutionFingerprintSha256,
   activeActionExecutions,
+  restoreActionExecutionLedger,
   terminalizeActionExecution
 } from "../../domain/action-execution-ledger.js";
 import {
@@ -62,12 +73,24 @@ import { materializeScenarioChunkDeltaState } from "../../domain/scenario-chunk-
 import {
   HumanoidEmbodiedEpisodeSchema,
   HumanoidEmbodiedExperienceSchema,
+  HumanoidEmbodiedMemoryStateAnchorSchema,
+  HumanoidContextMemoryStateAnchorSchema,
+  HumanoidExecutionLedgerStateAnchorSchema,
+  HumanoidGoalStateAnchorSchema,
+  HumanoidPhysicalStateAnchorSchema,
+  humanoidEmbodiedMemoryStateSha256,
+  humanoidContextMemoryStateSha256,
+  humanoidExecutionLedgerStateSha256,
+  humanoidGoalControlState,
+  humanoidGoalControlStateSha256,
+  humanoidActionReceiptsInCommitOrder,
   PersistedHumanoidActionReceiptSchema,
   type HumanoidEmbodiedEpisode,
   type HumanoidEmbodiedExperience,
   type HumanoidRunCheckpoint
 } from "../../domain/humanoid-run.js";
 import type { RunStore } from "../../persistence/run-store.js";
+import type { HumanoidPolicyFrameSink } from "../../world/humanoid/simulation.js";
 import {
   createLifecycleEvent,
   reconcileLifecycleOutbox
@@ -83,6 +106,10 @@ import {
 } from "../../runtime/humanoid-checker.js";
 import { HumanoidPhysicsClock } from "../../world/humanoid/physics-clock.js";
 import type { HumanoidWorld, HumanoidWorldSnapshot } from "../../world/humanoid/world.js";
+import {
+  HumanoidEmbodiedSkillEventSchema,
+  type HumanoidEmbodiedSkillEvent
+} from "../../world/humanoid/embodied-skill-call.js";
 import type { LongRunContextRuntime } from "../context-runtime.js";
 import {
   HumanoidActionRuntime,
@@ -107,7 +134,6 @@ import {
 } from "./goal-history.js";
 import { reconcileAndCompactGoalHistory } from "./goal-history-store.js";
 import {
-  recoverableBlockedGoalActionReceipt,
   recoverableBlockedGoalEvidence
 } from "./goal-retirement-evidence.js";
 import {
@@ -117,6 +143,7 @@ import {
   json,
   object,
   physicalExecutionReceipt,
+  completedPhysicalExecution,
   previousCycleEvidence,
   requiresHumanoidClockPause
 } from "./run-runtime-persistence.js";
@@ -151,6 +178,10 @@ import {
   type HumanoidCycleCompletionReadiness
 } from "./cycle-causal-evidence.js";
 import { HumanoidModelAuthority } from "./model-authority.js";
+import {
+  verifyDurableHumanoidActionRuntimeState,
+  verifyDurableHumanoidActionWindow
+} from "./durable-action-authority.js";
 import { HumanoidPhysicalExecutionRuntime } from "./physical-execution-runtime.js";
 import {
   loadGoalEvidenceWorkingSet,
@@ -167,23 +198,23 @@ export type HumanoidCoordinatorPhase =
   | "complete_satisfied_goal"
   | "observe_or_plan"
   | "plan"
+  | "post_failure_observation"
   | "replan_or_retire"
   | "execute_plan"
   | "post_execution"
   | "complete_cycle";
 
-function observationHasReachableBasePlacements(
-  receipt: HumanoidActionReceipt
+function pendingCompactReplanSpecialist(
+  budget: HumanoidReplanBudget
 ): boolean {
-  const detail = object(receipt.detail);
-  const rawGeometry = detail?.manipulation_geometry;
-  const geometry = rawGeometry === undefined ? undefined : object(rawGeometry);
-  if (!Array.isArray(geometry?.objects)) return false;
-  return geometry.objects.some((entry) => {
-    const observedObject = object(entry);
-    return Array.isArray(observedObject?.reachable_base_placements)
-      && observedObject.reachable_base_placements.length > 0;
-  });
+  const latestDecisionIndex = budget.model_calls.findLastIndex(
+    (call) => call.role === "replan_decision"
+  );
+  if (latestDecisionIndex < 0) return false;
+  const latestSpecialistIndex = budget.model_calls.findLastIndex(
+    (call) => call.role === "specialist_replan"
+  );
+  return latestDecisionIndex > latestSpecialistIndex;
 }
 
 export class HumanoidRunRuntime implements LongRunContextRuntime {
@@ -200,6 +231,19 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   #checkpoint: HumanoidRunCheckpoint;
   #scenario: Scenario;
   #checkpointWriteTail: Promise<void> = Promise.resolve();
+  #physicalStateAnchorTail: Promise<void> = Promise.resolve();
+  #goalStateAnchorTail: Promise<void> = Promise.resolve();
+  #embodiedMemoryStateAnchorTail: Promise<void> = Promise.resolve();
+  #contextMemoryStateAnchorTail: Promise<void> = Promise.resolve();
+  #executionLedgerStateAnchorTail: Promise<void> = Promise.resolve();
+  #physicalAnchorOrphanRecoveryPending = true;
+  #goalAnchorOrphanRecoveryPending = true;
+  #memoryAnchorOrphanRecoveryPending = true;
+  #contextAnchorOrphanRecoveryPending = true;
+  #executionLedgerAnchorOrphanRecoveryPending = true;
+  #recoveredAcknowledgedActionCommits: Array<
+    ReturnType<typeof stageActionCommit>["pending"][string]
+  > = [];
   #continuousPhysicsEnabled = false;
   #modelAuthority: HumanoidModelAuthority | undefined;
   #goalEvidence = new Map<string, GoalEvidenceArtifact>();
@@ -215,6 +259,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     world: HumanoidWorld;
     checkpoint: HumanoidRunCheckpoint;
     eventSink?: RuntimeEventSink;
+    policyFrameSink?: HumanoidPolicyFrameSink;
     signal?: AbortSignal;
   }) {
     this.#store = input.store;
@@ -253,10 +298,26 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       receipts: this.#checkpoint.committed_actions,
       state: this.#checkpoint.action_runtime_state,
       frameSink: (frame) => this.#physicalExecution.recordFrame(frame, "execution"),
+      ...(input.policyFrameSink
+        ? { policyFrameSink: input.policyFrameSink }
+        : {}),
       physicalFrameSink: (cut) => this.#physicalExecution.recordPhysicalCut(cut),
+      physicalExecutionFrameOffset: (transactionId) => (
+        this.#physicalExecution.executionFrameOffset(transactionId)
+      ),
+      completedPhysicalPlanFrameCount: (transactionId) => (
+        this.#physicalExecution.executionCompletedPlanFrameCount(transactionId)
+      ),
+      completedPhysicalPlanCount: (transactionId) => (
+        this.#physicalExecution.executionCompletedPlanCount(transactionId)
+      ),
+      skillEventSink: (event) => this.#emitHumanoidSkillEvent(event),
       receiptSink: (receipt) => this.#commitReceipt(receipt),
       beforePhysicalExecution: (intent) => this.#physicalExecution.admit(intent),
-      receiptNormalizer: (receipt) => this.#physicalExecution.normalizeReceipt(receipt),
+      receiptNormalizer: async (receipt) => ({
+        ...await this.#physicalExecution.normalizeReceipt(receipt),
+        commitSequence: this.#nextActionCommitSequence()
+      }),
       prepareBlockRemoval: (request) => this.#prepareBlockRemoval(request),
       realtimeExecution: true,
       retainPhysicalTerminals: true,
@@ -298,6 +359,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   async initializeGoalAutonomy(manifest: AgentManifest): Promise<void> {
+    await this.#verifyExistingPhysicalStateAnchor();
+    await this.#verifyExistingGoalStateAnchor();
+    await this.#verifyExistingEmbodiedMemoryStateAnchor();
+    await this.#verifyExistingContextMemoryStateAnchor();
+    await this.#verifyExistingExecutionLedgerStateAnchor();
     await this.#reconcileActionCommits();
     this.#scenario = materializeScenarioChunkDeltaState(
       this.#store.definition.scenario,
@@ -307,12 +373,21 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const optionalEvidenceRefs = optionalGoalEvidenceRefs(this.#checkpoint);
     const modelCallIds = requiredModelCallIds(this.#checkpoint);
     const optionalAuthorityIds = optionalModelCallIds(this.#checkpoint);
+    const activeExecutionPlanningTransactionIds = new Set(
+      Object.values(this.#checkpoint.action_execution_ledger.active).map(
+        (entry) => entry.admission.planning_transaction_id
+      )
+    );
+    const skillEventRecoveryCallIds = this.#actions.skillEventRecoveryCallIds(
+      activeExecutionPlanningTransactionIds
+    );
     const [
       evidence,
       rawModelCalls,
       rawActionIdentities,
       providerModelUsage,
-      archivedManifests
+      archivedManifests,
+      skillEvents
     ] = await Promise.all([
       loadGoalEvidenceWorkingSet(
         this.#store,
@@ -326,7 +401,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       ),
       this.#store.readJournal("action_identities"),
       latestProviderModelUsage(this.#store),
-      this.#store.readArchivedAgentManifests()
+      this.#store.readArchivedAgentManifests(),
+      loadDurableHumanoidSkillEvents(
+        this.#store,
+        skillEventRecoveryCallIds
+      )
     ]);
     const actionTransactionIdentities = rebuildActionTransactionIdentities(
       rawActionIdentities,
@@ -339,10 +418,86 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       archivedManifests,
       nodes: this.#checkpoint.nodes,
       records: rawModelCalls,
-      appendRecord: (record) => this.#store.append("model_calls", json(record))
+      appendRecord: (record) => appendDurableModelCallLifecycleRecord(
+        this.#store,
+        record
+      )
     });
+    const durableActions = await verifyDurableHumanoidActionWindow({
+      store: this.#store,
+      runId: this.runId,
+      receipts: this.#checkpoint.committed_actions,
+      identities: actionTransactionIdentities,
+      assertDecisionAuthority: (receipt, toolAuthority) => {
+        if (!receipt.decision || !receipt.cycle) {
+          throw new Error(
+            `Committed action has no durable model decision: ${receipt.transactionId}`
+          );
+        }
+        this.#assertActionDecisionRef(
+          receipt.decision,
+          receipt.action,
+          receipt.input,
+          receipt.transactionId,
+          receipt.agentId,
+          receipt.cycle,
+          toolAuthority
+        );
+      }
+    });
+    verifyDurableHumanoidActionRuntimeState({
+      receipts: this.#checkpoint.committed_actions,
+      proofs: durableActions,
+      checkpointState: this.#checkpoint.action_runtime_state
+    });
+    this.#durableActionReceiptCache = new Map(
+      [...durableActions].map(([transactionId, proof]) => (
+        [transactionId, structuredClone(proof.receipt)] as const
+      ))
+    );
+    const replanBudgetReconciliation = this.#reconcileReplanBudgetFromModelLifecycle(
+      rawModelCalls
+    );
+    const interruptedModelCalls = this.#modelAuthority.startedCalls();
+    if (interruptedModelCalls.length > 0) {
+      const interruptedAt = new Date().toISOString();
+      for (const call of interruptedModelCalls) {
+        await this.#modelAuthority.recordFailed(
+          call.model_call_id,
+          call.agent_id,
+          interruptedAt < call.at ? call.at : interruptedAt
+        );
+        if (this.#checkpoint.active_cycle
+          && sameAutonomousCycle(call.cycle, this.#checkpoint.active_cycle)) {
+          const update = finishHumanoidReplanModelCall(
+            this.#checkpoint.active_cycle.replan_budget,
+            {
+              modelCallId: call.model_call_id,
+              status: "failed",
+              at: interruptedAt < call.at ? call.at : interruptedAt
+            }
+          );
+          this.#checkpoint.active_cycle.replan_budget = update.budget;
+        }
+      }
+    }
+    if (replanBudgetReconciliation.changed
+      || interruptedModelCalls.length > 0) {
+      await this.#persist();
+    }
+    if (interruptedModelCalls.length > 0) {
+      await this.emit("model_requests_interrupted_by_restart", json({
+        model_calls: interruptedModelCalls.map((call) => ({
+          model_call_id: call.model_call_id,
+          agent_id: call.agent_id,
+          ...(call.cycle ? { cycle: call.cycle } : {})
+        })),
+        automatic_actuation: false
+      }));
+    }
     this.#actionTransactionIdentities = actionTransactionIdentities;
     this.#actionTransactionIdentitiesLoaded = true;
+    this.#actions.restoreSkillEventJournal(skillEvents);
     if (providerModelUsage) {
       this.#checkpoint.model_usage = reconcileModelUsage(
         this.#checkpoint.model_usage,
@@ -364,6 +519,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
     this.#assertActiveGoalProgress();
     this.#pruneRuntimeAuthority();
+    if (!this.#checkpoint.physical_state_anchor
+      || !this.#checkpoint.goal_state_anchor
+      || !this.#checkpoint.embodied_memory_state_anchor
+      || !this.#checkpoint.context_memory_state_anchor
+      || !this.#checkpoint.execution_ledger_state_anchor) {
+      await this.#persist(false);
+    }
   }
 
   async submitGoalCandidates(
@@ -566,20 +728,81 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }));
   }
 
-  validateGoalTransition(): JsonValue {
-    const latest = this.#checkpoint.goal_dag.epochs.at(-1);
-    if (!this.goalTransitionCompletionAvailable() || !latest) {
-      throw new Error("No evidence-backed Goal retirement is ready to complete");
-    }
-    return json({
-      epoch_id: latest.epoch_id,
-      candidate_id: latest.candidate_id,
-      status: latest.status,
-      reason: latest.retirement_reason,
-      resolved_world_revision: latest.resolved_world_revision,
-      evidence_refs: latest.physical_evidence_refs.resolution,
-      goal_dag_state_sha256: this.#checkpoint.goal_dag.state_sha256
-    });
+  async continueGoalEpoch(
+    input: Parameters<GoalManagerRuntime["continueGoalEpoch"]>[0],
+    authority: GoalToolCallAuthority
+  ): Promise<JsonValue> {
+    return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
+      this.#assertRunAcceptsDecisions();
+      if (this.coordinatorPhase() !== "replan_or_retire") {
+        throw new Error("The active Goal is not awaiting recovery re-evaluation");
+      }
+      const activeCycle = this.#checkpoint.active_cycle;
+      if (!activeCycle?.replan_budget.goal_reevaluation_started) {
+        throw new Error("Goal continuation requires exhausted compact replan authority");
+      }
+      const continuedBy = this.#goalModelSource(
+        authority,
+        "continue_goal_epoch",
+        input
+      );
+      const evidence = this.#requiredContextGoalEvidence(continuedBy.agent_id);
+      await this.#persistGoalEvidence([evidence.ref]);
+      const activeGoal = this.#requiredActiveGoal();
+      const captured = await this.#world.capturePersistenceState();
+      this.#applyWorldPersistenceState(captured);
+      const progress = this.#checkpoint.goal_progress;
+      if (!progress) throw new Error("Active Goal progress is unavailable");
+      const projected = captured.world.frame === progress.last_world_frame
+        && captured.world.worldRevision === progress.last_world_revision
+        ? {
+            progress,
+            checker: inspectHumanoidGoal(
+              activeGoal,
+              this.#scenario,
+              captured.world,
+              progress
+            )
+          }
+        : advanceHumanoidGoal(activeGoal, this.#scenario, captured.world, progress);
+      if (projected.checker.success) {
+        throw new Error(
+          "A physically satisfied Goal must complete instead of opening another recovery cycle"
+        );
+      }
+      const interruptedCycle = autonomousCycleRef(activeCycle);
+      this.#checkpoint.goal_progress = projected.progress;
+      this.#checkpoint.checker = projected.checker;
+      this.#checkpoint.cycle_index = interruptedCycle.cycle_index;
+      this.#checkpoint.last_cycle = json({
+        status: "goal_epoch_continued",
+        cycle: interruptedCycle,
+        reason: input.reason,
+        recovery_intent: input.recovery_intent,
+        evidence_ref: evidence.ref,
+        world_revision: captured.world.worldRevision
+      });
+      this.#checkpoint.active_cycle = null;
+      this.#pruneRuntimeAuthority();
+      await this.#persist();
+      await this.emit("autonomous_cycle_interrupted", json({
+        cycle: interruptedCycle,
+        reason: "goal_epoch_continued_after_re_evaluation",
+        recovery_intent: input.recovery_intent,
+        evidence_ref: evidence.ref,
+        world_revision: captured.world.worldRevision
+      }));
+      return json({
+        status: "goal_epoch_continued",
+        epoch_id: interruptedCycle.goal_epoch_id,
+        completed_cycle_id: interruptedCycle.cycle_id,
+        next_cycle_index: interruptedCycle.cycle_index + 1,
+        reason: input.reason,
+        recovery_intent: input.recovery_intent,
+        evidence_ref: evidence.ref,
+        world_revision: captured.world.worldRevision
+      });
+    }));
   }
 
   validateSatisfiedGoal(): JsonValue {
@@ -671,6 +894,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       if (durableReceipt) return durableReceipt;
       this.#assertRunAcceptsDecisions();
       this.#assertDecisionCycleActive(decision);
+      this.#assertActionRoleAuthority(action, agentId);
+      this.#assertCurrentExecutionAuthority(action, rawInput, transactionId);
       this.#physicsClock.throwIfFailed();
       this.#physicalExecution.assertExecutionOwner(transactionId);
       if (!requiresHumanoidClockPause(action)) {
@@ -680,7 +905,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           transactionId,
           agentId,
           decision,
-          options
+          { ...options, toolAuthority: authority }
         );
       }
       const resumeClock = this.#continuousPhysicsEnabled;
@@ -692,7 +917,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           transactionId,
           agentId,
           decision,
-          options
+          { ...options, toolAuthority: authority }
         );
       } finally {
         if (resumeClock
@@ -753,21 +978,43 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   coordinatorPhase(): HumanoidCoordinatorPhase {
     if (this.#checkpoint.goal_dag.status !== "active") return "goal_selection";
-    const activeCycle = this.#activeCycleRef();
+    const activeCycle = this.#checkpoint.active_cycle;
     if (!activeCycle) return "goal_selection";
-    const receipts = Object.values(this.#checkpoint.committed_actions);
+    const receipts = humanoidActionReceiptsInCommitOrder(
+      this.#checkpoint.committed_actions
+    );
     const cycleReceipts = receipts.filter((receipt) => (
       sameAutonomousCycle(receipt.cycle, activeCycle)
     ));
     const completion = this.cycleCompletionReadiness();
     if (completion.status === "ready") {
+      if (this.#pendingBlockRemoval()) {
+        const latestRejectedRemovalIndex = cycleReceipts.findLastIndex((receipt) => (
+          receipt.action === "remove_world_block"
+            && (!receipt.accepted
+              || receipt.code !== "world_block_removal_authorized")
+        ));
+        if (latestRejectedRemovalIndex >= 0) {
+          const failureObserved = cycleReceipts.slice(
+            latestRejectedRemovalIndex + 1
+          ).some((receipt) => receipt.agentId === "humanoid-sentry"
+            && receipt.accepted
+            && receipt.action === "observe_humanoid");
+          return failureObserved ? "replan_or_retire" : "post_failure_observation";
+        }
+        return "post_execution";
+      }
       return completion.observed_after_execution
         ? "complete_cycle"
         : "post_execution";
     }
     const latestExecutionIndex = cycleReceipts.findLastIndex(physicalExecutionReceipt);
+    const latestExecution = cycleReceipts[latestExecutionIndex];
     const latestAcceptedPlanIndex = cycleReceipts.findLastIndex((receipt) => (
       receipt.accepted && isHumanoidPlanningReceipt(receipt)
+    ));
+    const latestRejectedPlanIndex = cycleReceipts.findLastIndex((receipt) => (
+      !receipt.accepted && isHumanoidPlanningReceipt(receipt)
     ));
     const activeGoal = this.#activeGoal();
     if (this.#store.definition.run_mode === "mission"
@@ -782,64 +1029,73 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       return "complete_satisfied_goal";
     }
     if (latestAcceptedPlanIndex > latestExecutionIndex) return "execute_plan";
+    const latestFailedExecutionIndex = latestExecution
+      && !completedPhysicalExecution(latestExecution)
+      ? latestExecutionIndex
+      : -1;
+    const relevantRejectedPlanIndex = latestRejectedPlanIndex > latestExecutionIndex
+      ? latestRejectedPlanIndex
+      : -1;
+    const failureBarrier = Math.max(
+      latestFailedExecutionIndex,
+      relevantRejectedPlanIndex
+    );
+    if (failureBarrier >= 0) {
+      const failureObserved = cycleReceipts.slice(failureBarrier + 1).some(
+        (receipt) => receipt.agentId === "humanoid-sentry"
+          && receipt.accepted
+          && receipt.action === "observe_humanoid"
+      );
+      return failureObserved ? "replan_or_retire" : "post_failure_observation";
+    }
     const phaseStart = Math.max(0, latestExecutionIndex + 1);
     const observed = cycleReceipts.slice(phaseStart).some((receipt) => (
       receipt.accepted && receipt.action === "observe_humanoid"
     ));
     if (!observed) return "observe_or_plan";
-    const rejectedPlan = cycleReceipts.slice(phaseStart).some((receipt) => (
-      !receipt.accepted && isHumanoidPlanningReceipt(receipt)
-    ));
-    return rejectedPlan ? "replan_or_retire" : "plan";
+    return "plan";
   }
 
   executorDelegationAvailable(): boolean {
     const phase = this.coordinatorPhase();
     if (phase === "execute_plan") return true;
-    if (phase !== "post_execution" && phase !== "complete_cycle") return false;
-    const goal = this.#activeGoal();
-    return goal?.predicates.some((predicate, index) => (
-      predicate.type === "block_removed"
-        && this.#checkpoint.checker?.checks[index]?.passed !== true
-    )) ?? false;
+    if (phase !== "post_execution") return false;
+    return this.#pendingBlockRemoval();
   }
 
-  goalTransitionCompletionAvailable(): boolean {
-    const latest = this.#checkpoint.goal_dag.epochs.at(-1);
-    return this.#checkpoint.goal_dag.status === "awaiting_model_selection"
-      && this.#checkpoint.goal_dag.current_epoch_id === null
-      && latest !== undefined
-      && latest.status !== "completed"
-      && latest.status !== "active";
+  #pendingBlockRemoval(): boolean {
+    const goal = this.#activeGoal();
+    const progress = this.#checkpoint.goal_progress;
+    const world = this.#world.snapshot();
+    const checker = goal && progress
+      ? (world.frame === progress.last_world_frame
+          && world.worldRevision === progress.last_world_revision
+        ? inspectHumanoidGoal(goal, this.#scenario, world, progress)
+        : advanceHumanoidGoal(goal, this.#scenario, world, progress).checker)
+      : null;
+    return goal?.predicates.some((predicate, index) => (
+      predicate.type === "block_removed"
+        && checker?.checks[index]?.passed !== true
+    )) ?? false;
   }
 
   goalRetirementDelegationAvailable(): boolean {
     const phase = this.coordinatorPhase();
     if (phase === "goal_transition") return true;
     if (phase !== "replan_or_retire") return false;
-    const activeCycle = this.#activeCycleRef();
-    if (!activeCycle) return false;
-    const latestRejectedPlan = Object.values(this.#checkpoint.committed_actions)
-      .findLast((receipt) => (
-        sameAutonomousCycle(receipt.cycle, activeCycle)
-          && !receipt.accepted
-          && isHumanoidPlanningReceipt(receipt)
-    ));
-    if (!latestRejectedPlan) return false;
-    if (recoverableBlockedGoalActionReceipt(latestRejectedPlan)) return false;
-    const detail = object(latestRejectedPlan.detail);
-    const placements = detail?.reachable_base_placements;
-    if (Array.isArray(placements) && placements.length > 0) return false;
-    const latestMotionObservation = Object.values(
-      this.#checkpoint.committed_actions
-    ).findLast((receipt) => (
-      sameAutonomousCycle(receipt.cycle, activeCycle)
-        && receipt.agentId === "humanoid-motion-reference"
-        && receipt.accepted
-        && receipt.action === "observe_humanoid"
-    ));
-    return latestMotionObservation === undefined
-      || !observationHasReachableBasePlacements(latestMotionObservation);
+    const activeCycleState = this.#checkpoint.active_cycle;
+    if (!activeCycleState) return false;
+    const budget = activeCycleState.replan_budget;
+    if (budget.goal_reevaluation_started) return true;
+    const compactDecisionPendingSpecialist = pendingCompactReplanSpecialist(budget);
+    const recoveryDeadlineExceeded = budget.recovery_deadline_at !== null
+      && Date.now() > Date.parse(budget.recovery_deadline_at);
+    if (!compactDecisionPendingSpecialist
+      && (budget.compact_replans_started >= budget.compact_replan_limit
+        || recoveryDeadlineExceeded)) {
+      return true;
+    }
+    return false;
   }
 
   #missionGoalPhysicallySatisfied(): boolean {
@@ -865,21 +1121,49 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   sentryDelegationAvailable(): boolean {
     const phase = this.coordinatorPhase();
-    if (phase === "observe_or_plan" || phase === "post_execution") return true;
+    if (phase === "observe_or_plan" || phase === "post_failure_observation") {
+      return true;
+    }
+    if (phase === "post_execution") {
+      if (this.#pendingBlockRemoval()) return false;
+      return !this.cycleCompletionReadiness().observed_after_execution;
+    }
     if (phase !== "replan_or_retire") return false;
     const activeCycle = this.#activeCycleRef();
     if (!activeCycle) return false;
-    const cycleReceipts = Object.values(this.#checkpoint.committed_actions)
+    const cycleReceipts = humanoidActionReceiptsInCommitOrder(
+      this.#checkpoint.committed_actions
+    )
       .filter((receipt) => sameAutonomousCycle(receipt.cycle, activeCycle));
     const latestRejectedPlanIndex = cycleReceipts.findLastIndex((receipt) => (
       !receipt.accepted && isHumanoidPlanningReceipt(receipt)
     ));
-    if (latestRejectedPlanIndex < 0) return false;
-    return !cycleReceipts.slice(latestRejectedPlanIndex + 1).some((receipt) => (
+    const latestFailedExecutionIndex = cycleReceipts.findLastIndex((receipt) => (
+      physicalExecutionReceipt(receipt) && !completedPhysicalExecution(receipt)
+    ));
+    const feedbackBarrier = Math.max(
+      latestRejectedPlanIndex,
+      latestFailedExecutionIndex
+    );
+    if (feedbackBarrier < 0) return false;
+    return !cycleReceipts.slice(feedbackBarrier + 1).some((receipt) => (
       receipt.agentId === "humanoid-sentry"
         && receipt.accepted
         && receipt.action === "observe_humanoid"
     ));
+  }
+
+  motionDelegationAvailable(): boolean {
+    const phase = this.coordinatorPhase();
+    if (phase === "observe_or_plan" || phase === "plan") return true;
+    if (phase !== "replan_or_retire") return false;
+    const budget = this.#checkpoint.active_cycle?.replan_budget;
+    if (!budget || budget.goal_reevaluation_started) return false;
+    if (pendingCompactReplanSpecialist(budget)) return true;
+    const recoveryDeadlineExceeded = budget.recovery_deadline_at !== null
+      && Date.now() > Date.parse(budget.recovery_deadline_at);
+    return !recoveryDeadlineExceeded
+      && budget.compact_replans_started < budget.compact_replan_limit;
   }
 
   #validateCycleCausalEvidence(
@@ -1013,7 +1297,27 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#signal?.throwIfAborted();
       this.#assertRunAcceptsDecisions();
       const cycle = this.#activeCycleRef();
-      const record = await this.#requiredModelAuthority().recordStarted(agentId, cycle);
+      const modelCallId = randomUUID();
+      const at = new Date().toISOString();
+      const budgetRole = this.coordinatorPhase() === "replan_or_retire"
+        ? replanBudgetRole(agentId)
+        : undefined;
+      const budgetUpdate = budgetRole && this.#checkpoint.active_cycle
+        ? beginHumanoidReplanModelCall(
+            this.#checkpoint.active_cycle.replan_budget,
+            { modelCallId, agentId, role: budgetRole, at }
+          )
+        : undefined;
+      const record = await this.#requiredModelAuthority().recordStarted(
+        agentId,
+        cycle,
+        modelCallId,
+        at,
+        budgetUpdate?.call
+      );
+      if (budgetUpdate && this.#checkpoint.active_cycle) {
+        this.#checkpoint.active_cycle.replan_budget = budgetUpdate.budget;
+      }
       const node = this.#node(agentId);
       node.model_calls_used += 1;
       node.updated_at = record.at;
@@ -1026,7 +1330,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         ...(cycle ? { cycle } : {}),
         purpose: "agent_decision",
         node_model_calls: node.model_calls_used,
-        total_model_calls: this.#checkpoint.total_model_calls
+        total_model_calls: this.#checkpoint.total_model_calls,
+        ...replanModelCallEvent(
+          budgetUpdate?.call,
+          this.#checkpoint.active_cycle
+        )
       });
       return record.model_call_id;
     });
@@ -1045,12 +1353,22 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }): Promise<void> {
     await this.#goalStateMutex.runExclusive(async () => {
       const record = await this.#requiredModelAuthority().recordCompleted(input);
+      const budgetUpdate = this.#finishReplanModelCall(
+        input.modelCallId,
+        "completed",
+        record.at
+      );
+      await this.#persist();
       await this.emit("model_request_completed", {
         agent_id: input.agentId,
         model_call_id: input.modelCallId,
         response_id: input.responseId,
         ...(record.cycle ? { cycle: record.cycle } : {}),
-        tool_call_count: input.toolCalls.length
+        tool_call_count: input.toolCalls.length,
+        ...replanModelCallEvent(
+          budgetUpdate,
+          this.#checkpoint.active_cycle
+        )
       });
     });
   }
@@ -1061,12 +1379,103 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         modelCallId,
         agentId
       );
+      const budgetUpdate = this.#finishReplanModelCall(
+        modelCallId,
+        "failed",
+        record.at
+      );
+      await this.#persist();
       await this.emit("model_request_failed", {
         agent_id: agentId,
         model_call_id: modelCallId,
-        ...(record.cycle ? { cycle: record.cycle } : {})
+        ...(record.cycle ? { cycle: record.cycle } : {}),
+        ...replanModelCallEvent(
+          budgetUpdate,
+          this.#checkpoint.active_cycle
+        )
       });
     });
+  }
+
+  #finishReplanModelCall(
+    modelCallId: string,
+    status: "completed" | "failed",
+    at: string
+  ): HumanoidReplanModelCall | undefined {
+    const cycle = this.#checkpoint.active_cycle;
+    if (!cycle) return undefined;
+    const update = finishHumanoidReplanModelCall(cycle.replan_budget, {
+      modelCallId,
+      status,
+      at
+    });
+    if (!update.call) return undefined;
+    cycle.replan_budget = update.budget;
+    return update.call;
+  }
+
+  #reconcileReplanBudgetFromModelLifecycle(
+    rawRecords: readonly unknown[]
+  ): { changed: boolean; restoredModelCallIds: string[] } {
+    const cycle = this.#checkpoint.active_cycle;
+    if (!cycle) return { changed: false, restoredModelCallIds: [] };
+    const records = rawRecords.map((record) => (
+      ModelCallLifecycleRecordSchema.parse(record)
+    ));
+    const restoredModelCallIds: string[] = [];
+    let changed = false;
+    const replanStarts = new Map<string, Extract<
+      ModelCallLifecycleRecord,
+      { lifecycle: "started" }
+    >>();
+    for (const record of records) {
+      if (record.lifecycle !== "started"
+        || !record.replan_budget_call
+        || !sameAutonomousCycle(record.cycle, cycle)) continue;
+      const alreadyCheckpointed = cycle.replan_budget.model_calls.some(
+        (call) => call.model_call_id === record.model_call_id
+      );
+      cycle.replan_budget = restoreHumanoidReplanModelCall(
+        cycle.replan_budget,
+        record.replan_budget_call
+      );
+      if (!alreadyCheckpointed) {
+        changed = true;
+        restoredModelCallIds.push(record.model_call_id);
+      }
+      replanStarts.set(record.model_call_id, record);
+    }
+    for (const record of records) {
+      if (record.lifecycle === "started"
+        || !replanStarts.has(record.model_call_id)) continue;
+      const existing = cycle.replan_budget.model_calls.find(
+        (call) => call.model_call_id === record.model_call_id
+      );
+      if (!existing) {
+        throw new Error(
+          `Replan model lifecycle has no durable budget start: ${record.model_call_id}`
+        );
+      }
+      if (existing.status === "started") {
+        changed = true;
+        cycle.replan_budget = finishHumanoidReplanModelCall(
+          cycle.replan_budget,
+          {
+            modelCallId: record.model_call_id,
+            status: record.lifecycle === "completed" ? "completed" : "failed",
+            at: record.at
+          }
+        ).budget;
+        continue;
+      }
+      if (existing.status !== record.lifecycle
+        || existing.completed_at !== record.at) {
+        throw new Error(
+          `Replan model lifecycle conflicts with durable budget: ${record.model_call_id}`
+        );
+      }
+    }
+    return { changed, restoredModelCallIds };
   }
 
   async recordCompactionModelCall(agentId: string): Promise<void> {
@@ -1193,16 +1602,18 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       action: execution.action,
       committed_frame_count: execution.progress.committed_frame_count
     }));
+    const authority = execution.admission.tool_call_authority;
+    if (!execution.admission.decision || !authority) {
+      throw new Error(
+        `Durable physical execution has no Coordinator delegation: ${execution.transaction_id}`
+      );
+    }
     const receipt = await this.invoke(
       execution.action,
       input,
       execution.transaction_id,
       execution.agent_id,
-      {
-        tool_call_id: execution.transaction_id,
-        tool_name: execution.action,
-        arguments_sha256: modelPayloadSha256(input)
-      }
+      authority
     );
     await this.emit("physical_execution_recovered", json({
       transaction_id: receipt.transactionId,
@@ -1516,6 +1927,40 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     await this.#eventSink(persisted!);
   }
 
+  async #emitHumanoidSkillEvent(
+    event: HumanoidEmbodiedSkillEvent
+  ): Promise<void> {
+    const eventId = `humanoid-skill-event:${modelPayloadSha256({
+      run_id: this.runId,
+      event
+    })}`;
+    const runtimeEvent: RuntimeEvent = {
+      event_id: eventId,
+      run_id: this.runId,
+      type: "humanoid_skill_event",
+      at: new Date().toISOString(),
+      data: json(event)
+    };
+    let persisted: RuntimeEvent | undefined;
+    try {
+      [persisted] = await this.#store.appendRuntimeEvents([runtimeEvent]);
+    } catch (error) {
+      const committed = await findDurableRuntimeEventById(
+        this.#store,
+        eventId
+      );
+      if (!committed) throw error;
+      assertHumanoidSkillRuntimeEvent(committed, this.runId, event);
+      persisted = committed;
+    }
+    try {
+      await this.#eventSink(persisted!);
+    } catch {
+      // The journal is authoritative. A disconnected operator stream can
+      // replay this cursor; it must not roll physical Skill event state back.
+    }
+  }
+
   async #durableReceiptForInvocation(
     action: Parameters<HumanoidActionRuntime["invoke"]>[0],
     rawInput: unknown,
@@ -1663,13 +2108,17 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         `Humanoid action has no cycle-bound model decision authority: ${receipt.transactionId}`
       );
     }
+    const toolAuthority = this.#actions.toolCallAuthority(receipt.transactionId)
+      ?? this.#checkpoint.action_execution_ledger.active[receipt.transactionId]
+        ?.admission.tool_call_authority;
     this.#assertActionDecisionRef(
       receipt.decision,
       receipt.action,
       receipt.input,
       receipt.transactionId,
       receipt.agentId,
-      activeCycle
+      activeCycle,
+      toolAuthority
     );
     const pending = this.#checkpoint.action_commit_outbox.pending[receipt.transactionId];
     if (pending) {
@@ -1779,6 +2228,10 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       at: new Date().toISOString(),
       data: json({
         receipt: record,
+        ...(toolAuthority
+          ? { action_tool_authority: toolAuthority }
+          : {}),
+        action_runtime_state: this.#actions.persistenceState(),
         world: this.#checkpoint.world,
         checker: nextChecker,
         ...(physicalWorldDelta
@@ -1844,7 +2297,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   async #reconcileActionCommits(): Promise<void> {
-    const staged = Object.values(this.#checkpoint.action_commit_outbox.pending);
+    const stagedByTransaction = new Map(
+      this.#recoveredAcknowledgedActionCommits.map((entry) => (
+        [entry.transaction_id, structuredClone(entry)] as const
+      ))
+    );
+    for (const entry of Object.values(this.#checkpoint.action_commit_outbox.pending)) {
+      stagedByTransaction.set(entry.transaction_id, structuredClone(entry));
+    }
+    const staged = [...stagedByTransaction.values()];
     let reconciledScenarioState = false;
     for (const entry of staged) {
       if (entry.physical_world_delta) {
@@ -1945,7 +2406,33 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         createActionTransactionIdentity(entry)
       );
     }
+    const recoveredAcknowledgements = this.#recoveredAcknowledgedActionCommits.length;
+    if (recoveredAcknowledgements > 0) {
+      let recoveredLedger = this.#checkpoint.action_execution_ledger;
+      for (const entry of this.#recoveredAcknowledgedActionCommits) {
+        const execution = recoveredLedger.active[entry.transaction_id];
+        if (!execution) continue;
+        if (execution.status !== "terminal" || !execution.terminal) {
+          throw new Error(
+            `Recovered action acknowledgement has a nonterminal execution: ${entry.transaction_id}`
+          );
+        }
+        recoveredLedger = acknowledgeTerminalActionExecution(
+          recoveredLedger,
+          entry.transaction_id,
+          execution.terminal
+        );
+      }
+      this.#checkpoint.action_execution_ledger = recoveredLedger;
+    }
     await this.#physicalExecution.acknowledgeTerminals(staged);
+    this.#recoveredAcknowledgedActionCommits = [];
+    if (recoveredAcknowledgements > 0) {
+      // The durable outbox head may outrun checkpoint.json at the acknowledgement
+      // cut. Close that cut together with any terminal MuJoCo cleanup before
+      // accepting another action.
+      await this.#persist();
+    }
     const actionWindow = retainRecentActionReceipts(
       this.#checkpoint.committed_actions
     );
@@ -2199,13 +2686,109 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     );
   }
 
+  #nextActionCommitSequence(): number {
+    const receipts = humanoidActionReceiptsInCommitOrder(
+      this.#checkpoint.committed_actions
+    );
+    return (receipts.at(-1)?.commitSequence ?? 0) + 1;
+  }
+
+  #assertActionRoleAuthority(
+    action: Parameters<HumanoidActionRuntime["invoke"]>[0],
+    agentId: string
+  ): void {
+    const allowedAgentIds = humanoidActionRoleAuthority(action);
+    if (!allowedAgentIds.has(agentId.trim())) {
+      throw new Error(
+        `Humanoid action ${action} is outside Agent role authority: ${agentId}`
+      );
+    }
+  }
+
+  #assertCurrentExecutionAuthority(
+    action: Parameters<HumanoidActionRuntime["invoke"]>[0],
+    rawInput: unknown,
+    transactionId: string
+  ): void {
+    if (action !== "execute_humanoid_skill"
+      && action !== "execute_whole_body_motion"
+      && action !== "execute_humanoid_navigation") {
+      return;
+    }
+    const input = rawInput !== null
+      && typeof rawInput === "object"
+      && !Array.isArray(rawInput)
+      ? rawInput as Record<string, unknown>
+      : undefined;
+    const planningTransactionId = input?.planning_transaction_id;
+    const referencedReceipt = typeof planningTransactionId === "string"
+      ? this.#checkpoint.committed_actions[planningTransactionId]
+      : undefined;
+    // Malformed, missing, rejected, and action-mismatched references cannot
+    // actuate in HumanoidActionRuntime. Let that boundary produce its durable
+    // rejection receipt; current authority is required for an executable plan.
+    if (!referencedReceipt?.accepted
+      || !isHumanoidPlanningReceipt(referencedReceipt)
+      || action !== humanoidExecutionActionForPlan(referencedReceipt.action)) {
+      return;
+    }
+    const phase = this.coordinatorPhase();
+    if (phase !== "execute_plan") {
+      throw new Error(
+        `Humanoid physical action has no current execution authority in phase ${phase}`
+      );
+    }
+    const activeCycle = this.#requiredActiveCycleRef();
+    const planningReceipt = humanoidActionReceiptsInCommitOrder(
+      this.#checkpoint.committed_actions
+    )
+      .findLast((receipt) => (
+        receipt.accepted
+          && sameAutonomousCycle(receipt.cycle, activeCycle)
+          && isHumanoidPlanningReceipt(receipt)
+      ));
+    if (!planningReceipt) {
+      throw new Error("Humanoid physical action has no current planning receipt");
+    }
+    const expectedAction = humanoidExecutionActionForPlan(planningReceipt.action);
+    if (planningTransactionId !== planningReceipt.transactionId
+      || action !== expectedAction) {
+      throw new Error(
+        `Humanoid physical action does not match current execution authority: ${planningReceipt.transactionId}`
+      );
+    }
+    const committedConsumer = Object.values(this.#checkpoint.committed_actions).find(
+      (receipt) => (
+        sameAutonomousCycle(receipt.cycle, activeCycle)
+          && physicalExecutionReceipt(receipt)
+          && planningTransactionIdFromReceipt(receipt) === planningReceipt.transactionId
+      )
+    );
+    if (committedConsumer) {
+      throw new Error(
+        `Humanoid planning authority was already consumed: ${planningReceipt.transactionId}`
+      );
+    }
+    const activeConsumer = activeActionExecutions(
+      this.#checkpoint.action_execution_ledger
+    ).find((execution) => (
+      execution.admission.planning_transaction_id === planningReceipt.transactionId
+    ));
+    if (activeConsumer && activeConsumer.transaction_id !== transactionId) {
+      throw new Error(
+        `Humanoid planning authority is already executing: ${planningReceipt.transactionId}`
+      );
+    }
+  }
+
   #assertActionDecisionRef(
     rawDecision: ModelDecisionRef,
     expectedToolName: Parameters<HumanoidActionRuntime["invoke"]>[0],
     input: unknown,
     transactionId: string,
     agentId: string,
-    cycle: AutonomousCycleRef
+    cycle: AutonomousCycleRef,
+    toolAuthority?: HumanoidActionToolCallAuthority
   ): void {
     this.#requiredModelAuthority().assertActionDecision({
       rawDecision,
@@ -2213,7 +2796,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       actionInput: input,
       transactionId,
       agentId,
-      cycle
+      cycle,
+      ...(toolAuthority ? { toolAuthority } : {})
     });
   }
 
@@ -2256,6 +2840,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
     for (const receipt of Object.values(this.#checkpoint.committed_actions)) {
       if (receipt.decision) retainedModelCalls.add(receipt.decision.model_call_id);
+    }
+    for (const execution of Object.values(
+      this.#checkpoint.action_execution_ledger.active
+    )) {
+      if (execution.admission.decision) {
+        retainedModelCalls.add(execution.admission.decision.model_call_id);
+      }
+    }
+    for (const call of this.#checkpoint.active_cycle?.replan_budget.model_calls ?? []) {
+      retainedModelCalls.add(call.model_call_id);
     }
     this.#modelAuthority?.prune(retainedModelCalls);
   }
@@ -2402,6 +2996,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       // cannot split this persisted world/world-checkpoint cut.
       this.#applyWorldPersistenceState(captured);
     }
+    await this.#anchorCurrentPhysicalState();
+    await this.#anchorCurrentGoalState();
+    await this.#anchorCurrentEmbodiedMemoryState();
+    await this.#anchorCurrentContextMemoryState();
+    await this.#anchorCurrentExecutionLedgerState();
     this.#checkpoint.action_runtime_state = this.#actions.persistenceState();
     this.#assertActiveGoalProgress();
     this.#checkpoint.updated_at = new Date().toISOString();
@@ -2411,6 +3010,1095 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       .then(() => this.#store.writeCheckpoint(snapshot));
     this.#checkpointWriteTail = write;
     await write;
+  }
+
+  async #verifyExistingPhysicalStateAnchor(): Promise<void> {
+    const anchor = this.#checkpoint.physical_state_anchor;
+    if (!anchor) {
+      const worldCheckpointSha256 = actionCommitPayloadSha256(
+        json(this.#checkpoint.world_checkpoint)
+      );
+      const identity = {
+        version: 1 as const,
+        run_id: this.runId,
+        world_frame: this.#checkpoint.world.frame,
+        world_revision: this.#checkpoint.world.worldRevision,
+        world_checkpoint_sha256: worldCheckpointSha256
+      };
+      const eventId = `humanoid-physical-state:${actionCommitPayloadSha256(json(identity))}`;
+      const orphan = await findDurableRuntimeEventById(this.#store, eventId);
+      if (orphan) {
+        await assertDurableAnchorIsLatest(
+          this.#store,
+          "humanoid_physical_state_anchored",
+          eventId,
+          "Physical state anchor"
+        );
+        const recovered = HumanoidPhysicalStateAnchorSchema.parse({
+          version: 1,
+          event_id: eventId,
+          world_frame: identity.world_frame,
+          world_revision: identity.world_revision,
+          world_checkpoint_sha256: worldCheckpointSha256,
+          anchored_at: orphan.at
+        });
+        assertHumanoidPhysicalStateAnchorEvent(orphan, this.runId, recovered);
+        this.#checkpoint.physical_state_anchor = recovered;
+        this.#physicalAnchorOrphanRecoveryPending = false;
+        return;
+      }
+      await assertNoDurableAnchorDowngrade(
+        this.#store,
+        "humanoid_physical_state_anchored",
+        "Physical state anchor"
+      );
+      return;
+    }
+    const cut = await this.#world.capturePersistenceState();
+    const checkpointSha256 = actionCommitPayloadSha256(
+      json(this.#checkpoint.world_checkpoint)
+    );
+    if (cut.world.frame !== anchor.world_frame
+      || cut.world.worldRevision !== anchor.world_revision
+      || actionCommitPayloadSha256(json(cut.worldCheckpoint)) !== checkpointSha256
+      || checkpointSha256 !== anchor.world_checkpoint_sha256) {
+      throw new Error("Physical state anchor conflicts with the restored MuJoCo checkpoint");
+    }
+    const event = await findDurableRuntimeEventById(this.#store, anchor.event_id);
+    if (!event) {
+      throw new Error(`Physical state anchor event is missing: ${anchor.event_id}`);
+    }
+    assertHumanoidPhysicalStateAnchorEvent(event, this.runId, anchor);
+    await assertDurableAnchorIsLatest(
+      this.#store,
+      "humanoid_physical_state_anchored",
+      anchor.event_id,
+      "Physical state anchor"
+    );
+  }
+
+  async #verifyExistingGoalStateAnchor(): Promise<void> {
+    const anchor = this.#checkpoint.goal_state_anchor;
+    if (!anchor) {
+      const identity = {
+        version: 1 as const,
+        run_id: this.runId,
+        goal_dag_state_sha256: this.#checkpoint.goal_dag.state_sha256,
+        control_state_sha256: humanoidGoalControlStateSha256(this.#checkpoint)
+      };
+      const eventId = `humanoid-goal-state:${actionCommitPayloadSha256(json(identity))}`;
+      const orphan = await findDurableRuntimeEventById(this.#store, eventId);
+      if (orphan) {
+        await assertDurableAnchorIsLatest(
+          this.#store,
+          "humanoid_goal_state_anchored",
+          eventId,
+          "Goal state anchor"
+        );
+        const recovered = HumanoidGoalStateAnchorSchema.parse({
+          version: 1,
+          event_id: eventId,
+          goal_dag_state_sha256: identity.goal_dag_state_sha256,
+          control_state_sha256: identity.control_state_sha256,
+          anchored_at: orphan.at
+        });
+        assertHumanoidGoalStateAnchorEvent(orphan, this.runId, recovered);
+        this.#checkpoint.goal_state_anchor = recovered;
+        this.#goalAnchorOrphanRecoveryPending = false;
+        return;
+      }
+      await assertNoDurableAnchorDowngrade(
+        this.#store,
+        "humanoid_goal_state_anchored",
+        "Goal state anchor"
+      );
+      return;
+    }
+    if (anchor.goal_dag_state_sha256 !== this.#checkpoint.goal_dag.state_sha256
+      || anchor.control_state_sha256
+        !== humanoidGoalControlStateSha256(this.#checkpoint)) {
+      throw new Error("Goal state anchor conflicts with the persisted Goal DAG");
+    }
+    const event = await findDurableRuntimeEventById(this.#store, anchor.event_id);
+    if (!event) throw new Error(`Goal state anchor event is missing: ${anchor.event_id}`);
+    assertHumanoidGoalStateAnchorEvent(event, this.runId, anchor);
+    const latest = await latestDurableGoalStateAnchorEvent(this.#store);
+    if (!latest) throw new Error("Goal state anchor durable history is missing");
+    if (latest.event_id === anchor.event_id) return;
+    throw new Error("Goal state anchor is not the latest durable state");
+  }
+
+  async #verifyExistingEmbodiedMemoryStateAnchor(): Promise<void> {
+    const anchor = this.#checkpoint.embodied_memory_state_anchor;
+    if (!anchor) {
+      const memorySha256 = humanoidEmbodiedMemoryStateSha256(
+        this.#checkpoint.embodied_memory
+      );
+      const identity = {
+        version: 1 as const,
+        run_id: this.runId,
+        embodied_memory_sha256: memorySha256
+      };
+      const eventId = `humanoid-embodied-memory:${actionCommitPayloadSha256(json(identity))}`;
+      const orphan = await findDurableRuntimeEventById(this.#store, eventId);
+      if (orphan) {
+        await assertDurableAnchorIsLatest(
+          this.#store,
+          "humanoid_embodied_memory_state_anchored",
+          eventId,
+          "Embodied memory state anchor"
+        );
+        const recovered = HumanoidEmbodiedMemoryStateAnchorSchema.parse({
+          version: 1,
+          event_id: eventId,
+          embodied_memory_sha256: memorySha256,
+          anchored_at: orphan.at
+        });
+        assertHumanoidEmbodiedMemoryStateAnchorEvent(orphan, this.runId, recovered);
+        this.#checkpoint.embodied_memory_state_anchor = recovered;
+        this.#memoryAnchorOrphanRecoveryPending = false;
+        return;
+      }
+      await assertNoDurableAnchorDowngrade(
+        this.#store,
+        "humanoid_embodied_memory_state_anchored",
+        "Embodied memory state anchor"
+      );
+      return;
+    }
+    if (anchor.embodied_memory_sha256
+      !== humanoidEmbodiedMemoryStateSha256(this.#checkpoint.embodied_memory)) {
+      throw new Error(
+        "Embodied memory state anchor conflicts with the persisted memory"
+      );
+    }
+    const event = await findDurableRuntimeEventById(this.#store, anchor.event_id);
+    if (!event) {
+      throw new Error(`Embodied memory state anchor event is missing: ${anchor.event_id}`);
+    }
+    assertHumanoidEmbodiedMemoryStateAnchorEvent(event, this.runId, anchor);
+    await assertDurableAnchorIsLatest(
+      this.#store,
+      "humanoid_embodied_memory_state_anchored",
+      anchor.event_id,
+      "Embodied memory state anchor"
+    );
+  }
+
+  async #verifyExistingContextMemoryStateAnchor(): Promise<void> {
+    const anchor = this.#checkpoint.context_memory_state_anchor;
+    if (!anchor) {
+      const memorySha256 = humanoidContextMemoryStateSha256(
+        this.#checkpoint.context_memory
+      );
+      const identity = {
+        version: 1 as const,
+        run_id: this.runId,
+        context_memory_sha256: memorySha256
+      };
+      const eventId = `humanoid-context-memory:${actionCommitPayloadSha256(json(identity))}`;
+      const orphan = await findDurableRuntimeEventById(this.#store, eventId);
+      if (orphan) {
+        await assertDurableAnchorIsLatest(
+          this.#store,
+          "humanoid_context_memory_state_anchored",
+          eventId,
+          "Context memory state anchor"
+        );
+        const recovered = HumanoidContextMemoryStateAnchorSchema.parse({
+          version: 1,
+          event_id: eventId,
+          context_memory_sha256: memorySha256,
+          anchored_at: orphan.at
+        });
+        assertHumanoidContextMemoryStateAnchorEvent(orphan, this.runId, recovered);
+        this.#checkpoint.context_memory_state_anchor = recovered;
+        this.#contextAnchorOrphanRecoveryPending = false;
+        return;
+      }
+      await assertNoDurableAnchorDowngrade(
+        this.#store,
+        "humanoid_context_memory_state_anchored",
+        "Context memory state anchor"
+      );
+      return;
+    }
+    if (anchor.context_memory_sha256
+      !== humanoidContextMemoryStateSha256(this.#checkpoint.context_memory)) {
+      throw new Error("Context memory state anchor conflicts with the persisted memory");
+    }
+    const event = await findDurableRuntimeEventById(this.#store, anchor.event_id);
+    if (!event) {
+      throw new Error(`Context memory state anchor event is missing: ${anchor.event_id}`);
+    }
+    assertHumanoidContextMemoryStateAnchorEvent(event, this.runId, anchor);
+    await assertDurableAnchorIsLatest(
+      this.#store,
+      "humanoid_context_memory_state_anchored",
+      anchor.event_id,
+      "Context memory state anchor"
+    );
+  }
+
+  async #verifyExistingExecutionLedgerStateAnchor(): Promise<void> {
+    const anchor = this.#checkpoint.execution_ledger_state_anchor;
+    const ledgerSha256 = humanoidExecutionLedgerStateSha256(
+      this.#checkpoint.action_execution_ledger
+    );
+    if (!anchor) {
+      const identity = {
+        version: 1 as const,
+        run_id: this.runId,
+        execution_ledger_sha256: ledgerSha256
+      };
+      const eventId = `humanoid-execution-ledger:${actionCommitPayloadSha256(json(identity))}`;
+      const orphan = await findDurableRuntimeEventById(this.#store, eventId);
+      if (orphan) {
+        await assertDurableAnchorIsLatest(
+          this.#store,
+          "humanoid_execution_ledger_state_anchored",
+          eventId,
+          "Execution ledger state anchor"
+        );
+        const recovered = HumanoidExecutionLedgerStateAnchorSchema.parse({
+          version: 1,
+          event_id: eventId,
+          execution_ledger_sha256: ledgerSha256,
+          anchored_at: orphan.at
+        });
+        assertHumanoidExecutionLedgerStateAnchorEvent(orphan, this.runId, recovered);
+        this.#checkpoint.execution_ledger_state_anchor = recovered;
+        this.#executionLedgerAnchorOrphanRecoveryPending = false;
+        return;
+      }
+      await assertNoDurableAnchorDowngrade(
+        this.#store,
+        "humanoid_execution_ledger_state_anchored",
+        "Execution ledger state anchor"
+      );
+      return;
+    }
+    if (anchor.execution_ledger_sha256 !== ledgerSha256) {
+      throw new Error("Execution ledger state anchor conflicts with the persisted ledger");
+    }
+    const event = await findDurableRuntimeEventById(this.#store, anchor.event_id);
+    if (!event) {
+      throw new Error(`Execution ledger state anchor event is missing: ${anchor.event_id}`);
+    }
+    assertHumanoidExecutionLedgerStateAnchorEvent(event, this.runId, anchor);
+    const latest = await latestDurableExecutionLedgerAnchorEvent(this.#store);
+    if (!latest) {
+      throw new Error("Execution ledger state anchor durable history is missing");
+    }
+    if (latest.event_id === anchor.event_id) return;
+
+    // The only legitimate newer ledger head with an older checkpoint is the
+    // acknowledgement/removal cut written immediately before checkpoint.json.
+    // Recover it only when it consumes exactly the checkpoint's terminal
+    // outbox entries and the durable action journals prove those commits.
+    const recovered = await this.#recoverAcknowledgedExecutionLedgerHead(latest);
+    if (!recovered) {
+      throw new Error("Execution ledger state anchor is not the latest durable state");
+    }
+    this.#checkpoint.action_execution_ledger = recovered;
+    this.#checkpoint.execution_ledger_state_anchor = latest.anchor;
+  }
+
+  async #recoverAcknowledgedExecutionLedgerHead(
+    event: RuntimeEvent
+  ): Promise<HumanoidRunCheckpoint["action_execution_ledger"] | undefined> {
+    const data = object(event.data);
+    const rawLedger = data.action_execution_ledger;
+    if (rawLedger === undefined) return undefined;
+    try {
+      const ledger = restoreActionExecutionLedger(rawLedger);
+      const ledgerSha256 = humanoidExecutionLedgerStateSha256(ledger);
+      const anchor = HumanoidExecutionLedgerStateAnchorSchema.parse({
+        version: 1,
+        event_id: event.event_id,
+        execution_ledger_sha256: ledgerSha256,
+        anchored_at: event.at
+      });
+      assertHumanoidExecutionLedgerStateAnchorEvent(event, this.runId, anchor);
+      const expected = structuredClone(this.#checkpoint.action_execution_ledger);
+      const pending = Object.values(this.#checkpoint.action_commit_outbox.pending);
+      const consumed = Object.values(expected.active).filter((entry) => (
+        entry.status === "terminal"
+          && this.#checkpoint.action_commit_outbox.pending[entry.transaction_id]
+          && ledger.active[entry.transaction_id] === undefined
+      ));
+      if (pending.length === 0 || consumed.length === 0) {
+        return undefined;
+      }
+      for (const entry of consumed) delete expected.active[entry.transaction_id];
+      if (humanoidExecutionLedgerStateSha256(expected) !== ledgerSha256) return undefined;
+      const consumedTransactions = new Set(consumed.map((entry) => entry.transaction_id));
+      if (!await durableExecutionCommitProofsExist(
+        this.#store,
+        pending.filter((entry) => consumedTransactions.has(entry.transaction_id)),
+        this.#checkpoint.committed_actions
+      )) return undefined;
+      return ledger;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async #anchorCurrentPhysicalState(): Promise<void> {
+    const anchoring = this.#physicalStateAnchorTail
+      .catch(() => undefined)
+      .then(() => this.#anchorCurrentPhysicalStateOnce());
+    this.#physicalStateAnchorTail = anchoring;
+    await anchoring;
+  }
+
+  async #anchorCurrentPhysicalStateOnce(): Promise<void> {
+    const worldCheckpointSha256 = actionCommitPayloadSha256(
+      json(this.#checkpoint.world_checkpoint)
+    );
+    const current = this.#checkpoint.physical_state_anchor;
+    if (current
+      && current.world_frame === this.#checkpoint.world.frame
+      && current.world_revision === this.#checkpoint.world.worldRevision
+      && current.world_checkpoint_sha256 === worldCheckpointSha256) {
+      return;
+    }
+    const identity = {
+      version: 1 as const,
+      run_id: this.runId,
+      world_frame: this.#checkpoint.world.frame,
+      world_revision: this.#checkpoint.world.worldRevision,
+      world_checkpoint_sha256: worldCheckpointSha256
+    };
+    const eventId = `humanoid-physical-state:${actionCommitPayloadSha256(json(identity))}`;
+    const existing = this.#physicalAnchorOrphanRecoveryPending
+      ? await findDurableRuntimeEventById(this.#store, eventId)
+      : undefined;
+    this.#physicalAnchorOrphanRecoveryPending = false;
+    const committed = existing ?? await findDurableRuntimeEventById(this.#store, eventId);
+    const anchoredAt = committed?.at ?? new Date().toISOString();
+    const anchor = HumanoidPhysicalStateAnchorSchema.parse({
+      version: 1,
+      event_id: eventId,
+      world_frame: identity.world_frame,
+      world_revision: identity.world_revision,
+      world_checkpoint_sha256: worldCheckpointSha256,
+      anchored_at: anchoredAt
+    });
+    const runtimeEvent: RuntimeEvent = {
+      event_id: eventId,
+      run_id: this.runId,
+      type: "humanoid_physical_state_anchored",
+      at: anchoredAt,
+      data: json({
+        version: anchor.version,
+        world_frame: anchor.world_frame,
+        world_revision: anchor.world_revision,
+        world_checkpoint_sha256: anchor.world_checkpoint_sha256
+      })
+    };
+    let persisted: RuntimeEvent | undefined;
+    if (committed) {
+      persisted = committed;
+    } else try {
+      [persisted] = await this.#store.appendRuntimeEvents([runtimeEvent]);
+    } catch (error) {
+      const committed = await findDurableRuntimeEventById(this.#store, eventId);
+      if (!committed) throw error;
+      persisted = committed;
+    }
+    assertHumanoidPhysicalStateAnchorEvent(persisted!, this.runId, anchor);
+    this.#checkpoint.physical_state_anchor = anchor;
+    try {
+      await this.#eventSink(persisted!);
+    } catch {
+      return;
+    }
+  }
+
+  async #anchorCurrentGoalState(): Promise<void> {
+    const anchoring = this.#goalStateAnchorTail
+      .catch(() => undefined)
+      .then(() => this.#anchorCurrentGoalStateOnce());
+    this.#goalStateAnchorTail = anchoring;
+    await anchoring;
+  }
+
+  async #anchorCurrentGoalStateOnce(): Promise<void> {
+    const goalDAG = structuredClone(this.#checkpoint.goal_dag);
+    const goalControlState = structuredClone(humanoidGoalControlState(this.#checkpoint));
+    const controlStateSha256 = actionCommitPayloadSha256(goalControlState);
+    const current = this.#checkpoint.goal_state_anchor;
+    if (current?.goal_dag_state_sha256 === goalDAG.state_sha256
+      && current.control_state_sha256 === controlStateSha256) return;
+    const identity = {
+      version: 1 as const,
+      run_id: this.runId,
+      goal_dag_state_sha256: goalDAG.state_sha256,
+      control_state_sha256: controlStateSha256
+    };
+    const eventId = `humanoid-goal-state:${actionCommitPayloadSha256(json(identity))}`;
+    const existing = this.#goalAnchorOrphanRecoveryPending
+      ? await findDurableRuntimeEventById(this.#store, eventId)
+      : undefined;
+    this.#goalAnchorOrphanRecoveryPending = false;
+    const committed = existing ?? await findDurableRuntimeEventById(this.#store, eventId);
+    const anchoredAt = committed?.at ?? new Date().toISOString();
+    const anchor = HumanoidGoalStateAnchorSchema.parse({
+      version: 1,
+      event_id: eventId,
+      goal_dag_state_sha256: goalDAG.state_sha256,
+      control_state_sha256: controlStateSha256,
+      anchored_at: anchoredAt
+    });
+    const runtimeEvent: RuntimeEvent = {
+      event_id: eventId,
+      run_id: this.runId,
+      type: "humanoid_goal_state_anchored",
+      at: anchoredAt,
+      data: json({
+        version: anchor.version,
+        goal_dag_state_sha256: anchor.goal_dag_state_sha256,
+        control_state_sha256: anchor.control_state_sha256,
+        goal_dag: goalDAG,
+        goal_control_state: goalControlState
+      })
+    };
+    let persisted: RuntimeEvent | undefined;
+    if (committed) {
+      persisted = committed;
+    } else try {
+      [persisted] = await this.#store.appendRuntimeEvents([runtimeEvent]);
+    } catch (error) {
+      const committed = await findDurableRuntimeEventById(this.#store, eventId);
+      if (!committed) throw error;
+      persisted = committed;
+    }
+    assertHumanoidGoalStateAnchorEvent(persisted!, this.runId, anchor);
+    this.#checkpoint.goal_state_anchor = anchor;
+    try {
+      await this.#eventSink(persisted!);
+    } catch {
+      return;
+    }
+  }
+
+  async #anchorCurrentEmbodiedMemoryState(): Promise<void> {
+    const anchoring = this.#embodiedMemoryStateAnchorTail
+      .catch(() => undefined)
+      .then(() => this.#anchorCurrentEmbodiedMemoryStateOnce());
+    this.#embodiedMemoryStateAnchorTail = anchoring;
+    await anchoring;
+  }
+
+  async #anchorCurrentEmbodiedMemoryStateOnce(): Promise<void> {
+    const memory = this.#checkpoint.embodied_memory;
+    const memorySha256 = humanoidEmbodiedMemoryStateSha256(memory);
+    const current = this.#checkpoint.embodied_memory_state_anchor;
+    if (current?.embodied_memory_sha256 === memorySha256) return;
+    const identity = {
+      version: 1 as const,
+      run_id: this.runId,
+      embodied_memory_sha256: memorySha256
+    };
+    const eventId = `humanoid-embodied-memory:${actionCommitPayloadSha256(json(identity))}`;
+    const existing = this.#memoryAnchorOrphanRecoveryPending
+      ? await findDurableRuntimeEventById(this.#store, eventId)
+      : undefined;
+    this.#memoryAnchorOrphanRecoveryPending = false;
+    const committed = existing ?? await findDurableRuntimeEventById(this.#store, eventId);
+    const anchoredAt = committed?.at ?? new Date().toISOString();
+    const anchor = HumanoidEmbodiedMemoryStateAnchorSchema.parse({
+      version: 1,
+      event_id: eventId,
+      embodied_memory_sha256: memorySha256,
+      anchored_at: anchoredAt
+    });
+    const runtimeEvent: RuntimeEvent = {
+      event_id: eventId,
+      run_id: this.runId,
+      type: "humanoid_embodied_memory_state_anchored",
+      at: anchoredAt,
+      data: json({
+        version: anchor.version,
+        embodied_memory_sha256: anchor.embodied_memory_sha256,
+        embodied_memory: memory
+      })
+    };
+    let persisted: RuntimeEvent | undefined;
+    if (committed) {
+      persisted = committed;
+    } else try {
+      [persisted] = await this.#store.appendRuntimeEvents([runtimeEvent]);
+    } catch (error) {
+      const committed = await findDurableRuntimeEventById(this.#store, eventId);
+      if (!committed) throw error;
+      persisted = committed;
+    }
+    assertHumanoidEmbodiedMemoryStateAnchorEvent(persisted!, this.runId, anchor);
+    this.#checkpoint.embodied_memory_state_anchor = anchor;
+    try {
+      await this.#eventSink(persisted!);
+    } catch {
+      return;
+    }
+  }
+
+  async #anchorCurrentContextMemoryState(): Promise<void> {
+    const anchoring = this.#contextMemoryStateAnchorTail
+      .catch(() => undefined)
+      .then(() => this.#anchorCurrentContextMemoryStateOnce());
+    this.#contextMemoryStateAnchorTail = anchoring;
+    await anchoring;
+  }
+
+  async #anchorCurrentContextMemoryStateOnce(): Promise<void> {
+    const memory = this.#checkpoint.context_memory;
+    const memorySha256 = humanoidContextMemoryStateSha256(memory);
+    const current = this.#checkpoint.context_memory_state_anchor;
+    if (current?.context_memory_sha256 === memorySha256) return;
+    const identity = {
+      version: 1 as const,
+      run_id: this.runId,
+      context_memory_sha256: memorySha256
+    };
+    const eventId = `humanoid-context-memory:${actionCommitPayloadSha256(json(identity))}`;
+    const existing = this.#contextAnchorOrphanRecoveryPending
+      ? await findDurableRuntimeEventById(this.#store, eventId)
+      : undefined;
+    this.#contextAnchorOrphanRecoveryPending = false;
+    const committed = existing ?? await findDurableRuntimeEventById(this.#store, eventId);
+    const anchoredAt = committed?.at ?? new Date().toISOString();
+    const anchor = HumanoidContextMemoryStateAnchorSchema.parse({
+      version: 1,
+      event_id: eventId,
+      context_memory_sha256: memorySha256,
+      anchored_at: anchoredAt
+    });
+    const runtimeEvent: RuntimeEvent = {
+      event_id: eventId,
+      run_id: this.runId,
+      type: "humanoid_context_memory_state_anchored",
+      at: anchoredAt,
+      data: json({
+        version: anchor.version,
+        context_memory_sha256: anchor.context_memory_sha256,
+        context_memory: memory
+      })
+    };
+    let persisted: RuntimeEvent | undefined;
+    if (committed) {
+      persisted = committed;
+    } else try {
+      [persisted] = await this.#store.appendRuntimeEvents([runtimeEvent]);
+    } catch (error) {
+      const committed = await findDurableRuntimeEventById(this.#store, eventId);
+      if (!committed) throw error;
+      persisted = committed;
+    }
+    assertHumanoidContextMemoryStateAnchorEvent(persisted!, this.runId, anchor);
+    this.#checkpoint.context_memory_state_anchor = anchor;
+    try {
+      await this.#eventSink(persisted!);
+    } catch {
+      return;
+    }
+  }
+
+  async #anchorCurrentExecutionLedgerState(): Promise<void> {
+    const anchoring = this.#executionLedgerStateAnchorTail
+      .catch(() => undefined)
+      .then(async () => {
+        do {
+          await this.#anchorCurrentExecutionLedgerStateOnce();
+        } while (this.#checkpoint.execution_ledger_state_anchor
+          ?.execution_ledger_sha256 !== humanoidExecutionLedgerStateSha256(
+            this.#checkpoint.action_execution_ledger
+          ));
+      });
+    this.#executionLedgerStateAnchorTail = anchoring;
+    await anchoring;
+  }
+
+  async #anchorCurrentExecutionLedgerStateOnce(): Promise<void> {
+    const ledger = structuredClone(this.#checkpoint.action_execution_ledger);
+    const ledgerSha256 = humanoidExecutionLedgerStateSha256(ledger);
+    const current = this.#checkpoint.execution_ledger_state_anchor;
+    if (current?.execution_ledger_sha256 === ledgerSha256) {
+      const latest = await latestDurableExecutionLedgerAnchorEvent(this.#store);
+      if (latest?.event_id === current.event_id) return;
+      const event = await findDurableRuntimeEventById(this.#store, current.event_id);
+      if (!event) {
+        throw new Error(`Execution ledger state anchor event is missing: ${current.event_id}`);
+      }
+      assertHumanoidExecutionLedgerStateAnchorEvent(event, this.runId, current);
+      await this.#store.appendRuntimeEvents([{
+        event_id: event.event_id,
+        run_id: event.run_id,
+        type: event.type,
+        at: event.at,
+        data: event.data
+      }]);
+      return;
+    }
+    const identity = {
+      version: 1 as const,
+      run_id: this.runId,
+      execution_ledger_sha256: ledgerSha256
+    };
+    const eventId = `humanoid-execution-ledger:${actionCommitPayloadSha256(json(identity))}`;
+    const existing = this.#executionLedgerAnchorOrphanRecoveryPending
+      ? await findDurableRuntimeEventById(this.#store, eventId)
+      : undefined;
+    this.#executionLedgerAnchorOrphanRecoveryPending = false;
+    const committed = existing ?? await findDurableRuntimeEventById(this.#store, eventId);
+    const anchoredAt = committed?.at ?? new Date().toISOString();
+    const anchor = HumanoidExecutionLedgerStateAnchorSchema.parse({
+      version: 1,
+      event_id: eventId,
+      execution_ledger_sha256: ledgerSha256,
+      anchored_at: anchoredAt
+    });
+    const runtimeEvent: RuntimeEvent = {
+      event_id: eventId,
+      run_id: this.runId,
+      type: "humanoid_execution_ledger_state_anchored",
+      at: anchoredAt,
+      data: json({
+        version: anchor.version,
+        execution_ledger_sha256: anchor.execution_ledger_sha256,
+        action_execution_ledger: ledger
+      })
+    };
+    let persisted: RuntimeEvent | undefined;
+    if (committed) {
+      persisted = committed;
+    } else try {
+      [persisted] = await this.#store.appendRuntimeEvents([runtimeEvent]);
+    } catch (error) {
+      const committed = await findDurableRuntimeEventById(this.#store, eventId);
+      if (!committed) throw error;
+      persisted = committed;
+    }
+    assertHumanoidExecutionLedgerStateAnchorEvent(persisted!, this.runId, anchor);
+    if (humanoidExecutionLedgerStateSha256(this.#checkpoint.action_execution_ledger)
+      === ledgerSha256) {
+      this.#checkpoint.execution_ledger_state_anchor = anchor;
+    }
+    try {
+      await this.#eventSink(persisted!);
+    } catch {
+      return;
+    }
+  }
+
+}
+
+function assertHumanoidPhysicalStateAnchorEvent(
+  event: RuntimeEvent,
+  runId: string,
+  anchor: ReturnType<typeof HumanoidPhysicalStateAnchorSchema.parse>
+): void {
+  const data = object(event.data);
+  if (event.event_id !== anchor.event_id
+    || event.run_id !== runId
+    || event.type !== "humanoid_physical_state_anchored"
+    || event.at !== anchor.anchored_at
+    || data.version !== anchor.version
+    || data.world_frame !== anchor.world_frame
+    || data.world_revision !== anchor.world_revision
+    || data.world_checkpoint_sha256 !== anchor.world_checkpoint_sha256) {
+    throw new Error(`Physical state anchor event conflicts with ${anchor.event_id}`);
+  }
+}
+
+function assertHumanoidGoalStateAnchorEvent(
+  event: RuntimeEvent,
+  runId: string,
+  anchor: ReturnType<typeof HumanoidGoalStateAnchorSchema.parse>
+): void {
+  const data = object(event.data);
+  if (event.event_id !== anchor.event_id
+    || event.run_id !== runId
+    || event.type !== "humanoid_goal_state_anchored"
+    || event.at !== anchor.anchored_at
+    || data.version !== anchor.version
+    || data.goal_dag_state_sha256 !== anchor.goal_dag_state_sha256
+    || data.control_state_sha256 !== anchor.control_state_sha256
+    || object(data.goal_dag ?? null).state_sha256
+      !== anchor.goal_dag_state_sha256
+    || data.goal_control_state === undefined
+    || actionCommitPayloadSha256(json(data.goal_control_state))
+      !== anchor.control_state_sha256) {
+    throw new Error(`Goal state anchor event conflicts with ${anchor.event_id}`);
+  }
+}
+
+function assertHumanoidEmbodiedMemoryStateAnchorEvent(
+  event: RuntimeEvent,
+  runId: string,
+  anchor: ReturnType<typeof HumanoidEmbodiedMemoryStateAnchorSchema.parse>
+): void {
+  const data = object(event.data);
+  if (event.event_id !== anchor.event_id
+    || event.run_id !== runId
+    || event.type !== "humanoid_embodied_memory_state_anchored"
+    || event.at !== anchor.anchored_at
+    || data.version !== anchor.version
+    || data.embodied_memory_sha256 !== anchor.embodied_memory_sha256
+    || data.embodied_memory === undefined
+    || humanoidEmbodiedMemoryStateSha256(
+      data.embodied_memory as HumanoidRunCheckpoint["embodied_memory"]
+    ) !== anchor.embodied_memory_sha256) {
+    throw new Error(
+      `Embodied memory state anchor event conflicts with ${anchor.event_id}`
+    );
+  }
+}
+
+function assertHumanoidContextMemoryStateAnchorEvent(
+  event: RuntimeEvent,
+  runId: string,
+  anchor: ReturnType<typeof HumanoidContextMemoryStateAnchorSchema.parse>
+): void {
+  const data = object(event.data);
+  if (event.event_id !== anchor.event_id
+    || event.run_id !== runId
+    || event.type !== "humanoid_context_memory_state_anchored"
+    || event.at !== anchor.anchored_at
+    || data.version !== anchor.version
+    || data.context_memory_sha256 !== anchor.context_memory_sha256
+    || data.context_memory === undefined
+    || humanoidContextMemoryStateSha256(
+      data.context_memory as HumanoidRunCheckpoint["context_memory"]
+    ) !== anchor.context_memory_sha256) {
+    throw new Error(
+      `Context memory state anchor event conflicts with ${anchor.event_id}`
+    );
+  }
+}
+
+function assertHumanoidExecutionLedgerStateAnchorEvent(
+  event: RuntimeEvent,
+  runId: string,
+  anchor: ReturnType<typeof HumanoidExecutionLedgerStateAnchorSchema.parse>
+): void {
+  const data = object(event.data);
+  if (event.event_id !== anchor.event_id
+    || event.run_id !== runId
+    || event.type !== "humanoid_execution_ledger_state_anchored"
+    || event.at !== anchor.anchored_at
+    || data.version !== anchor.version
+    || data.execution_ledger_sha256 !== anchor.execution_ledger_sha256
+    || data.action_execution_ledger === undefined
+    || humanoidExecutionLedgerStateSha256(
+      data.action_execution_ledger as HumanoidRunCheckpoint["action_execution_ledger"]
+    ) !== anchor.execution_ledger_sha256) {
+    throw new Error(
+      `Execution ledger state anchor event conflicts with ${anchor.event_id}`
+    );
+  }
+}
+
+async function findDurableRuntimeEventById(
+  store: RunStore,
+  eventId: string
+): Promise<RuntimeEvent | undefined> {
+  const pageSize = 256;
+  const tail = await store.readJournalTail("events", 1);
+  let before = tail.total;
+  while (before > 0) {
+    const from = Math.max(0, before - pageSize);
+    const page = await store.readJournalPage("events", from, before - from);
+    if (page.entries.length === 0) {
+      throw new Error(`Runtime event journal stopped before offset ${before}`);
+    }
+    for (let offset = page.entries.length - 1; offset >= 0; offset -= 1) {
+      const record = object(page.entries[offset]!);
+      if (record.event_id !== eventId) continue;
+      if (typeof record.run_id !== "string"
+        || typeof record.type !== "string"
+        || typeof record.at !== "string") {
+        throw new Error(`Durable runtime event is malformed: ${eventId}`);
+      }
+      return {
+        event_id: eventId,
+        run_id: record.run_id,
+        type: record.type,
+        at: record.at,
+        data: json(record.data ?? null),
+        ...(typeof record.cursor === "string" ? { cursor: record.cursor } : {})
+      };
+    }
+    before = from;
+  }
+  return undefined;
+}
+
+async function assertNoDurableAnchorDowngrade(
+  store: RunStore,
+  eventType: string,
+  label: string
+): Promise<void> {
+  const pageSize = 256;
+  const tail = await store.readJournalTail("events", 1);
+  let before = tail.total;
+  while (before > 0) {
+    const from = Math.max(0, before - pageSize);
+    const page = await store.readJournalPage("events", from, before - from);
+    if (page.entries.length === 0) {
+      throw new Error(`Runtime event journal stopped before offset ${before}`);
+    }
+    if (page.entries.some((entry) => object(entry).type === eventType)) {
+      throw new Error(`${label} is missing while durable anchor history exists`);
+    }
+    before = from;
+  }
+}
+
+async function latestDurableExecutionLedgerAnchorEvent(
+  store: RunStore
+): Promise<(RuntimeEvent & {
+  anchor: ReturnType<typeof HumanoidExecutionLedgerStateAnchorSchema.parse>;
+}) | undefined> {
+  const eventType = "humanoid_execution_ledger_state_anchored";
+  const pageSize = 256;
+  const tail = await store.readJournalTail("events", 1);
+  let before = tail.total;
+  while (before > 0) {
+    const from = Math.max(0, before - pageSize);
+    const page = await store.readJournalPage("events", from, before - from);
+    if (page.entries.length === 0) {
+      throw new Error(`Runtime event journal stopped before offset ${before}`);
+    }
+    for (let offset = page.entries.length - 1; offset >= 0; offset -= 1) {
+      const record = object(page.entries[offset]!);
+      if (record.type !== eventType) continue;
+      if (typeof record.event_id !== "string"
+        || typeof record.run_id !== "string"
+        || typeof record.at !== "string") {
+        throw new Error(`Durable ${eventType} event is malformed`);
+      }
+      const data = object(record.data ?? null);
+      const anchor = HumanoidExecutionLedgerStateAnchorSchema.parse({
+        version: data.version,
+        event_id: record.event_id,
+        execution_ledger_sha256: data.execution_ledger_sha256,
+        anchored_at: record.at
+      });
+      return {
+        event_id: record.event_id,
+        run_id: record.run_id,
+        type: eventType,
+        at: record.at,
+        data: json(record.data ?? null),
+        ...(typeof record.cursor === "string" ? { cursor: record.cursor } : {}),
+        anchor
+      };
+    }
+    before = from;
+  }
+  return undefined;
+}
+
+async function latestDurableGoalStateAnchorEvent(
+  store: RunStore
+): Promise<(RuntimeEvent & {
+  anchor: ReturnType<typeof HumanoidGoalStateAnchorSchema.parse>;
+}) | undefined> {
+  const eventType = "humanoid_goal_state_anchored";
+  const pageSize = 256;
+  const tail = await store.readJournalTail("events", 1);
+  let before = tail.total;
+  while (before > 0) {
+    const from = Math.max(0, before - pageSize);
+    const page = await store.readJournalPage("events", from, before - from);
+    if (page.entries.length === 0) {
+      throw new Error(`Runtime event journal stopped before offset ${before}`);
+    }
+    for (let offset = page.entries.length - 1; offset >= 0; offset -= 1) {
+      const record = object(page.entries[offset]!);
+      if (record.type !== eventType) continue;
+      if (typeof record.event_id !== "string"
+        || typeof record.run_id !== "string"
+        || typeof record.at !== "string") {
+        throw new Error(`Durable ${eventType} event is malformed`);
+      }
+      const data = object(record.data ?? null);
+      const anchor = HumanoidGoalStateAnchorSchema.parse({
+        version: data.version,
+        event_id: record.event_id,
+        goal_dag_state_sha256: data.goal_dag_state_sha256,
+        control_state_sha256: data.control_state_sha256,
+        anchored_at: record.at
+      });
+      return {
+        event_id: record.event_id,
+        run_id: record.run_id,
+        type: eventType,
+        at: record.at,
+        data: json(record.data ?? null),
+        ...(typeof record.cursor === "string" ? { cursor: record.cursor } : {}),
+        anchor
+      };
+    }
+    before = from;
+  }
+  return undefined;
+}
+
+async function durableExecutionCommitProofsExist(
+  store: RunStore,
+  commits: readonly ReturnType<typeof stageActionCommit>["pending"][string][],
+  receipts: HumanoidRunCheckpoint["committed_actions"]
+): Promise<boolean> {
+  const requiredTransactions = new Set(commits.map((entry) => entry.transaction_id));
+  const requiredEvidence = new Set(commits.map((entry) => entry.goal_evidence_ref));
+  const requiredEvents = new Set(commits.map((entry) => entry.runtime_event_id));
+  const actions = new Map<string, Set<string>>();
+  const evidence = new Map<string, Set<string>>();
+  const identities = new Map<string, Set<string>>();
+  const events = new Map<string, Set<string>>();
+  await Promise.all([
+    store.scanJournal("actions", (record) => {
+      const transactionId = object(record).transactionId;
+      if (typeof transactionId === "string" && requiredTransactions.has(transactionId)) {
+        addDurableProofHash(actions, transactionId, actionCommitPayloadSha256(record));
+      }
+    }),
+    store.scanJournal("goal_evidence", (record) => {
+      const ref = object(object(record).evidence ?? null).ref;
+      if (typeof ref === "string" && requiredEvidence.has(ref)) {
+        addDurableProofHash(evidence, ref, actionCommitPayloadSha256(record));
+      }
+    }),
+    store.scanJournal("action_identities", (record) => {
+      const transactionId = object(record).transaction_id;
+      if (typeof transactionId === "string" && requiredTransactions.has(transactionId)) {
+        addDurableProofHash(identities, transactionId, actionCommitPayloadSha256(record));
+      }
+    }),
+    store.scanJournal("events", (record) => {
+      const envelope = object(record);
+      const eventId = envelope.event_id;
+      if (typeof eventId !== "string" || !requiredEvents.has(eventId)) return;
+      const { cursor: _cursor, ...event } = envelope;
+      addDurableProofHash(events, eventId, actionCommitPayloadSha256(json(event)));
+    })
+  ]);
+  return commits.every((entry) => {
+    const receipt = receipts[entry.transaction_id];
+    const expectedIdentity = createActionTransactionIdentity(entry);
+    return receipt !== undefined
+      && exactlyOneDurableProof(actions, entry.transaction_id, entry.action_record_sha256)
+      && exactlyOneDurableProof(evidence, entry.goal_evidence_ref, entry.goal_evidence_sha256)
+      && exactlyOneDurableProof(
+        identities,
+        entry.transaction_id,
+        actionCommitPayloadSha256(json(expectedIdentity))
+      )
+      && exactlyOneDurableProof(events, entry.runtime_event_id, entry.runtime_event_sha256);
+  });
+}
+
+function addDurableProofHash(
+  index: Map<string, Set<string>>,
+  id: string,
+  sha256: string
+): void {
+  const hashes = index.get(id) ?? new Set<string>();
+  hashes.add(sha256);
+  index.set(id, hashes);
+}
+
+function exactlyOneDurableProof(
+  index: ReadonlyMap<string, ReadonlySet<string>>,
+  id: string,
+  expectedSha256: string
+): boolean {
+  const hashes = index.get(id);
+  return hashes?.size === 1 && hashes.has(expectedSha256);
+}
+
+async function assertDurableAnchorIsLatest(
+  store: RunStore,
+  eventType: string,
+  eventId: string,
+  label: string
+): Promise<void> {
+  const pageSize = 256;
+  const tail = await store.readJournalTail("events", 1);
+  let before = tail.total;
+  while (before > 0) {
+    const from = Math.max(0, before - pageSize);
+    const page = await store.readJournalPage("events", from, before - from);
+    if (page.entries.length === 0) {
+      throw new Error(`Runtime event journal stopped before offset ${before}`);
+    }
+    for (let offset = page.entries.length - 1; offset >= 0; offset -= 1) {
+      const record = object(page.entries[offset]!);
+      if (record.type !== eventType) continue;
+      if (record.event_id !== eventId) {
+        throw new Error(`${label} is not the latest durable state`);
+      }
+      return;
+    }
+    before = from;
+  }
+  throw new Error(`${label} has no durable state history`);
+}
+
+async function appendDurableModelCallLifecycleRecord(
+  store: RunStore,
+  record: ModelCallLifecycleRecord
+): Promise<void> {
+  try {
+    await store.append("model_calls", json(record));
+  } catch (error) {
+    const committed = await findDurableModelCallLifecycleRecord(store, record);
+    if (!committed) throw error;
+  }
+}
+
+async function findDurableModelCallLifecycleRecord(
+  store: RunStore,
+  record: ModelCallLifecycleRecord
+): Promise<boolean> {
+  const pageSize = 256;
+  const expectedSha256 = modelPayloadSha256(record);
+  const tail = await store.readJournalTail("model_calls", 1);
+  let before = tail.total;
+  while (before > 0) {
+    const from = Math.max(0, before - pageSize);
+    const page = await store.readJournalPage("model_calls", from, before - from);
+    if (page.entries.length === 0) {
+      throw new Error(`Model call journal stopped before offset ${before}`);
+    }
+    for (let offset = page.entries.length - 1; offset >= 0; offset -= 1) {
+      const candidate = object(page.entries[offset]!);
+      if (candidate.model_call_id !== record.model_call_id
+        || candidate.lifecycle !== record.lifecycle) continue;
+      if (modelPayloadSha256(candidate) !== expectedSha256) {
+        throw new Error(
+          `Durable model call lifecycle identity conflict: ${record.model_call_id}`
+        );
+      }
+      return true;
+    }
+    before = from;
+  }
+  return false;
+}
+
+function assertHumanoidSkillRuntimeEvent(
+  runtimeEvent: RuntimeEvent,
+  runId: string,
+  event: HumanoidEmbodiedSkillEvent
+): void {
+  if (runtimeEvent.run_id !== runId
+    || runtimeEvent.type !== "humanoid_skill_event"
+    || modelPayloadSha256(runtimeEvent.data) !== modelPayloadSha256(event)) {
+    throw new Error(`Durable Skill event identity conflict: ${runtimeEvent.event_id}`);
   }
 }
 
@@ -2459,6 +4147,47 @@ function reconcileModelUsage(
     : structuredClone(checkpoint);
 }
 
+async function loadDurableHumanoidSkillEvents(
+  store: RunStore,
+  retainedCallIds: ReadonlySet<string>
+): Promise<HumanoidEmbodiedSkillEvent[]> {
+  if (retainedCallIds.size === 0) return [];
+  const indexed: Array<{ index: number; event: HumanoidEmbodiedSkillEvent }> = [];
+  const starts = new Set<string>();
+  const seen = new Set<string>();
+  const tail = await store.readJournalTail("events", 1);
+  let before = tail.total;
+  while (before > 0 && starts.size < retainedCallIds.size) {
+    const from = Math.max(0, before - 256);
+    const page = await store.readJournalPage("events", from, before - from);
+    if (page.entries.length === 0) {
+      throw new Error(`Skill event journal stopped before offset ${before}`);
+    }
+    for (let offset = page.entries.length - 1; offset >= 0; offset -= 1) {
+      const envelope = object(page.entries[offset]!);
+      if (envelope.type !== "humanoid_skill_event"
+        || envelope.data === undefined) continue;
+      const data = object(envelope.data);
+      if (data.status === undefined) continue;
+      const status = object(data.status);
+      if (typeof status.callId !== "string"
+        || !retainedCallIds.has(status.callId)) continue;
+      const event = HumanoidEmbodiedSkillEventSchema.parse(envelope.data);
+      indexed.push({ index: from + offset, event });
+      seen.add(event.status.callId);
+      if (event.sequence === 0) starts.add(event.status.callId);
+    }
+    before = from;
+  }
+  const missing = [...seen].filter((callId) => !starts.has(callId));
+  if (missing.length > 0) {
+    throw new Error(`Durable Skill event history is incomplete: ${missing[0]}`);
+  }
+  return indexed
+    .sort((left, right) => left.index - right.index)
+    .map(({ event }) => event);
+}
+
 function modelUsageDominates(left: ModelUsageState, right: ModelUsageState): boolean {
   if (!usageTotalsDominate(left.total, right.total)) return false;
   for (const [agentId, totals] of Object.entries(right.by_agent)) {
@@ -2477,9 +4206,76 @@ function usageTotalsDominate(
   );
 }
 
+function replanBudgetRole(
+  agentId: string
+): "coordinator" | "motion" | "goal_manager" | undefined {
+  if (agentId === "humanoid-coordinator") return "coordinator";
+  if (agentId === "humanoid-motion-reference") return "motion";
+  if (agentId === "humanoid-goal-manager") return "goal_manager";
+  return undefined;
+}
+
+function replanModelCallEvent(
+  call: HumanoidReplanModelCall | undefined,
+  cycle: ActiveAutonomousCycle | null
+): Record<string, JsonValue> {
+  if (!call || !cycle) return {};
+  return {
+    replan_budget_evidence: json({
+      call,
+      authority: humanoidReplanBudgetAuthority(
+        cycle.replan_budget,
+        call.completed_at ?? call.started_at
+      )
+    })
+  };
+}
+
 function isHumanoidPlanningReceipt(receipt: HumanoidActionReceipt): boolean {
   return receipt.action === "plan_humanoid_skill"
     || receipt.action === "plan_whole_body_motion"
     || receipt.action === "plan_whole_body_motion_candidates"
     || receipt.action === "plan_humanoid_navigation";
+}
+
+function humanoidExecutionActionForPlan(
+  action: HumanoidActionReceipt["action"]
+): "execute_humanoid_skill" | "execute_whole_body_motion" | "execute_humanoid_navigation" {
+  if (action === "plan_humanoid_skill") return "execute_humanoid_skill";
+  if (action === "plan_humanoid_navigation") return "execute_humanoid_navigation";
+  if (action === "plan_whole_body_motion"
+    || action === "plan_whole_body_motion_candidates") {
+    return "execute_whole_body_motion";
+  }
+  throw new Error(`Humanoid action is not a planning receipt: ${action}`);
+}
+
+function planningTransactionIdFromReceipt(
+  receipt: HumanoidActionReceipt
+): string | undefined {
+  const input = object(receipt.input);
+  return typeof input.planning_transaction_id === "string"
+    ? input.planning_transaction_id
+    : undefined;
+}
+
+function humanoidActionRoleAuthority(action: HumanoidActionReceipt["action"]): Set<string> {
+  if (action === "observe_humanoid") {
+    return new Set(["humanoid-sentry", "humanoid-motion-reference"]);
+  }
+  if (action === "submit_humanoid_skill_plan"
+    || action === "begin_humanoid_skill"
+    || isHumanoidPlanningActionName(action)) {
+    return new Set(["humanoid-motion-reference"]);
+  }
+  return new Set(["humanoid-executor"]);
+}
+
+function isHumanoidPlanningActionName(
+  action: HumanoidActionReceipt["action"]
+): boolean {
+  return action === "plan_humanoid_skill"
+    || action === "plan_whole_body_motion"
+    || action === "plan_whole_body_motion_candidates"
+    || action === "plan_humanoid_navigation";
 }

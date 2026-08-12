@@ -107,6 +107,11 @@ const catalog: RuntimeCatalog = {
   templates: {},
   materialize: () => structuredClone(scenario)
 };
+const HUMANOID_REASONING_AGENT_IDS = [
+  HUMANOID_AGENT_IDS.goalManager,
+  HUMANOID_AGENT_IDS.motion,
+  HUMANOID_AGENT_IDS.coordinator
+] as const;
 const temporaryDirectories: string[] = [];
 
 beforeEach(() => {
@@ -320,7 +325,7 @@ describe("humanoid mission initialization recovery", () => {
     const config = provider();
     const manifest = createManifest(config);
     await store.writeAgentManifest(manifest);
-    const sessionItems = new Map(Object.values(HUMANOID_AGENT_IDS).map((agentId) => (
+    const sessionItems = new Map(HUMANOID_REASONING_AGENT_IDS.map((agentId) => (
       [agentId, [{ role: "user" as const, content: `baseline:${agentId}` }]]
     )));
     await Promise.all([...sessionItems.entries()].map(async ([agentId, items]) => {
@@ -331,7 +336,7 @@ describe("humanoid mission initialization recovery", () => {
     });
     runnerControl.run.mockImplementation(async (_agent, runInput) => {
       const inputText = typeof runInput === "string" ? runInput : "serialized RunState";
-      await Promise.all(Object.values(HUMANOID_AGENT_IDS).map(async (agentId) => {
+      await Promise.all(HUMANOID_REASONING_AGENT_IDS.map(async (agentId) => {
         await missionSession(store, manifest.epoch_id, agentId).addItems([{
           role: "user",
           content: `failed:${runnerControl.run.mock.calls.length}:${inputText}`
@@ -361,7 +366,7 @@ describe("humanoid mission initialization recovery", () => {
     const config = provider();
     const manifest = createManifest(config);
     await store.writeAgentManifest(manifest);
-    await Promise.all(Object.values(HUMANOID_AGENT_IDS).map(async (agentId) => {
+    await Promise.all(HUMANOID_REASONING_AGENT_IDS.map(async (agentId) => {
       await missionSession(store, manifest.epoch_id, agentId).addItems([{
         role: "user",
         content: `baseline:${agentId}`
@@ -383,7 +388,7 @@ describe("humanoid mission initialization recovery", () => {
         role: "user",
         content: `baseline:${HUMANOID_AGENT_IDS.coordinator}`
       }]);
-      for (const agentId of Object.values(HUMANOID_AGENT_IDS)) {
+      for (const agentId of HUMANOID_REASONING_AGENT_IDS) {
         if (agentId === HUMANOID_AGENT_IDS.coordinator) continue;
         expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual([{
           role: "user",
@@ -449,7 +454,7 @@ describe("humanoid mission initialization recovery", () => {
     const config = provider();
     const manifest = createManifest(config);
     await store.writeAgentManifest(manifest);
-    const sessions = new Map(Object.values(HUMANOID_AGENT_IDS).map((agentId) => (
+    const sessions = new Map(HUMANOID_REASONING_AGENT_IDS.map((agentId) => (
       [agentId, missionSession(store, manifest.epoch_id, agentId)]
     )));
     await Promise.all([...sessions.entries()].map(async ([agentId, session]) => {
@@ -486,7 +491,7 @@ describe("humanoid mission initialization recovery", () => {
     }
   });
 
-  it("continues prose-only decisions in the same Agent Session", async () => {
+  it("bounds prose-only decision recovery at one physical authority", async () => {
     const store = await createCheckpointedRun();
     const config = provider();
     const manifest = createManifest(config);
@@ -499,7 +504,6 @@ describe("humanoid mission initialization recovery", () => {
     await coordinatorSession.addItems([{ role: "user", content: "durable-prefix" }]);
     const inputs: unknown[] = [];
     let activeSession: FileSession | undefined;
-    const inspectionComplete = new Error("unbounded decision recovery inspected");
     runnerControl.run.mockImplementation(async (
       agent: { name: string },
       runInput,
@@ -511,7 +515,6 @@ describe("humanoid mission initialization recovery", () => {
       if (activeSession) expect(options.session).toBe(activeSession);
       else activeSession = options.session;
       const attempt = runnerControl.run.mock.calls.length;
-      if (attempt === 7) throw inspectionComplete;
       await options.session?.addItems([{
         role: "assistant",
         content: `prose-only-response:${attempt}`
@@ -524,17 +527,19 @@ describe("humanoid mission initialization recovery", () => {
       };
     });
 
-    await expect(resume(store, config)).rejects.toBe(inspectionComplete);
+    await expect(resume(store, config)).rejects.toThrow(
+      "Humanoid coordinator did not return a formal tool result"
+    );
 
-    expect(runnerControl.run).toHaveBeenCalledTimes(7);
-    expect(String(inputs[0])).toContain("继续下一次人形自主闭环");
+    expect(runnerControl.run).toHaveBeenCalledTimes(3);
+    expect(String(inputs[0])).toContain("推进人形自主闭环的下一个层级步骤");
     for (const input of inputs.slice(1)) {
       expect(String(input)).toContain("上一次模型分支没有产生 Harness 可验收的正式工具决策");
     }
     const followUps = (await store.readJournal("provider")).filter((entry) => (
       isRecord(entry) && entry.status === "model_decision_follow_up"
     ));
-    expect(followUps).toEqual([1, 2, 3, 4, 5, 6].map((attempt) => expect.objectContaining({
+    expect(followUps).toEqual([1, 2].map((attempt) => expect.objectContaining({
       agent_id: HUMANOID_AGENT_IDS.coordinator,
       follow_up_attempt: attempt,
       recovery_sequence: attempt,
@@ -751,39 +756,29 @@ describe("humanoid mission initialization recovery", () => {
       attempt: 2,
       sequence: 2
     });
-    expect(third).toEqual({
-      authorityFingerprint: "authority-a",
-      contextCompactionCount: 0,
-      attempt: 3,
-      sequence: 3
-    });
+    expect(third).toBeUndefined();
     expect(nextModelDecisionFollowUpState(
-      third ?? undefined,
+      second ?? undefined,
       "authority-a"
-    )).toEqual({
-      authorityFingerprint: "authority-a",
-      contextCompactionCount: 0,
-      attempt: 4,
-      sequence: 4
-    });
+    )).toBeUndefined();
     expect(nextModelDecisionFollowUpState(
-      third ?? undefined,
+      second ?? undefined,
       "authority-b"
     )).toEqual({
       authorityFingerprint: "authority-b",
       contextCompactionCount: 0,
       attempt: 1,
-      sequence: 4
+      sequence: 3
     });
     expect(nextModelDecisionFollowUpState(
-      third ?? undefined,
+      second ?? undefined,
       "authority-a",
       1
     )).toEqual({
       authorityFingerprint: "authority-a",
       contextCompactionCount: 1,
       attempt: 1,
-      sequence: 4
+      sequence: 3
     });
   });
 
@@ -792,7 +787,7 @@ describe("humanoid mission initialization recovery", () => {
     const config = provider();
     const manifest = createManifest(config);
     await store.writeAgentManifest(manifest);
-    const baselineItems = new Map(Object.values(HUMANOID_AGENT_IDS).map((agentId) => (
+    const baselineItems = new Map(HUMANOID_REASONING_AGENT_IDS.map((agentId) => (
       [agentId, [{ role: "user" as const, content: `baseline:${agentId}` }]]
     )));
     await Promise.all([...baselineItems.entries()].map(async ([agentId, items]) => {
@@ -845,7 +840,7 @@ describe("humanoid mission initialization recovery", () => {
     }
     expect(await store.readAgentStateRecord()).toMatchObject({
       state: "invalid-but-persisted-sdk-state",
-      sessionBaseline: Object.fromEntries(Object.values(HUMANOID_AGENT_IDS).map(
+      sessionBaseline: Object.fromEntries(HUMANOID_REASONING_AGENT_IDS.map(
         (agentId) => [agentId, {
           item_count: agentId === HUMANOID_AGENT_IDS.coordinator ? 2 : 1
         }]

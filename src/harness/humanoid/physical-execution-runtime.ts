@@ -3,6 +3,7 @@ import {
   activeActionExecutions,
   recordActionExecutionProgress,
   stageActionExecutionIntent,
+  ExecutionGateToolCallAuthoritySchema,
   type ActionExecutionLedgerEntry
 } from "../../domain/action-execution-ledger.js";
 import type { PendingActionCommit } from "../../domain/action-commit-outbox.js";
@@ -13,6 +14,8 @@ import {
 import type { HumanoidRunCheckpoint } from "../../domain/humanoid-run.js";
 import type { PhysicalTrajectorySummary } from "../../domain/physical-trajectory.js";
 import type { Goal, Scenario } from "../../domain/schema.js";
+import type { HumanoidGroundingReceipt } from
+  "../../domain/humanoid-grounding.js";
 import { advanceHumanoidGoal } from "../../runtime/humanoid-checker.js";
 import type {
   HumanoidWorld,
@@ -33,6 +36,7 @@ import type {
   HumanoidActionReceipt,
   HumanoidPhysicalExecutionIntent
 } from "./runtime.js";
+import { groundHumanoidPhysicalExecution } from "./dispatch-grounding.js";
 
 const EXECUTION_FRAME_CHECKPOINT_INTERVAL = 10;
 const STATIONARY_CHECKPOINT_INTERVAL_SECONDS = 5 * 60;
@@ -103,7 +107,40 @@ export class HumanoidPhysicalExecutionRuntime {
     }
   }
 
-  async admit(intent: HumanoidPhysicalExecutionIntent): Promise<void> {
+  executionFrameOffset(transactionId: string): number {
+    const entry = this.#checkpoint().action_execution_ledger.active[
+      transactionId.trim()
+    ];
+    return entry?.progress.committed_frame_count ?? 0;
+  }
+
+  executionCompletedPlanFrameCount(transactionId: string): number {
+    const entry = this.#checkpoint().action_execution_ledger.active[
+      transactionId.trim()
+    ];
+    const last = entry?.progress.completed_plan_terminals.at(-1);
+    return entry && last
+      ? last.final_world_revision - entry.admission.world_revision
+      : 0;
+  }
+
+  executionCompletedPlanCount(transactionId: string): number {
+    return this.#checkpoint().action_execution_ledger.active[
+      transactionId.trim()
+    ]?.progress.completed_plan_terminals.length ?? 0;
+  }
+
+  async admit(
+    intent: HumanoidPhysicalExecutionIntent
+  ): Promise<HumanoidGroundingReceipt | undefined> {
+    if (!intent.decision || !intent.toolAuthority) {
+      throw new Error(
+        `Physical execution has no durable Coordinator delegation: ${intent.transactionId}`
+      );
+    }
+    const toolCallAuthority = ExecutionGateToolCallAuthoritySchema.parse(
+      intent.toolAuthority
+    );
     const checkpoint = this.#checkpoint();
     const cycle = this.#requiredActiveCycle();
     const planningReceipt = checkpoint.committed_actions[intent.planningTransactionId];
@@ -113,37 +150,58 @@ export class HumanoidPhysicalExecutionRuntime {
       );
     }
     this.assertExecutionOwner(intent.transactionId);
-    const cut = await this.#capturePhysicalCut();
-    this.#applyPhysicalCut(cut);
     const existing = checkpoint.action_execution_ledger.active[intent.transactionId];
     if (existing) {
+      const cut = await this.#capturePhysicalCut();
+      this.#applyPhysicalCut(cut);
       this.#assertExecutionIntent(existing, intent);
       if (existing.status !== "terminal") {
         this.#synchronizeExecutionProgress(existing, cut);
       }
-    } else {
-      const trajectory = createPhysicalTrajectory(cut.world);
-      this.#physicalTrajectories.set(intent.transactionId, trajectory);
-      checkpoint.action_execution_ledger = stageActionExecutionIntent(
-        checkpoint.action_execution_ledger,
-        {
-          runId: this.#runId,
-          transactionId: intent.transactionId,
-          agentId: intent.agentId,
-          action: intent.action,
-          actionFingerprint: intent.fingerprint,
-          cycle,
-          planningTransactionId: intent.planningTransactionId,
-          planId: intent.planId,
-          worldFrame: cut.world.frame,
-          worldRevision: cut.world.worldRevision,
-          authorityStateSha256: cut.authority.stateSha256,
-          physicalCheckpointSha256: physicalCheckpointSha256(cut),
-          physicalTrajectory: trajectory
-        }
-      );
+      await this.#persist();
+      return existing.admission.grounding_receipt;
     }
+    const observation = this.#world.observe();
+    const cut = await this.#capturePhysicalCut();
+    if (observation.frame !== cut.world.frame
+      || observation.worldRevision !== cut.world.worldRevision) {
+      throw new Error("Grounding observation is not aligned with physical authority");
+    }
+    this.#applyPhysicalCut(cut);
+    const activeGoal = this.#activeGoal();
+    const grounding = groundHumanoidPhysicalExecution({
+      planningReceipt,
+      intent,
+      observation,
+      authorityStateSha256: cut.authority.stateSha256,
+      ...(activeGoal ? { activeGoal } : {})
+    });
+    if (!grounding.accepted) return grounding;
+    const trajectory = createPhysicalTrajectory(cut.world);
+    this.#physicalTrajectories.set(intent.transactionId, trajectory);
+    checkpoint.action_execution_ledger = stageActionExecutionIntent(
+      checkpoint.action_execution_ledger,
+      {
+        runId: this.#runId,
+        transactionId: intent.transactionId,
+        agentId: intent.agentId,
+        action: intent.action,
+        actionFingerprint: intent.fingerprint,
+        cycle,
+        planningTransactionId: intent.planningTransactionId,
+        planId: intent.planId,
+        worldFrame: cut.world.frame,
+        worldRevision: cut.world.worldRevision,
+        authorityStateSha256: cut.authority.stateSha256,
+        physicalCheckpointSha256: physicalCheckpointSha256(cut),
+        decision: intent.decision,
+        toolCallAuthority,
+        physicalTrajectory: trajectory,
+        groundingReceipt: grounding
+      }
+    );
     await this.#persist();
+    return grounding;
   }
 
   async normalizeReceipt(
@@ -185,6 +243,14 @@ export class HumanoidPhysicalExecutionRuntime {
       );
     }
     detail.physical_trajectory = json(trajectory);
+    if (current.admission.grounding_receipt) {
+      detail.grounding_receipt = json(current.admission.grounding_receipt);
+    }
+    if (current.progress.completed_plan_terminals.length > 0) {
+      detail.completed_plan_terminals = json(
+        current.progress.completed_plan_terminals
+      );
+    }
     return {
       ...receipt,
       worldBeforeRevision: current.admission.world_revision,
@@ -245,15 +311,15 @@ export class HumanoidPhysicalExecutionRuntime {
   ): Promise<void> {
     const checkpoint = this.#checkpoint();
     const advanced = this.#advanceGoal(frame);
-    checkpoint.world = structuredClone(frame);
-    checkpoint.goal_progress = advanced?.progress ?? null;
-    checkpoint.checker = advanced?.checker ?? null;
     if (source === "stationary") {
       if (frame.robot.simulatedTime - this.#lastStationaryCheckpointSimulationTime
         >= STATIONARY_CHECKPOINT_INTERVAL_SECONDS) {
         const cut = await this.#capturePhysicalCut();
+        const durableAdvance = this.#advanceGoal(cut.world);
         this.#applyPhysicalCut(cut);
-        await this.#persist();
+        checkpoint.goal_progress = durableAdvance?.progress ?? null;
+        checkpoint.checker = durableAdvance?.checker ?? null;
+        await this.#persist(false);
         this.#lastStationaryCheckpointSimulationTime =
           cut.world.robot.simulatedTime;
       }
@@ -264,7 +330,10 @@ export class HumanoidPhysicalExecutionRuntime {
       }
       this.#recordTrajectoryFrame(entry, frame);
       const cut = await this.#capturePhysicalCut();
+      const durableAdvance = this.#advanceGoal(cut.world);
       this.#applyPhysicalCut(cut);
+      checkpoint.goal_progress = durableAdvance?.progress ?? null;
+      checkpoint.checker = durableAdvance?.checker ?? null;
       await this.#persistExecutionCut(cut);
     }
     if (this.#signal?.aborted) return;
@@ -297,15 +366,28 @@ export class HumanoidPhysicalExecutionRuntime {
     for (const entry of staged) {
       if (checkpoint.action_commit_outbox.pending[entry.transaction_id]) continue;
       const action = object(entry.action_record);
-      if (action.action !== "execute_whole_body_motion"
-        && action.action !== "execute_humanoid_navigation") continue;
       const detail = object(action.detail ?? null);
-      const planId = detail.plan_id;
-      const resultSha256 = detail.terminal_result_sha256;
-      if (typeof planId !== "string" || typeof resultSha256 !== "string") continue;
-      changed = action.action === "execute_whole_body_motion"
-        ? await this.#world.acknowledgeWholeBodyMotion(planId, resultSha256) || changed
-        : await this.#world.acknowledgeNavigation(planId, resultSha256) || changed;
+      const durableTerminals = checkpoint.action_execution_ledger.active[
+        entry.transaction_id
+      ]?.progress.completed_plan_terminals ?? [];
+      const terminals = durableTerminals.length > 0
+        ? durableTerminals.map((terminal) => ({
+            kind: terminal.kind,
+            planId: terminal.plan_id,
+            resultSha256: terminal.result_sha256
+          }))
+        : physicalPlanTerminals(action.action, detail);
+      for (const terminal of terminals) {
+        changed = terminal.kind === "motion"
+          ? await this.#world.acknowledgeWholeBodyMotion(
+              terminal.planId,
+              terminal.resultSha256
+            ) || changed
+          : await this.#world.acknowledgeNavigation(
+              terminal.planId,
+              terminal.resultSha256
+            ) || changed;
+      }
       this.#physicalTrajectories.delete(entry.transaction_id);
     }
     if (!changed) return;
@@ -373,7 +455,12 @@ export class HumanoidPhysicalExecutionRuntime {
       || entry.action_fingerprint_sha256
         !== actionExecutionFingerprintSha256(intent.fingerprint)
       || entry.admission.planning_transaction_id !== intent.planningTransactionId
-      || entry.admission.plan_id !== intent.planId) {
+      || entry.admission.plan_id !== intent.planId
+      || !intent.decision
+      || !intent.toolAuthority
+      || JSON.stringify(entry.admission.decision) !== JSON.stringify(intent.decision)
+      || JSON.stringify(entry.admission.tool_call_authority)
+        !== JSON.stringify(intent.toolAuthority)) {
       throw new Error(
         `Physical execution retry conflicts with durable intent: ${intent.transactionId}`
       );
@@ -410,7 +497,8 @@ export class HumanoidPhysicalExecutionRuntime {
         worldRevision: cut.world.worldRevision,
         authorityStateSha256: cut.authority.stateSha256,
         physicalCheckpointSha256: physicalCheckpointSha256(cut),
-        physicalTrajectory: this.#requiredTrajectory(entry, cut.world)
+        physicalTrajectory: this.#requiredTrajectory(entry, cut.world),
+        completedPlanTerminals: completedExecutionPlanTerminals(entry, cut)
       }
     );
   }
@@ -440,12 +528,25 @@ export class HumanoidPhysicalExecutionRuntime {
       );
     }
     const planId = entry.admission.plan_id;
-    const motion = cut.worldCheckpoint.motions.find((candidate) => (
-      candidate.plan.id === planId
-    ));
-    const route = cut.worldCheckpoint.routes.find((candidate) => (
-      candidate.id === planId
-    ));
+    const activeSkillCallId = executionSkillCallId(entry, cut);
+    const motion = activeSkillCallId === undefined
+      ? cut.worldCheckpoint.motions.find(({ plan }) => plan.id === planId)
+      : cut.worldCheckpoint.motions.find((candidate) => (
+          candidate.skillCallIdentity?.callId === activeSkillCallId
+          && candidate.terminal === null
+        )) ?? [...cut.worldCheckpoint.motions].reverse().find((candidate) => (
+          candidate.skillCallIdentity?.callId === activeSkillCallId
+          && candidate.terminal?.final_world_revision === cut.world.worldRevision
+        ));
+    const route = activeSkillCallId === undefined
+      ? cut.worldCheckpoint.routes.find(({ id }) => id === planId)
+      : cut.worldCheckpoint.routes.find((candidate) => (
+          candidate.skillCallIdentity?.callId === activeSkillCallId
+          && candidate.terminal === null
+        )) ?? [...cut.worldCheckpoint.routes].reverse().find((candidate) => (
+          candidate.skillCallIdentity?.callId === activeSkillCallId
+          && candidate.terminal?.final_world_revision === cut.world.worldRevision
+        ));
     const expectsMotion = entry.action === "execute_whole_body_motion";
     const expectsRoute = entry.action === "execute_humanoid_navigation";
     const matchedPlanCount = Number(Boolean(motion)) + Number(Boolean(route));
@@ -457,11 +558,15 @@ export class HumanoidPhysicalExecutionRuntime {
       );
     }
     const planProgressRevision = motion
-      ? (motion.validatedRevision ?? motion.createdRevision)
-        + motion.progress.nextFrameIndex
-      : route?.progress
-        ? (route.validatedRevision ?? route.createdRevision)
-          + route.progress.committed_frame_count
+      ? motion.terminal?.final_world_revision
+        ?? (motion.validatedRevision ?? motion.createdRevision)
+          + motion.progress.nextFrameIndex
+      : route
+        ? route.terminal?.final_world_revision
+          ?? (route.progress
+            ? (route.validatedRevision ?? route.createdRevision)
+              + route.progress.committed_frame_count
+            : undefined)
         : undefined;
     if (planProgressRevision !== cut.world.worldRevision) {
       throw new Error(
@@ -524,4 +629,140 @@ export class HumanoidPhysicalExecutionRuntime {
     checkpoint.world = structuredClone(cut.world);
     checkpoint.world_checkpoint = structuredClone(cut.worldCheckpoint);
   }
+}
+
+function executionSkillCallId(
+  entry: ActionExecutionLedgerEntry,
+  cut: HumanoidPersistenceCut
+): string | undefined {
+  const admissionMotion = cut.worldCheckpoint.motions.find(
+    ({ plan }) => plan.id === entry.admission.plan_id
+  );
+  const admissionRoute = cut.worldCheckpoint.routes.find(
+    ({ id }) => id === entry.admission.plan_id
+  );
+  const last = entry.progress.completed_plan_terminals.at(-1);
+  const completedMotion = last?.kind === "motion"
+    ? cut.worldCheckpoint.motions.find(({ plan }) => plan.id === last.plan_id)
+    : undefined;
+  const completedRoute = last?.kind === "navigation"
+    ? cut.worldCheckpoint.routes.find(({ id }) => id === last.plan_id)
+    : undefined;
+  return admissionMotion?.skillCallIdentity?.callId
+    ?? admissionRoute?.skillCallIdentity?.callId
+    ?? completedMotion?.skillCallIdentity?.callId
+    ?? completedRoute?.skillCallIdentity?.callId;
+}
+
+function completedExecutionPlanTerminals(
+  entry: ActionExecutionLedgerEntry,
+  cut: HumanoidPersistenceCut
+): ActionExecutionLedgerEntry["progress"]["completed_plan_terminals"] {
+  if (entry.action !== "execute_humanoid_skill") {
+    return entry.progress.completed_plan_terminals;
+  }
+  const callId = executionSkillCallId(entry, cut);
+  if (!callId) return entry.progress.completed_plan_terminals;
+  return [
+    ...cut.worldCheckpoint.motions.flatMap((motion) => (
+      motion.skillCallIdentity?.callId === callId && motion.terminal
+        ? [{
+            kind: "motion" as const,
+            plan_id: motion.plan.id,
+            result_sha256: motion.terminal.result_sha256,
+            final_frame: motion.terminal.final_frame,
+            final_world_revision: motion.terminal.final_world_revision
+          }]
+        : []
+    )),
+    ...cut.worldCheckpoint.routes.flatMap((route) => (
+      route.skillCallIdentity?.callId === callId && route.terminal
+        ? [{
+            kind: "navigation" as const,
+            plan_id: route.id,
+            result_sha256: route.terminal.result_sha256,
+            final_frame: route.terminal.final_frame,
+            final_world_revision: route.terminal.final_world_revision
+          }]
+        : []
+    ))
+  ].sort((left, right) => (
+    left.final_world_revision - right.final_world_revision
+      || left.plan_id.localeCompare(right.plan_id)
+  ));
+}
+
+interface PhysicalPlanTerminal {
+  kind: "motion" | "navigation";
+  planId: string;
+  resultSha256: string;
+}
+
+function physicalPlanTerminals(
+  action: unknown,
+  detail: Record<string, unknown>
+): PhysicalPlanTerminal[] {
+  if (action !== "execute_whole_body_motion"
+    && action !== "execute_humanoid_navigation"
+    && action !== "execute_humanoid_skill") return [];
+
+  const kind = action === "execute_humanoid_navigation"
+    || (action === "execute_humanoid_skill"
+      && detail.autonomous_plan_kind === "navigation")
+    ? "navigation"
+    : "motion";
+  const durable = Array.isArray(detail.completed_plan_terminals)
+    ? detail.completed_plan_terminals.flatMap((value): PhysicalPlanTerminal[] => {
+        const terminal = object(value);
+        return (terminal.kind === "motion" || terminal.kind === "navigation")
+          && typeof terminal.plan_id === "string"
+          && typeof terminal.result_sha256 === "string"
+          ? [{
+              kind: terminal.kind,
+              planId: terminal.plan_id,
+              resultSha256: terminal.result_sha256
+            }]
+          : [];
+      })
+    : [];
+  const result = unknownRecord(detail.result);
+  const horizon = unknownRecord(result.articulation_horizon);
+  const segments = Array.isArray(horizon.segments) ? horizon.segments : [];
+  const terminals = durable.length > 0 ? durable : segments.flatMap(
+    (value): PhysicalPlanTerminal[] => {
+    const segment = object(value);
+    return typeof segment.plan_id === "string"
+      && typeof segment.terminal_result_sha256 === "string"
+      ? [{
+          kind: "motion",
+          planId: segment.plan_id,
+          resultSha256: segment.terminal_result_sha256
+        }]
+      : [];
+    });
+  if (terminals.length === 0
+    && typeof detail.plan_id === "string"
+    && typeof detail.terminal_result_sha256 === "string") {
+    terminals.push({
+      kind,
+      planId: detail.plan_id,
+      resultSha256: detail.terminal_result_sha256
+    });
+  }
+  const unique = new Map<string, PhysicalPlanTerminal>();
+  for (const terminal of terminals) {
+    const key = `${terminal.kind}:${terminal.planId}`;
+    const previous = unique.get(key);
+    if (previous && previous.resultSha256 !== terminal.resultSha256) {
+      throw new Error(`Conflicting physical terminal evidence: ${terminal.planId}`);
+    }
+    unique.set(key, terminal);
+  }
+  return [...unique.values()];
+}
+
+function unknownRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
 }

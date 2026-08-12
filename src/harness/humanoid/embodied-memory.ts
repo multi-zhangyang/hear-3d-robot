@@ -2,6 +2,7 @@ import {
   HumanoidEmbodiedEpisodeSchema,
   HumanoidEmbodiedExperienceSchema,
   HumanoidEmbodiedMemoryStateSchema,
+  humanoidActionReceiptEntriesInCommitOrder,
   type HumanoidEmbodiedEpisode,
   type HumanoidEmbodiedExperience,
   type HumanoidEmbodiedMemoryState
@@ -359,14 +360,16 @@ export function recentEmbodiedExperiences(
   return structuredClone(parsed.recent_experiences.slice(-limit));
 }
 
-export function retainRecentActionReceipts<T>(
+export function retainRecentActionReceipts<
+  T extends { commitSequence?: number | undefined }
+>(
   receipts: Readonly<Record<string, T>>,
   limit = MAX_CHECKPOINT_ACTION_RECEIPTS
 ): { receipts: Record<string, T>; removed: number } {
   if (!Number.isSafeInteger(limit) || limit <= 0) {
     throw new Error("Action receipt checkpoint limit must be a positive integer");
   }
-  const entries = Object.entries(receipts);
+  const entries = humanoidActionReceiptEntriesInCommitOrder(receipts);
   const retained = entries.slice(-limit).map(([id, receipt]) => (
     [id, structuredClone(receipt)] as const
   ));

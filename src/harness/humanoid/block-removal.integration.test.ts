@@ -574,23 +574,49 @@ async function authorizeAction(
   transactionId: string,
   agentId: string
 ): Promise<HumanoidActionToolCallAuthority> {
-  const modelCallId = await runtime.recordModelCallStarted(agentId);
-  const argumentsSha256 = modelPayloadSha256(actionInput);
+  const sourceInput = agentId === HUMANOID_AGENT_IDS.sentry
+    && action === "observe_humanoid"
+    ? {}
+    : {
+        objective: "提交已有稳定接触证明的方块拆除事务",
+        execution: {
+          kind: "remove_world_block",
+          solid_id: (actionInput as { solid_id: string }).solid_id,
+          execution_transaction_id:
+            (actionInput as { execution_transaction_id: string })
+              .execution_transaction_id
+        }
+      };
+  const toolName = agentId === HUMANOID_AGENT_IDS.sentry
+    ? "delegate_humanoid_sentry"
+    : "delegate_physics_executor";
+  const contractId = agentId === HUMANOID_AGENT_IDS.sentry
+    ? "grounding_monitor_v1" as const
+    : "execution_gate_v1" as const;
+  const modelCallId = await runtime.recordModelCallStarted(
+    HUMANOID_AGENT_IDS.coordinator
+  );
+  const argumentsSha256 = modelPayloadSha256(sourceInput);
   await runtime.recordModelCallCompleted({
     modelCallId,
-    agentId,
+    agentId: HUMANOID_AGENT_IDS.coordinator,
     responseId: `response-${modelCallId}`,
     responseOutputSha256: modelPayloadSha256({ modelCallId, transactionId }),
     toolCalls: [{
       toolCallId: transactionId,
-      toolName: action,
+      toolName,
       argumentsSha256
     }]
   });
   return {
     tool_call_id: transactionId,
-    tool_name: action,
-    arguments_sha256: argumentsSha256
+    tool_name: toolName,
+    arguments_sha256: argumentsSha256,
+    deterministic_delegation: {
+      contract_id: contractId,
+      source_input: sourceInput,
+      action_input_sha256: modelPayloadSha256(actionInput)
+    }
   };
 }
 

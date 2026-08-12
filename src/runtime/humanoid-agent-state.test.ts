@@ -10,6 +10,7 @@ import {
 } from "vitest";
 import { EmptyActionCommitOutbox } from "../domain/action-commit-outbox.js";
 import { EmptyActionExecutionLedger } from "../domain/action-execution-ledger.js";
+import { EmptyContextMemoryState } from "../domain/schema.js";
 import { FileSession } from "../persistence/file-session.js";
 import {
   captureHumanoidSessionBaseline,
@@ -326,7 +327,10 @@ function checkpoint(): FingerprintFixture {
     committed_actions: { "motion-1": {} },
     action_commit_outbox: structuredClone(EmptyActionCommitOutbox),
     action_execution_ledger: structuredClone(EmptyActionExecutionLedger),
-    context_memory: { total_compactions: 3 },
+    context_memory: {
+      ...structuredClone(EmptyContextMemoryState),
+      total_compactions: 3
+    },
     cycle_index: 7,
     active_cycle: { cycle_id: "cycle-1" }
   };

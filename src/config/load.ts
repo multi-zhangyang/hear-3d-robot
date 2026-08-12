@@ -136,6 +136,7 @@ export interface ServerConfig {
   port: number;
   password: string;
   runsDir: string;
+  densePolicyRolloutDir?: string;
 }
 
 export function loadEnvironment(path = resolve(process.cwd(), ".env")): void {
@@ -204,7 +205,11 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     host,
     port,
     password,
-    runsDir: resolve(env.HEAR_RUNS_DIR?.trim() || "runs")
+    runsDir: resolve(env.HEAR_RUNS_DIR?.trim() || "runs"),
+    densePolicyRolloutDir: resolve(
+      env.HEAR_DENSE_POLICY_ROLLOUT_DIR?.trim()
+        || "artifacts/training/harness-rollouts/dense"
+    )
   };
 }
 

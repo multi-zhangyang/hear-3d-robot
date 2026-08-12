@@ -101,6 +101,9 @@ export async function normalizeHumanoidRunCheckpoint(
         ...(state.handCommandTargets === undefined
           ? {}
           : { handCommandTargets: [...state.handCommandTargets] }),
+        handPolicyAuthority: state.handPolicyAuthority
+          ? structuredClone(state.handPolicyAuthority)
+          : null,
         controller: structuredClone(state.controller)
       }
     });
@@ -243,6 +246,9 @@ async function migratePreGraspV6(
         ...(state.handCommandTargets === undefined
           ? {}
           : { handCommandTargets: [...state.handCommandTargets] }),
+        handPolicyAuthority: state.handPolicyAuthority
+          ? structuredClone(state.handPolicyAuthority)
+          : null,
         controller: structuredClone(state.controller)
       }
     });

@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import {
+  createHumanoidReplanBudget,
+  HumanoidReplanBudgetSchema,
+  type HumanoidReplanBudget
+} from "./humanoid-replan-budget.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const GOAL_EPOCH_PATTERN = /^goal-epoch:[a-f0-9]{64}$/;
@@ -17,7 +22,10 @@ export const AutonomousCycleRefSchema = z.object({
 export const ActiveAutonomousCycleSchema = AutonomousCycleRefSchema.extend({
   started_world_frame: z.number().int().nonnegative(),
   started_world_revision: z.number().int().nonnegative(),
-  started_at: z.string().datetime()
+  started_at: z.string().datetime(),
+  replan_budget: HumanoidReplanBudgetSchema.default(
+    () => createHumanoidReplanBudget()
+  )
 }).strict();
 
 export const EmbodiedMemoryIdSchema = z.string().regex(
@@ -34,6 +42,7 @@ export function createActiveAutonomousCycle(input: {
   worldRevision: number;
   cycleUuid?: string;
   startedAt?: string;
+  replanBudget?: HumanoidReplanBudget;
 }): ActiveAutonomousCycle {
   const cycleUuid = input.cycleUuid ?? randomUUID();
   if (!UUID_PATTERN.test(cycleUuid)) {
@@ -45,7 +54,8 @@ export function createActiveAutonomousCycle(input: {
     goal_epoch_id: input.goalEpochId,
     started_world_frame: input.worldFrame,
     started_world_revision: input.worldRevision,
-    started_at: input.startedAt ?? new Date().toISOString()
+    started_at: input.startedAt ?? new Date().toISOString(),
+    replan_budget: input.replanBudget ?? createHumanoidReplanBudget()
   });
 }
 

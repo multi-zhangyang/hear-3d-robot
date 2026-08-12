@@ -9,6 +9,8 @@ import {
   modelPayloadSha256,
   type ModelDecisionRef
 } from "../../domain/model-call-authority.js";
+import type { HumanoidGroundingReceipt } from
+  "../../domain/humanoid-grounding.js";
 import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
 import { yawFromQuaternion } from "../../world/geometry.js";
@@ -17,10 +19,13 @@ import type { HumanoidBodyChannel } from "../../world/humanoid/motion-plan.js";
 import {
   type HumanoidFrameSink,
   type HumanoidPersistenceSink,
+  type HumanoidSkillEventSink,
   type HumanoidWorld,
   type HumanoidWorldObservation,
   type HumanoidWorldSnapshot
 } from "../../world/humanoid/world.js";
+import type { HumanoidPolicyFrameSink } from
+  "../../world/humanoid/simulation.js";
 import {
   HumanoidActionInputs,
   type HumanoidActionName
@@ -39,6 +44,7 @@ import {
 import {
   bindHumanoidSkill,
   ActiveHumanoidSkillBindingSchema,
+  humanoidEmbodiedSkillIdentity,
   validateSkillPlanningReference,
   type ActiveHumanoidSkillBinding
 } from "./skill-binding.js";
@@ -60,6 +66,18 @@ import {
   executeHumanoidArticulationHorizon,
   isHumanoidArticulationActuation
 } from "./articulation-horizon-executor.js";
+import {
+  HUMANOID_ARTICULATION_HORIZON,
+  humanoidArticulationSegmentBudgetExhausted
+} from "./articulation-control.js";
+import { HumanoidSkillEventStream } from
+  "../../world/humanoid/skill-event-stream.js";
+import {
+  restoreHumanoidSkillEventStreamStates,
+  type HumanoidSkillEventStreamState
+} from "../../world/humanoid/skill-event-stream.js";
+import type { HumanoidEmbodiedSkillEvent } from
+  "../../world/humanoid/embodied-skill-call.js";
 
 type HumanoidPlanningActionName = "plan_humanoid_skill"
   | "plan_whole_body_motion"
@@ -87,7 +105,7 @@ interface RepeatedPlanningFailure {
   lastCode: string;
 }
 
-const HumanoidActionRuntimeStateSchema = z.object({
+export const HumanoidActionRuntimeStateSchema = z.object({
   version: z.literal(1),
   latest_physical_execution_revision: z.number().int().nonnegative(),
   skill_plans: z.array(RegisteredHumanoidSkillPlanSchema),
@@ -169,17 +187,25 @@ export interface HumanoidPhysicalExecutionIntent {
   fingerprint: string;
   planningTransactionId: string;
   planId: string;
+  decision?: ModelDecisionRef;
+  toolAuthority?: HumanoidActionToolCallAuthority;
 }
 
 export interface HumanoidActionToolCallAuthority {
   tool_call_id: string;
   tool_name: string;
   arguments_sha256: string;
-  normalized_arguments_sha256?: string;
+  normalized_arguments_sha256?: string | undefined;
+  deterministic_delegation?: {
+    contract_id: "grounding_monitor_v1" | "execution_gate_v1";
+    source_input: JsonValue;
+    action_input_sha256: string;
+  };
 }
 
 export interface HumanoidActionInvocationOptions {
   signal?: AbortSignal;
+  toolAuthority?: HumanoidActionToolCallAuthority;
 }
 
 export interface HumanoidActionInvoker {
@@ -212,16 +238,23 @@ export interface HumanoidActionReceipt {
   frameCount: number;
   channels: HumanoidBodyChannel[];
   detail: JsonValue;
+  commitSequence?: number | undefined;
   committedAt: string;
 }
 
 export interface HumanoidActionRuntimeOptions {
   frameSink?: HumanoidFrameSink;
+  policyFrameSink?: HumanoidPolicyFrameSink;
   physicalFrameSink?: HumanoidPersistenceSink;
+  physicalExecutionFrameOffset?: (transactionId: string) => number;
+  completedPhysicalPlanFrameCount?: (transactionId: string) => number;
+  completedPhysicalPlanCount?: (transactionId: string) => number;
+  skillEventSink?: HumanoidSkillEventSink;
   receiptSink?: (receipt: HumanoidActionReceipt) => void | Promise<void>;
   beforePhysicalExecution?: (
     intent: HumanoidPhysicalExecutionIntent
-  ) => void | Promise<void>;
+  ) => HumanoidGroundingReceipt | undefined
+    | Promise<HumanoidGroundingReceipt | undefined>;
   receiptNormalizer?: (
     receipt: HumanoidActionReceipt
   ) => HumanoidActionReceipt | Promise<HumanoidActionReceipt>;
@@ -243,7 +276,18 @@ export interface HumanoidActionRuntimeOptions {
 export class HumanoidActionRuntime {
   readonly #world: HumanoidWorld;
   readonly #frameSink: HumanoidFrameSink | undefined;
+  readonly #policyFrameSink: HumanoidPolicyFrameSink | undefined;
   readonly #physicalFrameSink: HumanoidPersistenceSink | undefined;
+  readonly #physicalExecutionFrameOffset: NonNullable<
+    HumanoidActionRuntimeOptions["physicalExecutionFrameOffset"]
+  >;
+  readonly #completedPhysicalPlanFrameCount: NonNullable<
+    HumanoidActionRuntimeOptions["completedPhysicalPlanFrameCount"]
+  >;
+  readonly #completedPhysicalPlanCount: NonNullable<
+    HumanoidActionRuntimeOptions["completedPhysicalPlanCount"]
+  >;
+  readonly #skillEventSink: HumanoidSkillEventSink | undefined;
   readonly #receiptSink: HumanoidActionRuntimeOptions["receiptSink"];
   readonly #beforePhysicalExecution: HumanoidActionRuntimeOptions[
     "beforePhysicalExecution"
@@ -259,6 +303,8 @@ export class HumanoidActionRuntime {
   readonly #transactions = new Map<string, {
     fingerprint: string;
     decisionSha256: string | undefined;
+    toolAuthoritySha256: string | undefined;
+    toolAuthority: HumanoidActionToolCallAuthority | undefined;
     promise: Promise<HumanoidActionReceipt>;
   }>();
   readonly #receiptCommits = new Map<string, Promise<void>>();
@@ -292,12 +338,28 @@ export class HumanoidActionRuntime {
     RepeatedPlanningFailure
   >();
   readonly #latestPlanningFailureKeyByAgent = new Map<string, string>();
+  readonly #restoredSkillEventStateByCallId = new Map<
+    string,
+    HumanoidSkillEventStreamState
+  >();
+  readonly #skillEventStreamByCallId = new Map<
+    string,
+    HumanoidSkillEventStream
+  >();
   #latestPhysicalExecutionRevision = 0;
 
   constructor(world: HumanoidWorld, options: HumanoidActionRuntimeOptions = {}) {
     this.#world = world;
     this.#frameSink = options.frameSink;
+    this.#policyFrameSink = options.policyFrameSink;
     this.#physicalFrameSink = options.physicalFrameSink;
+    this.#physicalExecutionFrameOffset = options.physicalExecutionFrameOffset
+      ?? (() => 0);
+    this.#completedPhysicalPlanFrameCount = options.completedPhysicalPlanFrameCount
+      ?? (() => 0);
+    this.#completedPhysicalPlanCount = options.completedPhysicalPlanCount
+      ?? (() => 0);
+    this.#skillEventSink = options.skillEventSink;
     this.#receiptSink = options.receiptSink;
     this.#beforePhysicalExecution = options.beforePhysicalExecution;
     this.#receiptNormalizer = options.receiptNormalizer;
@@ -353,6 +415,8 @@ export class HumanoidActionRuntime {
         decisionSha256: receipt.decision
           ? modelPayloadSha256(receipt.decision)
           : undefined,
+        toolAuthoritySha256: undefined,
+        toolAuthority: undefined,
         promise: Promise.resolve(receipt)
       });
       if (receipt.accepted
@@ -400,6 +464,30 @@ export class HumanoidActionRuntime {
         requirement: structuredClone(requirement)
       }))
     }));
+  }
+
+  restoreSkillEventJournal(
+    events: readonly HumanoidEmbodiedSkillEvent[]
+  ): void {
+    const restored = restoreHumanoidSkillEventStreamStates(events);
+    this.#restoredSkillEventStateByCallId.clear();
+    this.#skillEventStreamByCallId.clear();
+    for (const [callId, state] of restored) {
+      this.#restoredSkillEventStateByCallId.set(
+        callId,
+        structuredClone(state)
+      );
+    }
+  }
+
+  skillEventRecoveryCallIds(
+    planningTransactionIds?: ReadonlySet<string>
+  ): Set<string> {
+    return new Set([...this.#skillByPlanningTransactionId]
+      .filter(([planningTransactionId]) => (
+        planningTransactionIds?.has(planningTransactionId) ?? true
+      ))
+      .map(([, binding]) => humanoidEmbodiedSkillIdentity(binding).callId));
   }
 
   #restoreState(rawState: JsonValue): void {
@@ -456,6 +544,13 @@ export class HumanoidActionRuntime {
   receipt(transactionId: string): HumanoidActionReceipt | undefined {
     const receipt = this.#receipts.get(transactionId);
     return receipt ? structuredClone(receipt) : undefined;
+  }
+
+  toolCallAuthority(
+    transactionId: string
+  ): HumanoidActionToolCallAuthority | undefined {
+    const authority = this.#transactions.get(transactionId.trim())?.toolAuthority;
+    return authority ? structuredClone(authority) : undefined;
   }
 
   isActionAvailable(name: HumanoidActionName, agentId: string): boolean {
@@ -606,10 +701,14 @@ export class HumanoidActionRuntime {
     if (!normalizedAgentId) throw new Error("Humanoid action agent id is required");
     const fingerprint = humanoidActionFingerprint(name, normalizedAgentId, rawInput);
     const decisionSha256 = decision ? modelPayloadSha256(decision) : undefined;
+    const toolAuthoritySha256 = options.toolAuthority
+      ? modelPayloadSha256(options.toolAuthority)
+      : undefined;
     const existing = this.#transactions.get(normalizedTransactionId);
     if (existing) {
       if (existing.fingerprint !== fingerprint
-        || existing.decisionSha256 !== decisionSha256) {
+        || existing.decisionSha256 !== decisionSha256
+        || existing.toolAuthoritySha256 !== toolAuthoritySha256) {
         throw new Error(
           `Humanoid action transaction conflict: ${normalizedTransactionId}`
         );
@@ -632,11 +731,15 @@ export class HumanoidActionRuntime {
       normalizedAgentId,
       fingerprint,
       decision,
-      options.signal
+      options
     );
     this.#transactions.set(normalizedTransactionId, {
       fingerprint,
       decisionSha256,
+      toolAuthoritySha256,
+      toolAuthority: options.toolAuthority
+        ? structuredClone(options.toolAuthority)
+        : undefined,
       promise
     });
     try {
@@ -696,14 +799,16 @@ export class HumanoidActionRuntime {
     agentId: string,
     fingerprint: string,
     decision: ModelDecisionRef | undefined,
-    signal: AbortSignal | undefined
+    options: HumanoidActionInvocationOptions
   ): Promise<HumanoidActionReceipt> {
     const before = this.#world.snapshot();
     const result = await this.#execute(name, rawInput, {
       transactionId,
       agentId,
       fingerprint,
-      ...(signal ? { signal } : {})
+      ...(decision ? { decision } : {}),
+      ...(options.toolAuthority ? { toolAuthority: options.toolAuthority } : {}),
+      ...(options.signal ? { signal: options.signal } : {})
     });
     const after = this.#world.snapshot();
     const baseReceipt: HumanoidActionReceipt = {
@@ -1037,6 +1142,8 @@ export class HumanoidActionRuntime {
       transactionId: string;
       agentId: string;
       fingerprint: string;
+      decision?: ModelDecisionRef;
+      toolAuthority?: HumanoidActionToolCallAuthority;
       signal?: AbortSignal;
     }
   ): Promise<{
@@ -1368,7 +1475,9 @@ export class HumanoidActionRuntime {
         };
       }
       if (plan.kind === "motion") {
-        const result = await this.#world.planWholeBodyMotionCandidates(plan.batch);
+        const result = await this.#world.planWholeBodyMotionCandidates(plan.batch, {
+          skillCallIdentity: humanoidEmbodiedSkillIdentity(binding)
+        });
         if (result.accepted) this.#planChannels.set(result.planId, result.channels);
         return {
           accepted: result.accepted,
@@ -1418,7 +1527,8 @@ export class HumanoidActionRuntime {
         const result = await this.#world.planNavigation(
           candidate.target,
           candidate.arrivalHeading,
-          candidate.acceptedPositionToleranceMeters ?? null
+          candidate.acceptedPositionToleranceMeters ?? null,
+          { skillCallIdentity: humanoidEmbodiedSkillIdentity(binding) }
         );
         attempts.push({
           target: { ...candidate.target },
@@ -1513,29 +1623,97 @@ export class HumanoidActionRuntime {
           }
         };
       }
-      await this.#beforePhysicalExecution?.({
+      const grounding = await this.#beforePhysicalExecution?.({
         transactionId: invocation.transactionId,
         agentId: invocation.agentId,
         action: name,
         fingerprint: invocation.fingerprint,
         planningTransactionId: input.planning_transaction_id,
-        planId: reference.planId
+        planId: reference.planId,
+        ...(invocation.decision ? { decision: invocation.decision } : {}),
+        ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {})
       });
+      if (grounding && !grounding.accepted) {
+        return groundingRejection({
+          grounding,
+          channels,
+          planningTransactionId: input.planning_transaction_id,
+          planId: reference.planId,
+          planKind
+        });
+      }
       const executionSignal = combineExecutionSignals(
         this.#signal,
         invocation.signal
       );
+      const skill = this.#skillByPlanningTransactionId.get(
+        input.planning_transaction_id
+      );
+      const skillEventStream = skill
+        ? this.#skillEventStream(humanoidEmbodiedSkillIdentity(skill))
+        : null;
+      const articulationHorizon = isHumanoidArticulationActuation(skill)
+        ? skillEventStream
+        : null;
+      const skillFrameOffset = articulationHorizon
+        ? this.#physicalExecutionFrameOffset(invocation.transactionId)
+        : 0;
+      const completedPlanFrameCount = articulationHorizon
+        ? this.#completedPhysicalPlanFrameCount(invocation.transactionId)
+        : 0;
+      const completedPlanCount = articulationHorizon
+        ? this.#completedPhysicalPlanCount(invocation.transactionId)
+        : 0;
+      const continuationPlanId = articulationHorizon && skill
+        ? this.#world.pendingWholeBodyMotionPlanIdForSkillCall(
+            humanoidEmbodiedSkillIdentity(skill).callId
+          )
+        : undefined;
+      const resumeBetweenArticulationSegments = articulationHorizon !== null
+        && skillFrameOffset > 0
+        && continuationPlanId === undefined;
+      const articulationSegmentBudgetExhausted = articulationHorizon !== null
+        && humanoidArticulationSegmentBudgetExhausted(completedPlanCount);
+      const executionPlanId = continuationPlanId ?? reference.planId;
       const options = {
         realtime: this.#realtimeExecution,
         retainTerminal: this.#retainPhysicalTerminals,
         ...(this.#physicalFrameSink
           ? { persistenceSink: this.#physicalFrameSink }
           : {}),
+        ...(this.#skillEventSink
+          ? { skillEventSink: this.#skillEventSink }
+          : {}),
+        ...(skillEventStream ? { skillEventStream } : {}),
+        ...(articulationHorizon
+          ? {
+              deferSkillProgress: true,
+              deferSkillTerminal: true,
+              deferSkillControllerOutcome: true,
+              skillWindow: {
+                maximumSteps:
+                  HUMANOID_ARTICULATION_HORIZON.maximum_control_steps,
+                stepOffset: completedPlanFrameCount
+              }
+            }
+          : {}),
+        ...(this.#policyFrameSink
+          ? { policyFrameSink: this.#policyFrameSink }
+          : {}),
         ...(executionSignal ? { signal: executionSignal } : {})
       };
-      const initialResult = planKind === "motion"
+      const initialResult = resumeBetweenArticulationSegments
+        || articulationSegmentBudgetExhausted
+        ? {
+            accepted: true,
+            code: "motion_option_succeeded" as const,
+            frames: 0,
+            finalSnapshot: this.#world.snapshot(),
+            detail: {}
+          }
+        : planKind === "motion"
         ? await this.#world.executeWholeBodyMotion(
-            reference.planId,
+            executionPlanId,
             this.#frameSink,
             options
           )
@@ -1552,16 +1730,19 @@ export class HumanoidActionRuntime {
         terminalResultSha256?: string;
         detail: unknown;
       } = initialResult;
-      const skill = this.#skillByPlanningTransactionId.get(
-        input.planning_transaction_id
-      );
       if (planKind === "motion" && result.accepted
         && isHumanoidArticulationActuation(skill)) {
         result = await executeHumanoidArticulationHorizon({
           world: this.#world,
           binding: skill,
-          initialPlanId: reference.planId,
+          initialPlanId: resumeBetweenArticulationSegments
+            || articulationSegmentBudgetExhausted
+            ? null
+            : executionPlanId,
           initialExecution: initialResult,
+          skillEventStream: articulationHorizon!,
+          initialCommittedFrames: skillFrameOffset,
+          initialCompletedSegments: completedPlanCount,
           ...(this.#frameSink ? { frameSink: this.#frameSink } : {}),
           executionOptions: options
         });
@@ -1604,8 +1785,12 @@ export class HumanoidActionRuntime {
         ? manipulationBasePlacementMotionRejection([plan], placementRequirement)
         : null;
       if (placementRejection) return placementRejection;
+      const activeSkill = this.#activeSkillByAgent.get(invocation.agentId);
       const result = await this.#world.planWholeBodyMotion(plan, {
-        retainTerminalJointTracking: transitClearance !== undefined
+        retainTerminalJointTracking: transitClearance !== undefined,
+        ...(activeSkill
+          ? { skillCallIdentity: humanoidEmbodiedSkillIdentity(activeSkill) }
+          : {})
       });
       if (result.accepted) this.#planChannels.set(result.planId, result.channels);
       return {
@@ -1653,8 +1838,12 @@ export class HumanoidActionRuntime {
           )
         : null;
       if (placementRejection) return placementRejection;
+      const activeSkill = this.#activeSkillByAgent.get(invocation.agentId);
       const result = await this.#world.planWholeBodyMotionCandidates(batch, {
-        retainTerminalJointTracking: transitClearance !== undefined
+        retainTerminalJointTracking: transitClearance !== undefined,
+        ...(activeSkill
+          ? { skillCallIdentity: humanoidEmbodiedSkillIdentity(activeSkill) }
+          : {})
       });
       if (result.accepted) this.#planChannels.set(result.planId, result.channels);
       return {
@@ -1723,18 +1912,35 @@ export class HumanoidActionRuntime {
           }
         };
       }
-      await this.#beforePhysicalExecution?.({
+      const grounding = await this.#beforePhysicalExecution?.({
         transactionId: invocation.transactionId,
         agentId: invocation.agentId,
         action: name,
         fingerprint: invocation.fingerprint,
         planningTransactionId: input.planning_transaction_id,
-        planId: reference.planId
+        planId: reference.planId,
+        ...(invocation.decision ? { decision: invocation.decision } : {}),
+        ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {})
       });
+      if (grounding && !grounding.accepted) {
+        return groundingRejection({
+          grounding,
+          channels,
+          planningTransactionId: input.planning_transaction_id,
+          planId: reference.planId,
+          planningAction: reference.planningAction
+        });
+      }
       const executionSignal = combineExecutionSignals(
         this.#signal,
         invocation.signal
       );
+      const motionSkill = this.#skillByPlanningTransactionId.get(
+        input.planning_transaction_id
+      );
+      const motionSkillEventStream = motionSkill
+        ? this.#skillEventStream(humanoidEmbodiedSkillIdentity(motionSkill))
+        : null;
       const result = await this.#world.executeWholeBodyMotion(
         reference.planId,
         this.#frameSink,
@@ -1743,6 +1949,15 @@ export class HumanoidActionRuntime {
           retainTerminal: this.#retainPhysicalTerminals,
           ...(this.#physicalFrameSink
             ? { persistenceSink: this.#physicalFrameSink }
+            : {}),
+          ...(this.#skillEventSink
+            ? { skillEventSink: this.#skillEventSink }
+            : {}),
+          ...(motionSkillEventStream
+            ? { skillEventStream: motionSkillEventStream }
+            : {}),
+          ...(this.#policyFrameSink
+            ? { policyFrameSink: this.#policyFrameSink }
             : {}),
           ...(executionSignal ? { signal: executionSignal } : {})
         }
@@ -1781,9 +1996,14 @@ export class HumanoidActionRuntime {
         ? manipulationBasePlacementNavigationRejection(input, placementRequirement)
         : null;
       if (placementRejection) return placementRejection;
+      const activeSkill = this.#activeSkillByAgent.get(invocation.agentId);
       const result = await this.#world.planNavigation(
         input.target,
-        input.arrival_heading
+        input.arrival_heading,
+        null,
+        activeSkill
+          ? { skillCallIdentity: humanoidEmbodiedSkillIdentity(activeSkill) }
+          : {}
       );
       if (result.accepted) this.#planChannels.set(result.planId, ["locomotion"]);
       return {
@@ -1881,18 +2101,35 @@ export class HumanoidActionRuntime {
         }
       };
     }
-    await this.#beforePhysicalExecution?.({
+    const grounding = await this.#beforePhysicalExecution?.({
       transactionId: invocation.transactionId,
       agentId: invocation.agentId,
       action: name,
       fingerprint: invocation.fingerprint,
       planningTransactionId: input.planning_transaction_id,
-      planId: reference.planId
+      planId: reference.planId,
+      ...(invocation.decision ? { decision: invocation.decision } : {}),
+      ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {})
     });
+    if (grounding && !grounding.accepted) {
+      return groundingRejection({
+        grounding,
+        channels: ["locomotion"],
+        planningTransactionId: input.planning_transaction_id,
+        planId: reference.planId,
+        planningAction: reference.planningAction
+      });
+    }
     const executionSignal = combineExecutionSignals(
       this.#signal,
       invocation.signal
     );
+    const navigationSkill = this.#skillByPlanningTransactionId.get(
+      input.planning_transaction_id
+    );
+    const navigationSkillEventStream = navigationSkill
+      ? this.#skillEventStream(humanoidEmbodiedSkillIdentity(navigationSkill))
+      : null;
     const result = await this.#world.executeNavigation(
       reference.planId,
       this.#frameSink,
@@ -1901,6 +2138,15 @@ export class HumanoidActionRuntime {
         retainTerminal: this.#retainPhysicalTerminals,
         ...(this.#physicalFrameSink
           ? { persistenceSink: this.#physicalFrameSink }
+          : {}),
+        ...(this.#skillEventSink
+          ? { skillEventSink: this.#skillEventSink }
+          : {}),
+        ...(navigationSkillEventStream
+          ? { skillEventStream: navigationSkillEventStream }
+          : {}),
+        ...(this.#policyFrameSink
+          ? { policyFrameSink: this.#policyFrameSink }
           : {}),
         ...(executionSignal ? { signal: executionSignal } : {})
       }
@@ -1925,6 +2171,20 @@ export class HumanoidActionRuntime {
         final: conciseRobot(result.finalSnapshot.robot)
       }
     };
+  }
+
+  #skillEventStream(
+    identity: ReturnType<typeof humanoidEmbodiedSkillIdentity>
+  ): HumanoidSkillEventStream {
+    const existing = this.#skillEventStreamByCallId.get(identity.callId);
+    if (existing) return existing;
+    const stream = new HumanoidSkillEventStream(
+      identity,
+      this.#skillEventSink,
+      this.#restoredSkillEventStateByCallId.get(identity.callId)
+    );
+    this.#skillEventStreamByCallId.set(identity.callId, stream);
+    return stream;
   }
 
   #planningReference(
@@ -2865,6 +3125,35 @@ function jsonObject(value: JsonValue): Record<string, JsonValue> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value
     : undefined;
+}
+
+function groundingRejection(input: {
+  grounding: HumanoidGroundingReceipt;
+  channels: HumanoidBodyChannel[];
+  planningTransactionId: string;
+  planId: string;
+  planKind?: "motion" | "navigation";
+  planningAction?: HumanoidPlanningActionName;
+}): {
+  accepted: false;
+  code: "execution_grounding_rejected";
+  channels: HumanoidBodyChannel[];
+  detail: JsonValue;
+} {
+  return {
+    accepted: false,
+    code: "execution_grounding_rejected",
+    channels: [...input.channels],
+    detail: jsonValue({
+      planning_transaction_id: input.planningTransactionId,
+      plan_id: input.planId,
+      ...(input.planKind ? { autonomous_plan_kind: input.planKind } : {}),
+      ...(input.planningAction ? { planning_action: input.planningAction } : {}),
+      automatic_actuation: false,
+      failed_obligation_ids: input.grounding.failed_obligation_ids,
+      grounding_receipt: input.grounding
+    })
+  };
 }
 
 function rejectedPlanningReference(

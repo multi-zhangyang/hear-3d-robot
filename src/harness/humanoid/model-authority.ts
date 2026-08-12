@@ -15,6 +15,8 @@ import {
   sameAutonomousCycle,
   type AutonomousCycleRef
 } from "../../domain/autonomous-cycle.js";
+import type { HumanoidReplanModelCall } from
+  "../../domain/humanoid-replan-budget.js";
 import type {
   GoalHarnessValidation,
   GoalModelSource
@@ -25,11 +27,16 @@ import {
   type GoalEvidenceArtifact
 } from "./goal-evidence.js";
 
-interface ToolCallAuthority {
+export interface HumanoidModelToolCallAuthority {
   tool_call_id: string;
   tool_name: string;
   arguments_sha256: string;
-  normalized_arguments_sha256?: string;
+  normalized_arguments_sha256?: string | undefined;
+  deterministic_delegation?: {
+    contract_id: "grounding_monitor_v1" | "execution_gate_v1";
+    source_input: unknown;
+    action_input_sha256: string;
+  };
 }
 
 interface ManifestAuthority {
@@ -53,8 +60,9 @@ type FailedModelCall = Extract<
 
 export class HumanoidModelAuthority {
   readonly #goalManager: ManifestAuthority;
+  readonly #coordinator: ManifestAuthority;
   readonly #authorizedGoalManagers: readonly ManifestAuthority[];
-  readonly #actionAgents: ReadonlyMap<string, ManifestAuthority>;
+  readonly #actionAgents: ReadonlyMap<string, readonly ManifestAuthority[]>;
   readonly #appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
   readonly #started = new Map<string, StartedModelCall>();
   readonly #terminalIds = new Set<string>();
@@ -62,12 +70,14 @@ export class HumanoidModelAuthority {
 
   private constructor(input: {
     goalManager: ManifestAuthority;
+    coordinator: ManifestAuthority;
     authorizedGoalManagers: readonly ManifestAuthority[];
-    actionAgents: ReadonlyMap<string, ManifestAuthority>;
+    actionAgents: ReadonlyMap<string, readonly ManifestAuthority[]>;
     records: readonly ModelCallLifecycleRecord[];
     appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
   }) {
     this.#goalManager = input.goalManager;
+    this.#coordinator = input.coordinator;
     this.#authorizedGoalManagers = input.authorizedGoalManagers;
     this.#actionAgents = input.actionAgents;
     this.#appendRecord = input.appendRecord;
@@ -108,23 +118,56 @@ export class HumanoidModelAuthority {
       }
       goalAuthorityKeys.add(key);
     }
-    const actionAgents = new Map<string, ManifestAuthority>();
+    const actionAgents = new Map<string, ManifestAuthority[]>();
+    const addActionAgent = (
+      sourceManifest: AgentManifest,
+      agentId: string,
+      role: string
+    ): void => {
+      assertManifestNode(input.nodes, agentId, role);
+      const authority = manifestAuthority(sourceManifest, agentId);
+      const existing = actionAgents.get(agentId) ?? [];
+      if (!existing.some((candidate) => (
+        candidate.epochId === authority.epochId
+          && candidate.identitySha256 === authority.identitySha256
+      ))) {
+        existing.push(authority);
+        actionAgents.set(agentId, existing);
+      }
+    };
+    const coordinator = input.manifest.agents.coordinator;
+    const coordinatorAuthority = manifestAuthority(
+      input.manifest,
+      coordinator.agent_id
+    );
+    addActionAgent(input.manifest, coordinator.agent_id, "Coordinator");
     for (const role of ["sentry", "motion", "executor"] as const) {
       const agent = input.manifest.agents[role];
-      assertManifestNode(input.nodes, agent.agent_id, role);
       if (agent.agent_id === goalManager.agent_id || actionAgents.has(agent.agent_id)) {
         throw new Error(`Agent manifest reuses an authority identity: ${agent.agent_id}`);
       }
-      actionAgents.set(
-        agent.agent_id,
-        manifestAuthority(input.manifest, agent.agent_id)
+      addActionAgent(input.manifest, agent.agent_id, role);
+    }
+    for (const archived of input.archivedManifests ?? []) {
+      addActionAgent(
+        archived,
+        archived.agents.coordinator.agent_id,
+        "Archived Coordinator"
       );
+      for (const role of ["sentry", "motion", "executor"] as const) {
+        addActionAgent(
+          archived,
+          archived.agents[role].agent_id,
+          `Archived ${role}`
+        );
+      }
     }
     const records = input.records.map((record) => (
       ModelCallLifecycleRecordSchema.parse(record)
     ));
     return new HumanoidModelAuthority({
       goalManager: goalAuthority,
+      coordinator: coordinatorAuthority,
       authorizedGoalManagers,
       actionAgents,
       records,
@@ -136,7 +179,8 @@ export class HumanoidModelAuthority {
     agentId: string,
     cycle?: AutonomousCycleRef,
     modelCallId = randomUUID(),
-    at = new Date().toISOString()
+    at = new Date().toISOString(),
+    replanBudgetCall?: HumanoidReplanModelCall
   ): Promise<StartedModelCall> {
     const parsed = ModelCallLifecycleRecordSchema.parse({
       version: 1,
@@ -144,6 +188,9 @@ export class HumanoidModelAuthority {
       model_call_id: modelCallId,
       agent_id: agentId,
       ...(cycle ? { cycle } : {}),
+      ...(replanBudgetCall
+        ? { replan_budget_call: replanBudgetCall }
+        : {}),
       at
     });
     if (parsed.lifecycle !== "started") {
@@ -228,6 +275,10 @@ export class HumanoidModelAuthority {
     return structuredClone(record);
   }
 
+  startedCalls(): StartedModelCall[] {
+    return [...this.#started.values()].map((record) => structuredClone(record));
+  }
+
   goalHarness(input: {
     evidence: ReadonlyMap<string, GoalEvidenceArtifact>;
     scenario: Scenario;
@@ -269,7 +320,7 @@ export class HumanoidModelAuthority {
   }
 
   goalModelSource(
-    toolAuthority: ToolCallAuthority,
+    toolAuthority: HumanoidModelToolCallAuthority,
     expectedToolName: string,
     normalizedInput: unknown
   ): GoalModelSource {
@@ -318,36 +369,83 @@ export class HumanoidModelAuthority {
   }
 
   actionModelSource(input: {
-    toolAuthority: ToolCallAuthority;
+    toolAuthority: HumanoidModelToolCallAuthority;
     expectedToolName: HumanoidActionName;
     actionInput: unknown;
     transactionId: string;
     agentId: string;
   }): ModelDecisionRef {
     const transactionId = input.transactionId.trim();
-    const agentId = input.agentId.trim();
-    if (input.toolAuthority.tool_name !== input.expectedToolName
-      || input.toolAuthority.tool_call_id !== transactionId) {
+    const actorAgentId = input.agentId.trim();
+    if (input.toolAuthority.tool_call_id !== transactionId) {
       throw new Error(`Humanoid action tool authority mismatch: ${transactionId}`);
     }
     const normalizedArgumentsSha256 = modelPayloadSha256(input.actionInput);
-    if ((input.toolAuthority.normalized_arguments_sha256
-      ?? input.toolAuthority.arguments_sha256) !== normalizedArgumentsSha256) {
-      throw new Error(`Humanoid action tool arguments have no model authority: ${transactionId}`);
+    const delegation = input.toolAuthority.deterministic_delegation;
+    const requiredDelegation = requiredDeterministicDelegation(
+      input.expectedToolName,
+      actorAgentId
+    );
+    if (requiredDelegation && delegation?.contract_id !== requiredDelegation) {
+      throw new Error(
+        `Humanoid action requires Coordinator deterministic delegation: ${transactionId}`
+      );
     }
-    const manifest = this.#actionAgents.get(agentId);
+    const sourceAgentId = delegation
+      ? this.#deterministicDecisionSource({
+          contractId: delegation.contract_id,
+          sourceToolName: input.toolAuthority.tool_name,
+          action: input.expectedToolName,
+          actorAgentId
+        })
+      : actorAgentId;
+    if (delegation) {
+      const normalizedSourceArgumentsSha256 = modelPayloadSha256(
+        delegation.source_input
+      );
+      if ((input.toolAuthority.normalized_arguments_sha256
+        ?? input.toolAuthority.arguments_sha256) !== normalizedSourceArgumentsSha256) {
+        throw new Error(
+          `Deterministic humanoid delegation input has no model authority: ${transactionId}`
+        );
+      }
+      if (delegation.action_input_sha256 !== normalizedArgumentsSha256) {
+        throw new Error(
+          `Deterministic humanoid action input is not bound to its delegation: ${transactionId}`
+        );
+      }
+      this.#assertDeterministicActionMapping({
+        contractId: delegation.contract_id,
+        sourceToolName: input.toolAuthority.tool_name,
+        sourceInput: delegation.source_input,
+        action: input.expectedToolName,
+        actionInput: input.actionInput,
+        actorAgentId
+      });
+    } else {
+      if (input.toolAuthority.tool_name !== input.expectedToolName) {
+        throw new Error(`Humanoid action tool authority mismatch: ${transactionId}`);
+      }
+      if ((input.toolAuthority.normalized_arguments_sha256
+          ?? input.toolAuthority.arguments_sha256) !== normalizedArgumentsSha256) {
+        throw new Error(
+          `Humanoid action tool arguments have no model authority: ${transactionId}`
+        );
+      }
+    }
+    const manifest = this.#actionAgents.get(sourceAgentId)?.[0];
     if (!manifest) {
-      throw new Error(`Humanoid action Agent has no manifest authority: ${agentId}`);
+      throw new Error(`Humanoid action decision source has no manifest authority: ${sourceAgentId}`);
     }
     const authority = authorityForToolCall(
       this.#authorities,
-      agentId,
+      sourceAgentId,
       transactionId,
-      input.expectedToolName
+      input.toolAuthority.tool_name
     );
     const toolCall = authority?.tool_calls.find((entry) => (
       entry.tool_call_id === transactionId
-        && entry.tool_name === input.expectedToolName
+        && entry.tool_name === input.toolAuthority.tool_name
     ));
     if (!authority || !authority.cycle || !toolCall
       || toolCall.arguments_sha256 !== input.toolAuthority.arguments_sha256) {
@@ -356,7 +454,7 @@ export class HumanoidModelAuthority {
       );
     }
     return ModelDecisionRefSchema.parse({
-      agent_id: agentId,
+      agent_id: sourceAgentId,
       agent_manifest_sha256: manifest.identitySha256,
       agent_manifest_epoch_id: manifest.epochId,
       model_call_id: authority.model_call_id,
@@ -389,30 +487,160 @@ export class HumanoidModelAuthority {
     transactionId: string;
     agentId: string;
     cycle: AutonomousCycleRef;
+    toolAuthority?: HumanoidModelToolCallAuthority;
   }): void {
     const decision = ModelDecisionRefSchema.parse(input.rawDecision);
-    const manifest = this.#actionAgents.get(input.agentId);
+    const manifest = this.#actionAgents.get(decision.agent_id)?.find((candidate) => (
+      candidate.identitySha256 === decision.agent_manifest_sha256
+        && candidate.epochId === decision.agent_manifest_epoch_id
+    ));
     const authority = this.#authorities.get(decision.model_call_id);
     const toolCalls = authority?.tool_calls.filter((entry) => (
       entry.tool_call_id === input.transactionId
-        && entry.tool_name === input.expectedToolName
         && entry.arguments_sha256 === decision.tool_arguments_sha256
     ));
+    const sourceToolName = toolCalls?.length === 1 ? toolCalls[0]!.tool_name : undefined;
+    const requiredDelegation = requiredDeterministicDelegation(
+      input.expectedToolName,
+      input.agentId
+    );
+    const sourceAuthorized = requiredDelegation
+      ? sourceToolName !== undefined && this.#deterministicDecisionSource({
+          sourceToolName,
+          action: input.expectedToolName,
+          actorAgentId: input.agentId,
+          contractId: requiredDelegation
+        }) === decision.agent_id
+      : sourceToolName === input.expectedToolName
+        ? decision.agent_id === input.agentId
+        : sourceToolName !== undefined && this.#deterministicDecisionSource({
+            sourceToolName,
+            action: input.expectedToolName,
+            actorAgentId: input.agentId
+          }) === decision.agent_id;
     const normalizedArgumentsSha256 = modelPayloadSha256(input.actionInput);
+    if (requiredDelegation) {
+      const envelope = input.toolAuthority;
+      const delegation = envelope?.deterministic_delegation;
+      if (!envelope || !delegation
+        || envelope.tool_call_id !== input.transactionId
+        || envelope.tool_name !== sourceToolName
+        || envelope.arguments_sha256 !== decision.tool_arguments_sha256
+        || delegation.contract_id !== requiredDelegation
+        || modelPayloadSha256(delegation.source_input)
+          !== (envelope.normalized_arguments_sha256
+            ?? envelope.arguments_sha256)
+        || delegation.action_input_sha256 !== normalizedArgumentsSha256) {
+        throw new Error(
+          `Humanoid action decision has no durable deterministic delegation: ${input.transactionId}`
+        );
+      }
+      this.#assertDeterministicActionMapping({
+        contractId: delegation.contract_id,
+        sourceToolName: envelope.tool_name,
+        sourceInput: delegation.source_input,
+        action: input.expectedToolName,
+        actionInput: input.actionInput,
+        actorAgentId: input.agentId
+      });
+    }
     if (!manifest
-      || decision.agent_id !== input.agentId
       || decision.agent_manifest_sha256 !== manifest.identitySha256
       || decision.agent_manifest_epoch_id !== manifest.epochId
       || decision.tool_call_id !== input.transactionId
       || !authority
-      || authority.agent_id !== input.agentId
+      || authority.agent_id !== decision.agent_id
       || authority.response_id !== decision.response_id
       || authority.response_output_sha256 !== decision.response_output_sha256
       || !sameAutonomousCycle(authority.cycle, input.cycle)
       || toolCalls?.length !== 1
+      || !sourceAuthorized
       || (decision.normalized_tool_arguments_sha256
         ?? decision.tool_arguments_sha256) !== normalizedArgumentsSha256) {
       throw new Error(`Humanoid action decision is not authoritative: ${input.transactionId}`);
+    }
+  }
+
+  #deterministicDecisionSource(input: {
+    sourceToolName: string;
+    action: HumanoidActionName;
+    actorAgentId: string;
+    contractId?: "grounding_monitor_v1" | "execution_gate_v1";
+  }): string {
+    if (input.sourceToolName === "delegate_humanoid_sentry"
+      && input.actorAgentId === "humanoid-sentry"
+      && input.action === "observe_humanoid"
+      && (input.contractId === undefined
+        || input.contractId === "grounding_monitor_v1")) {
+      return this.#coordinator.agentId;
+    }
+    if (input.sourceToolName === "delegate_physics_executor"
+      && input.actorAgentId === "humanoid-executor"
+      && [
+        "execute_humanoid_skill",
+        "execute_whole_body_motion",
+        "execute_humanoid_navigation",
+        "remove_world_block"
+      ].includes(input.action)
+      && (input.contractId === undefined || input.contractId === "execution_gate_v1")) {
+      return this.#coordinator.agentId;
+    }
+    throw new Error(
+      `Humanoid deterministic delegation is not authoritative: ${input.sourceToolName}`
+    );
+  }
+
+  #assertDeterministicActionMapping(input: {
+    contractId: "grounding_monitor_v1" | "execution_gate_v1";
+    sourceToolName: string;
+    sourceInput: unknown;
+    action: HumanoidActionName;
+    actionInput: unknown;
+    actorAgentId: string;
+  }): void {
+    if (input.contractId === "grounding_monitor_v1") {
+      if (input.sourceToolName !== "delegate_humanoid_sentry"
+        || input.actorAgentId !== "humanoid-sentry"
+        || input.action !== "observe_humanoid"
+        || modelPayloadSha256(input.sourceInput) !== modelPayloadSha256({})
+        || modelPayloadSha256(input.actionInput) !== modelPayloadSha256({})) {
+        throw new Error("Grounding Monitor delegation changed its deterministic action");
+      }
+      return;
+    }
+    const source = objectRecord(input.sourceInput);
+    const execution = objectRecord(source?.execution);
+    if (input.sourceToolName !== "delegate_physics_executor"
+      || input.actorAgentId !== "humanoid-executor"
+      || !execution) {
+      throw new Error("Execution Gate delegation has no validated source input");
+    }
+    let expectedAction: HumanoidActionName | undefined;
+    let expectedInput: unknown;
+    if (execution.kind === "remove_world_block") {
+      expectedAction = "remove_world_block";
+      expectedInput = {
+        solid_id: execution.solid_id,
+        execution_transaction_id: execution.execution_transaction_id
+      };
+    } else if (execution.kind === "execute_plan") {
+      const actions: Record<string, HumanoidActionName> = {
+        plan_humanoid_skill: "execute_humanoid_skill",
+        plan_whole_body_motion: "execute_whole_body_motion",
+        plan_whole_body_motion_candidates: "execute_whole_body_motion",
+        plan_humanoid_navigation: "execute_humanoid_navigation"
+      };
+      expectedAction = typeof execution.planning_action === "string"
+        ? actions[execution.planning_action]
+        : undefined;
+      expectedInput = {
+        planning_transaction_id: execution.planning_transaction_id
+      };
+    }
+    if (!expectedAction
+      || input.action !== expectedAction
+      || modelPayloadSha256(input.actionInput) !== modelPayloadSha256(expectedInput)) {
+      throw new Error("Execution Gate delegation changed its deterministic action");
     }
   }
 
@@ -470,6 +698,24 @@ function manifestAuthority(
   };
 }
 
+function requiredDeterministicDelegation(
+  action: HumanoidActionName,
+  actorAgentId: string
+): "grounding_monitor_v1" | "execution_gate_v1" | undefined {
+  if (actorAgentId === "humanoid-sentry" && action === "observe_humanoid") {
+    return "grounding_monitor_v1";
+  }
+  if (actorAgentId === "humanoid-executor" && [
+    "execute_humanoid_skill",
+    "execute_whole_body_motion",
+    "execute_humanoid_navigation",
+    "remove_world_block"
+  ].includes(action)) {
+    return "execution_gate_v1";
+  }
+  return undefined;
+}
+
 function assertManifestNode(
   nodes: Readonly<Record<string, TaskNode>>,
   agentId: string,
@@ -478,4 +724,10 @@ function assertManifestNode(
   if (!nodes[agentId]) {
     throw new Error(`${role} manifest identity is absent from the hierarchy: ${agentId}`);
   }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }

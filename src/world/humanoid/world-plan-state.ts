@@ -27,9 +27,11 @@ import type {
 } from "./carried-object-binding.js";
 import type { HumanoidCarryTaskSpaceTarget } from "./carry-task-space-servo.js";
 import type { HumanoidNavigationArrivalHeading } from "./navigation-arrival.js";
+import type { HumanoidEmbodiedSkillIdentity } from "./embodied-skill-call.js";
 
 export interface StoredHumanoidMotionPlan {
   plan: HumanoidMotionPlan;
+  skillCallIdentity: HumanoidEmbodiedSkillIdentity | null;
   artifact: HumanoidMotionArtifact;
   rollout: HumanoidMotionRollout | null;
   retainTerminalJointTracking: boolean;
@@ -50,6 +52,7 @@ export interface StoredHumanoidMotionPlan {
 
 export interface StoredHumanoidNavigationPlan {
   id: string;
+  skillCallIdentity: HumanoidEmbodiedSkillIdentity | null;
   plan: NavigationPlan;
   requestedTarget: Vec3;
   requestedArrivalHeading: HumanoidNavigationArrivalHeading | null;

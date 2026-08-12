@@ -30,6 +30,9 @@ import type {
   HumanoidPolicyState,
   HumanoidWholeBodyController
 } from "./whole-body-controller.js";
+import {
+  legacyHumanoidEmbodiedSkillIdentity
+} from "./embodied-skill-call.js";
 
 describe("HumanoidSimulation", () => {
   it("releases native contact handles across long-running snapshots", async () => {
@@ -427,26 +430,65 @@ describe("HumanoidSimulation", () => {
       const wrist = simulation.snapshot().links.right_wrist_yaw_link;
       await simulation.step(neutralHumanoidReference(), {
         taskCommand: {
-          protocol: "humanoid-controller-task-v1",
-          taskId: "skill:grasp:contact",
-          source: "motion_option",
+          protocol: "humanoid-embodied-skill-call-v2",
+          identity: legacyHumanoidEmbodiedSkillIdentity({
+            callId: "skill:grasp:contact",
+            runtimeKind: "legacy_motion",
+            phase: "test",
+            observedFrame: 0,
+            observedWorldRevision: 0
+          }),
+          authority: {
+            source: "deterministic_runtime",
+            worldFrame: 0,
+            worldRevision: 0
+          },
+          window: {
+            mode: "autonomous_closed_loop",
+            replanPolicy: "event_driven",
+            controlStepSeconds: 0.02,
+            maximumSteps: 1,
+            stepIndex: 0,
+            remainingSteps: 1
+          },
           requestedCapabilities: [
             "joint_reference_tracking",
             "contact_rich_manipulation"
           ],
-          goal: null,
-          endEffectors: [{
-            body: "right_wrist_yaw_link",
-            frame: "world",
-            position: { ...wrist.position },
-            tolerance: 0.04
-          }],
-          grasps: [{
-            objectId: "workpiece",
-            hand: "right",
-            minimumNormalForceN: 1,
-            minimumDistinctContactSurfaces: 2
-          }]
+          command: {
+            baseTwist: {
+              forwardMetersPerSecond: 0,
+              lateralMetersPerSecond: 0,
+              yawRadiansPerSecond: 0
+            },
+            rootHeightMeters: neutralHumanoidReference().rootHeight,
+            leftWristPositionPelvis: null,
+            rightWristPositionPelvis: null,
+            endEffectors: [{
+              body: "right_wrist_yaw_link",
+              frame: "world",
+              position: { ...wrist.position },
+              tolerance: 0.04
+            }],
+            grasps: [{
+              objectId: "workpiece",
+              hand: "right",
+              minimumNormalForceN: 1,
+              minimumDistinctContactSurfaces: 2
+            }]
+          },
+          contract: null,
+          safety: {
+            authorizedContacts: [],
+            stopOnFall: true,
+            stopOnUnauthorizedContact: true,
+            stopOnContractViolation: true
+          },
+          feedback: {
+            mode: "event_driven",
+            progressDelta: 0.1,
+            events: ["progress"]
+          }
         }
       });
       expect(controller.lastState?.environment).toMatchObject({
@@ -458,16 +500,19 @@ describe("HumanoidSimulation", () => {
         "left_ankle_roll_link",
         "right_ankle_roll_link",
         "left_wrist_yaw_link",
-        "right_wrist_yaw_link"
+        "right_wrist_yaw_link",
+        "torso_link"
       ]);
       expect(controller.lastOptions?.taskCommand).toMatchObject({
-        taskId: "skill:grasp:contact",
+        identity: { callId: "skill:grasp:contact" },
         requestedCapabilities: [
           "joint_reference_tracking",
           "contact_rich_manipulation"
         ],
-        goal: null,
-        grasps: [{ objectId: "workpiece", hand: "right" }]
+        contract: null,
+        command: {
+          grasps: [{ objectId: "workpiece", hand: "right" }]
+        }
       });
     } finally {
       await simulation.dispose();

@@ -79,6 +79,38 @@ export class G1HandActuator {
     }
   }
 
+  setClosingLeadGuardedTargets(
+    targets: Readonly<Partial<Record<G1HandJointName, number>>>,
+    maximumLeadRadians: number
+  ): Readonly<Partial<Record<G1HandJointName, number>>> {
+    const maximumLead = requiredFinite(
+      maximumLeadRadians,
+      "maximum closing target lead"
+    );
+    if (maximumLead <= 0) {
+      throw new Error("G1 hand maximum closing target lead must be positive");
+    }
+    const guardedTargets = Object.fromEntries(Object.entries(targets).map(
+      ([name, target]) => {
+        const jointName = name as G1HandJointName;
+        const binding = this.#bindings.find(
+          (candidate) => candidate.name === jointName
+        );
+        if (!binding) throw new Error(`Unknown G1 hand joint target: ${name}`);
+        return [jointName, guardClosingTarget(
+          requiredFinite(
+            this.#data.qpos[binding.positionAddress],
+            `${jointName} position`
+          ),
+          requiredFinite(target, `${jointName} target`),
+          maximumLead
+        )];
+      }
+    )) as Partial<Record<G1HandJointName, number>>;
+    this.setTargets(guardedTargets);
+    return guardedTargets;
+  }
+
   validateCurrentTargets(): void {
     for (const binding of this.#bindings) {
       const target = requiredFinite(
@@ -205,6 +237,28 @@ export class G1HandActuator {
     }
     return [minimum, maximum];
   }
+}
+
+export function guardClosingTarget(
+  measuredPosition: number,
+  requestedTarget: number,
+  maximumLeadRadians: number
+): number {
+  const measured = requiredFinite(measuredPosition, "measured position");
+  const requested = requiredFinite(requestedTarget, "requested target");
+  const maximumLead = requiredFinite(maximumLeadRadians, "maximum closing target lead");
+  if (maximumLead <= 0) {
+    throw new Error("G1 hand maximum closing target lead must be positive");
+  }
+  if (requested === 0) return 0;
+  const closingDirection = Math.sign(requested);
+  const requestedProgress = Math.abs(requested);
+  const measuredProgress = measured * closingDirection;
+  const guardedProgress = Math.max(
+    0,
+    Math.min(requestedProgress, measuredProgress + maximumLead)
+  );
+  return closingDirection * guardedProgress;
 }
 
 function actuatorParameterWidth(

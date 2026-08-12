@@ -154,6 +154,7 @@ function storedMotion(
   };
   return {
     plan,
+    skillCallIdentity: null,
     artifact,
     rollout: null,
     createdRevision: 0,
@@ -237,6 +238,9 @@ async function handContactFixture(): Promise<{
   });
   snapshot.contactCount = snapshot.contacts.length;
   const simulation = {
+    controllerDescriptor() {
+      return authority.controllerDescriptor();
+    },
     async step(): Promise<HumanoidSimulationSnapshot> {
       return structuredClone(snapshot);
     }

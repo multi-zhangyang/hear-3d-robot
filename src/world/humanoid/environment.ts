@@ -97,6 +97,11 @@ export function humanoidEnvironment(
         || humanoidPhysicalRegionIncludesBox(physicalRegion, solid)),
       ...fixedObjects
     ],
-    objects: physicalObjects
+    objects: physicalObjects,
+    zones: scenario.zones.map((zone) => ({
+      id: zone.id,
+      center: { ...zone.center },
+      size: { ...zone.size }
+    }))
   };
 }

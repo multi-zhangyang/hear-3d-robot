@@ -86,6 +86,11 @@ const RetireGoalEpochSchema = z.object({
   }
 });
 
+const ContinueGoalEpochSchema = z.object({
+  reason: z.string().trim().min(1),
+  recovery_intent: z.string().trim().min(1)
+}).strict();
+
 const RecallGoalHistorySchema = z.object({
   candidate_ids: z.array(CandidateIdSchema).max(32).nullable().optional()
     .describe("精确召回的 Goal candidate 标识"),
@@ -157,6 +162,10 @@ export interface GoalManagerRuntime {
     input: z.infer<typeof RetireGoalEpochSchema>,
     authority: GoalToolCallAuthority
   ): Promise<JsonValue>;
+  continueGoalEpoch(
+    input: z.infer<typeof ContinueGoalEpochSchema>,
+    authority: GoalToolCallAuthority
+  ): Promise<JsonValue>;
 }
 
 export interface GoalToolCallAuthority {
@@ -192,6 +201,14 @@ export function createGoalManagerTools(
       RetireGoalEpochSchema,
       (input, authority) => runtime.retireGoalEpoch(
         RetireGoalEpochSchema.parse(input),
+        authority
+      )
+    ),
+    goalTool(
+      "continue_goal_epoch",
+      ContinueGoalEpochSchema,
+      (input, authority) => runtime.continueGoalEpoch(
+        ContinueGoalEpochSchema.parse(input),
         authority
       )
     )
@@ -318,6 +335,9 @@ function goalToolDescription(name: string): string {
   }
   if (name === "select_goal_candidate") {
     return "用候选回执中的短序号显式选择一个已提交且依赖已完成的 Goal。短序号与持久候选身份一对一对应；Harness 不打分、不随机选择，也不提供替代目标。";
+  }
+  if (name === "continue_goal_epoch") {
+    return "目标重评后保留当前 active Goal，结束已经失败的自主周期并以新的恢复预算开始下一周期。只有 Goal 仍物理可达、但当前周期的 compact replan 已耗尽时使用；必须给出新的恢复意图。";
   }
   return "用当前物理证据将 active Goal 退役为 blocked、abandoned、superseded 或 expired。退役后必须由后续模型调用重新提交并选择，Harness 不自动替换。";
 }

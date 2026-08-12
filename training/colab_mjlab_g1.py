@@ -66,7 +66,12 @@ def latest_artifacts(log_root: Path) -> tuple[Path, Path, Path]:
   return run_dir, checkpoints[-1], onnx_models[-1]
 
 
-def evaluate(checkpoint: Path, num_envs: int, steps: int) -> dict[str, float | int]:
+def evaluate(
+  checkpoint: Path,
+  num_envs: int,
+  steps: int,
+  jit_export: Path,
+) -> dict[str, float | int | bool | list[int]]:
   import torch
   import mjlab.tasks  # noqa: F401
   from mjlab.envs import ManagerBasedRlEnv
@@ -90,6 +95,28 @@ def evaluate(checkpoint: Path, num_envs: int, steps: int) -> dict[str, float | i
     )
     policy = runner.get_inference_policy(device=device)
     observations = env.get_observations()
+    actor_observations = observations["actor"]
+    runner.export_policy_to_jit(str(jit_export.parent), jit_export.name)
+    frozen_teacher = torch.jit.load(str(jit_export), map_location=device).eval()
+    for parameter in frozen_teacher.parameters():
+      parameter.requires_grad_(False)
+    with torch.inference_mode():
+      native_actions = policy(observations)
+      jit_actions = frozen_teacher(actor_observations)
+    expected_action_shape = (num_envs, env.num_actions)
+    if tuple(jit_actions.shape) != expected_action_shape:
+      raise RuntimeError(
+        f"JIT teacher returned {tuple(jit_actions.shape)}, expected "
+        f"{expected_action_shape}"
+      )
+    if not torch.isfinite(jit_actions).all():
+      raise RuntimeError("JIT teacher emitted non-finite validation actions")
+    if not torch.allclose(native_actions, jit_actions, rtol=1e-5, atol=1e-6):
+      maximum_difference = float((native_actions - jit_actions).abs().max().item())
+      raise RuntimeError(
+        "JIT teacher does not reproduce the native policy; maximum difference "
+        f"is {maximum_difference}"
+      )
     robot = env.unwrapped.scene["robot"]
     start = robot.data.root_link_pose_w[:, :3].clone()
     reward_total = torch.zeros(num_envs, device=device)
@@ -120,6 +147,9 @@ def evaluate(checkpoint: Path, num_envs: int, steps: int) -> dict[str, float | i
       "minimum_root_height_m": minimum_height,
       "termination_count": termination_count,
       "maximum_absolute_action": maximum_action,
+      "jit_batch_validated": True,
+      "jit_input_shape": [num_envs, int(actor_observations.shape[-1])],
+      "jit_output_shape": [num_envs, int(jit_actions.shape[-1])],
     }
   finally:
     env.close()
@@ -193,7 +223,8 @@ def main() -> None:
   iteration = int(checkpoint_data.get("iter", -1))
   if iteration <= 0:
     raise RuntimeError("mjlab checkpoint has no positive training iteration")
-  evaluation = evaluate(checkpoint, args.eval_envs, args.eval_steps)
+  copied_jit = staging / "g1_velocity_teacher.jit.pt"
+  evaluation = evaluate(checkpoint, args.eval_envs, args.eval_steps, copied_jit)
   copied_checkpoint = staging / "g1_velocity.pt"
   copied_onnx = staging / "g1_velocity.onnx"
   shutil.copy2(checkpoint, copied_checkpoint)
@@ -223,6 +254,17 @@ def main() -> None:
       "file": copied_checkpoint.name,
       "bytes": copied_checkpoint.stat().st_size,
       "sha256": sha256(copied_checkpoint),
+    },
+    "teacher_jit": {
+      "file": copied_jit.name,
+      "bytes": copied_jit.stat().st_size,
+      "sha256": sha256(copied_jit),
+      "input": "obs",
+      "input_size": 99,
+      "output": "actions",
+      "output_size": 29,
+      "batch_dynamic": True,
+      "runtime": "torchscript_cuda",
     },
     "onnx": {
       "file": copied_onnx.name,

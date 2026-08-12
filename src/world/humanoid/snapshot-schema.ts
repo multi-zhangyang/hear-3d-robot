@@ -15,6 +15,8 @@ import { HumanoidWorldGraspStateSchema } from "./grasp-world-state.js";
 import {
   HUMANOID_POLICY_OBSERVATION_FEATURES
 } from "./whole-body-controller.js";
+import { HumanoidPolicyAdmissionAssessmentSchema } from
+  "./policy-capability-evidence.js";
 import {
   HUMANOID_LEARNED_POLICY_CAPABILITIES
 } from "../../domain/humanoid-policy.js";
@@ -129,7 +131,7 @@ const HumanoidSimulationSnapshotSchema = z.object({
     }).strict().optional(),
     capabilityRouting: z.object({
       protocol: z.literal("humanoid-controller-capability-routing-v1"),
-      strategy: z.literal("declared_capabilities"),
+      strategy: z.enum(["declared_capabilities", "capability_evidence"]),
       fallback: z.object({
         mode: z.literal("reference_control"),
         implementation: z.string().trim().min(1)
@@ -145,7 +147,31 @@ const HumanoidSimulationSnapshotSchema = z.object({
       toImplementation: z.string().trim().min(1),
       progress: z.number().finite().min(0).max(1),
       durationSeconds: z.number().finite().positive()
-    }).strict().nullable()
+    }).strict().nullable(),
+    routing: z.object({
+      callId: z.string().trim().min(1),
+      route: z.enum(["primary", "fallback", "upper_body_overlay"]),
+      assessment: HumanoidPolicyAdmissionAssessmentSchema.nullable(),
+      attribution: z.object({
+        primarySteps: z.number().int().nonnegative(),
+        fallbackSteps: z.number().int().nonnegative(),
+        upperBodyOverlaySteps: z.number().int().nonnegative(),
+        memoryBridgeSteps: z.number().int().nonnegative()
+      }).strict(),
+      memoryBridge: z.object({
+        protocol: z.literal("humanoid-policy-memory-bridge-v1"),
+        phase: z.enum(["guiding", "completed", "timed_out", "aborted"]),
+        trigger: z.literal("entry_state_ood"),
+        completedSteps: z.number().int().nonnegative(),
+        maximumSteps: z.number().int().positive(),
+        stableSteps: z.number().int().nonnegative(),
+        requiredStableSteps: z.number().int().positive(),
+        progress: z.number().finite().min(0).max(1),
+        entryStateOodScore: z.number().finite().nonnegative(),
+        jointPrototypeRmsError: z.number().finite().nonnegative(),
+        maximumJointVelocity: z.number().finite().nonnegative()
+      }).strict().nullable()
+    }).strict().optional()
   }).strict().optional(),
   rootPosition: Vec3Schema,
   rootRotation: QuaternionSchema,

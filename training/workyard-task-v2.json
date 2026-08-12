@@ -1,0 +1,212 @@
+{
+  "protocol": "hear-workyard-training-contract-v2",
+  "scenario_id": "humanoid_workyard",
+  "environment": {
+    "framework": "mjlab",
+    "task_id": "Hear-Workyard-Skill-Conditioned-G1-v2",
+    "module": "training/workyard_mjlab_env.py",
+    "implementation_status": "implemented"
+  },
+  "morphology": {
+    "id": "unitree_g1_43dof_with_hands",
+    "body_joint_names": [
+      "left_hip_pitch_joint",
+      "left_hip_roll_joint",
+      "left_hip_yaw_joint",
+      "left_knee_joint",
+      "left_ankle_pitch_joint",
+      "left_ankle_roll_joint",
+      "right_hip_pitch_joint",
+      "right_hip_roll_joint",
+      "right_hip_yaw_joint",
+      "right_knee_joint",
+      "right_ankle_pitch_joint",
+      "right_ankle_roll_joint",
+      "waist_yaw_joint",
+      "waist_roll_joint",
+      "waist_pitch_joint",
+      "left_shoulder_pitch_joint",
+      "left_shoulder_roll_joint",
+      "left_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "left_wrist_roll_joint",
+      "left_wrist_pitch_joint",
+      "left_wrist_yaw_joint",
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint",
+      "right_wrist_pitch_joint",
+      "right_wrist_yaw_joint"
+    ],
+    "hand_joint_names": [
+      "left_hand_thumb_0_joint",
+      "left_hand_thumb_1_joint",
+      "left_hand_thumb_2_joint",
+      "left_hand_middle_0_joint",
+      "left_hand_middle_1_joint",
+      "left_hand_index_0_joint",
+      "left_hand_index_1_joint",
+      "right_hand_thumb_0_joint",
+      "right_hand_thumb_1_joint",
+      "right_hand_thumb_2_joint",
+      "right_hand_middle_0_joint",
+      "right_hand_middle_1_joint",
+      "right_hand_index_0_joint",
+      "right_hand_index_1_joint"
+    ]
+  },
+  "timing": {
+    "physics_step_seconds": 0.005,
+    "control_step_seconds": 0.02,
+    "episode_seconds": 20
+  },
+  "policy": {
+    "role": "skill_call_conditioned_student",
+    "conditioning_protocol": "humanoid-embodied-skill-call-v2",
+    "capabilities": [
+      "balance",
+      "locomotion",
+      "joint_reference_tracking",
+      "contact_rich_manipulation"
+    ],
+    "observation_features": [
+      "proprioception",
+      "command_history",
+      "root_kinematics",
+      "hand_state",
+      "end_effector_state",
+      "contact_state",
+      "object_state",
+      "task_space_command",
+      "grasp_command"
+    ]
+  },
+  "task": {
+    "object_id": "assembly_rod",
+    "source_support_id": "pickup_stand",
+    "target_zone_id": "assembly_bay",
+    "teacher_stages": ["reach", "contact", "grasp", "lift", "carry", "place"],
+    "deployment_authority": "agent_harness_skill_call",
+    "student_forbidden_observations": [
+      "teacher_stage",
+      "teacher_target_stage",
+      "full_task_automaton_state"
+    ]
+  },
+  "training_strategy": {
+    "protocol": "hear-teacher-student-skill-training-v1",
+    "teacher_role": "curriculum_command_and_label_generator",
+    "teacher_deployed": false,
+    "student_role": "autonomous_skill_window_executor",
+    "student_deployed": true,
+    "distillation": "context_gated_mixture_of_experts",
+    "trajectory_sources": [
+      "teacher_success",
+      "student_success",
+      "student_failure",
+      "harness_recovery"
+    ],
+    "outcome_attribution": "policy_segment_and_intervention_segment_separated"
+  },
+  "observation": {
+    "protocol": "hear-workyard-observation-v2",
+    "size": 221,
+    "history_steps": 1,
+    "terms": [
+      { "name": "body_joint_position_offset", "size": 29, "source": "policy_state", "frame": "joint", "normalization": "standardized" },
+      { "name": "body_joint_velocity", "size": 29, "source": "policy_state", "frame": "joint", "normalization": "standardized" },
+      { "name": "previous_body_action", "size": 29, "source": "policy_state", "frame": "joint", "normalization": "identity" },
+      { "name": "hand_joint_position_fraction", "size": 14, "source": "mujoco_state", "frame": "joint", "normalization": "unit_interval" },
+      { "name": "hand_joint_velocity", "size": 14, "source": "mujoco_state", "frame": "joint", "normalization": "standardized" },
+      { "name": "previous_hand_action", "size": 8, "source": "policy_state", "frame": "joint", "normalization": "identity" },
+      { "name": "root_linear_velocity_pelvis", "size": 3, "source": "mujoco_state", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "root_angular_velocity_pelvis", "size": 3, "source": "mujoco_state", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "projected_gravity_pelvis", "size": 3, "source": "mujoco_state", "frame": "pelvis", "normalization": "identity" },
+      { "name": "end_effector_pose_pelvis", "size": 28, "source": "mujoco_state", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "support_contact_features", "size": 6, "source": "mujoco_state", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "hand_object_contact_features", "size": 6, "source": "mujoco_state", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "target_object_pose_pelvis", "size": 7, "source": "mujoco_state", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "target_object_twist_pelvis", "size": 6, "source": "mujoco_state", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "target_zone_relation", "size": 5, "source": "mujoco_state", "frame": "task", "normalization": "standardized" },
+      { "name": "requested_capabilities_multi_hot", "size": 5, "source": "task_command", "frame": "task", "normalization": "one_hot" },
+      { "name": "skill_window_progress", "size": 1, "source": "task_command", "frame": "task", "normalization": "unit_interval" },
+      { "name": "active_hand_one_hot", "size": 2, "source": "task_command", "frame": "task", "normalization": "one_hot" },
+      { "name": "desired_base_twist", "size": 3, "source": "task_command", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "wrist_pose_targets_pelvis", "size": 14, "source": "task_command", "frame": "pelvis", "normalization": "standardized" },
+      { "name": "wrist_position_tolerances", "size": 2, "source": "task_command", "frame": "task", "normalization": "standardized" },
+      { "name": "grasp_requirements", "size": 4, "source": "task_command", "frame": "task", "normalization": "standardized" }
+    ]
+  },
+  "action": {
+    "protocol": "hear-workyard-action-v1",
+    "size": 37,
+    "terms": [
+      { "name": "body_joint_position_residual", "size": 29, "representation": "reference_position_residual", "minimum": -1, "maximum": 1, "scale": 0.35 },
+      { "name": "hand_synergy_delta", "size": 8, "representation": "synergy_delta", "minimum": -1, "maximum": 1, "scale": 0.08 }
+    ]
+  },
+  "rewards": {
+    "terms": [
+      { "id": "reach_distance_progress", "stage": "reach", "authority": "mujoco_state", "objective": "maximize", "weight": 2 },
+      { "id": "wrist_orientation_alignment", "stage": "reach", "authority": "mujoco_state", "objective": "maximize", "weight": 0.25 },
+      { "id": "qualified_hand_contact", "stage": "contact", "authority": "humanoid_grasp_tracker", "objective": "maximize", "weight": 0.5 },
+      { "id": "opposing_contact", "stage": "contact", "authority": "humanoid_grasp_tracker", "objective": "maximize", "weight": 1.5 },
+      { "id": "grasp_verified", "stage": "grasp", "authority": "humanoid_grasp_tracker", "objective": "maximize", "weight": 8 },
+      { "id": "lift_height_progress", "stage": "lift", "authority": "humanoid_grasp_tracker", "objective": "maximize", "weight": 3 },
+      { "id": "object_to_zone_progress", "stage": "carry", "authority": "humanoid_object_zone_relation", "objective": "maximize", "weight": 3 },
+      { "id": "object_inside_zone", "stage": "place", "authority": "humanoid_object_zone_relation", "objective": "maximize", "weight": 4 },
+      { "id": "object_released_and_settled", "stage": "place", "authority": "humanoid_object_settled_support", "objective": "maximize", "weight": 15 },
+      { "id": "upright_support", "stage": "all", "authority": "humanoid_physical_safety", "objective": "maximize", "weight": 0.5 },
+      { "id": "fall", "stage": "all", "authority": "humanoid_physical_safety", "objective": "minimize", "weight": 25 },
+      { "id": "non_foot_collision", "stage": "all", "authority": "mujoco_state", "objective": "minimize", "weight": 2 },
+      { "id": "joint_limit_proximity", "stage": "all", "authority": "humanoid_physical_safety", "objective": "minimize", "weight": 0.5 },
+      { "id": "foot_slip", "stage": "all", "authority": "humanoid_physical_safety", "objective": "minimize", "weight": 0.2 },
+      { "id": "actuator_saturation", "stage": "all", "authority": "humanoid_physical_safety", "objective": "minimize", "weight": 0.5 },
+      { "id": "action_rate", "stage": "all", "authority": "policy_action", "objective": "minimize", "weight": 0.02 }
+    ]
+  },
+  "curriculum": [
+    { "stage": "reach", "minimum_episodes": 20000, "promotion_success_rate": 0.9, "previous_stage_replay_fraction": 0 },
+    { "stage": "contact", "minimum_episodes": 20000, "promotion_success_rate": 0.85, "previous_stage_replay_fraction": 0.2 },
+    { "stage": "grasp", "minimum_episodes": 30000, "promotion_success_rate": 0.8, "previous_stage_replay_fraction": 0.25 },
+    { "stage": "lift", "minimum_episodes": 30000, "promotion_success_rate": 0.8, "previous_stage_replay_fraction": 0.25 },
+    { "stage": "carry", "minimum_episodes": 40000, "promotion_success_rate": 0.75, "previous_stage_replay_fraction": 0.3 },
+    { "stage": "place", "minimum_episodes": 50000, "promotion_success_rate": 0.7, "previous_stage_replay_fraction": 0.35 }
+  ],
+  "randomization": {
+    "object_position_jitter_m": 0.08,
+    "target_position_jitter_m": 0.15,
+    "object_mass_scale": [0.7, 1.3],
+    "friction_scale": [0.7, 1.3],
+    "actuator_strength_scale": [0.9, 1.1],
+    "observation_latency_control_steps": [0, 2]
+  },
+  "evaluation": {
+    "seeds": {
+      "training": { "first": 0, "last": 4999 },
+      "validation": { "first": 5000, "last": 5199 },
+      "held_out": { "first": 10000, "last": 10499 }
+    },
+    "episodes_per_stage": 200,
+    "full_task_episodes": 500,
+    "stage_success_rate_minimum": {
+      "reach": 0.95,
+      "contact": 0.9,
+      "grasp": 0.85,
+      "lift": 0.8,
+      "carry": 0.75,
+      "place": 0.7
+    },
+    "full_task_success_rate_minimum": 0.7,
+    "fall_rate_maximum": 0.02,
+    "dropped_object_rate_maximum": 0.1,
+    "minimum_support_margin_m": -0.03,
+    "maximum_foot_slip_mps": 0.35,
+    "minimum_joint_limit_margin_rad": 0.02,
+    "maximum_requested_effort_utilization": 1.1,
+    "learned_policy_frame_ratio_minimum": 0.95,
+    "reference_control_frame_ratio_maximum": 0.05
+  }
+}

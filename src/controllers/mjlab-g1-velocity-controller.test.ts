@@ -106,7 +106,7 @@ describe("mjlab G1 velocity controller", () => {
         implementation: "mjlab_g1_velocity_onnx",
         learnedPolicy: { capabilities: ["balance", "locomotion"] },
         capabilityRouting: {
-          strategy: "declared_capabilities",
+          strategy: "capability_evidence",
           fallback: {
             mode: "reference_control",
             implementation: "yahmp_onnx"
@@ -150,7 +150,7 @@ describe("mjlab G1 velocity controller", () => {
         snapshot.rootPosition.z - start.rootPosition.z
       )).toBeGreaterThan(0.5);
       expect(first.captureState().controller.payload).toMatchObject({
-        protocol: "humanoid-controller-capability-routing-state-v3",
+        protocol: "humanoid-controller-capability-routing-state-v4",
         active: "primary"
       });
 
@@ -171,7 +171,7 @@ describe("mjlab G1 velocity controller", () => {
         }
       });
       expect(first.captureState().controller.payload).toMatchObject({
-        protocol: "humanoid-controller-capability-routing-state-v3",
+        protocol: "humanoid-controller-capability-routing-state-v4",
         active: "upper_body_overlay"
       });
 
@@ -187,7 +187,7 @@ describe("mjlab G1 velocity controller", () => {
       expect(second.captureState().controller).toMatchObject({
         implementation: "mjlab_g1_velocity_onnx",
         payload: {
-          protocol: "humanoid-controller-capability-routing-state-v3",
+          protocol: "humanoid-controller-capability-routing-state-v4",
           active: "upper_body_overlay"
         }
       });

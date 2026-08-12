@@ -28,6 +28,7 @@ const AgentToolUseBehaviorIdentitySchema = z.discriminatedUnion("kind", [
 ]);
 
 const AgentToolContractSchema = z.object({
+  dispatch_kind: z.enum(["model_agent", "deterministic_service"]).optional(),
   tool_name: z.string().trim().min(1),
   target_role: z.enum(["goal_manager", "sentry", "motion", "executor"]),
   target_agent_id: z.string().trim().min(1),
@@ -39,19 +40,72 @@ const AgentToolContractSchema = z.object({
     "goal_manager_authority_envelope_v2",
     "live_authority_delegation_v1",
     "motion_authority_envelope_v1",
-    "validated_execution_task_json_v1"
+    "validated_execution_task_json_v1",
+    "grounding_monitor_direct_v1",
+    "validated_execution_gate_v1"
   ]),
   input_builder_sha256: Sha256Schema,
+  implementation_contract: z.string().trim().min(1).optional(),
   run_options: z.object({
     session_agent_id: z.string().trim().min(1),
     context_source: z.literal("parent_run_context"),
     max_turns: z.literal("unbounded")
-  }).strict(),
-  resume_context_strategy: z.enum(["merge", "replace", "preferSerialized"]),
+  }).strict().optional(),
+  resume_context_strategy: z.enum(["merge", "replace", "preferSerialized"]).optional(),
   include_input_schema: z.literal(false),
   needs_approval: z.literal(false),
-  output_contract: z.literal("nested_agent_final_output_text")
-}).strict();
+  output_contract: z.enum([
+    "nested_agent_final_output_text",
+    "formal_action_receipt"
+  ])
+}).strict().superRefine((contract, context) => {
+  const dispatch = contract.dispatch_kind ?? "model_agent";
+  if (dispatch === "model_agent") {
+    if (!contract.run_options) {
+      context.addIssue({
+        code: "custom",
+        path: ["run_options"],
+        message: "A model Agent delegation requires owned Session run options"
+      });
+    }
+    if (!contract.resume_context_strategy) {
+      context.addIssue({
+        code: "custom",
+        path: ["resume_context_strategy"],
+        message: "A model Agent delegation requires a resume context strategy"
+      });
+    }
+    if (contract.output_contract !== "nested_agent_final_output_text") {
+      context.addIssue({
+        code: "custom",
+        path: ["output_contract"],
+        message: "A model Agent delegation must return nested final output"
+      });
+    }
+  } else {
+    if (!contract.implementation_contract) {
+      context.addIssue({
+        code: "custom",
+        path: ["implementation_contract"],
+        message: "A deterministic service requires an implementation contract"
+      });
+    }
+    if (contract.run_options || contract.resume_context_strategy) {
+      context.addIssue({
+        code: "custom",
+        path: ["dispatch_kind"],
+        message: "A deterministic service must not own model Session run options"
+      });
+    }
+    if (contract.output_contract !== "formal_action_receipt") {
+      context.addIssue({
+        code: "custom",
+        path: ["output_contract"],
+        message: "A deterministic service must return a formal action receipt"
+      });
+    }
+  }
+});
 
 const AgentModelSettingsIdentitySchema = z.object({
   request_timeout_ms: z.number().int().positive(),
@@ -65,6 +119,7 @@ const AgentModelSettingsIdentitySchema = z.object({
 }).strict();
 
 const AgentModelIdentitySchema = z.object({
+  execution_kind: z.literal("model").optional(),
   agent_id: z.string().trim().min(1),
   agent_name: z.string().trim().min(1),
   role: z.enum([
@@ -90,6 +145,20 @@ const AgentModelIdentitySchema = z.object({
   settings: AgentModelSettingsIdentitySchema
 }).strict();
 
+const AgentDeterministicServiceIdentitySchema = z.object({
+  execution_kind: z.literal("deterministic_service"),
+  agent_id: z.string().trim().min(1),
+  agent_name: z.string().trim().min(1),
+  role: z.enum(["sentry", "executor"]),
+  implementation_contract: z.string().trim().min(1),
+  decision_authority_role: z.literal("coordinator")
+}).strict();
+
+const AgentServiceOrLegacyModelIdentitySchema = z.union([
+  AgentDeterministicServiceIdentitySchema,
+  AgentModelIdentitySchema
+]);
+
 export const AgentManifestSchema = z.object({
   version: z.literal(1),
   runtime: z.literal("humanoid_g1"),
@@ -100,9 +169,9 @@ export const AgentManifestSchema = z.object({
   agents: z.object({
     goal_manager: AgentModelIdentitySchema,
     coordinator: AgentModelIdentitySchema,
-    sentry: AgentModelIdentitySchema,
+    sentry: AgentServiceOrLegacyModelIdentitySchema,
     motion: AgentModelIdentitySchema,
-    executor: AgentModelIdentitySchema,
+    executor: AgentServiceOrLegacyModelIdentitySchema,
     compactor: AgentModelIdentitySchema
   }).strict(),
   agent_tool_contracts: z.array(AgentToolContractSchema),
@@ -149,15 +218,29 @@ export const AgentManifestSchema = z.object({
         message: "Agent-as-tool target name does not match its target role"
       });
     }
-    if (contract.run_options.session_agent_id !== target.agent_id) {
+    if (contract.run_options
+      && contract.run_options.session_agent_id !== target.agent_id) {
       context.addIssue({
         code: "custom",
         path: ["agent_tool_contracts", index, "run_options", "session_agent_id"],
         message: "Agent-as-tool Session owner does not match its target role"
       });
     }
+    if (contract.dispatch_kind === "deterministic_service") {
+      if (target.execution_kind !== "deterministic_service"
+        || target.implementation_contract !== contract.implementation_contract) {
+        context.addIssue({
+          code: "custom",
+          path: ["agent_tool_contracts", index, "implementation_contract"],
+          message: "Deterministic service contract does not match its target identity"
+        });
+      }
+    }
   }
 });
 
 export type AgentManifest = z.infer<typeof AgentManifestSchema>;
 export type AgentModelIdentity = z.infer<typeof AgentModelIdentitySchema>;
+export type AgentDeterministicServiceIdentity = z.infer<
+  typeof AgentDeterministicServiceIdentitySchema
+>;

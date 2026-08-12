@@ -213,11 +213,16 @@ describe("humanoid navigation execution progress", () => {
     await execution.step(simulation.asHumanoidSimulation());
 
     expect(simulation.lastControllerOptions?.taskCommand).toMatchObject({
-      taskId: "navigation",
-      source: "motion_option",
+      protocol: "humanoid-embodied-skill-call-v2",
+      identity: {
+        runtimeKind: "navigation"
+      },
+      authority: {
+        source: "deterministic_runtime"
+      },
       requestedCapabilities: ["balance", "locomotion"],
-      goal: {
-        protocol: "humanoid-controller-navigation-goal-v1",
+      contract: {
+        protocol: "humanoid-embodied-navigation-contract-v1",
         target: route.waypoints.at(-1)
       }
     });

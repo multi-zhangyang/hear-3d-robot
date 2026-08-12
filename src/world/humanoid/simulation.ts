@@ -58,6 +58,15 @@ import {
   type G1HandActuatorSnapshot
 } from "./hand-actuator.js";
 import {
+  createG1HandArtifactCommand
+} from "./hand-coordination.js";
+import {
+  HumanoidHandPolicyAuthorityStateSchema,
+  assessHumanoidHandPolicyAuthority,
+  type HumanoidHandPolicyAuthorityAssessment,
+  type HumanoidHandPolicyAuthorityState
+} from "./hand-policy-authority.js";
+import {
   looksLikeLegacyG129DoFState,
   migrateLegacyG129DoFState
 } from "./legacy-state-migration.js";
@@ -83,8 +92,11 @@ import {
 } from "./task-space-servo.js";
 import type {
   HumanoidControllerInferenceOptions,
+  HumanoidControllerInferenceTrace,
+  HumanoidControllerCapabilityEvidenceSummary,
   HumanoidControllerDescriptor,
   HumanoidControllerExecutionState,
+  HumanoidControllerSkillOutcome,
   HumanoidControllerTaskCommand,
   HumanoidControllerState,
   HumanoidJointPositionCommand,
@@ -111,6 +123,11 @@ export interface HumanoidSimulationOptions {
   spawn?: HumanoidSpawn;
   solids?: readonly HumanoidSceneSolid[];
   objects?: readonly HumanoidSceneObject[];
+  zones?: readonly {
+    id: string;
+    center: Vec3;
+    size: Vec3;
+  }[];
   controllerFactory?: HumanoidWholeBodyControllerFactory;
 }
 
@@ -198,6 +215,7 @@ export interface HumanoidSimulationState {
   accelerationWarmstart: Float64Array;
   requestedActuatorTorques?: Float64Array;
   handCommandTargets?: Float64Array;
+  handPolicyAuthority?: HumanoidHandPolicyAuthorityState | null;
   controller: HumanoidControllerState;
 }
 
@@ -238,6 +256,23 @@ export interface HumanoidSimulationSnapshot {
   nonFootEnvironmentContacts: HumanoidBodyName[];
   fallen: boolean;
 }
+
+export interface HumanoidPolicyControlFrame {
+  protocol: "humanoid-policy-control-frame-v1";
+  taskCommand: HumanoidControllerTaskCommand;
+  preState: HumanoidPolicyState;
+  reference: HumanoidReference;
+  controller: HumanoidControllerDescriptor;
+  controllerExecution: HumanoidControllerExecutionState | null;
+  controllerInference: HumanoidControllerInferenceTrace | null;
+  actuation: HumanoidJointPositionCommand;
+  postState: HumanoidPolicyState;
+  postSnapshot: HumanoidSimulationSnapshot;
+}
+
+export type HumanoidPolicyFrameSink = (
+  frame: HumanoidPolicyControlFrame
+) => void | Promise<void>;
 
 export type HumanoidEndEffectorTarget = HumanoidTaskSpaceServoTarget;
 
@@ -289,11 +324,13 @@ export class HumanoidSimulation {
   readonly #handSurfaceNamesByGeomId = new Map<number, G1HandContactSurfaceName>();
   readonly #handSurfaceGeometryIds = new Map<G1HandContactSurfaceName, number>();
   readonly #handActuator: G1HandActuator;
+  #handPolicyAuthority: HumanoidHandPolicyAuthorityState | null = null;
   readonly #objectJointBindings: readonly MujocoJointBinding[];
   readonly #objectJointBindingsById = new Map<string, MujocoJointBinding>();
   readonly #objectNamesByBodyId = new Map<number, string>();
   readonly #objectSizesById = new Map<string, Vec3>();
   readonly #objectDescriptorsById = new Map<string, ResolvedHumanoidSceneObject>();
+  readonly #zones: ReadonlyArray<{ id: string; center: Vec3; size: Vec3 }>;
   readonly #solidNamesByGeomId = new Map<number, string>();
   readonly #solidDescriptorsById = new Map<string, HumanoidSceneSolid>();
   readonly #pelvisBodyId: number;
@@ -380,6 +417,11 @@ export class HumanoidSimulation {
     this.#model = model;
     this.#data = data;
     this.#controller = controller;
+    this.#zones = Object.freeze((options.zones ?? []).map((zone) => ({
+      id: zone.id,
+      center: { ...zone.center },
+      size: { ...zone.size }
+    })));
     this.#bodyJointBindings = resolveMujocoActuatedJoints(
       runtime,
       model,
@@ -487,6 +529,7 @@ export class HumanoidSimulation {
         "trackedJointPolicyCommand"
       ];
       taskCommand?: HumanoidControllerTaskCommand;
+      policyFrameSink?: HumanoidPolicyFrameSink;
     } = {}
   ): Promise<HumanoidSimulationSnapshot> {
     this.#validateReference(reference);
@@ -501,19 +544,29 @@ export class HumanoidSimulation {
       && options.trackedJointPolicyCommand !== "neutral") {
       throw new Error("Tracked-joint policy command must be measured or neutral");
     }
+    const handPolicyAuthority = assessHumanoidHandPolicyAuthority({
+      previous: this.#handPolicyAuthority,
+      taskCommand: options.taskCommand,
+      ...(options.taskCommand ? { snapshot: this.snapshot() } : {})
+    });
+    this.#handPolicyAuthority = handPolicyAuthority.state;
     const controllerOptions: HumanoidControllerInferenceOptions = {
       ...(options.trackedJointPolicyCommand === undefined
         ? {}
         : { trackedJointPolicyCommand: options.trackedJointPolicyCommand }),
       ...(options.taskCommand === undefined
         ? {}
-        : { taskCommand: structuredClone(options.taskCommand) })
+        : { taskCommand: structuredClone(options.taskCommand) }),
+      handPolicyAuthority: structuredClone(handPolicyAuthority)
     };
+    const preState = this.#policyState();
     const command = await this.#controller.infer(
-      this.#policyState(),
+      preState,
       reference,
       controllerOptions
     );
+    this.#applyHandSynergyCommand(command, handPolicyAuthority);
+    const controllerInference = this.#controller.inferenceTrace?.() ?? null;
     const substeps = Math.round(
       this.#controller.descriptor.controlStepSeconds
       / this.#controller.descriptor.physicsStepSeconds
@@ -528,16 +581,43 @@ export class HumanoidSimulation {
     } finally {
       this.#model.opt.noslip_iterations = previousNoslipIterations;
     }
+    const postState = this.#policyState();
     this.#controller.advanceHistory(
-      this.#policyState(),
+      postState,
       reference,
       controllerOptions
     );
-    return this.snapshot();
+    const postSnapshot = this.snapshot();
+    if (options.policyFrameSink && options.taskCommand) {
+      await options.policyFrameSink({
+        protocol: "humanoid-policy-control-frame-v1",
+        taskCommand: structuredClone(options.taskCommand),
+        preState,
+        reference: cloneReference(reference),
+        controller: structuredClone(this.#controller.descriptor),
+        controllerExecution: humanoidControllerExecutionState(this.#controller),
+        controllerInference,
+        actuation: cloneJointPositionCommand(command),
+        postState,
+        postSnapshot
+      });
+    }
+    return postSnapshot;
   }
 
   controllerDescriptor(): HumanoidControllerDescriptor {
     return { ...this.#controller.descriptor };
+  }
+
+  controllerCapabilityEvidence():
+  readonly HumanoidControllerCapabilityEvidenceSummary[] {
+    return this.#controller.capabilityEvidence?.().map((summary) => (
+      structuredClone(summary)
+    )) ?? [];
+  }
+
+  recordControllerSkillOutcome(outcome: HumanoidControllerSkillOutcome): void {
+    this.#controller.recordSkillOutcome?.(structuredClone(outcome));
   }
 
   solidIds(): string[] {
@@ -866,6 +946,9 @@ export class HumanoidSimulation {
         ? { requestedActuatorTorques: this.#requestedActuatorTorques.slice() }
         : {}),
       handCommandTargets: this.#handCommandTargets.slice(),
+      handPolicyAuthority: this.#handPolicyAuthority
+        ? structuredClone(this.#handPolicyAuthority)
+        : null,
       controller: this.#controller.captureState()
     };
   }
@@ -887,6 +970,11 @@ export class HumanoidSimulation {
       && state.handCommandTargets.length !== G1_HAND_JOINT_NAMES.length) {
       throw new Error("Hand command authority must contain all 14 hand joints");
     }
+    const restoredHandPolicyAuthority = state.handPolicyAuthority == null
+      ? null
+      : HumanoidHandPolicyAuthorityStateSchema.parse(
+          state.handPolicyAuthority
+        );
     const current = {
       positions: Float64Array.from(this.#data.qpos),
       velocities: Float64Array.from(this.#data.qvel),
@@ -935,6 +1023,7 @@ export class HumanoidSimulation {
           this.#handActuator.snapshot().joints[name].target
         ));
     this.#handCommandTargets.set(restoredHandTargets);
+    this.#handPolicyAuthority = restoredHandPolicyAuthority;
     this.#runtime.mj_forward(this.#model, this.#data);
   }
 
@@ -1241,6 +1330,7 @@ export class HumanoidSimulation {
     this.#data.ctrl.fill(0);
     this.#requestedActuatorTorques.fill(0);
     this.#hasRequestedActuatorEvidence = false;
+    this.#handPolicyAuthority = null;
     this.#data.qpos[0] = this.#spawn.position.z;
     this.#data.qpos[1] = this.#spawn.position.x;
     this.#data.qpos[2] = this.#spawn.position.y + 0.793;
@@ -1409,7 +1499,8 @@ export class HumanoidSimulation {
       "left_ankle_roll_link",
       "right_ankle_roll_link",
       "left_wrist_yaw_link",
-      "right_wrist_yaw_link"
+      "right_wrist_yaw_link",
+      "torso_link"
     ] as const;
     state.environment = {
       protocol: "humanoid-policy-environment-v1",
@@ -1425,9 +1516,12 @@ export class HumanoidSimulation {
         requiredValue(rootVelocity, 1),
         requiredValue(rootVelocity, 2)
       ],
+      rootPosition: { ...snapshot.rootPosition },
       endEffectors: Object.fromEntries(endEffectorNames.map((name) => [name, {
         position: { ...snapshot.links[name].position },
-        rotation: { ...snapshot.links[name].rotation }
+        rotation: { ...snapshot.links[name].rotation },
+        linearVelocity: { ...snapshot.links[name].linearVelocity },
+        angularVelocity: { ...snapshot.links[name].angularVelocity }
       }])),
       hands: Object.fromEntries(Object.entries(snapshot.hands.joints).map(
         ([name, joint]) => [name, {
@@ -1449,24 +1543,54 @@ export class HumanoidSimulation {
         firstHandLink: contact.firstHandLink,
         secondHandLink: contact.secondHandLink
       })),
-      objects: Object.values(snapshot.objects).map((object) => ({
-        id: object.id,
-        position: { ...object.position },
-        rotation: { ...object.rotation },
-        linearVelocity: { ...object.linearVelocity },
-        angularVelocity: { ...object.angularVelocity },
-        ...(object.articulation
-          ? {
-              articulation: {
-                type: object.articulation.type,
-                position: object.articulation.position,
-                velocity: object.articulation.velocity,
-                minimum: object.articulation.minimum,
-                maximum: object.articulation.maximum
+      objects: Object.values(snapshot.objects).map((object) => {
+        const descriptor = this.#objectDescriptorsById.get(object.id);
+        if (!descriptor) {
+          throw new Error(`Missing policy object descriptor: ${object.id}`);
+        }
+        return {
+          id: object.id,
+          shape: descriptor.shape,
+          size: { ...descriptor.size },
+          massKg: descriptor.mass,
+          friction: { ...descriptor.friction },
+          position: { ...object.position },
+          rotation: { ...object.rotation },
+          linearVelocity: { ...object.linearVelocity },
+          angularVelocity: { ...object.angularVelocity },
+          ...(object.articulation
+            ? {
+                articulation: {
+                  type: object.articulation.type,
+                  position: object.articulation.position,
+                  velocity: object.articulation.velocity,
+                  minimum: object.articulation.minimum,
+                  maximum: object.articulation.maximum
+                }
               }
-            }
-          : {})
-      }))
+            : {})
+        };
+      }),
+      zones: this.#zones.map((zone) => ({
+        id: zone.id,
+        center: { ...zone.center },
+        size: { ...zone.size }
+      })),
+      feet: {
+        left: {
+          touching: snapshot.feet.left.touching,
+          normalForce: snapshot.feet.left.normalForce
+        },
+        right: {
+          touching: snapshot.feet.right.touching,
+          normalForce: snapshot.feet.right.normalForce
+        }
+      },
+      centerOfMass: { ...snapshot.balance.centerOfMass },
+      centerOfMassVelocity: worldVector(
+        this.#data.cvel,
+        this.#pelvisBodyId * 6 + 3
+      )
     };
     return state;
   }
@@ -1501,6 +1625,52 @@ export class HumanoidSimulation {
         Math.min(this.#model.actuator_ctrlrange[rangeOffset + 1]!, torque)
       );
     }
+  }
+
+  #applyHandSynergyCommand(
+    command: HumanoidJointPositionCommand,
+    assessment: HumanoidHandPolicyAuthorityAssessment
+  ): void {
+    const hand = command.handSynergy;
+    if (!hand) return;
+    if (hand.protocol !== "humanoid-authorized-hand-synergy-command-v1"
+      || !assessment.granted
+      || !assessment.state) {
+      throw new Error(
+        "Humanoid controller returned hand actuation without physical contact authority"
+      );
+    }
+    const authority = HumanoidHandPolicyAuthorityStateSchema.parse(hand.authority);
+    if (JSON.stringify(authority) !== JSON.stringify(assessment.state)) {
+      throw new Error("Humanoid hand command authority does not match the active Skill latch");
+    }
+    if (hand.action.length !== 8
+      || hand.maximumClosingJointLeadRadians !== 0.25
+      || !Array.from(hand.action).every((value) => (
+        Number.isFinite(value) && value >= -1 && value <= 1
+      ))) {
+      throw new Error("Humanoid hand policy returned an invalid 8D synergy action");
+    }
+    const inactiveOffset = authority.activeHand === "left" ? 4 : 0;
+    if (Array.from(hand.action.slice(inactiveOffset, inactiveOffset + 4)).some(
+      (value) => Math.abs(value) > 1e-12
+    )) {
+      throw new Error("Humanoid hand policy attempted to actuate the inactive hand");
+    }
+    const inactiveCoordination = authority.activeHand === "left"
+      ? hand.coordination.right
+      : hand.coordination.left;
+    if (Object.values(inactiveCoordination).some((value) => Math.abs(value) > 1e-12)) {
+      throw new Error("Humanoid hand policy retained inactive-hand coordination");
+    }
+    const artifact = createG1HandArtifactCommand(hand.coordination);
+    const appliedTargets = this.#handActuator.setClosingLeadGuardedTargets(
+      artifact.jointTargets,
+      hand.maximumClosingJointLeadRadians
+    );
+    G1_HAND_JOINT_NAMES.forEach((name, index) => {
+      this.#handCommandTargets[index] = appliedTargets[name]!;
+    });
   }
 
   #validateReference(reference: HumanoidReference): void {
@@ -1970,6 +2140,42 @@ function crossProduct(left: Vec3, right: Vec3): Vec3 {
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.max(minimum, Math.min(maximum, value));
+}
+
+function cloneReference(reference: HumanoidReference): HumanoidReference {
+  return {
+    jointPositions: reference.jointPositions.slice(),
+    jointVelocities: reference.jointVelocities.slice(),
+    jointTrackingWeights: reference.jointTrackingWeights.slice(),
+    rootVelocity: [...reference.rootVelocity],
+    rootYawVelocity: reference.rootYawVelocity,
+    rootHeight: reference.rootHeight,
+    rootRoll: reference.rootRoll,
+    rootPitch: reference.rootPitch
+  };
+}
+
+function cloneJointPositionCommand(
+  command: HumanoidJointPositionCommand
+): HumanoidJointPositionCommand {
+  return {
+    kind: "joint_position_pd",
+    positions: command.positions.slice(),
+    stiffness: command.stiffness.slice(),
+    damping: command.damping.slice(),
+    ...(command.handSynergy
+      ? {
+          handSynergy: {
+            protocol: command.handSynergy.protocol,
+            authority: structuredClone(command.handSynergy.authority),
+            action: command.handSynergy.action.slice(),
+            coordination: structuredClone(command.handSynergy.coordination),
+            maximumClosingJointLeadRadians:
+              command.handSynergy.maximumClosingJointLeadRadians
+          }
+        }
+      : {})
+  };
 }
 
 function rotate(

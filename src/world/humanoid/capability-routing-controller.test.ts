@@ -3,7 +3,8 @@ import type { HumanoidLearnedPolicyCapability } from "../../domain/humanoid-poli
 import type { JsonValue } from "../../domain/schema.js";
 import {
   neutralHumanoidReference,
-  targetReference
+  targetReference,
+  type HumanoidReference
 } from "./reference.js";
 import {
   CapabilityRoutingHumanoidController,
@@ -18,6 +19,10 @@ import type {
   HumanoidPolicyState,
   HumanoidWholeBodyController
 } from "./whole-body-controller.js";
+import {
+  HumanoidEmbodiedSkillCallSchema,
+  legacyHumanoidEmbodiedSkillIdentity
+} from "./embodied-skill-call.js";
 
 describe("humanoid controller capability routing", () => {
   it("keeps learned locomotion active while overlaying upper-body reference tracking", async () => {
@@ -42,7 +47,7 @@ describe("humanoid controller capability routing", () => {
       learnedPolicy: { capabilities: ["balance", "locomotion"] },
       capabilityRouting: {
         protocol: "humanoid-controller-capability-routing-v1",
-        strategy: "declared_capabilities",
+        strategy: "capability_evidence",
         fallback: {
           mode: "reference_control",
           implementation: "reference-tracking"
@@ -140,6 +145,159 @@ describe("humanoid controller capability routing", () => {
     ]);
   });
 
+  it("stops admitting a learned policy when its Skill-family posterior is weak", async () => {
+    const routed = new CapabilityRoutingHumanoidController(
+      controller("trained-velocity", ["balance", "locomotion"], 1),
+      controller(
+        "reference-tracking",
+        ["balance", "locomotion", "joint_reference_tracking"],
+        2
+      )
+    );
+    const state = policyState();
+    const reference = neutralHumanoidReference();
+
+    for (let index = 0; index < 8; index += 1) {
+      const options = taskOptions(["locomotion"], `failed-navigation-${index}`);
+      expect((await routed.infer(state, reference, options)).positions[0]).toBe(1);
+      routed.recordSkillOutcome({
+        protocol: "humanoid-controller-skill-outcome-v1",
+        identity: options.taskCommand!.identity,
+        outcome: "failed",
+        terminalReason: "navigation_blocked"
+      });
+    }
+
+    const rejected = taskOptions(["locomotion"], "rejected-navigation");
+    expect((await routed.infer(state, reference, rejected)).positions[0]).toBe(2);
+    expect(routed.executionState().routing?.assessment).toMatchObject({
+      admitted: false,
+      reason: "insufficient_success_posterior",
+      coldStart: false,
+      posterior: { outcomes: 8, successes: 0, failures: 8 }
+    });
+  });
+
+  it("restores successful entry evidence and rejects an out-of-distribution command", async () => {
+    const create = () => new CapabilityRoutingHumanoidController(
+      controller("trained-velocity", ["balance", "locomotion"], 1),
+      controller(
+        "reference-tracking",
+        ["balance", "locomotion", "joint_reference_tracking"],
+        2
+      )
+    );
+    const state = policyState();
+    const reference = neutralHumanoidReference();
+    const trained = create();
+    for (let index = 0; index < 8; index += 1) {
+      const options = taskOptions(["locomotion"], `successful-navigation-${index}`);
+      await trained.infer(state, reference, options);
+      trained.recordSkillOutcome({
+        protocol: "humanoid-controller-skill-outcome-v1",
+        identity: options.taskCommand!.identity,
+        outcome: "succeeded",
+        terminalReason: "navigation_completed"
+      });
+    }
+
+    const restored = create();
+    restored.restoreState(trained.captureState());
+    const ood = taskOptions(["locomotion"], "fast-navigation");
+    ood.taskCommand!.command.baseTwist.forwardMetersPerSecond = 2;
+    expect((await restored.infer(state, reference, ood)).positions[0]).toBe(2);
+    expect(restored.executionState().routing?.assessment).toMatchObject({
+      admitted: false,
+      reason: "command_ood",
+      posterior: { outcomes: 8, successes: 8, failures: 0 }
+    });
+    expect(restored.executionState().routing?.assessment?.commandOodScore)
+      .toBeGreaterThan(4);
+  });
+
+  it("uses a recoverable Memory Bridge before admitting an entry-state OOD policy", async () => {
+    const create = () => {
+      const primary = controller(
+        "trained-velocity",
+        ["balance", "locomotion"],
+        1
+      );
+      const fallback = controller(
+        "reference-tracking",
+        ["balance", "locomotion", "joint_reference_tracking"],
+        2
+      );
+      return {
+        routed: new CapabilityRoutingHumanoidController(primary, fallback),
+        primary,
+        fallback
+      };
+    };
+    const trained = create();
+    const settled = policyState();
+    const reference = neutralHumanoidReference();
+    for (let index = 0; index < 8; index += 1) {
+      const options = taskOptions(["locomotion"], `bridge-training-${index}`);
+      await trained.routed.infer(settled, reference, options);
+      trained.routed.recordSkillOutcome({
+        protocol: "humanoid-controller-skill-outcome-v1",
+        identity: options.taskCommand!.identity,
+        outcome: "succeeded",
+        terminalReason: "navigation_completed"
+      });
+    }
+
+    const oodState = policyState();
+    oodState.jointVelocities = new Float64Array(
+      HUMANOID_JOINT_NAMES.length
+    ).fill(3);
+    const options = taskOptions(["locomotion"], "memory-bridge-navigation");
+    expect((await trained.routed.infer(oodState, reference, options)).positions[0])
+      .toBe(2);
+    expect(trained.routed.executionState().routing).toMatchObject({
+      route: "fallback",
+      assessment: { admitted: false, reason: "entry_state_ood" },
+      attribution: { memoryBridgeSteps: 1, fallbackSteps: 0 },
+      memoryBridge: { phase: "guiding", trigger: "entry_state_ood" }
+    });
+    const bridgeReference = trained.fallback.references.at(-1)!;
+    expect([...bridgeReference.jointTrackingWeights].every((weight) => weight === 1))
+      .toBe(true);
+    expect(bridgeReference.rootVelocity).toEqual([0, 0]);
+
+    const restored = create();
+    restored.routed.restoreState(trained.routed.captureState());
+    for (let step = 0; step < 5; step += 1) {
+      await restored.routed.infer(settled, reference, options);
+    }
+    expect(restored.routed.executionState().routing).toMatchObject({
+      route: "primary",
+      assessment: { admitted: true, reason: "memory_bridge_completed" },
+      attribution: {
+        primarySteps: 1,
+        fallbackSteps: 0,
+        memoryBridgeSteps: 5
+      },
+      memoryBridge: {
+        phase: "completed",
+        stableSteps: 5,
+        progress: 1
+      }
+    });
+    restored.routed.recordSkillOutcome({
+      protocol: "humanoid-controller-skill-outcome-v1",
+      identity: options.taskCommand!.identity,
+      outcome: "succeeded",
+      terminalReason: "navigation_completed"
+    });
+    expect(restored.routed.capabilityEvidence()[0]?.posterior).toMatchObject({
+      outcomes: 9,
+      successes: 9,
+      transitionAttempts: 1,
+      transitionSuccesses: 1
+    });
+  });
+
   it("captures both branches, restores the active route, and accepts legacy primary state", async () => {
     const state = policyState();
     const navigation = neutralHumanoidReference();
@@ -164,7 +322,7 @@ describe("humanoid controller capability routing", () => {
     expect(checkpoint).toMatchObject({
       implementation: "trained-velocity",
       payload: {
-        protocol: "humanoid-controller-capability-routing-state-v3",
+        protocol: "humanoid-controller-capability-routing-state-v4",
         active: "upper_body_overlay",
         primary: { implementation: "trained-velocity" },
         fallback: { implementation: "reference-tracking" },
@@ -409,6 +567,7 @@ describe("humanoid controller capability routing", () => {
 
 interface TestController extends HumanoidWholeBodyController {
   calls: { reset: number; infer: number; advance: number; restore: number };
+  references: HumanoidReference[];
 }
 
 function controller(
@@ -420,6 +579,7 @@ function controller(
 ): TestController {
   let revision = 0;
   const calls = { reset: 0, infer: 0, advance: 0, restore: 0 };
+  const references: HumanoidReference[] = [];
   const descriptor: HumanoidControllerDescriptor = {
     protocol: "humanoid-controller-v1",
     implementation,
@@ -440,12 +600,23 @@ function controller(
   return {
     descriptor,
     calls,
+    references,
     reset() {
       calls.reset += 1;
     },
-    async infer(): Promise<HumanoidJointPositionCommand> {
+    async infer(
+      _state: HumanoidPolicyState,
+      reference: HumanoidReference
+    ): Promise<HumanoidJointPositionCommand> {
       calls.infer += 1;
       revision += 1;
+      references.push({
+        ...reference,
+        jointPositions: reference.jointPositions.slice(),
+        jointVelocities: reference.jointVelocities.slice(),
+        jointTrackingWeights: reference.jointTrackingWeights.slice(),
+        rootVelocity: [...reference.rootVelocity]
+      });
       return {
         kind: "joint_position_pd",
         positions: new Float64Array(HUMANOID_JOINT_NAMES.length).fill(commandValue),
@@ -483,17 +654,57 @@ function policyState(): HumanoidPolicyState {
 }
 
 function taskOptions(
-  requestedCapabilities: HumanoidLearnedPolicyCapability[]
+  requestedCapabilities: HumanoidLearnedPolicyCapability[],
+  callId = "capability-routing-test"
 ): HumanoidControllerInferenceOptions {
   return {
-    taskCommand: {
-      protocol: "humanoid-controller-task-v1",
-      taskId: "capability-routing-test",
-      source: "motion_option",
+    taskCommand: HumanoidEmbodiedSkillCallSchema.parse({
+      protocol: "humanoid-embodied-skill-call-v2",
+      identity: legacyHumanoidEmbodiedSkillIdentity({
+        callId,
+        runtimeKind: "legacy_motion",
+        phase: "test",
+        observedFrame: 0,
+        observedWorldRevision: 0
+      }),
+      authority: {
+        source: "deterministic_runtime",
+        worldFrame: 0,
+        worldRevision: 0
+      },
+      window: {
+        mode: "autonomous_closed_loop",
+        replanPolicy: "event_driven",
+        controlStepSeconds: 0.02,
+        maximumSteps: 1,
+        stepIndex: 0,
+        remainingSteps: 1
+      },
       requestedCapabilities,
-      goal: null,
-      endEffectors: [],
-      grasps: []
-    }
+      command: {
+        baseTwist: {
+          forwardMetersPerSecond: 0,
+          lateralMetersPerSecond: 0,
+          yawRadiansPerSecond: 0
+        },
+        rootHeightMeters: 0.78,
+        leftWristPositionPelvis: null,
+        rightWristPositionPelvis: null,
+        endEffectors: [],
+        grasps: []
+      },
+      contract: null,
+      safety: {
+        authorizedContacts: [],
+        stopOnFall: true,
+        stopOnUnauthorizedContact: true,
+        stopOnContractViolation: true
+      },
+      feedback: {
+        mode: "event_driven",
+        progressDelta: 0.1,
+        events: ["progress"]
+      }
+    })
   };
 }

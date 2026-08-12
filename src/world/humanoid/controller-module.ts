@@ -313,7 +313,8 @@ function assertCapabilityRoutingDescriptor(
 ): void {
   if (!isRecord(value)
     || value.protocol !== "humanoid-controller-capability-routing-v1"
-    || value.strategy !== "declared_capabilities"
+    || (value.strategy !== "declared_capabilities"
+      && value.strategy !== "capability_evidence")
     || !isRecord(value.fallback)
     || value.fallback.mode !== "reference_control"
     || !isNonEmptyString(value.fallback.implementation)

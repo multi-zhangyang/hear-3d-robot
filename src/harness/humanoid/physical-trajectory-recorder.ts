@@ -42,6 +42,7 @@ export function createPhysicalTrajectory(
     end_effector_path_length_m: endEffectorNumbers(0),
     object_path_length_m: Object.fromEntries(frame.objects.map(({ id }) => [id, 0])),
     contact_transition_count: 0,
+    controller_usage: controllerUsage(frame, true),
     trajectory_sha256: advancePhysicalTrajectorySha256(null, frame.frame_sha256)
   });
 }
@@ -123,6 +124,7 @@ export function advancePhysicalTrajectory(
     object_path_length_m: objectDistance,
     contact_transition_count: summary.contact_transition_count
       + (sameContactState(previous, frame) ? 0 : 1),
+    controller_usage: advanceControllerUsage(summary.controller_usage, frame),
     trajectory_sha256: advancePhysicalTrajectorySha256(
       summary.trajectory_sha256,
       frame.frame_sha256
@@ -158,12 +160,260 @@ function captureFrame(world: HumanoidWorldSnapshot): PhysicalTrajectoryFrame {
       position: vector(object.position)
     })).sort((left, right) => compareCodePoints(left.id, right.id)),
     support: robot.balance.support,
-    fallen: robot.fallen
+    fallen: robot.fallen,
+    controller_execution: controllerExecution(world)
   };
   return PhysicalTrajectoryFrameSchema.parse({
     ...identity,
     frame_sha256: physicalTrajectoryFrameSha256(identity)
   });
+}
+
+function controllerExecution(
+  world: HumanoidWorldSnapshot
+): NonNullable<PhysicalTrajectoryFrame["controller_execution"]> {
+  const execution = world.robot.controllerExecution ?? {
+    protocol: "humanoid-controller-execution-v1" as const,
+    mode: world.robot.controller.learnedPolicy
+      ? "learned_policy" as const
+      : "reference_control" as const,
+    activeImplementation: world.robot.controller.implementation,
+    transition: null
+  };
+  return {
+    mode: execution.mode,
+    active_implementation: execution.activeImplementation,
+    transition: execution.transition
+      ? {
+          from_implementation: execution.transition.fromImplementation,
+          to_implementation: execution.transition.toImplementation,
+          progress: rounded(execution.transition.progress),
+          duration_seconds: rounded(execution.transition.durationSeconds)
+        }
+      : null,
+    ...(execution.routing?.assessment
+      ? {
+          routing: {
+            call_id: execution.routing.callId,
+            route: execution.routing.route,
+            implementation: execution.routing.assessment.implementation,
+            skill_family: execution.routing.assessment.skillFamily,
+            admitted: execution.routing.assessment.admitted,
+            reason: execution.routing.assessment.reason,
+            cold_start: execution.routing.assessment.coldStart,
+            entry_state_ood_score:
+              nullableRounded(execution.routing.assessment.entryStateOodScore),
+            command_ood_score:
+              nullableRounded(execution.routing.assessment.commandOodScore),
+            attribution: {
+              primary_steps: execution.routing.attribution.primarySteps,
+              fallback_steps: execution.routing.attribution.fallbackSteps,
+              upper_body_overlay_steps:
+                execution.routing.attribution.upperBodyOverlaySteps,
+              memory_bridge_steps:
+                execution.routing.attribution.memoryBridgeSteps
+            },
+            memory_bridge: execution.routing.memoryBridge
+              ? {
+                  protocol: execution.routing.memoryBridge.protocol,
+                  phase: execution.routing.memoryBridge.phase,
+                  trigger: execution.routing.memoryBridge.trigger,
+                  completed_steps:
+                    execution.routing.memoryBridge.completedSteps,
+                  maximum_steps: execution.routing.memoryBridge.maximumSteps,
+                  stable_steps: execution.routing.memoryBridge.stableSteps,
+                  required_stable_steps:
+                    execution.routing.memoryBridge.requiredStableSteps,
+                  progress: rounded(execution.routing.memoryBridge.progress),
+                  entry_state_ood_score: rounded(
+                    execution.routing.memoryBridge.entryStateOodScore
+                  ),
+                  joint_prototype_rms_error: rounded(
+                    execution.routing.memoryBridge.jointPrototypeRmsError
+                  ),
+                  maximum_joint_velocity: rounded(
+                    execution.routing.memoryBridge.maximumJointVelocity
+                  )
+                }
+              : null,
+            posterior: {
+              outcomes: execution.routing.assessment.posterior.outcomes,
+              successes: execution.routing.assessment.posterior.successes,
+              failures: execution.routing.assessment.posterior.failures,
+              mean: rounded(
+                execution.routing.assessment.posterior.posteriorMean
+              ),
+              lower_bound: rounded(
+                execution.routing.assessment.posterior.lowerBound
+              ),
+              upper_bound: rounded(
+                execution.routing.assessment.posterior.upperBound
+              ),
+              recent_success_rate: nullableRounded(
+                execution.routing.assessment.posterior.recentSuccessRate
+              ),
+              transition_attempts:
+                execution.routing.assessment.posterior.transitionAttempts,
+              transition_successes:
+                execution.routing.assessment.posterior.transitionSuccesses
+            }
+          }
+        }
+      : {})
+  };
+}
+
+function controllerUsage(
+  frame: PhysicalTrajectoryFrame,
+  completeFromAdmission: boolean
+): NonNullable<PhysicalTrajectorySummary["controller_usage"]> {
+  const execution = frame.controller_execution;
+  if (!execution) {
+    throw new Error("Cannot capture controller usage without execution authority");
+  }
+  return {
+    protocol: "humanoid-controller-usage-v1",
+    complete_from_admission: completeFromAdmission,
+    observed_frame_count: 1,
+    mode_frame_counts: {
+      learned_policy: execution.mode === "learned_policy" ? 1 : 0,
+      reference_control: execution.mode === "reference_control" ? 1 : 0,
+      hybrid_control: execution.mode === "hybrid_control" ? 1 : 0
+    },
+    implementation_frame_counts: {
+      [execution.active_implementation]: 1
+    },
+    transition_frame_count: execution.transition ? 1 : 0,
+    ...(execution.routing
+      ? { routing: initialRoutingUsage(execution.routing) }
+      : {})
+  };
+}
+
+function advanceControllerUsage(
+  current: PhysicalTrajectorySummary["controller_usage"],
+  frame: PhysicalTrajectoryFrame
+): PhysicalTrajectorySummary["controller_usage"] {
+  const execution = frame.controller_execution;
+  if (!execution) return current;
+  if (!current) return controllerUsage(frame, false);
+  const routing = frame.controller_execution?.routing;
+  const nextRouting = !routing
+    ? current.routing
+    : !current.routing
+      ? initialRoutingUsage(routing)
+      : current.routing.last_call_id === routing.call_id
+        ? advanceCurrentRoutingUsage(current.routing, routing)
+        : advanceRoutingUsage(current.routing, routing);
+  return {
+    ...current,
+    observed_frame_count: current.observed_frame_count + 1,
+    mode_frame_counts: {
+      ...current.mode_frame_counts,
+      [execution.mode]: current.mode_frame_counts[execution.mode] + 1
+    },
+    implementation_frame_counts: {
+      ...current.implementation_frame_counts,
+      [execution.active_implementation]:
+        (current.implementation_frame_counts[execution.active_implementation] ?? 0) + 1
+    },
+    transition_frame_count: current.transition_frame_count
+      + (execution.transition ? 1 : 0),
+    ...(nextRouting ? { routing: nextRouting } : {})
+  };
+}
+
+function initialRoutingUsage(
+  routing: NonNullable<
+    NonNullable<PhysicalTrajectoryFrame["controller_execution"]>["routing"]
+  >
+): NonNullable<
+  NonNullable<PhysicalTrajectorySummary["controller_usage"]>["routing"]
+> {
+  return {
+    last_call_id: routing.call_id,
+    decision_count: 1,
+    admitted_count: routing.admitted ? 1 : 0,
+    rejected_count: routing.admitted ? 0 : 1,
+    cold_start_count: routing.cold_start ? 1 : 0,
+    rejection_reason_counts: {
+      insufficient_success_posterior:
+        routing.reason === "insufficient_success_posterior" ? 1 : 0,
+      entry_state_ood: routing.reason === "entry_state_ood" ? 1 : 0,
+      command_ood: routing.reason === "command_ood" ? 1 : 0,
+      memory_bridge_timeout:
+        routing.reason === "memory_bridge_timeout" ? 1 : 0
+    },
+    memory_bridge_attempt_count: routing.memory_bridge ? 1 : 0,
+    memory_bridge_completed_count:
+      routing.memory_bridge?.phase === "completed" ? 1 : 0,
+    memory_bridge_timeout_count:
+      routing.memory_bridge?.phase === "timed_out" ? 1 : 0,
+    memory_bridge_aborted_count:
+      routing.memory_bridge?.phase === "aborted" ? 1 : 0,
+    last_memory_bridge_phase: routing.memory_bridge?.phase ?? null
+  };
+}
+
+function advanceRoutingUsage(
+  current: NonNullable<
+    NonNullable<PhysicalTrajectorySummary["controller_usage"]>["routing"]
+  >,
+  routing: NonNullable<
+    NonNullable<PhysicalTrajectoryFrame["controller_execution"]>["routing"]
+  >
+): typeof current {
+  const added = initialRoutingUsage(routing);
+  return {
+    last_call_id: routing.call_id,
+    decision_count: current.decision_count + 1,
+    admitted_count: current.admitted_count + added.admitted_count,
+    rejected_count: current.rejected_count + added.rejected_count,
+    cold_start_count: current.cold_start_count + added.cold_start_count,
+    rejection_reason_counts: {
+      insufficient_success_posterior:
+        current.rejection_reason_counts.insufficient_success_posterior
+          + added.rejection_reason_counts.insufficient_success_posterior,
+      entry_state_ood: current.rejection_reason_counts.entry_state_ood
+        + added.rejection_reason_counts.entry_state_ood,
+      command_ood: current.rejection_reason_counts.command_ood
+        + added.rejection_reason_counts.command_ood,
+      memory_bridge_timeout:
+        current.rejection_reason_counts.memory_bridge_timeout
+          + added.rejection_reason_counts.memory_bridge_timeout
+    },
+    memory_bridge_attempt_count: current.memory_bridge_attempt_count
+      + added.memory_bridge_attempt_count,
+    memory_bridge_completed_count: current.memory_bridge_completed_count
+      + added.memory_bridge_completed_count,
+    memory_bridge_timeout_count: current.memory_bridge_timeout_count
+      + added.memory_bridge_timeout_count,
+    memory_bridge_aborted_count: current.memory_bridge_aborted_count
+      + added.memory_bridge_aborted_count,
+    last_memory_bridge_phase: added.last_memory_bridge_phase
+  };
+}
+
+function advanceCurrentRoutingUsage(
+  current: NonNullable<
+    NonNullable<PhysicalTrajectorySummary["controller_usage"]>["routing"]
+  >,
+  routing: NonNullable<
+    NonNullable<PhysicalTrajectoryFrame["controller_execution"]>["routing"]
+  >
+): typeof current {
+  const phase = routing.memory_bridge?.phase ?? null;
+  if (phase === current.last_memory_bridge_phase) return current;
+  return {
+    ...current,
+    memory_bridge_completed_count: current.memory_bridge_completed_count
+      + (phase === "completed" ? 1 : 0),
+    memory_bridge_timeout_count: current.memory_bridge_timeout_count
+      + (phase === "timed_out" ? 1 : 0),
+    memory_bridge_aborted_count: current.memory_bridge_aborted_count
+      + (phase === "aborted" ? 1 : 0),
+    last_memory_bridge_phase: phase
+  };
 }
 
 function aggregateContacts(
@@ -226,6 +476,10 @@ function distance(left: Vec3 | undefined, right: Vec3): number {
 
 function rounded(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function nullableRounded(value: number | null): number | null {
+  return value === null ? null : rounded(value);
 }
 
 function compareCodePoints(left: string, right: string): number {

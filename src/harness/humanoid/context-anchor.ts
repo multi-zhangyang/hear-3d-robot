@@ -5,7 +5,10 @@ import type {
   TaskNode
 } from "../../domain/schema.js";
 import type { HumanoidRunMode } from "../../domain/run-mode.js";
-import type { HumanoidRunCheckpoint } from "../../domain/humanoid-run.js";
+import {
+  humanoidActionReceiptsInCommitOrder,
+  type HumanoidRunCheckpoint
+} from "../../domain/humanoid-run.js";
 import { sameAutonomousCycle } from "../../domain/autonomous-cycle.js";
 import { inspectHumanoidGoal } from "../../runtime/humanoid-checker.js";
 import { yawFromQuaternion } from "../../world/geometry.js";
@@ -23,6 +26,7 @@ import {
 } from "./goal-evidence.js";
 import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.js";
 import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
+import { humanoidReplanBudgetAuthority } from "../../domain/humanoid-replan-budget.js";
 import { createHumanoidAutonomyContext } from "./autonomy-context.js";
 import { goalDAGContextView } from "./goal-dag-context.js";
 import { recentReceiptContext } from "./receipt-context.js";
@@ -59,10 +63,15 @@ export function createHumanoidContextAnchor(input: {
     observation: input.observation,
     scenario: input.scenario
   });
-  const recentReceipts = Object.values(input.checkpoint.committed_actions)
+  const recentReceipts = humanoidActionReceiptsInCommitOrder(
+    input.checkpoint.committed_actions
+  )
     .slice(-16)
     .map(recentReceiptContext);
   const executionAuthority = pendingExecutionAuthority(input);
+  const recoveryAuthority = input.checkpoint.active_cycle
+    ? humanoidReplanBudgetAuthority(input.checkpoint.active_cycle.replan_budget)
+    : null;
   const rootYaw = yawFromQuaternion(input.world.robot.rootRotation);
   return {
     worldEvidence,
@@ -73,10 +82,16 @@ export function createHumanoidContextAnchor(input: {
       mission_goal: input.missionGoal,
       goal_dag: goalDAGContextView(input.checkpoint.goal_dag),
       active_goal: input.activeGoal ?? null,
-      active_cycle: input.checkpoint.active_cycle ?? null,
+      active_cycle: input.checkpoint.active_cycle
+        ? {
+            ...input.checkpoint.active_cycle,
+            replan_budget: recoveryAuthority
+          }
+        : null,
       cycle_completion: input.cycleCompletion,
       coordinator_phase: input.coordinatorPhase,
       execution_authority: executionAuthority,
+      recovery_authority: recoveryAuthority,
       goal_context: {
         evidence_ref: worldEvidence.evidence.ref,
         evidence: worldEvidence.evidence,
@@ -87,6 +102,7 @@ export function createHumanoidContextAnchor(input: {
         })
       },
       cycle_index: input.checkpoint.cycle_index,
+      previous_cycle_transition: input.checkpoint.last_cycle,
       world_frame: input.world.frame,
       world_revision: input.world.worldRevision,
       robot: {
@@ -154,7 +170,9 @@ function pendingExecutionAuthority(input: {
 }): JsonValue {
   const cycle = input.checkpoint.active_cycle;
   if (input.coordinatorPhase !== "execute_plan" || !cycle) return null;
-  const receipt = Object.values(input.checkpoint.committed_actions).findLast((candidate) => (
+  const receipt = humanoidActionReceiptsInCommitOrder(
+    input.checkpoint.committed_actions
+  ).findLast((candidate) => (
     candidate.accepted
       && sameAutonomousCycle(candidate.cycle, cycle)
       && (candidate.action === "plan_humanoid_skill"

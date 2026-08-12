@@ -45,15 +45,25 @@ export function requiredModelCallIds(
     ids.add(epoch.selected_by.model_call_id);
     if (epoch.retired_by) ids.add(epoch.retired_by.model_call_id);
   }
+  for (const execution of Object.values(checkpoint.action_execution_ledger.active)) {
+    if (execution.admission.decision) {
+      ids.add(execution.admission.decision.model_call_id);
+    }
+  }
+  for (const receipt of Object.values(checkpoint.committed_actions)) {
+    if (receipt.decision) ids.add(receipt.decision.model_call_id);
+  }
   return ids;
 }
 
 export function optionalModelCallIds(
   checkpoint: HumanoidRunCheckpoint
 ): Set<string> {
-  return new Set(Object.values(checkpoint.committed_actions).flatMap((receipt) => (
-    receipt.decision ? [receipt.decision.model_call_id] : []
-  )));
+  return new Set([
+    ...(checkpoint.active_cycle?.replan_budget.model_calls.map(
+      (call) => call.model_call_id
+    ) ?? [])
+  ]);
 }
 
 export async function loadGoalEvidenceWorkingSet(
@@ -138,8 +148,13 @@ export async function loadModelAuthorityWorkingSet(
     }
     from += page.entries.length;
   }
-  for (const [modelCallId, started] of [...pending.entries()]
-    .slice(-RECENT_MODEL_LIFECYCLE_LIMIT)) {
+  const retainedPendingIds = new Set([
+    ...[...pending.keys()].slice(-RECENT_MODEL_LIFECYCLE_LIMIT),
+    ...[...requiredIds].filter((modelCallId) => pending.has(modelCallId)),
+    ...[...optionalIds].filter((modelCallId) => pending.has(modelCallId))
+  ]);
+  for (const modelCallId of retainedPendingIds) {
+    const started = pending.get(modelCallId)!;
     retained.set(modelCallId, [started]);
   }
   const missing = [...requiredIds].filter((modelCallId) => !retained.has(modelCallId));

@@ -84,6 +84,9 @@ export async function createOperatorServer(input: {
     ...(input.provider ? { provider: input.provider } : {}),
     ...(input.providerError ? { providerError: input.providerError } : {}),
     ...(input.controllerSource ? { controllerSource: input.controllerSource } : {}),
+    ...(input.server.densePolicyRolloutDir
+      ? { densePolicyRolloutDir: input.server.densePolicyRolloutDir }
+      : {}),
     mutationFence
   });
   const scenarioSummaries = Object.entries(input.catalog.templates).map(([id, template]) => {

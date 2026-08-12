@@ -26,6 +26,7 @@ import {
 import type { HumanoidMotionOptionExecutionState } from "./checkpoint.js";
 import type { HumanoidReference } from "./reference.js";
 import type {
+  HumanoidPolicyFrameSink,
   HumanoidSimulation,
   HumanoidSimulationSnapshot
 } from "./simulation.js";
@@ -41,6 +42,7 @@ import {
   captureHumanoidStationKeepingAnchor,
   type HumanoidStationKeepingAnchor
 } from "./station-keeping.js";
+import type { HumanoidSkillProgressEvidence } from "./skill-event-stream.js";
 
 export interface HumanoidMotionExecutionStep {
   snapshot?: HumanoidSimulationSnapshot;
@@ -74,6 +76,9 @@ export class HumanoidMotionExecution {
   readonly #graspTargets: readonly G1ContactAwareGraspTarget[];
   readonly #carryTaskSpaceTargets: readonly HumanoidCarryTaskSpaceTarget[];
   readonly #stationKeepingRequired: boolean;
+  readonly #policyFrameSink: HumanoidPolicyFrameSink | undefined;
+  readonly #skillWindowMaximumSteps: number;
+  readonly #skillWindowStepOffset: number;
   #stationKeepingAnchor: HumanoidStationKeepingAnchor | undefined;
   #stationKeepingCommand: [number, number] = [0, 0];
   #frames = 0;
@@ -90,11 +95,17 @@ export class HumanoidMotionExecution {
     graspTargets?: readonly G1ContactAwareGraspTarget[];
     carryTaskSpaceTargets?: readonly HumanoidCarryTaskSpaceTarget[];
     stationKeepingAnchor?: HumanoidStationKeepingAnchor;
+    policyFrameSink?: HumanoidPolicyFrameSink;
+    skillWindow?: {
+      maximumSteps: number;
+      stepOffset: number;
+    };
     commitPhysicalFrame?: (
       snapshot: HumanoidSimulationSnapshot
     ) => string | undefined;
   }) {
     this.#stored = input.stored;
+    this.#policyFrameSink = input.policyFrameSink;
     this.#reference = input.reference;
     this.#detectorInput = input.detectorInput;
     this.#commitPhysicalFrame = input.commitPhysicalFrame ?? (() => undefined);
@@ -147,6 +158,16 @@ export class HumanoidMotionExecution {
     this.#frameLimit = input.stored.option
       ? input.stored.option.certificate.validated_frame_limit
       : input.stored.artifact.frames.length;
+    this.#skillWindowStepOffset = input.skillWindow?.stepOffset ?? 0;
+    this.#skillWindowMaximumSteps = input.skillWindow?.maximumSteps
+      ?? this.#frameLimit;
+    if (!Number.isSafeInteger(this.#skillWindowStepOffset)
+      || this.#skillWindowStepOffset < 0
+      || !Number.isSafeInteger(this.#skillWindowMaximumSteps)
+      || this.#skillWindowMaximumSteps
+        < this.#skillWindowStepOffset + this.#frameLimit) {
+      throw new Error("Humanoid motion Skill window cannot contain this plan");
+    }
     if (input.stored.option && !terminalOption(input.stored.option.status)) {
       input.stored.option.status = "executing";
     }
@@ -160,7 +181,41 @@ export class HumanoidMotionExecution {
     return this.#reference;
   }
 
-  async step(simulation: HumanoidSimulation): Promise<HumanoidMotionExecutionStep> {
+  skillProgressEvidence(): HumanoidSkillProgressEvidence {
+    const elapsedRatio = boundedRatio(
+      this.#stored.progress.nextFrameIndex,
+      this.#frameLimit
+    );
+    const detection = this.#lastOptionDetection;
+    const predicateCount = detection?.evidence.length ?? 0;
+    const satisfiedPredicateRatio = predicateCount > 0
+      ? detection!.evidence.filter(({ status }) => status === "satisfied").length
+        / predicateCount
+      : null;
+    const observablePredicateRatio = predicateCount > 0
+      ? detection!.evidence.filter(({ status }) => status !== "uncertain").length
+        / predicateCount
+      : 1;
+    const requiredContacts = this.#modelConstraints.filter(({ required }) => required);
+    const requiredContactRatio = requiredContacts.length > 0
+      ? requiredContacts.filter((constraint) => (
+          this.#satisfiedContacts.has(humanoidContactConstraintKey(constraint))
+        )).length / requiredContacts.length
+      : null;
+    return {
+      elapsedRatio,
+      physicalCompletionRatio: satisfiedPredicateRatio ?? requiredContactRatio,
+      satisfiedPredicateRatio,
+      stableSteps: this.#stored.option?.monitor.terminalStableSteps ?? 0,
+      requiredStableSteps: this.#stored.option?.contract.stable_steps ?? null,
+      confidence: observablePredicateRatio
+    };
+  }
+
+  async step(
+    simulation: HumanoidSimulation,
+    authority?: { worldFrame: number; worldRevision: number }
+  ): Promise<HumanoidMotionExecutionStep> {
     if (this.#result) throw new Error("Humanoid motion execution is already complete");
     if (this.#shouldFinishBeforeStep()) {
       this.#finish();
@@ -190,11 +245,26 @@ export class HumanoidMotionExecution {
         ?? `motion-plan:${this.#stored.plan.id}`,
       taskGoal: this.#stored.option
         ? {
-            protocol: "humanoid-controller-motion-goal-v1",
-            predicates: structuredClone(this.#stored.option.contract.predicates),
-            stableSteps: this.#stored.option.contract.stable_steps
+            protocol: "humanoid-embodied-motion-contract-v1",
+            option: structuredClone(this.#stored.option.contract)
           }
         : null,
+      ...(this.#stored.skillCallIdentity
+        ? { skillIdentity: this.#stored.skillCallIdentity }
+        : {}),
+      authority: authority ?? {
+        worldFrame: (this.#stored.skillCallIdentity?.observedFrame ?? 0) + index,
+        worldRevision:
+          (this.#stored.skillCallIdentity?.observedWorldRevision ?? 0) + index
+      },
+      controlWindow: {
+        maximumSteps: this.#skillWindowMaximumSteps,
+        stepIndex: this.#skillWindowStepOffset + index
+      },
+      authorizedContacts: this.#constraints,
+      ...(this.#policyFrameSink
+        ? { policyFrameSink: this.#policyFrameSink }
+        : {}),
       ...(this.#stationKeepingAnchor
         ? {
             stationKeepingAnchor: this.#stationKeepingAnchor,
@@ -508,6 +578,10 @@ export class HumanoidMotionExecution {
 
 function terminalOption(status: HumanoidMotionOptionExecutionState["status"]): boolean {
   return status === "succeeded" || status === "failed" || status === "goal_unmet";
+}
+
+function boundedRatio(value: number, total: number): number {
+  return total <= 0 ? 0 : Math.min(1, Math.max(0, value / total));
 }
 
 function mergeContactConstraints(

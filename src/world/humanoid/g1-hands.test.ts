@@ -18,7 +18,7 @@ import { HumanoidSimulation } from "./simulation.js";
 import { g1HandObjectContacts } from "./hand-contact-evidence.js";
 import { HumanoidSimulationStateCheckpointSchema } from "./checkpoint.js";
 import { HumanoidWorldSnapshotSchema } from "./snapshot-schema.js";
-import { G1HandActuator } from "./hand-actuator.js";
+import { G1HandActuator, guardClosingTarget } from "./hand-actuator.js";
 import {
   g1HandContactGeomName
 } from "./hand-collision-geometry.js";
@@ -35,6 +35,16 @@ import type {
 } from "./whole-body-controller.js";
 
 describe("Unitree G1 43DoF hands", () => {
+  it("bounds stored closing energy without slowing release for either hand", () => {
+    expect(guardClosingTarget(-0.10, -1.20, 0.25)).toBeCloseTo(-0.35);
+    expect(guardClosingTarget(0.10, 1.20, 0.25)).toBeCloseTo(0.35);
+    expect(guardClosingTarget(-0.60, -0.20, 0.25)).toBeCloseTo(-0.20);
+    expect(guardClosingTarget(0.60, 0.20, 0.25)).toBeCloseTo(0.20);
+    expect(guardClosingTarget(-0.60, 0, 0.25)).toBe(0);
+    expect(guardClosingTarget(0.60, 0, 0.25)).toBe(0);
+    expect(() => guardClosingTarget(0, 1, 0)).toThrow(/must be positive/);
+  });
+
   it("maps interleaved body and hand actuators by joint identity without overlap", async () => {
     const runtime = await loadHumanoidMujoco();
     const model = runtime.MjModel.from_xml_path(humanoidModelPath());
@@ -62,7 +72,7 @@ describe("Unitree G1 43DoF hands", () => {
       import.meta.url
     ));
     expect(createHash("sha256").update(source).digest("hex")).toBe(
-      "2d41a3c6783fbf9e17349608d9c2222d970163b1db315ce9f30c4a97631fc078"
+      "6d80af81ab8153f18158b190ab52fbfb880418b295c3bcb1827040896246057a"
     );
     const controller = new RecordingBodyController();
     const simulation = await HumanoidSimulation.create({
@@ -126,6 +136,10 @@ describe("Unitree G1 43DoF hands", () => {
         actuation: "joint_position_pd",
         jointCount: 14
       });
+      expect(Object.values(initial.hands.joints).every((joint) => (
+        Math.abs(joint.stiffnessNewtonMetersPerRadian - 2.5) < 1e-9
+          && Math.abs(joint.dampingNewtonMeterSecondsPerRadian - 0.3) < 1e-9
+      ))).toBe(true);
       expect(controller.policyJointCounts).toEqual([29]);
       await simulation.step(neutralHumanoidReference());
       expect(controller.policyJointCounts).toEqual([29, 29, 29]);
@@ -178,7 +192,11 @@ describe("Unitree G1 43DoF hands", () => {
         controller: captured.controller
       });
       const capturedHand = simulation.snapshot().hands.joints.left_hand_index_0_joint;
-      expect(capturedHand.position).toBeCloseTo(-0.63, 2);
+      // The contact-policy hand is intentionally compliant (kp=2.5, kv=0.3),
+      // so checkpointing must not assume the near-instantaneous kp=500
+      // response that the hand actuators inherited before deployment parity.
+      expect(Math.abs(capturedHand.position - capturedHand.target))
+        .toBeLessThan(Math.abs(baselinePosition - capturedHand.target) / 2);
 
       simulation.setHandJointTargets({ left_hand_index_0_joint: -0.05 });
       for (let index = 0; index < 4; index += 1) {

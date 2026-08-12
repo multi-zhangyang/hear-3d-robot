@@ -24,7 +24,7 @@ describe("LongRunContextManager hierarchy identity", () => {
     const configuredAgents: string[] = [];
     const nodes = new Map([
       ["humanoid-coordinator", taskNode("humanoid-coordinator", "协调")],
-      ["humanoid-sentry", taskNode("humanoid-sentry", "感知")]
+      ["humanoid-motion-reference", taskNode("humanoid-motion-reference", "运动")]
     ]);
     const runtime = {
       rootAgentId: "humanoid-coordinator",
@@ -63,20 +63,20 @@ describe("LongRunContextManager hierarchy identity", () => {
       })
     });
     const modelData: ModelInputData = {
-      instructions: `${agentInvocationMarker("humanoid-sentry")}\nObserve only.`,
+      instructions: `${agentInvocationMarker("humanoid-motion-reference")}\nPlan motion only.`,
       input: [{ role: "user", content: "Inspect the current robot." }] as AgentInputItem[]
     };
 
     const filtered = await manager.filter({
       modelData,
-      agent: { name: "人形感知哨兵", tools: [] }
+      agent: { name: "全身运动参考智能体", tools: [] }
     } as never);
 
-    expect(activeNodeCalls).toEqual(["humanoid-sentry"]);
-    expect(configuredAgents).toEqual(["humanoid-sentry"]);
-    expect(manager.snapshot.active_scope_id).toBe("humanoid-sentry");
-    expect(Object.keys(manager.snapshot.scopes)).toEqual(["humanoid-sentry"]);
-    expect(filtered.instructions).toContain(agentInvocationMarker("humanoid-sentry"));
+    expect(activeNodeCalls).toEqual(["humanoid-motion-reference"]);
+    expect(configuredAgents).toEqual(["humanoid-motion-reference"]);
+    expect(manager.snapshot.active_scope_id).toBe("humanoid-motion-reference");
+    expect(Object.keys(manager.snapshot.scopes)).toEqual(["humanoid-motion-reference"]);
+    expect(filtered.instructions).toContain(agentInvocationMarker("humanoid-motion-reference"));
   });
 
   it("surfaces revision-bound Goal identifiers in the final authority envelope", async () => {
@@ -882,7 +882,7 @@ describe("LongRunContextManager hierarchy identity", () => {
     const requests: Array<{ agentId: string; request: ContextSummaryRequest }> = [];
     const nodes = new Map([
       ["humanoid-coordinator", taskNode("humanoid-coordinator", "协调")],
-      ["humanoid-sentry", taskNode("humanoid-sentry", "感知")]
+      ["humanoid-motion-reference", taskNode("humanoid-motion-reference", "运动")]
     ]);
     const coordinator = providerConfig({
       contextWindowTokens: 8_192,
@@ -890,7 +890,7 @@ describe("LongRunContextManager hierarchy identity", () => {
       compactRecentModelTurns: 3,
       compactMaxOutputTokens: 80
     });
-    const sentry = providerConfig({
+    const motion = providerConfig({
       contextWindowTokens: 4_096,
       compactTriggerTokens: 700,
       compactRecentModelTurns: 1,
@@ -928,7 +928,9 @@ describe("LongRunContextManager hierarchy identity", () => {
       runtime,
       provider: coordinator,
       compactorProvider: compactor,
-      configForAgent: (agentId) => agentId === "humanoid-sentry" ? sentry : coordinator,
+      configForAgent: (agentId) => (
+        agentId === "humanoid-motion-reference" ? motion : coordinator
+      ),
       createGenerator: (agentId) => ({
         async generate(request) {
           requests.push({ agentId, request });
@@ -958,14 +960,14 @@ describe("LongRunContextManager hierarchy identity", () => {
     } as never);
     await manager.filter({
       modelData: {
-        instructions: `${agentInvocationMarker("humanoid-sentry")}\nObserve.`,
+        instructions: `${agentInvocationMarker("humanoid-motion-reference")}\nPlan.`,
         input: [
           { role: "user", content: "x".repeat(3_000) },
           { role: "assistant", content: "Observation acknowledged." },
           { role: "user", content: "Keep the newest evidence." }
         ] as AgentInputItem[]
       },
-      agent: { name: "感知", tools: [] }
+      agent: { name: "运动", tools: [] }
     } as never);
 
     expect(manager.snapshot.scopes["humanoid-coordinator"]).toMatchObject({
@@ -974,14 +976,14 @@ describe("LongRunContextManager hierarchy identity", () => {
       compact_recent_model_turns: 3,
       compact_max_output_tokens: 80
     });
-    expect(manager.snapshot.scopes["humanoid-sentry"]).toMatchObject({
+    expect(manager.snapshot.scopes["humanoid-motion-reference"]).toMatchObject({
       context_window_tokens: 4_096,
       compact_trigger_tokens: 700,
       compact_recent_model_turns: 1,
       compact_max_output_tokens: 120
     });
     expect(manager.snapshot).toMatchObject({
-      active_scope_id: "humanoid-sentry",
+      active_scope_id: "humanoid-motion-reference",
       context_window_tokens: 4_096,
       compact_trigger_tokens: 700,
       compact_recent_model_turns: 1,
@@ -989,7 +991,7 @@ describe("LongRunContextManager hierarchy identity", () => {
     });
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({
-      agentId: "humanoid-sentry",
+      agentId: "humanoid-motion-reference",
       request: {
         maxOutputTokens: 120,
         maxInputTokens: compactorInputTokenLimit(8_192, 120)

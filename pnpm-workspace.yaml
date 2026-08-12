@@ -1,6 +1,10 @@
 packages:
   - .
 
+storeDir: .pnpm-store
+cacheDir: .pnpm-cache
+stateDir: .pnpm-state
+
 overrides:
   brace-expansion@5.0.8: 5.0.9
   fast-uri@3.1.4: 3.1.5

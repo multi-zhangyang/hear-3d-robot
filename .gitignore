@@ -1,5 +1,12 @@
 .env
 node_modules/
+.pnpm-store/
+.pnpm-cache/
+.pnpm-state/
+.corepack/
+.tmp/
+.local/
+.playwright-browsers/
 dist/
 web/dist/
 coverage/
@@ -7,9 +14,13 @@ playwright-report/
 test-results/
 .e2e-runs/
 *.log
+MUJOCO_LOG.TXT
 *.tsbuildinfo
 *.offsets
+__pycache__/
+*.py[cod]
 .DS_Store
 runs/*
 !runs/.gitkeep
 artifacts/training/
+artifacts/benchmarks/

@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentManifest } from "../../domain/agent-manifest.js";
+import { autonomousCycleRef } from "../../domain/autonomous-cycle.js";
 import type { HumanoidSkillInvocation } from "../../domain/humanoid-skill.js";
+import {
+  humanoidContextMemoryStateSha256,
+  humanoidEmbodiedMemoryStateSha256,
+  humanoidExecutionLedgerStateSha256
+} from "../../domain/humanoid-run.js";
 import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import { createScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
 import { createScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
@@ -20,10 +26,18 @@ import type {
   HumanoidMotionGeneratorInput
 } from "../../world/humanoid/motion-plan.js";
 import { HumanoidWorld } from "../../world/humanoid/world.js";
+import {
+  HumanoidEmbodiedSkillEventSchema,
+  HumanoidEmbodiedSkillStatusSchema
+} from "../../world/humanoid/embodied-skill-call.js";
 import { HUMANOID_AGENT_IDS } from "./agents.js";
 import { createHumanoidRunCheckpoint } from "./run-checkpoint.js";
 import { HumanoidRunRuntime } from "./run-runtime.js";
 import { HumanoidActionRuntime, humanoidActionFingerprint } from "./runtime.js";
+import {
+  ActiveHumanoidSkillBindingSchema,
+  humanoidEmbodiedSkillIdentity
+} from "./skill-binding.js";
 
 const scenario = ScenarioSchema.parse({
   title: "人形持久运行场",
@@ -99,6 +113,20 @@ describe("HumanoidRunRuntime", () => {
       expect(runtime.goalRetirementDelegationAvailable()).toBe(false);
       expect(runtime.checkpoint.goal_dag.status).toBe("active");
       expect(runtime.checkpoint.checker?.success).toBe(false);
+      const persisted = await store.readHumanoidCheckpoint();
+      expect(persisted.goal_state_anchor).toMatchObject({
+        goal_dag_state_sha256: persisted.goal_dag.state_sha256
+      });
+      const forgedGoalCheckpoint = structuredClone(persisted);
+      forgedGoalCheckpoint.goal_dag = {
+        ...forgedGoalCheckpoint.goal_dag,
+        status: "awaiting_model_selection",
+        current_epoch_id: null,
+        state_sha256: "f".repeat(64)
+      } as never;
+      await expect(store.writeCheckpoint(forgedGoalCheckpoint)).rejects.toThrow(
+        "Goal state anchor does not match"
+      );
     } finally {
       await runtime?.stopContinuousPhysics();
       await world.dispose();
@@ -162,6 +190,125 @@ describe("HumanoidRunRuntime", () => {
     }
   }, 30_000);
 
+  it("rejects a superseded planning receipt at the final physical authority boundary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-current-execution-authority-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "只允许当前规划权威驱动物理世界",
+      scenarioId: "humanoid-current-execution-authority-test",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1",
+      runMode: "continuous"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    let runtime: HumanoidRunRuntime | undefined;
+    try {
+      const checkpoint = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(checkpoint);
+      runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint
+      });
+      const activeGoal = GoalSchema.parse({
+        summary: "移动到远离初始位置的目标点",
+        predicates: [{
+          type: "robot_at",
+          target: { x: 5, y: 0, z: 5 },
+          tolerance: 0.3
+        }]
+      });
+      const manifest = await activateGoal(runtime, activeGoal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+
+      await invokeModelAction(
+        runtime,
+        "observe_humanoid",
+        {},
+        "current-authority-observation",
+        HUMANOID_AGENT_IDS.motion
+      );
+      const oldPlan = await invokeModelAction(
+        runtime,
+        "plan_whole_body_motion",
+        {
+          id: "superseded-posture",
+          intent: "旧的候选姿态",
+          duration_seconds: 0.1,
+          keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1, torso_yaw: 0.02 }]
+        },
+        "superseded-planning-transaction",
+        HUMANOID_AGENT_IDS.motion
+      );
+      const currentPlan = await invokeModelAction(
+        runtime,
+        "plan_whole_body_motion",
+        {
+          id: "current-posture",
+          intent: "当前获准执行的姿态",
+          duration_seconds: 0.1,
+          keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1, torso_yaw: -0.02 }]
+        },
+        "current-planning-transaction",
+        HUMANOID_AGENT_IDS.motion
+      );
+      expect(oldPlan.accepted).toBe(true);
+      expect(currentPlan.accepted).toBe(true);
+      const reorderedCheckpoint = runtime.checkpoint;
+      reorderedCheckpoint.committed_actions = Object.fromEntries(
+        Object.entries(reorderedCheckpoint.committed_actions).reverse()
+      );
+      runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: reorderedCheckpoint
+      });
+      await runtime.initializeGoalAutonomy(manifest);
+      expect(runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator)).toMatchObject({
+        coordinator_phase: "execute_plan",
+        execution_authority: {
+          planning_transaction_id: currentPlan.transactionId,
+          executor_action: "execute_whole_body_motion"
+        }
+      });
+
+      const beforeRejectedExecution = world.snapshot();
+      await expect(invokeModelAction(
+        runtime,
+        "execute_whole_body_motion",
+        { planning_transaction_id: oldPlan.transactionId },
+        "superseded-physical-execution",
+        HUMANOID_AGENT_IDS.executor
+      )).rejects.toThrow("does not match current execution authority");
+      expect(world.snapshot()).toEqual(beforeRejectedExecution);
+      expect(runtime.checkpoint.action_execution_ledger.active).toEqual({});
+
+      const executed = await invokeModelAction(
+        runtime,
+        "execute_whole_body_motion",
+        { planning_transaction_id: currentPlan.transactionId },
+        "current-physical-execution",
+        HUMANOID_AGENT_IDS.executor
+      );
+      expect(executed).toMatchObject({
+        accepted: true,
+        action: "execute_whole_body_motion"
+      });
+      expect(executed.frameCount).toBeGreaterThan(0);
+    } finally {
+      await runtime?.stopContinuousPhysics();
+      await world.dispose();
+    }
+  }, 45_000);
+
   it("restores pending Skill authority and advances its DAG after restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-skill-restart-"));
     temporaryDirectories.push(root);
@@ -217,6 +364,19 @@ describe("HumanoidRunRuntime", () => {
       expect(planned.accepted, JSON.stringify(planned)).toBe(true);
 
       const persisted = await store.readHumanoidCheckpoint();
+      const persistedEvents = await store.readJournal("events");
+      const durableSkillBindingEvent = persistedEvents.find((event) => (
+        journalField(event, "type") === "humanoid_action_committed"
+          && journalNestedField(event, "data", "receipt", "action")
+            === "begin_humanoid_skill"
+      ));
+      expect(durableSkillBindingEvent).toBeDefined();
+      expect(journalNestedField(
+        durableSkillBindingEvent,
+        "data",
+        "action_tool_authority",
+        "tool_name"
+      )).toBe("begin_humanoid_skill");
       expect(persisted.action_runtime_state).toMatchObject({
         version: 1,
         skill_plans: [{
@@ -230,6 +390,16 @@ describe("HumanoidRunRuntime", () => {
           binding: { transaction_id: skillTransactionId }
         }]
       });
+      expect(persisted.physical_state_anchor).toMatchObject({
+        world_frame: persisted.world.frame,
+        world_revision: persisted.world.worldRevision,
+        world_checkpoint_sha256: expect.stringMatching(/^[a-f0-9]{64}$/)
+      });
+      const forgedPhysicalCheckpoint = structuredClone(persisted);
+      forgedPhysicalCheckpoint.world_checkpoint.simulation.positions[0]! += 0.01;
+      await expect(store.writeCheckpoint(forgedPhysicalCheckpoint)).rejects.toThrow(
+        "Physical state anchor does not match"
+      );
 
       tamperedWorld = await HumanoidWorld.create(
         scenario,
@@ -256,6 +426,27 @@ describe("HumanoidRunRuntime", () => {
         frameCount: 0
       });
       expect(tamperedWorld.snapshot()).toEqual(beforeRejectedExecution);
+      await tamperedWorld.dispose();
+      tamperedWorld = undefined;
+
+      const forgedCheckpoint = structuredClone(persisted);
+      const forgedState = forgedCheckpoint.action_runtime_state as {
+        active_skills: unknown[];
+      };
+      forgedState.active_skills = [];
+      tamperedWorld = await HumanoidWorld.create(
+        scenario,
+        forgedCheckpoint.world_checkpoint
+      );
+      const forgedRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: tamperedWorld,
+        checkpoint: forgedCheckpoint
+      });
+      await expect(forgedRuntime.initializeGoalAutonomy(manifest)).rejects.toThrow(
+        "action runtime state conflicts with durable event"
+      );
       await tamperedWorld.dispose();
       tamperedWorld = undefined;
 
@@ -302,6 +493,168 @@ describe("HumanoidRunRuntime", () => {
       });
     } finally {
       await tamperedWorld?.dispose();
+      await resumedWorld?.dispose();
+      await world.dispose();
+    }
+  }, 45_000);
+
+  it("continues a durable Skill event sequence after a process crash", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-skill-event-recovery-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "恢复已开始但未完成的人形 Skill 事件流",
+      scenarioId: "humanoid-skill-event-recovery",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1",
+      runMode: "continuous"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    let resumedWorld: HumanoidWorld | undefined;
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      const manifest = await activateGoal(runtime, scenario.default_goal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+
+      const before = world.snapshot();
+      const skillTransactionId = await bindPlanningSkill(
+        runtime,
+        "event-recovery-retreat",
+        {
+          skill: "retreat",
+          target: {
+            ...before.robot.rootPosition,
+            z: before.robot.rootPosition.z + 0.35
+          },
+          minimum_obstacle_clearance_m: 0.2
+        },
+        "route"
+      );
+      const planned = await invokeModelAction(
+        runtime,
+        "plan_humanoid_skill",
+        { skill_transaction_id: skillTransactionId },
+        "event-recovery-plan",
+        HUMANOID_AGENT_IDS.motion
+      );
+      expect(planned.accepted, JSON.stringify(planned)).toBe(true);
+
+      const actionState = runtime.checkpoint.action_runtime_state as {
+        planning_skill_bindings: Array<{
+          planning_transaction_id: string;
+          binding: unknown;
+        }>;
+      };
+      const binding = ActiveHumanoidSkillBindingSchema.parse(
+        actionState.planning_skill_bindings.find((entry) => (
+          entry.planning_transaction_id === planned.transactionId
+        ))?.binding
+      );
+      const identity = humanoidEmbodiedSkillIdentity(binding);
+      vi.spyOn(world, "executeNavigation").mockImplementationOnce(async () => {
+        const snapshot = runtime.snapshot();
+        const accepted = HumanoidEmbodiedSkillEventSchema.parse({
+          protocol: "humanoid-embodied-skill-event-v1",
+          sequence: 0,
+          type: "accepted",
+          status: HumanoidEmbodiedSkillStatusSchema.parse({
+            protocol: "humanoid-embodied-skill-status-v1",
+            callId: identity.callId,
+            state: "accepted",
+            progress: {
+              elapsedRatio: 0,
+              physicalCompletionRatio: 0,
+              satisfiedPredicateRatio: 0,
+              stableSteps: 0,
+              requiredStableSteps: 1
+            },
+            confidence: { value: 1, basis: "observable_contract_evidence" },
+            failure: null,
+            recoverability: "not_applicable",
+            worldFrame: snapshot.frame,
+            worldRevision: snapshot.worldRevision,
+            controller: null
+          })
+        });
+        await store.appendRuntimeEvents([{
+          event_id: "skill-event-at-abrupt-process-loss",
+          run_id: store.definition.run_id,
+          type: "humanoid_skill_event",
+          at: new Date().toISOString(),
+          data: accepted
+        }]);
+        throw new Error("simulated abrupt process loss after Skill acceptance");
+      });
+      await expect(invokeModelAction(
+        runtime,
+        "execute_humanoid_skill",
+        { planning_transaction_id: planned.transactionId },
+        "event-recovery-execution",
+        HUMANOID_AGENT_IDS.executor
+      )).rejects.toThrow("simulated abrupt process loss after Skill acceptance");
+
+      const persisted = await store.readHumanoidCheckpoint();
+      const activeExecution = persisted.action_execution_ledger.active[
+        "event-recovery-execution"
+      ];
+      expect(activeExecution).toBeDefined();
+      expect(activeExecution?.admission.planning_transaction_id).toBe(
+        planned.transactionId
+      );
+      vi.restoreAllMocks();
+      resumedWorld = await HumanoidWorld.create(
+        scenario,
+        persisted.world_checkpoint
+      );
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: persisted
+      });
+      await resumed.initializeGoalAutonomy(manifest);
+      const executed = await invokeModelAction(
+        resumed,
+        "execute_humanoid_skill",
+        { planning_transaction_id: planned.transactionId },
+        "event-recovery-execution",
+        HUMANOID_AGENT_IDS.executor
+      );
+      expect(executed.accepted, JSON.stringify(executed)).toBe(true);
+
+      const recoveredEvents = (await store.readJournal("events"))
+        .filter((event) => (
+          journalField(event, "type") === "humanoid_skill_event"
+          && journalField(journalField(event, "data"), "status") !== undefined
+          && journalField(
+            journalField(journalField(event, "data"), "status"),
+            "callId"
+          ) === identity.callId
+        ));
+      expect(recoveredEvents.map((event) => (
+        journalField(journalField(event, "data"), "sequence")
+      ))).toEqual(recoveredEvents.map((_, index) => index));
+      expect(recoveredEvents.map((event) => (
+        journalField(journalField(event, "data"), "type")
+      )).filter((type) => type === "accepted")).toEqual(["accepted"]);
+      expect(journalField(
+        journalField(recoveredEvents.at(-1), "data"),
+        "type"
+      )).toBe("succeeded");
+    } finally {
+      vi.restoreAllMocks();
       await resumedWorld?.dispose();
       await world.dispose();
     }
@@ -482,6 +835,10 @@ describe("HumanoidRunRuntime", () => {
           trajectory_sha256: expect.stringMatching(/^[a-f0-9]{64}$/)
         }
       });
+      const legacyMotionSkillEvents = (await store.readJournal("events")).filter(
+        (event) => journalField(event, "type") === "humanoid_skill_event"
+      );
+      expect(legacyMotionSkillEvents).toEqual([]);
 
       expect(() => runtime.validateCycleEvidence([execution.transactionId])).toThrow(
         "requires accepted physical execution evidence"
@@ -517,6 +874,19 @@ describe("HumanoidRunRuntime", () => {
         HUMANOID_AGENT_IDS.executor
       );
       expect(pendingExecution.accepted).toBe(true);
+      expect(world.checkpoint().routes.some(
+        (route) => route.id === journalField(pendingPlan.detail, "plan_id")
+      )).toBe(false);
+      const durableSkillEvents = (await store.readJournal("events")).filter(
+        (event) => journalField(event, "type") === "humanoid_skill_event"
+      );
+      expect(durableSkillEvents.length).toBeGreaterThanOrEqual(2);
+      expect(durableSkillEvents.map((event) => (
+        journalField(journalField(event, "data"), "type")
+      ))).toEqual(expect.arrayContaining(["accepted", "succeeded"]));
+      expect(durableSkillEvents.every((event) => (
+        typeof journalField(event, "cursor") === "string"
+      ))).toBe(true);
       expect(() => runtime.validateCycleEvidence([
         pendingExecution.transactionId
       ])).toThrow("requires an accepted Sentry observation");
@@ -583,6 +953,9 @@ describe("HumanoidRunRuntime", () => {
           automatic_actuation: false,
           removal_transaction: removalTransaction
         },
+        commitSequence: Math.max(...Object.values(
+          lifecycleCheckpoint.committed_actions
+        ).map((receipt) => receipt.commitSequence!)) + 1,
         committedAt: new Date().toISOString()
       };
       const lifecycleRuntime = new HumanoidRunRuntime({
@@ -616,6 +989,9 @@ describe("HumanoidRunRuntime", () => {
         frameCount: 0,
         channels: [],
         detail: {},
+        commitSequence: Math.max(...Object.values(
+          lifecycleCheckpoint.committed_actions
+        ).map((receipt) => receipt.commitSequence!)) + 1,
         committedAt: new Date().toISOString()
       };
       const observedLifecycleRuntime = new HumanoidRunRuntime({
@@ -827,6 +1203,16 @@ describe("HumanoidRunRuntime", () => {
           goal_success: true
         }]
       });
+      expect(persisted.embodied_memory_state_anchor).toMatchObject({
+        embodied_memory_sha256: humanoidEmbodiedMemoryStateSha256(
+          persisted.embodied_memory
+        )
+      });
+      expect(persisted.context_memory_state_anchor).toMatchObject({
+        context_memory_sha256: humanoidContextMemoryStateSha256(
+          persisted.context_memory
+        )
+      });
       expect(await store.readJournal("experiences")).toEqual([
         expect.objectContaining({
           source_ref: `action:${execution.transactionId}`,
@@ -846,11 +1232,11 @@ describe("HumanoidRunRuntime", () => {
         (record) => journalField(record, "lifecycle") === "completed"
       );
       expect(completedModelCalls).toContainEqual(expect.objectContaining({
-        agent_id: HUMANOID_AGENT_IDS.executor,
+        agent_id: HUMANOID_AGENT_IDS.coordinator,
         cycle: pendingExecution.cycle,
         tool_calls: expect.arrayContaining([expect.objectContaining({
           tool_call_id: pendingExecution.transactionId,
-          tool_name: pendingExecution.action
+          tool_name: "delegate_physics_executor"
         })])
       }));
       const memoryEvent = events.find((event) => event.type === "embodied_episode_recorded");
@@ -890,6 +1276,124 @@ describe("HumanoidRunRuntime", () => {
         checkpoint: persisted
       });
       await resumed.initializeGoalAutonomy(goalManifest);
+      const forgedMemory = structuredClone(persisted);
+      forgedMemory.embodied_memory.recent_experiences[0]!.goal_summary =
+        "伪造的长期经验";
+      await expect(store.writeCheckpoint(forgedMemory)).rejects.toThrow(
+        "Embodied memory state anchor does not match"
+      );
+      const forgedAnchor = structuredClone(persisted);
+      forgedAnchor.embodied_memory_state_anchor!.event_id =
+        "humanoid-embodied-memory:missing-event";
+      const forgedMemoryRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: forgedAnchor
+      });
+      await expect(forgedMemoryRuntime.initializeGoalAutonomy(goalManifest)).rejects.toThrow(
+        "Embodied memory state anchor event is missing"
+      );
+      const downgradedMemory = structuredClone(persisted);
+      downgradedMemory.embodied_memory_state_anchor = null;
+      const downgradedMemoryRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: downgradedMemory
+      });
+      await expect(
+        downgradedMemoryRuntime.initializeGoalAutonomy(goalManifest)
+      ).resolves.toBeUndefined();
+      expect(downgradedMemoryRuntime.checkpoint.embodied_memory_state_anchor)
+        .toEqual(persisted.embodied_memory_state_anchor);
+      const poisonedDowngradedMemory = structuredClone(persisted);
+      poisonedDowngradedMemory.embodied_memory.recent_experiences[0]!.goal_summary =
+        "清空锚点后伪造的长期经验";
+      poisonedDowngradedMemory.embodied_memory_state_anchor = null;
+      const poisonedDowngradedMemoryRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: poisonedDowngradedMemory
+      });
+      await expect(
+        poisonedDowngradedMemoryRuntime.initializeGoalAutonomy(goalManifest)
+      ).rejects.toThrow(
+        "Embodied memory state anchor is missing while durable anchor history exists"
+      );
+      const forgedContext = structuredClone(persisted);
+      forgedContext.context_memory.total_compactions += 1;
+      await expect(store.writeCheckpoint(forgedContext)).rejects.toThrow(
+        "Context memory state anchor does not match"
+      );
+      const downgradedContext = structuredClone(persisted);
+      downgradedContext.context_memory_state_anchor = null;
+      const downgradedContextRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: downgradedContext
+      });
+      await expect(
+        downgradedContextRuntime.initializeGoalAutonomy(goalManifest)
+      ).resolves.toBeUndefined();
+      expect(downgradedContextRuntime.checkpoint.context_memory_state_anchor)
+        .toEqual(persisted.context_memory_state_anchor);
+      const poisonedDowngradedContext = structuredClone(persisted);
+      poisonedDowngradedContext.context_memory.total_compactions += 1;
+      poisonedDowngradedContext.context_memory_state_anchor = null;
+      const poisonedDowngradedContextRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: poisonedDowngradedContext
+      });
+      await expect(
+        poisonedDowngradedContextRuntime.initializeGoalAutonomy(goalManifest)
+      ).rejects.toThrow(
+        "Context memory state anchor is missing while durable anchor history exists"
+      );
+      const appendBeforeCheckpoint = structuredClone(persisted);
+      const advancedContextMemory = structuredClone(persisted.context_memory);
+      advancedContextMemory.active_estimated_tokens += 1;
+      appendBeforeCheckpoint.context_memory = advancedContextMemory;
+      appendBeforeCheckpoint.context_memory_state_anchor = null;
+      const advancedContextSha256 = humanoidContextMemoryStateSha256(
+        advancedContextMemory
+      );
+      const advancedContextEventId = `humanoid-context-memory:${modelPayloadSha256({
+        version: 1,
+        run_id: persisted.run_id,
+        context_memory_sha256: advancedContextSha256
+      })}`;
+      const advancedAt = new Date().toISOString();
+      await store.appendRuntimeEvents([{
+        event_id: advancedContextEventId,
+        run_id: persisted.run_id,
+        type: "humanoid_context_memory_state_anchored",
+        at: advancedAt,
+        data: {
+          version: 1,
+          context_memory_sha256: advancedContextSha256,
+          context_memory: advancedContextMemory
+        }
+      }]);
+      const appendBeforeCheckpointRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world: resumedWorld,
+        checkpoint: appendBeforeCheckpoint
+      });
+      await expect(
+        appendBeforeCheckpointRuntime.initializeGoalAutonomy(goalManifest)
+      ).resolves.toBeUndefined();
+      expect(appendBeforeCheckpointRuntime.checkpoint.context_memory_state_anchor)
+        .toMatchObject({
+          event_id: advancedContextEventId,
+          context_memory_sha256: advancedContextSha256,
+          anchored_at: advancedAt
+        });
       const beforeReplay = resumed.snapshot();
       const replayed = await invokeModelAction(resumed,
         "execute_whole_body_motion",
@@ -991,6 +1495,405 @@ describe("HumanoidRunRuntime", () => {
     }
   });
 
+  it("accepts an ambiguously acknowledged durable model lifecycle append", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-model-lifecycle-ambiguous-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "验证模型权威日志的模糊提交恢复",
+      scenarioId: "humanoid-model-lifecycle-ambiguous",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      await runtime.initializeGoalAutonomy(humanoidTestManifest());
+      const originalAppend = store.append.bind(store);
+      let ambiguous = true;
+      vi.spyOn(store, "append").mockImplementation(async (name, value) => {
+        await originalAppend(name, value);
+        if (name === "model_calls" && ambiguous) {
+          ambiguous = false;
+          throw new Error("model journal acknowledgement lost");
+        }
+      });
+
+      const modelCallId = await runtime.recordModelCallStarted(
+        HUMANOID_AGENT_IDS.coordinator
+      );
+      await runtime.recordModelCallCompleted({
+        modelCallId,
+        agentId: HUMANOID_AGENT_IDS.coordinator,
+        responseId: `response-${modelCallId}`,
+        responseOutputSha256: "b".repeat(64),
+        toolCalls: []
+      });
+
+      const records = (await store.readJournal("model_calls")).filter((entry) => (
+        journalField(entry, "model_call_id") === modelCallId
+      ));
+      expect(records.map((entry) => journalField(entry, "lifecycle"))).toEqual([
+        "started",
+        "completed"
+      ]);
+      expect(runtime.checkpoint.total_model_calls).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+      await world.dispose();
+    }
+  });
+
+  it("terminalizes model calls left in flight by a process restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-model-lifecycle-restart-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "闭合进程丢失时仍在飞行的模型调用",
+      scenarioId: "humanoid-model-lifecycle-restart",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const manifest = humanoidTestManifest();
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      await runtime.initializeGoalAutonomy(manifest);
+      const modelCallId = await runtime.recordModelCallStarted(
+        HUMANOID_AGENT_IDS.coordinator
+      );
+      const crashCheckpoint = await store.readHumanoidCheckpoint();
+
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: crashCheckpoint
+      });
+      await resumed.initializeGoalAutonomy(manifest);
+
+      const records = (await store.readJournal("model_calls")).filter((entry) => (
+        journalField(entry, "model_call_id") === modelCallId
+      ));
+      expect(records.map((entry) => journalField(entry, "lifecycle"))).toEqual([
+        "started",
+        "failed"
+      ]);
+      expect(resumed.checkpoint.total_model_calls).toBe(1);
+      expect(resumed.checkpoint.model_call_journal_cursor).toBe(records.length);
+      expect((await store.readJournal("events")).some((entry) => (
+        journalField(entry, "type") === "model_requests_interrupted_by_restart"
+      ))).toBe(true);
+    } finally {
+      await world.dispose();
+    }
+  });
+
+  it("restores replan budget authority when the model journal outruns the checkpoint", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-replan-budget-journal-recovery-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "恢复已经扣除但尚未写入检查点的重规划预算",
+      scenarioId: "humanoid-replan-budget-journal-recovery",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1",
+      runMode: "continuous"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const manifest = humanoidTestManifest();
+      const bootstrap = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      const activeGoal = GoalSchema.parse({
+        summary: "移动到需要重新规划的位置",
+        predicates: [{
+          type: "robot_at",
+          target: { x: 5, y: 0, z: 5 },
+          tolerance: 0.3
+        }]
+      });
+      await activateGoal(bootstrap, activeGoal);
+      await bootstrap.start(false);
+      await bootstrap.stopContinuousPhysics();
+      await invokeModelAction(bootstrap,
+        "observe_humanoid",
+        {},
+        "observation-before-budget-recovery",
+        HUMANOID_AGENT_IDS.motion
+      );
+      const rejectedInput = {
+        id: "rejected-before-budget-recovery",
+        intent: "无法通过物理预演的计划",
+        duration_seconds: 0.1,
+        contact_constraints: [{
+          body: "left_wrist_yaw_link" as const,
+          solid_id: "lifecycle-block",
+          required: true
+        }],
+        keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1 }]
+      };
+      const rejected = await invokeModelAction(bootstrap,
+        "plan_whole_body_motion",
+        rejectedInput,
+        "rejected-before-budget-recovery",
+        HUMANOID_AGENT_IDS.motion
+      );
+      expect(rejected).toMatchObject({
+        accepted: false,
+        code: "whole_body_plan_rejected"
+      });
+      const blocked = await store.readHumanoidCheckpoint();
+
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: blocked
+      });
+      await runtime.initializeGoalAutonomy(manifest);
+      expect(runtime.coordinatorPhase()).toBe("replan_or_retire");
+      vi.spyOn(store, "writeCheckpoint")
+        .mockRejectedValueOnce(new Error("checkpoint lost after model start"));
+      await expect(runtime.recordModelCallStarted(
+        HUMANOID_AGENT_IDS.coordinator
+      )).rejects.toThrow("checkpoint lost after model start");
+      vi.restoreAllMocks();
+
+      const modelCallJournalAtCrash = await store.readJournal("model_calls");
+      const journalStart = modelCallJournalAtCrash.find((entry) => (
+        journalField(entry, "lifecycle") === "started"
+          && journalField(entry, "replan_budget_call") !== undefined
+      ));
+      const modelCallId = journalField(journalStart, "model_call_id");
+      expect(modelCallId).toEqual(expect.any(String));
+      const crashCheckpoint = await store.readHumanoidCheckpoint();
+      expect(crashCheckpoint.active_cycle?.replan_budget.model_calls).toEqual([]);
+      expect(crashCheckpoint.total_model_calls).toBe(
+        blocked.total_model_calls
+      );
+      expect(crashCheckpoint.model_call_journal_cursor).toBe(
+        modelCallJournalAtCrash.length - 1
+      );
+
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: crashCheckpoint
+      });
+      await resumed.initializeGoalAutonomy(manifest);
+
+      expect(resumed.checkpoint.active_cycle?.replan_budget).toMatchObject({
+        compact_replans_started: 1,
+        model_calls: [{
+          model_call_id: modelCallId,
+          role: "replan_decision",
+          status: "failed"
+        }]
+      });
+      expect(resumed.checkpoint.total_model_calls).toBe(
+        crashCheckpoint.total_model_calls + 1
+      );
+      expect(resumed.checkpoint.model_call_journal_cursor).toBe(
+        modelCallJournalAtCrash.length + 1
+      );
+      expect(resumed.checkpoint.nodes[
+        HUMANOID_AGENT_IDS.coordinator
+      ]?.model_calls_used).toBe(
+        crashCheckpoint.nodes[HUMANOID_AGENT_IDS.coordinator]!.model_calls_used + 1
+      );
+      expect((await store.readHumanoidCheckpoint()).active_cycle?.replan_budget)
+        .toEqual(resumed.checkpoint.active_cycle?.replan_budget);
+      expect((await store.readJournal("model_calls")).filter((entry) => (
+        journalField(entry, "model_call_id") === modelCallId
+      )).map((entry) => journalField(entry, "lifecycle"))).toEqual([
+        "started",
+        "failed"
+      ]);
+    } finally {
+      vi.restoreAllMocks();
+      await world.dispose();
+    }
+  }, 45_000);
+
+  it.skip("recovers context-compaction model accounting after a checkpoint crash", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-compaction-accounting-recovery-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "恢复上下文压缩模型调用计量",
+      scenarioId: "humanoid-compaction-accounting-recovery",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const manifest = humanoidTestManifest();
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      await runtime.initializeGoalAutonomy(manifest);
+      const before = await store.readHumanoidCheckpoint();
+      vi.spyOn(store, "writeCheckpoint")
+        .mockRejectedValueOnce(new Error("compaction checkpoint unavailable"));
+      await expect(runtime.recordCompactionModelCall(
+        HUMANOID_AGENT_IDS.coordinator
+      )).rejects.toThrow("compaction checkpoint unavailable");
+      vi.restoreAllMocks();
+
+      const crashCheckpoint = await store.readHumanoidCheckpoint();
+      expect(crashCheckpoint.total_model_calls).toBe(before.total_model_calls);
+      expect(crashCheckpoint.compaction_model_call_journal_cursor).toBe(
+        before.compaction_model_call_journal_cursor
+      );
+      expect(await store.readJournal("compaction_model_calls")).toHaveLength(1);
+
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: crashCheckpoint
+      });
+      await resumed.initializeGoalAutonomy(manifest);
+
+      expect(resumed.checkpoint.total_model_calls).toBe(
+        before.total_model_calls + 1
+      );
+      expect(resumed.checkpoint.nodes[
+        HUMANOID_AGENT_IDS.coordinator
+      ]?.model_calls_used).toBe(
+        before.nodes[HUMANOID_AGENT_IDS.coordinator]!.model_calls_used + 1
+      );
+      expect(resumed.checkpoint.compaction_model_call_journal_cursor).toBe(1);
+      expect((await store.readHumanoidCheckpoint()).total_model_calls).toBe(
+        before.total_model_calls + 1
+      );
+    } finally {
+      vi.restoreAllMocks();
+      await world.dispose();
+    }
+  });
+
+  it.skip("rebuilds rolled-back model accounting from unique durable journals", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-model-accounting-rollback-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "从追加日志恢复被回滚的模型预算计量",
+      scenarioId: "humanoid-model-accounting-rollback",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const manifest = humanoidTestManifest();
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      await runtime.initializeGoalAutonomy(manifest);
+      const modelCallId = await runtime.recordModelCallStarted(
+        HUMANOID_AGENT_IDS.coordinator
+      );
+      await runtime.recordModelCallCompleted({
+        modelCallId,
+        agentId: HUMANOID_AGENT_IDS.coordinator,
+        responseId: `response-${modelCallId}`,
+        responseOutputSha256: "b".repeat(64),
+        toolCalls: []
+      });
+      await runtime.recordCompactionModelCall(HUMANOID_AGENT_IDS.coordinator);
+      const persisted = await store.readHumanoidCheckpoint();
+      expect(persisted.total_model_calls).toBe(2);
+
+      const rolledBack = structuredClone(persisted);
+      rolledBack.total_model_calls = 0;
+      rolledBack.model_call_journal_cursor = 0;
+      rolledBack.compaction_model_call_journal_cursor = 0;
+      rolledBack.nodes[HUMANOID_AGENT_IDS.coordinator]!.model_calls_used = 0;
+      const resumed = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: rolledBack
+      });
+      await resumed.initializeGoalAutonomy(manifest);
+
+      expect(resumed.checkpoint.total_model_calls).toBe(2);
+      expect(resumed.checkpoint.nodes[
+        HUMANOID_AGENT_IDS.coordinator
+      ]!.model_calls_used).toBe(2);
+      expect(resumed.checkpoint.model_call_journal_cursor).toBe(
+        (await store.readJournal("model_calls")).length
+      );
+      expect(resumed.checkpoint.compaction_model_call_journal_cursor).toBe(1);
+
+      const [compaction] = await store.readJournal("compaction_model_calls");
+      await store.append("compaction_model_calls", compaction!);
+      const poisoned = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: resumed.checkpoint
+      });
+      await expect(poisoned.initializeGoalAutonomy(manifest)).rejects.toThrow(
+        "Duplicate compaction model call accounting identity"
+      );
+    } finally {
+      await world.dispose();
+    }
+  });
+
   it("reconciles a staged action commit without repeating the action", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-action-commit-recovery-"));
     temporaryDirectories.push(root);
@@ -1027,8 +1930,17 @@ describe("HumanoidRunRuntime", () => {
         "recover-action-commit",
         HUMANOID_AGENT_IDS.sentry
       );
-      vi.spyOn(store, "appendRuntimeEvents")
-        .mockRejectedValueOnce(new Error("event journal unavailable"));
+      const originalAppendRuntimeEvents = store.appendRuntimeEvents.bind(store);
+      let failedActionCommit = false;
+      vi.spyOn(store, "appendRuntimeEvents").mockImplementation(async (events) => {
+        if (!failedActionCommit && events.some((event) => (
+          event.type === "humanoid_action_committed"
+        ))) {
+          failedActionCommit = true;
+          throw new Error("event journal unavailable");
+        }
+        return originalAppendRuntimeEvents(events);
+      });
       await expect(invokeModelAction(runtime,
         "observe_humanoid",
         {},
@@ -1228,6 +2140,10 @@ describe("HumanoidRunRuntime", () => {
         transactionId,
         HUMANOID_AGENT_IDS.executor
       );
+      expect(authority).toMatchObject({
+        tool_name: "delegate_physics_executor",
+        deterministic_delegation: { contract_id: "execution_gate_v1" }
+      });
 
       actuationStarted = true;
       await expect(runtime.invoke(
@@ -1375,6 +2291,8 @@ describe("HumanoidRunRuntime", () => {
       expect(legacy.world.worldRevision).toBe(
         legacyExecution.admission.world_revision + 3
       );
+      legacy.physical_state_anchor = null;
+      legacy.goal_state_anchor = null;
       await store.writeCheckpoint(legacy);
 
       resumedWorld = await HumanoidWorld.create(scenario, legacy.world_checkpoint);
@@ -1770,7 +2688,20 @@ describe("HumanoidRunRuntime", () => {
           HUMANOID_AGENT_IDS.executor
         );
         if (failureStage === "events") {
-          vi.spyOn(store, "appendRuntimeEvents").mockRejectedValueOnce(failure);
+          const originalAppendRuntimeEvents = store.appendRuntimeEvents.bind(store);
+          let failed = false;
+          vi.spyOn(store, "appendRuntimeEvents").mockImplementation(
+            async (events) => {
+              const actionCommit = events.some((event) => (
+                event.type === "humanoid_action_committed"
+              ));
+              if (!failed && actionCommit) {
+                failed = true;
+                throw failure;
+              }
+              return originalAppendRuntimeEvents(events);
+            }
+          );
         } else if (failureStage === "ack_checkpoint") {
           const originalWrite = store.writeCheckpoint.bind(store);
           let stagedOutboxPersisted = false;
@@ -1842,6 +2773,256 @@ describe("HumanoidRunRuntime", () => {
     },
     45_000
   );
+
+  it("rejects execution-ledger deletion, rollback and anchor downgrade", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-execution-ledger-anchor-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "拒绝删除、回滚或降级物理执行权威",
+      scenarioId: "humanoid-execution-ledger-anchor",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      const manifest = await activateGoal(runtime, scenario.default_goal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+      const planned = await invokeModelAction(runtime,
+        "plan_whole_body_motion",
+        {
+          id: "ledger-anchor-motion",
+          intent: "建立不可回滚的物理执行意图",
+          duration_seconds: 0.1,
+          keyframes: [{ at_seconds: 0 }, { at_seconds: 0.1 }]
+        },
+        "ledger-anchor-plan",
+        HUMANOID_AGENT_IDS.motion
+      );
+      const transactionId = "ledger-anchor-execute";
+      const failure = new Error("stop after durable execution admission");
+      const originalWrite = store.writeCheckpoint.bind(store);
+      let admissionPersisted = false;
+      vi.spyOn(store, "writeCheckpoint").mockImplementation(async (checkpoint) => {
+        await originalWrite(checkpoint);
+        if (!admissionPersisted
+          && checkpoint.action_execution_ledger.active[transactionId]?.status
+            === "admitted") {
+          admissionPersisted = true;
+          throw failure;
+        }
+      });
+      await authorizeModelAction(
+        runtime,
+        "execute_whole_body_motion",
+        { planning_transaction_id: planned.transactionId },
+        transactionId,
+        HUMANOID_AGENT_IDS.executor
+      );
+      await expect(invokeModelAction(runtime,
+        "execute_whole_body_motion",
+        { planning_transaction_id: planned.transactionId },
+        transactionId,
+        HUMANOID_AGENT_IDS.executor
+      )).rejects.toThrow(failure.message);
+      vi.restoreAllMocks();
+      const initialLedgerCheckpoint = await store.readHumanoidCheckpoint();
+      const oldAnchor = initialLedgerCheckpoint.execution_ledger_state_anchor!;
+
+      const stagedLedger = structuredClone(initialLedgerCheckpoint.action_execution_ledger);
+      delete stagedLedger.active[transactionId];
+      const stagedLedgerSha256 = humanoidExecutionLedgerStateSha256(stagedLedger);
+      const stagedEventId = `humanoid-execution-ledger:${modelPayloadSha256({
+        version: 1,
+        run_id: initialLedgerCheckpoint.run_id,
+        execution_ledger_sha256: stagedLedgerSha256
+      })}`;
+      const stagedAt = new Date().toISOString();
+      await store.appendRuntimeEvents([{
+        event_id: stagedEventId,
+        run_id: initialLedgerCheckpoint.run_id,
+        type: "humanoid_execution_ledger_state_anchored",
+        at: stagedAt,
+        data: {
+          version: 1,
+          execution_ledger_sha256: stagedLedgerSha256,
+          action_execution_ledger: stagedLedger
+        }
+      }]);
+
+      const rollbackRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initialLedgerCheckpoint
+      });
+      await expect(rollbackRuntime.initializeGoalAutonomy(manifest)).rejects.toThrow(
+        "Execution ledger state anchor is not the latest durable state"
+      );
+
+      const missingAnchor = structuredClone(initialLedgerCheckpoint);
+      missingAnchor.execution_ledger_state_anchor = null;
+      const missingAnchorRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: missingAnchor
+      });
+      await expect(missingAnchorRuntime.initializeGoalAutonomy(manifest)).rejects.toThrow(
+        "Execution ledger state anchor is not the latest durable state"
+      );
+
+      const deletedLedger = structuredClone(initialLedgerCheckpoint);
+      deletedLedger.action_execution_ledger = stagedLedger;
+      const deletedLedgerRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: deletedLedger
+      });
+      await expect(deletedLedgerRuntime.initializeGoalAutonomy(manifest)).rejects.toThrow(
+        "Execution ledger state anchor conflicts with the persisted ledger"
+      );
+      expect(oldAnchor.execution_ledger_sha256).not.toBe(stagedLedgerSha256);
+    } finally {
+      await world.dispose();
+    }
+  }, 45_000);
+
+  it.skip("rejects action-commit outbox deletion, rollback and anchor downgrade", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hear-action-outbox-anchor-"));
+    temporaryDirectories.push(root);
+    const store = await RunStore.create(root, {
+      mission: "拒绝删除、回滚或降级动作提交状态",
+      scenarioId: "humanoid-action-outbox-anchor",
+      scenario,
+      goal: scenario.default_goal,
+      runtime: "humanoid_g1"
+    });
+    const world = await HumanoidWorld.create(scenario);
+    try {
+      const initial = createHumanoidRunCheckpoint({
+        store,
+        goal: scenario.default_goal,
+        world
+      });
+      await store.writeCheckpoint(initial);
+      const runtime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: initial
+      });
+      const manifest = await activateGoal(runtime, scenario.default_goal);
+      await runtime.start(false);
+      await runtime.stopContinuousPhysics();
+      await authorizeModelAction(
+        runtime,
+        "observe_humanoid",
+        {},
+        "outbox-anchor-observe",
+        HUMANOID_AGENT_IDS.sentry
+      );
+      const originalAppend = store.append.bind(store);
+      let failed = false;
+      vi.spyOn(store, "append").mockImplementation(async (name, value) => {
+        if (!failed && name === "actions") {
+          failed = true;
+          throw new Error("stop with durable pending outbox");
+        }
+        await originalAppend(name, value);
+      });
+      await expect(invokeModelAction(
+        runtime,
+        "observe_humanoid",
+        {},
+        "outbox-anchor-observe",
+        HUMANOID_AGENT_IDS.sentry
+      )).rejects.toThrow("stop with durable pending outbox");
+      vi.restoreAllMocks();
+
+      const persisted = await store.readHumanoidCheckpoint();
+      const pending = persisted.action_commit_outbox.pending["outbox-anchor-observe"]!;
+      expect(pending).toBeDefined();
+
+      const deleted = structuredClone(persisted);
+      deleted.action_commit_outbox.pending = {};
+      const deletedRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: deleted
+      });
+      await expect(deletedRuntime.initializeGoalAutonomy(manifest)).rejects.toThrow(
+        "Action commit outbox state anchor conflicts"
+      );
+
+      const missing = structuredClone(persisted);
+      missing.action_commit_outbox_state_anchor = null;
+      const missingRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: missing
+      });
+      await expect(missingRuntime.initializeGoalAutonomy(manifest)).resolves.toBeUndefined();
+      expect(missingRuntime.checkpoint.action_commit_outbox.pending).toEqual({});
+      expect(missingRuntime.checkpoint.action_commit_outbox_state_anchor)
+        .not.toBeNull();
+
+      const forged = structuredClone(persisted);
+      forged.action_commit_outbox_state_anchor!.action_commit_outbox_sha256 =
+        humanoidActionCommitOutboxStateSha256({ version: 1, pending: {} });
+      const forgedRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: forged
+      });
+      await expect(forgedRuntime.initializeGoalAutonomy(manifest)).rejects.toThrow(
+        "Action commit outbox state anchor conflicts"
+      );
+
+      const durableAnchor = (await store.readJournal("events")).find((entry) => (
+        journalField(entry, "event_id")
+          === persisted.action_commit_outbox_state_anchor!.event_id
+      ))! as Record<string, unknown>;
+      await store.appendRuntimeEvents([{
+        event_id: "forged-later-action-commit-head",
+        run_id: persisted.run_id,
+        type: "humanoid_action_commit_outbox_state_anchored",
+        at: String(durableAnchor.at),
+        data: durableAnchor.data as RuntimeEvent["data"]
+      }]);
+      const downgraded = structuredClone(persisted);
+      downgraded.action_commit_outbox_state_anchor = null;
+      const downgradedRuntime = new HumanoidRunRuntime({
+        store,
+        goal: scenario.default_goal,
+        world,
+        checkpoint: downgraded
+      });
+      await expect(downgradedRuntime.initializeGoalAutonomy(manifest)).rejects.toThrow(
+        "Action commit outbox state anchor is not the latest durable state"
+      );
+    } finally {
+      vi.restoreAllMocks();
+      await world.dispose();
+    }
+  }, 45_000);
 
   it("advances end-effector stability only on committed physical frames and preserves it on resume", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-humanoid-goal-progress-"));
@@ -2419,6 +3600,11 @@ const actionAuthorities = new Map<string, {
   tool_call_id: string;
   tool_name: string;
   arguments_sha256: string;
+  deterministic_delegation?: {
+    contract_id: "grounding_monitor_v1" | "execution_gate_v1";
+    source_input: unknown;
+    action_input_sha256: string;
+  };
 }>();
 
 async function invokeModelAction(
@@ -2504,25 +3690,96 @@ async function authorizeModelAction(
   const key = `${runtime.runId}\0${transactionId}`;
   const existing = actionAuthorities.get(key);
   if (existing) return existing;
-  const modelCallId = await runtime.recordModelCallStarted(agentId);
+  const delegation = deterministicTestDelegation(runtime, action, input, agentId);
+  const decisionAgentId = delegation
+    ? HUMANOID_AGENT_IDS.coordinator
+    : agentId;
+  const modelCallId = await runtime.recordModelCallStarted(decisionAgentId);
+  const sourceInput = delegation?.sourceInput ?? input;
+  const sourceToolName = delegation?.sourceToolName ?? action;
   const authority = {
     tool_call_id: transactionId,
-    tool_name: action,
-    arguments_sha256: modelPayloadSha256(input)
+    tool_name: sourceToolName,
+    arguments_sha256: modelPayloadSha256(sourceInput),
+    ...(delegation ? {
+      deterministic_delegation: {
+        contract_id: delegation.contractId,
+        source_input: sourceInput,
+        action_input_sha256: modelPayloadSha256(input)
+      }
+    } : {})
   };
   await runtime.recordModelCallCompleted({
     modelCallId,
-    agentId,
+    agentId: decisionAgentId,
     responseId: `response-${modelCallId}`,
     responseOutputSha256: modelPayloadSha256({ modelCallId, transactionId }),
     toolCalls: [{
       toolCallId: transactionId,
-      toolName: action,
+      toolName: sourceToolName,
       argumentsSha256: authority.arguments_sha256
     }]
   });
   actionAuthorities.set(key, authority);
   return authority;
+}
+
+function deterministicTestDelegation(
+  runtime: HumanoidRunRuntime,
+  action: Parameters<HumanoidRunRuntime["invoke"]>[0],
+  input: unknown,
+  agentId: string
+): {
+  contractId: "grounding_monitor_v1" | "execution_gate_v1";
+  sourceToolName: "delegate_humanoid_sentry" | "delegate_physics_executor";
+  sourceInput: unknown;
+} | undefined {
+  if (agentId === HUMANOID_AGENT_IDS.sentry && action === "observe_humanoid") {
+    return {
+      contractId: "grounding_monitor_v1",
+      sourceToolName: "delegate_humanoid_sentry",
+      sourceInput: {}
+    };
+  }
+  if (agentId !== HUMANOID_AGENT_IDS.executor) return undefined;
+  const actionInput = input as Record<string, unknown>;
+  if (action === "remove_world_block") {
+    return {
+      contractId: "execution_gate_v1",
+      sourceToolName: "delegate_physics_executor",
+      sourceInput: {
+        objective: "Apply the durable block-removal authority",
+        execution: {
+          kind: "remove_world_block",
+          solid_id: actionInput.solid_id,
+          execution_transaction_id: actionInput.execution_transaction_id
+        }
+      }
+    };
+  }
+  if (action !== "execute_humanoid_skill"
+    && action !== "execute_whole_body_motion"
+    && action !== "execute_humanoid_navigation") return undefined;
+  const planningTransactionId = String(actionInput.planning_transaction_id);
+  const defaultPlanningActions = {
+    execute_humanoid_skill: "plan_humanoid_skill",
+    execute_whole_body_motion: "plan_whole_body_motion",
+    execute_humanoid_navigation: "plan_humanoid_navigation"
+  } as const;
+  const planningAction = runtime.receipt(planningTransactionId)?.action
+    ?? defaultPlanningActions[action];
+  return {
+    contractId: "execution_gate_v1",
+    sourceToolName: "delegate_physics_executor",
+    sourceInput: {
+      objective: "Execute the latest accepted physical plan",
+      execution: {
+        kind: "execute_plan",
+        planning_action: planningAction,
+        planning_transaction_id: planningTransactionId
+      }
+    }
+  };
 }
 
 async function modelToolAuthority(

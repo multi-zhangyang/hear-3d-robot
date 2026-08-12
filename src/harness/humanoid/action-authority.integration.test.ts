@@ -68,13 +68,13 @@ describe("humanoid action model authority", () => {
 
       const incompleteTransaction = "observe-without-response";
       const incompleteModelCall = await runtime.recordModelCallStarted(
-        HUMANOID_AGENT_IDS.sentry
+        HUMANOID_AGENT_IDS.motion
       );
       await expect(runtime.invoke(
         "observe_humanoid",
         {},
         incompleteTransaction,
-        HUMANOID_AGENT_IDS.sentry,
+        HUMANOID_AGENT_IDS.motion,
         {
           tool_call_id: incompleteTransaction,
           tool_name: "observe_humanoid",
@@ -83,11 +83,11 @@ describe("humanoid action model authority", () => {
       )).rejects.toThrow("no completed model response authority");
       await runtime.recordModelCallFailed(
         incompleteModelCall,
-        HUMANOID_AGENT_IDS.sentry
+        HUMANOID_AGENT_IDS.motion
       );
 
       const transactionId = "observe-authoritative";
-      const authority = await authorizeAction(
+      const directSentryAuthority = await authorizeAction(
         runtime,
         transactionId,
         HUMANOID_AGENT_IDS.sentry
@@ -97,44 +97,88 @@ describe("humanoid action model authority", () => {
         {},
         transactionId,
         HUMANOID_AGENT_IDS.sentry,
-        { ...authority, arguments_sha256: "0".repeat(64) }
-      )).rejects.toThrow("arguments have no model authority");
+        directSentryAuthority
+      )).rejects.toThrow("requires Coordinator deterministic delegation");
+
+      const delegatedTransactionId = "observe-coordinator-delegation";
+      const authority = await authorizeSentryDelegation(
+        runtime,
+        delegatedTransactionId
+      );
       await expect(runtime.invoke(
         "observe_humanoid",
         {},
-        transactionId,
+        delegatedTransactionId,
+        HUMANOID_AGENT_IDS.sentry,
+        { ...authority, arguments_sha256: "0".repeat(64) }
+      )).rejects.toThrow("delegation input has no model authority");
+      await expect(runtime.invoke(
+        "observe_humanoid",
+        {},
+        delegatedTransactionId,
         HUMANOID_AGENT_IDS.sentry,
         { ...authority, tool_name: "plan_humanoid_navigation" }
-      )).rejects.toThrow("tool authority mismatch");
+      )).rejects.toThrow("deterministic delegation is not authoritative");
       await expect(runtime.invoke(
         "observe_humanoid",
         {},
-        transactionId,
+        delegatedTransactionId,
         HUMANOID_AGENT_IDS.sentry,
         { ...authority, tool_call_id: "another-tool-call" }
       )).rejects.toThrow("tool authority mismatch");
       await expect(runtime.invoke(
         "observe_humanoid",
         {},
-        transactionId,
+        delegatedTransactionId,
         HUMANOID_AGENT_IDS.motion,
         authority
-      )).rejects.toThrow("no completed model response authority");
+      )).rejects.toThrow("deterministic delegation is not authoritative");
+
+      const crossRoleTransaction = "executor-invented-observation";
+      const crossRoleAuthority = await authorizeAction(
+        runtime,
+        crossRoleTransaction,
+        HUMANOID_AGENT_IDS.executor
+      );
+      await expect(runtime.invoke(
+        "observe_humanoid",
+        {},
+        crossRoleTransaction,
+        HUMANOID_AGENT_IDS.executor,
+        crossRoleAuthority
+      )).rejects.toThrow("outside Agent role authority");
+
+      const directExecutorTransaction = "executor-direct-physical-response";
+      const directExecutorInput = { planning_transaction_id: "invented-plan" };
+      const directExecutorAuthority = await authorizeDirectAction(
+        runtime,
+        "execute_whole_body_motion",
+        directExecutorInput,
+        directExecutorTransaction,
+        HUMANOID_AGENT_IDS.executor
+      );
+      await expect(runtime.invoke(
+        "execute_whole_body_motion",
+        directExecutorInput,
+        directExecutorTransaction,
+        HUMANOID_AGENT_IDS.executor,
+        directExecutorAuthority
+      )).rejects.toThrow("requires Coordinator deterministic delegation");
 
       const receipt = await runtime.invoke(
         "observe_humanoid",
         {},
-        transactionId,
+        delegatedTransactionId,
         HUMANOID_AGENT_IDS.sentry,
         authority
       );
       expect(receipt).toMatchObject({
-        transactionId,
+        transactionId: delegatedTransactionId,
         agentId: HUMANOID_AGENT_IDS.sentry,
         accepted: true,
         decision: {
-          agent_id: HUMANOID_AGENT_IDS.sentry,
-          tool_call_id: transactionId,
+          agent_id: HUMANOID_AGENT_IDS.coordinator,
+          tool_call_id: delegatedTransactionId,
           tool_arguments_sha256: modelPayloadSha256({})
         },
         cycle: {
@@ -144,7 +188,7 @@ describe("humanoid action model authority", () => {
       });
       const actionRecords = await store.readJournal("actions");
       expect(actionRecords).toContainEqual(expect.objectContaining({
-        transactionId,
+        transactionId: delegatedTransactionId,
         decision: receipt.decision,
         cycle: receipt.cycle
       }));
@@ -161,27 +205,26 @@ describe("humanoid action model authority", () => {
       expect(await resumed.invoke(
         "observe_humanoid",
         {},
-        transactionId,
+        delegatedTransactionId,
         HUMANOID_AGENT_IDS.sentry,
         authority
       )).toEqual(receipt);
       await expect(resumed.invoke(
         "observe_humanoid",
         { changed: true },
-        transactionId,
+        delegatedTransactionId,
         HUMANOID_AGENT_IDS.sentry,
         authority
       )).rejects.toThrow("transaction conflict");
 
-      await authorizeAction(
+      await authorizeSentryDelegation(
         resumed,
-        transactionId,
-        HUMANOID_AGENT_IDS.sentry
+        delegatedTransactionId
       );
       await expect(resumed.invoke(
         "observe_humanoid",
         {},
-        transactionId,
+        delegatedTransactionId,
         HUMANOID_AGENT_IDS.sentry,
         authority
       )).rejects.toThrow("no completed model response authority");
@@ -267,6 +310,66 @@ async function authorizeAction(
     tool_call_id: transactionId,
     tool_name: "observe_humanoid",
     arguments_sha256: argumentsSha256
+  };
+}
+
+async function authorizeDirectAction(
+  runtime: HumanoidRunRuntime,
+  action: Parameters<HumanoidRunRuntime["invoke"]>[0],
+  input: unknown,
+  transactionId: string,
+  agentId: string
+) {
+  const modelCallId = await runtime.recordModelCallStarted(agentId);
+  const argumentsSha256 = modelPayloadSha256(input);
+  await runtime.recordModelCallCompleted({
+    modelCallId,
+    agentId,
+    responseId: `response-${modelCallId}`,
+    responseOutputSha256: modelPayloadSha256({ modelCallId, transactionId }),
+    toolCalls: [{
+      toolCallId: transactionId,
+      toolName: action,
+      argumentsSha256
+    }]
+  });
+  return {
+    tool_call_id: transactionId,
+    tool_name: action,
+    arguments_sha256: argumentsSha256
+  };
+}
+
+async function authorizeSentryDelegation(
+  runtime: HumanoidRunRuntime,
+  transactionId: string
+) {
+  const sourceInput = {};
+  const actionInput = {};
+  const modelCallId = await runtime.recordModelCallStarted(
+    HUMANOID_AGENT_IDS.coordinator
+  );
+  const argumentsSha256 = modelPayloadSha256(sourceInput);
+  await runtime.recordModelCallCompleted({
+    modelCallId,
+    agentId: HUMANOID_AGENT_IDS.coordinator,
+    responseId: `response-${modelCallId}`,
+    responseOutputSha256: modelPayloadSha256({ modelCallId, transactionId }),
+    toolCalls: [{
+      toolCallId: transactionId,
+      toolName: "delegate_humanoid_sentry",
+      argumentsSha256
+    }]
+  });
+  return {
+    tool_call_id: transactionId,
+    tool_name: "delegate_humanoid_sentry",
+    arguments_sha256: argumentsSha256,
+    deterministic_delegation: {
+      contract_id: "grounding_monitor_v1" as const,
+      source_input: sourceInput,
+      action_input_sha256: modelPayloadSha256(actionInput)
+    }
   };
 }
 

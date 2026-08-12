@@ -41,6 +41,8 @@ export function humanoidAuthorityStateSha256(input: {
   } else {
     hash.update("no-hand-command-targets\0");
   }
+  hash.update("hand-policy-authority\0");
+  hash.update(canonicalJson(input.simulation.handPolicyAuthority ?? null));
   hash.update(canonicalJson({
     protocol: input.simulation.controller.protocol,
     version: input.simulation.controller.version,

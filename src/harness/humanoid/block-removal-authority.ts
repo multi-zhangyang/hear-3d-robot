@@ -18,6 +18,7 @@ import {
 } from "../../world/humanoid/motion-option.js";
 import type { HumanoidWorldSnapshot } from "../../world/humanoid/world.js";
 import type { HumanoidActionReceipt } from "./runtime.js";
+import { humanoidActionReceiptsInCommitOrder } from "../../domain/humanoid-run.js";
 
 export type BlockRemovalAuthorityCode =
   | "block_removal_execution_missing"
@@ -73,7 +74,7 @@ export function prepareAuthorizedBlockRemoval(input: {
     );
   }
 
-  const receipts = Object.values(input.committedActions);
+  const receipts = humanoidActionReceiptsInCommitOrder(input.committedActions);
   const latestActuation = receipts.findLast((receipt) => (
     receipt.frameCount > 0
       && (receipt.action === "execute_whole_body_motion"

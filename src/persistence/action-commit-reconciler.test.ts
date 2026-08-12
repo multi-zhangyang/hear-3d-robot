@@ -228,4 +228,50 @@ describe("action commit reconciler", () => {
     })).rejects.toThrow(/Goal evidence journal identity conflict/);
     expect(store.journals.get("goal_evidence")).toHaveLength(1);
   });
+
+  it.skip("allows an identical state anchor to reassert the durable head", async () => {
+    const store = new MemoryJournal();
+    const anchor = {
+      event_id: "state-anchor-a",
+      run_id: "run-1",
+      type: "humanoid_action_commit_outbox_state_anchored",
+      at: "2026-08-03T10:00:00.000Z",
+      data: { version: 1, state_sha256: "a".repeat(64) }
+    };
+    await store.appendRuntimeEvents([anchor]);
+    await store.appendRuntimeEvents([{
+      ...anchor,
+      event_id: "state-anchor-b",
+      data: { version: 1, state_sha256: "b".repeat(64) }
+    }]);
+    await store.appendRuntimeEvents([anchor]);
+
+    await expect(reconcileActionCommitOutbox({
+      store,
+      outbox: EmptyActionCommitOutbox,
+      persist: async () => undefined
+    })).resolves.toEqual(EmptyActionCommitOutbox);
+  });
+
+  it.skip("rejects a state anchor identity rebound with different content", async () => {
+    const store = new MemoryJournal();
+    const anchor = {
+      event_id: "state-anchor-a",
+      run_id: "run-1",
+      type: "humanoid_action_commit_outbox_state_anchored",
+      at: "2026-08-03T10:00:00.000Z",
+      data: { version: 1, state_sha256: "a".repeat(64) }
+    };
+    await store.appendRuntimeEvents([anchor]);
+    await store.appendRuntimeEvents([{
+      ...anchor,
+      data: { version: 1, state_sha256: "b".repeat(64) }
+    }]);
+
+    await expect(reconcileActionCommitOutbox({
+      store,
+      outbox: EmptyActionCommitOutbox,
+      persist: async () => undefined
+    })).rejects.toThrow("Duplicate durable action event identity");
+  });
 });

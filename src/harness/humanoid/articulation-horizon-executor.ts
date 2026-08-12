@@ -8,14 +8,22 @@ import type {
   HumanoidWorldSnapshot
 } from "../../world/humanoid/world.js";
 import {
+  HumanoidEmbodiedSkillStatusSchema,
+  type HumanoidEmbodiedSkillStatus
+} from "../../world/humanoid/embodied-skill-call.js";
+import type { HumanoidSkillEventStream } from
+  "../../world/humanoid/skill-event-stream.js";
+import {
   HUMANOID_ARTICULATION_HORIZON,
   humanoidArticulationGoal,
   humanoidArticulationGoalSatisfied,
+  humanoidArticulationSegmentBudgetExhausted,
   type HumanoidArticulationGoal
 } from "./articulation-control.js";
 import { planAutonomousHumanoidSkill } from "./autonomous-skill-planner.js";
 import {
   bindHumanoidSkill,
+  humanoidEmbodiedSkillIdentity,
   type ActiveHumanoidSkillBinding
 } from "./skill-binding.js";
 
@@ -61,51 +69,73 @@ export async function executeHumanoidArticulationHorizon(input: {
       skill: "open" | "close" | "turn";
     }>;
   };
-  initialPlanId: string;
+  initialPlanId: string | null;
   initialExecution: HumanoidExecutionReceipt;
+  skillEventStream: HumanoidSkillEventStream;
+  initialCommittedFrames?: number;
+  initialCompletedSegments?: number;
   frameSink?: HumanoidFrameSink;
   executionOptions?: HumanoidExecutionOptions;
 }): Promise<HumanoidArticulationHorizonResult> {
   const initialArticulation = input.binding.target_articulation;
   if (!initialArticulation) {
-    return failureFromExecution(
+    return finishHorizon(input, failureFromExecution(
       input.initialExecution,
       "articulation_horizon_authority_missing",
       [],
       null,
       "The bound Skill does not contain live articulation authority"
-    );
+    ), null, input.world.observe());
   }
   const goal = humanoidArticulationGoal({
     invocation: input.binding.invocation,
     articulation: initialArticulation
   });
   let execution = input.initialExecution;
-  let totalFrames = execution.frames;
+  let totalFrames = (input.initialCommittedFrames ?? 0) + execution.frames;
+  const completedSegmentPrefix = input.initialCompletedSegments ?? 0;
   let observation = input.world.observe();
-  const segments: HumanoidArticulationHorizonSegment[] = [segmentRecord({
-    index: 1,
+  const segments: HumanoidArticulationHorizonSegment[] = input.initialPlanId
+    ? [segmentRecord({
+    index: completedSegmentPrefix + 1,
     planId: input.initialPlanId,
     jointId: goal.joint_id,
     beforeRevision: input.binding.observed_world_revision,
     beforePosition: initialArticulation.position,
     observation,
     execution
-  })];
+      })]
+    : [];
   if (!execution.accepted) {
-    return aggregateExecution(execution, totalFrames, goal, segments, observation);
+    return finishHorizon(
+      input,
+      aggregateExecution(
+        execution,
+        totalFrames,
+        goal,
+        segments,
+        observation,
+        completedSegmentPrefix
+      ),
+      goal,
+      observation
+    );
   }
 
   while (!goalSatisfied(input.binding, observation, goal)) {
-    if (segments.length >= HUMANOID_ARTICULATION_HORIZON.maximum_segments) {
-      return failureFromExecution(
+    if (humanoidArticulationSegmentBudgetExhausted(
+      completedSegmentPrefix,
+      segments.length
+    )) {
+      return finishHorizon(input, failureFromExecution(
         execution,
         "articulation_horizon_exhausted",
         segments,
         goal,
         "The rolling articulation horizon exhausted its bounded segment budget",
-        totalFrames
-      );
+        totalFrames,
+        completedSegmentPrefix
+      ), goal, observation);
     }
     const rebound = bindHumanoidSkill({
       transactionId: input.binding.transaction_id,
@@ -120,66 +150,231 @@ export async function executeHumanoidArticulationHorizon(input: {
       articulationGoal: goal
     });
     if (!rebound.accepted) {
-      return failureFromExecution(
+      return finishHorizon(input, failureFromExecution(
         execution,
         "articulation_horizon_rebind_failed",
         segments,
         goal,
         jsonString(rebound.detail),
-        totalFrames
-      );
+        totalFrames,
+        completedSegmentPrefix
+      ), goal, observation);
     }
-    const plan = planAutonomousHumanoidSkill({
-      binding: rebound.binding,
-      observation,
-      articulationGoal: goal
-    });
-    if (plan.kind !== "motion") {
-      return failureFromExecution(
-        execution,
-        "articulation_horizon_plan_kind_invalid",
-        segments,
-        goal,
-        "Articulation continuation produced a non-motion plan",
-        totalFrames
-      );
-    }
-    const planned = await input.world.planWholeBodyMotionCandidates(plan.batch);
-    if (!planned.accepted) {
-      return failureFromExecution(
-        execution,
-        "articulation_horizon_planning_failed",
-        segments,
-        goal,
-        JSON.stringify(planned.candidates.map((candidate) => ({
-          rank: candidate.rank,
-          failures: candidate.validation.failures
-        }))),
-        totalFrames
-      );
+    let continuationPlanId = input.world.pendingWholeBodyMotionPlanIdForSkillCall(
+      humanoidEmbodiedSkillIdentity(input.binding).callId
+    );
+    if (!continuationPlanId) {
+      const plan = planAutonomousHumanoidSkill({
+        binding: rebound.binding,
+        observation,
+        articulationGoal: goal
+      });
+      if (plan.kind !== "motion") {
+        return finishHorizon(input, failureFromExecution(
+          execution,
+          "articulation_horizon_plan_kind_invalid",
+          segments,
+          goal,
+          "Articulation continuation produced a non-motion plan",
+          totalFrames,
+          completedSegmentPrefix
+        ), goal, observation);
+      }
+      const planned = await input.world.planWholeBodyMotionCandidates(plan.batch, {
+        skillCallIdentity: humanoidEmbodiedSkillIdentity(input.binding)
+      });
+      if (!planned.accepted) {
+        return finishHorizon(input, failureFromExecution(
+          execution,
+          "articulation_horizon_planning_failed",
+          segments,
+          goal,
+          JSON.stringify(planned.candidates.map((candidate) => ({
+            rank: candidate.rank,
+            failures: candidate.validation.failures
+          }))),
+          totalFrames,
+          completedSegmentPrefix
+        ), goal, observation);
+      }
+      continuationPlanId = planned.planId;
     }
     const beforeObservation = observation;
     execution = await input.world.executeWholeBodyMotion(
-      planned.planId,
+      continuationPlanId,
       input.frameSink,
-      input.executionOptions
+      {
+        ...input.executionOptions,
+        skillWindow: {
+          maximumSteps: HUMANOID_ARTICULATION_HORIZON.maximum_control_steps,
+          stepOffset: totalFrames
+        }
+      }
     );
     totalFrames += execution.frames;
     observation = input.world.observe();
     segments.push(segmentRecord({
-      index: segments.length + 1,
-      planId: planned.planId,
+      index: completedSegmentPrefix + segments.length + 1,
+      planId: continuationPlanId,
       jointId: goal.joint_id,
       beforeRevision: beforeObservation.worldRevision,
       beforePosition: articulationPosition(input.binding, beforeObservation),
       observation,
       execution
     }));
+    await input.skillEventStream.progress(articulationHorizonStatus(
+      input.binding,
+      aggregateExecution(
+        execution,
+        totalFrames,
+        goal,
+        segments,
+        observation,
+        completedSegmentPrefix
+      ),
+      goal,
+      observation,
+      false
+    ));
     if (!execution.accepted) {
-      return aggregateExecution(execution, totalFrames, goal, segments, observation);
+      return finishHorizon(
+        input,
+        aggregateExecution(
+          execution,
+          totalFrames,
+          goal,
+          segments,
+          observation,
+          completedSegmentPrefix
+        ),
+        goal,
+        observation
+      );
     }
   }
-  return aggregateExecution(execution, totalFrames, goal, segments, observation);
+  return finishHorizon(
+    input,
+    aggregateExecution(
+      execution,
+      totalFrames,
+      goal,
+      segments,
+      observation,
+      completedSegmentPrefix
+    ),
+    goal,
+    observation
+  );
+}
+
+async function finishHorizon(
+  input: Pick<
+    Parameters<typeof executeHumanoidArticulationHorizon>[0],
+    "world" | "binding" | "skillEventStream"
+  >,
+  result: HumanoidArticulationHorizonResult,
+  goal: HumanoidArticulationGoal | null,
+  observation: HumanoidWorldObservation
+): Promise<HumanoidArticulationHorizonResult> {
+  const status = articulationHorizonStatus(
+    input.binding,
+    result,
+    goal,
+    observation
+  );
+  input.world.recordSkillOutcome({
+    protocol: "humanoid-controller-skill-outcome-v1",
+    identity: humanoidEmbodiedSkillIdentity(input.binding),
+    outcome: status.state === "succeeded" ? "succeeded" : "failed",
+    terminalReason: result.code
+  });
+  await input.skillEventStream.terminal(
+    status.state === "succeeded" ? "succeeded" : "failed",
+    status
+  );
+  return {
+    ...result,
+    detail: jsonValue({
+      ...jsonRecord(result.detail),
+      skill_status: status
+    })
+  };
+}
+
+function articulationHorizonStatus(
+  binding: ActiveHumanoidSkillBinding,
+  result: HumanoidArticulationHorizonResult,
+  goal: HumanoidArticulationGoal | null,
+  observation: HumanoidWorldObservation,
+  terminal = true
+): HumanoidEmbodiedSkillStatus {
+  const articulation = goal ? articulationForGoal(observation, goal) : null;
+  const completion = goal && articulation && articulation.position !== null
+    ? directedCompletion(goal, articulation.position)
+    : 0;
+  const succeeded = terminal && result.accepted
+    && goal !== null
+    && humanoidArticulationGoalSatisfied(goal, articulation);
+  const controller = result.finalSnapshot.robot.controllerExecution;
+  return HumanoidEmbodiedSkillStatusSchema.parse({
+    protocol: "humanoid-embodied-skill-status-v1",
+    callId: humanoidEmbodiedSkillIdentity(binding).callId,
+    state: terminal ? succeeded ? "succeeded" : "failed" : "executing",
+    progress: {
+      elapsedRatio: Math.min(
+        1,
+        result.frames / HUMANOID_ARTICULATION_HORIZON.maximum_control_steps
+      ),
+      physicalCompletionRatio: succeeded ? 1 : completion,
+      satisfiedPredicateRatio: succeeded ? 1 : 0,
+      stableSteps: succeeded ? 1 : 0,
+      requiredStableSteps: 1
+    },
+    confidence: {
+      value: articulation?.position === null || articulation === null ? 0 : 1,
+      basis: "observable_contract_evidence"
+    },
+    failure: terminal && !succeeded ? {
+      code: result.code,
+      detail: failureReason(result.detail)
+    } : null,
+    recoverability: terminal && !succeeded ? "replan" : "not_applicable",
+    worldFrame: result.finalSnapshot.frame,
+    worldRevision: result.finalSnapshot.worldRevision,
+    controller: controller ? {
+      mode: controller.mode,
+      implementation: controller.activeImplementation
+    } : null
+  });
+}
+
+function articulationForGoal(
+  observation: HumanoidWorldObservation,
+  goal: HumanoidArticulationGoal
+) {
+  return observation.interaction.object_world_model.objects
+    .flatMap(({ articulation }) => articulation ? [articulation] : [])
+    .find(({ joint_id }) => joint_id === goal.joint_id) ?? null;
+}
+
+function directedCompletion(
+  goal: HumanoidArticulationGoal,
+  position: number
+): number {
+  const span = goal.target_position - goal.origin_position;
+  if (Math.abs(span) <= 1e-12) return 0;
+  return Math.max(0, Math.min(1, (position - goal.origin_position) / span));
+}
+
+function failureReason(value: JsonValue): string | null {
+  const reason = jsonRecord(value).reason;
+  return typeof reason === "string" && reason.trim() ? reason : null;
+}
+
+function jsonRecord(value: JsonValue): Record<string, JsonValue> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
 }
 
 function goalSatisfied(
@@ -244,7 +439,8 @@ function aggregateExecution(
   totalFrames: number,
   goal: HumanoidArticulationGoal,
   segments: HumanoidArticulationHorizonSegment[],
-  observation: HumanoidWorldObservation
+  observation: HumanoidWorldObservation,
+  completedSegmentPrefix = 0
 ): HumanoidArticulationHorizonResult {
   return {
     accepted: execution.accepted
@@ -271,7 +467,8 @@ function aggregateExecution(
             .flatMap(({ articulation }) => articulation ? [articulation] : [])
             .find(({ joint_id }) => joint_id === goal.joint_id)
         ),
-        segment_count: segments.length,
+        segment_count: completedSegmentPrefix + segments.length,
+        completed_segment_prefix_count: completedSegmentPrefix,
         segments
       }
     })
@@ -284,7 +481,8 @@ function failureFromExecution(
   segments: HumanoidArticulationHorizonSegment[],
   goal: HumanoidArticulationGoal | null,
   reason: string,
-  totalFrames = execution.frames
+  totalFrames = execution.frames,
+  completedSegmentPrefix = 0
 ): HumanoidArticulationHorizonResult {
   return {
     accepted: false,
@@ -301,7 +499,8 @@ function failureFromExecution(
         protocol: "humanoid-articulation-horizon-v1",
         goal,
         completed: false,
-        segment_count: segments.length,
+        segment_count: completedSegmentPrefix + segments.length,
+        completed_segment_prefix_count: completedSegmentPrefix,
         segments
       }
     })

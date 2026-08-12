@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 import type { AgentInputItem } from "@openai/agents";
 import type { ActionCommitOutbox } from "../domain/action-commit-outbox.js";
 import type { ActionExecutionLedger } from "../domain/action-execution-ledger.js";
-import type { HumanoidGoalProgress } from "../domain/humanoid-run.js";
+import {
+  humanoidContextMemoryStateSha256,
+  type HumanoidGoalProgress
+} from "../domain/humanoid-run.js";
+import type { ContextMemoryState } from "../domain/schema.js";
 import type { FileSession } from "../persistence/file-session.js";
 import type {
   AgentSessionStateBaseline
@@ -14,7 +18,7 @@ export interface HumanoidAgentStateCheckpoint {
   committed_actions: Readonly<Record<string, unknown>>;
   action_commit_outbox: ActionCommitOutbox;
   action_execution_ledger: ActionExecutionLedger;
-  context_memory: { total_compactions: number };
+  context_memory: ContextMemoryState;
   cycle_index: number;
   active_cycle: { cycle_id: string } | null;
 }
@@ -42,7 +46,9 @@ export function humanoidAgentStateFingerprint(
     committedActionIds: Object.keys(checkpoint.committed_actions).sort(compareCodePoints),
     actionCommitOutbox: checkpoint.action_commit_outbox,
     actionExecutionLedger: checkpoint.action_execution_ledger,
-    totalCompactions: checkpoint.context_memory.total_compactions,
+    contextMemorySha256: humanoidContextMemoryStateSha256(
+      checkpoint.context_memory
+    ),
     cycleIndex: checkpoint.cycle_index,
     activeCycleId: checkpoint.active_cycle?.cycle_id ?? null
   })).digest("hex");

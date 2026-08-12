@@ -89,7 +89,12 @@ describe("world materialization", () => {
     expect(rod).toMatchObject({
       portable: true,
       position: { x: 4.2, y: 0.67, z: 4.8 },
-      size: { x: 0.03, y: 0.22, z: 0.03 }
+      size: { x: 0.06, y: 0.22, z: 0.06 },
+      capability: {
+        shape: "cylinder",
+        mass_kg: 0.35,
+        friction: { sliding: 0.8, torsional: 0.012, rolling: 0.002 }
+      }
     });
     expect(stand).toMatchObject({
       portable: false,

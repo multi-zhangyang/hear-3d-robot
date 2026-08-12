@@ -24,6 +24,7 @@ import {
   type StoredHumanoidNavigationPlan
 } from "./world-plan-state.js";
 import type { HumanoidWorldSnapshot } from "./world-contract.js";
+import { legacyHumanoidEmbodiedSkillIdentity } from "./embodied-skill-call.js";
 
 export interface RestoredHumanoidWorldPlans {
   motions: Map<string, StoredHumanoidMotionPlan>;
@@ -124,6 +125,17 @@ function restoreMotions(input: {
     }
     const restored: StoredHumanoidMotionPlan = {
       ...structuredClone(entry),
+      skillCallIdentity: entry.skillCallIdentity
+        ?? legacyHumanoidEmbodiedSkillIdentity({
+          callId: `restored-motion:${entry.plan.id}`,
+          runtimeKind: "legacy_motion",
+          phase: "execute_reference",
+          observedFrame: Math.max(
+            0,
+            input.checkpoint.frame - entry.progress.nextFrameIndex
+          ),
+          observedWorldRevision: entry.createdRevision
+        }),
       retainTerminalJointTracking: entry.retainTerminalJointTracking ?? false,
       validatedRevision,
       validatedStateSha256: entry.validatedStateSha256
@@ -229,6 +241,17 @@ function restoreRoutes(input: {
     }
     plans.set(entry.id, {
       ...structuredClone(entry),
+      skillCallIdentity: entry.skillCallIdentity
+        ?? legacyHumanoidEmbodiedSkillIdentity({
+          callId: `restored-navigation:${entry.id}`,
+          runtimeKind: "navigation",
+          phase: "navigate",
+          observedFrame: Math.max(
+            0,
+            input.checkpoint.frame - progress.committed_frame_count
+          ),
+          observedWorldRevision: entry.createdRevision
+        }),
       validatedRevision,
       validatedStateSha256: entry.validatedStateSha256
         ?? input.restoredStateSha256,

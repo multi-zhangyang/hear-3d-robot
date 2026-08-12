@@ -14,7 +14,10 @@ export const HUMANOID_ARTICULATION_HORIZON = Object.freeze({
   minimum_segment_progress_ratio: 0.65,
   minimum_hinge_progress_rad: 0.025,
   minimum_slide_progress_m: 0.006,
-  maximum_segments: 32
+  maximum_segments: 32,
+  // One immutable semantic window spans all deterministic 50 Hz motion
+  // segments. Individual articulation candidates are capped below 8 seconds.
+  maximum_control_steps: 32 * 400
 });
 
 const HumanoidArticulationGoalSchema = z.object({
@@ -78,6 +81,19 @@ export function humanoidArticulationGoalSatisfied(
   return goal.direction === "increasing"
     ? articulation.position >= goal.target_position - tolerance
     : articulation.position <= goal.target_position + tolerance;
+}
+
+export function humanoidArticulationSegmentBudgetExhausted(
+  completedSegments: number,
+  currentProcessSegments = 0
+): boolean {
+  if (!Number.isSafeInteger(completedSegments) || completedSegments < 0
+    || !Number.isSafeInteger(currentProcessSegments)
+    || currentProcessSegments < 0) {
+    throw new Error("Articulation segment progress must be a non-negative integer");
+  }
+  return completedSegments + currentProcessSegments
+    >= HUMANOID_ARTICULATION_HORIZON.maximum_segments;
 }
 
 export function humanoidArticulationSegmentMinimumDelta(input: {

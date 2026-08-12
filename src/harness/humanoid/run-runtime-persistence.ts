@@ -46,8 +46,25 @@ export function physicalExecutionCheckpointDue(
   if (committedFrameCount <= 0) return false;
   if (committedFrameCount % interval === 0) return true;
   const planId = entry.admission.plan_id;
+  if (entry.action === "execute_humanoid_skill") {
+    const admissionMotion = cut.worldCheckpoint.motions.find(
+      (motion) => motion.plan.id === planId
+    );
+    const admissionRoute = cut.worldCheckpoint.routes.find(
+      (route) => route.id === planId
+    );
+    const callId = admissionMotion?.skillCallIdentity?.callId
+      ?? admissionRoute?.skillCallIdentity?.callId;
+    if (!callId) return false;
+    return cut.worldCheckpoint.motions.some((motion) => (
+      motion.skillCallIdentity?.callId === callId
+      && motion.terminal?.final_world_revision === cut.world.worldRevision
+    )) || cut.worldCheckpoint.routes.some((route) => (
+      route.skillCallIdentity?.callId === callId
+      && route.terminal?.final_world_revision === cut.world.worldRevision
+    ));
+  }
   return entry.action === "execute_whole_body_motion"
-    || entry.action === "execute_humanoid_skill"
       && cut.worldCheckpoint.motions.some((motion) => motion.plan.id === planId)
     ? cut.worldCheckpoint.motions.some((motion) => (
         motion.plan.id === planId && motion.terminal !== null

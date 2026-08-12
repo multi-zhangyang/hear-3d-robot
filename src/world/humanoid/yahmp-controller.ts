@@ -15,6 +15,7 @@ import {
 import type {
   HumanoidControllerDescriptor,
   HumanoidControllerInferenceOptions,
+  HumanoidControllerInferenceTrace,
   HumanoidControllerState,
   HumanoidJointPositionCommand,
   HumanoidPolicyState,
@@ -78,6 +79,7 @@ export class YahmpController implements HumanoidWholeBodyController {
   readonly #session: ort.InferenceSession;
   #previousAction = new Float32Array(HUMANOID_JOINT_NAMES.length);
   #history: Float32Array[] = [];
+  #lastInferenceTrace: HumanoidControllerInferenceTrace | null = null;
 
   static async create(): Promise<YahmpController> {
     ort.env.wasm.numThreads = 1;
@@ -97,6 +99,7 @@ export class YahmpController implements HumanoidWholeBodyController {
     options: HumanoidControllerInferenceOptions = {}
   ): void {
     this.#previousAction.fill(0);
+    this.#lastInferenceTrace = null;
     const current = this.#observationBlock(state, reference, options);
     this.#history = Array.from(
       { length: YAHMP_POLICY.historyLength },
@@ -140,7 +143,7 @@ export class YahmpController implements HumanoidWholeBodyController {
       const target = Math.max(value, taskTrackingStiffness(joint));
       return value + (target - value) * reference.jointTrackingWeights[index]!;
     });
-    return {
+    const command: HumanoidJointPositionCommand = {
       kind: "joint_position_pd",
       positions: Float64Array.from(action, (value, index) => (
         reference.jointPositions[index]!
@@ -158,6 +161,31 @@ export class YahmpController implements HumanoidWholeBodyController {
         value * Math.sqrt(stiffness[index]! / YAHMP_POLICY.stiffness[index]!)
       ))
     };
+    this.#lastInferenceTrace = {
+      protocol: "humanoid-controller-inference-trace-v1",
+      implementation: this.descriptor.implementation,
+      route: "direct",
+      components: [{
+        protocol: "humanoid-controller-tensor-trace-v1",
+        role: "direct",
+        implementation: this.descriptor.implementation,
+        observation: {
+          protocol: this.descriptor.learnedPolicy!.observationSpace.protocol,
+          values: [...observation]
+        },
+        action: {
+          protocol: this.descriptor.learnedPolicy!.actionSpace.protocol,
+          values: [...action]
+        }
+      }]
+    };
+    return command;
+  }
+
+  inferenceTrace(): HumanoidControllerInferenceTrace | null {
+    return this.#lastInferenceTrace
+      ? structuredClone(this.#lastInferenceTrace)
+      : null;
   }
 
   advanceHistory(
@@ -195,6 +223,7 @@ export class YahmpController implements HumanoidWholeBodyController {
     if (!payload.success) throw new Error("Invalid YAHMP controller state");
     this.#previousAction = Float32Array.from(payload.data.previous_action);
     this.#history = payload.data.history.map((entry) => Float32Array.from(entry));
+    this.#lastInferenceTrace = null;
   }
 
   async dispose(): Promise<void> {

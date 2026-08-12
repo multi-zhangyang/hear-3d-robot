@@ -29,22 +29,14 @@ const provider: ProviderConfig = {
 };
 
 describe("humanoid agent hierarchy", () => {
-  it("renders an exact executor authority envelope", () => {
-    const rendered = HUMANOID_AGENT_TOOL_CONTRACTS.executor.inputBuilder({
-      params: {
-        objective: "执行已接受导航",
-        execution: {
-          kind: "execute_plan",
-          planning_action: "plan_humanoid_navigation",
-          planning_transaction_id: "planning-call-41"
-        }
-      }
+  it("declares the Executor as a deterministic gate instead of a nested model", () => {
+    expect(HUMANOID_AGENT_TOOL_CONTRACTS.executor).toMatchObject({
+      dispatchKind: "deterministic_service",
+      toolName: "delegate_physics_executor",
+      implementationContract: "accepted_plan_to_runtime_action_v1",
+      outputContract: "formal_action_receipt"
     });
-
-    expect(rendered).toContain("CURRENT EXECUTION AUTHORITY");
-    expect(rendered).toContain('"planning_action":"plan_humanoid_navigation"');
-    expect(rendered).toContain('"planning_transaction_id":"planning-call-41"');
-    expect(rendered).toContain("不能改写为内部 plan_id");
+    expect(HUMANOID_AGENT_TOOL_CONTRACTS.executor).not.toHaveProperty("runOptions");
   });
 
   it("places exact live Goal identifiers in every Goal Manager invocation", () => {
@@ -203,7 +195,7 @@ describe("humanoid agent hierarchy", () => {
     expect(rendered).not.toContain('"root_position"');
   });
 
-  it("owns one Model facade and one Session per concrete hierarchy node", async () => {
+  it("owns Models only for reasoning nodes and executes service gates directly", async () => {
     const modelOwners: string[] = [];
     const sessionOwners: string[] = [];
     const models: Model[] = [];
@@ -282,12 +274,7 @@ describe("humanoid agent hierarchy", () => {
       runtime,
       createModel: (agentId) => {
         modelOwners.push(agentId);
-        const model = agentId === "humanoid-executor"
-          ? functionCallModel(
-            "execute_humanoid_skill",
-            JSON.stringify({ planning_transaction_id: "planning-call-41" })
-          )
-          : modelStub();
+        const model = modelStub();
         models.push(model);
         return model;
       },
@@ -300,27 +287,27 @@ describe("humanoid agent hierarchy", () => {
 
     expect(modelOwners).toEqual([
       "humanoid-goal-manager",
-      "humanoid-sentry",
       "humanoid-motion-reference",
-      "humanoid-executor",
       "humanoid-coordinator"
     ]);
     expect(sessionOwners).toEqual([
       "humanoid-goal-manager",
-      "humanoid-sentry",
       "humanoid-motion-reference",
-      "humanoid-executor",
       "humanoid-coordinator"
     ]);
-    expect(new Set(models).size).toBe(5);
+    expect(new Set(models).size).toBe(3);
     expect(hierarchy.goalManager.model).not.toBe(hierarchy.coordinator.model);
-    expect(hierarchy.coordinator.model).not.toBe(hierarchy.sentry.model);
-    expect(hierarchy.sentry.model).not.toBe(hierarchy.motion.model);
-    expect(hierarchy.motion.model).not.toBe(hierarchy.executor.model);
-    expect(hierarchy.session("humanoid-sentry")).toBeDefined();
-    expect(hierarchy.session("humanoid-sentry")).not.toBe(
-      hierarchy.session("humanoid-motion-reference")
-    );
+    expect(hierarchy.coordinator.model).not.toBe(hierarchy.motion.model);
+    expect(hierarchy.sentry).toMatchObject({
+      kind: "deterministic_service",
+      id: "humanoid-sentry"
+    });
+    expect(hierarchy.executor).toMatchObject({
+      kind: "deterministic_service",
+      id: "humanoid-executor"
+    });
+    expect(hierarchy.session("humanoid-sentry")).toBeUndefined();
+    expect(hierarchy.session("humanoid-executor")).toBeUndefined();
     expect(hierarchy.coordinatorSession).toBe(
       hierarchy.session("humanoid-coordinator")
     );
@@ -328,7 +315,8 @@ describe("humanoid agent hierarchy", () => {
       "recall_goal_history",
       "submit_goal_candidates",
       "select_goal_candidate",
-      "retire_goal_epoch"
+      "retire_goal_epoch",
+      "continue_goal_epoch"
     ]);
 
     expect(hierarchy.coordinator.tools.map((entry) => entry.name)).toEqual([
@@ -338,15 +326,11 @@ describe("humanoid agent hierarchy", () => {
       "delegate_motion_reference",
       "delegate_physics_executor",
       "complete_autonomous_cycle",
-      "complete_goal_transition",
       "complete_satisfied_goal"
     ]);
     expect(hierarchy.coordinator.tools.map((entry) => entry.name)).not.toContain(
       "execute_whole_body_motion"
     );
-    expect(hierarchy.sentry.tools.map((entry) => entry.name)).toEqual([
-      "observe_humanoid"
-    ]);
     expect(hierarchy.motion.tools.map((entry) => entry.name)).toEqual([
       "observe_humanoid",
       "recall_embodied_history",
@@ -355,17 +339,6 @@ describe("humanoid agent hierarchy", () => {
       "plan_humanoid_skill",
       "plan_whole_body_motion_candidates"
     ]);
-    expect(hierarchy.executor.tools.map((entry) => entry.name)).toEqual([
-      "execute_humanoid_skill",
-      "execute_whole_body_motion",
-      "remove_world_block"
-    ]);
-    expect(hierarchy.sentry.tools.map((entry) => entry.name)).not.toContain(
-      "recall_embodied_history"
-    );
-    expect(hierarchy.executor.tools.map((entry) => entry.name)).not.toContain(
-      "recall_embodied_history"
-    );
 
     const coordinatorTool = (name: string) => {
       const selected = hierarchy.coordinator.tools.find((entry) => entry.name === name);
@@ -551,7 +524,8 @@ describe("humanoid agent hierarchy", () => {
       }
     );
     expect(String(validExecutorDelegation)).toContain('"accepted":true');
-    expect(invokedActions).toContain("execute_humanoid_skill");
+    expect(invokedActions).toContain("execute_humanoid_navigation");
+    expect(modelOwners).toHaveLength(3);
     cycleCompletion = {
       status: "ready",
       evidence_transaction_ids: [execution.transactionId],
@@ -626,9 +600,9 @@ describe("humanoid agent hierarchy", () => {
     expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
       "同一次 submit_goal_candidates 调用产生一个互斥决策批次"
     ));
-    expect(hierarchy.executor.instructions).toEqual(expect.stringContaining(
-      "plan_humanoid_skill 必须调用 execute_humanoid_skill"
-    ));
+    expect(hierarchy.executor.implementationContract).toBe(
+      "accepted_plan_to_runtime_action_v1"
+    );
 
     const motionBehavior = hierarchy.motion.toolUseBehavior;
     if (typeof motionBehavior !== "function") {
@@ -822,7 +796,7 @@ describe("humanoid agent hierarchy", () => {
     })).toThrow("cannot share one Model facade");
   });
 
-  it("keeps Sentry available during replanning and applies the nested input filter", async () => {
+  it("keeps the deterministic Grounding Monitor available during replanning", async () => {
     const filteredAgents: string[] = [];
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
@@ -848,9 +822,7 @@ describe("humanoid agent hierarchy", () => {
         }),
         coordinatorPhase: () => "replan_or_retire"
       } as never,
-      createModel: (agentId) => agentId === "humanoid-sentry"
-        ? functionCallModel("observe_humanoid")
-        : modelStub(),
+      createModel: () => modelStub(),
       createSession: (agentId) => new MemorySession({ sessionId: agentId }),
       callModelInputFilter: ({ modelData, agent }) => {
         filteredAgents.push(agent.name);
@@ -882,10 +854,10 @@ describe("humanoid agent hierarchy", () => {
       action: "observe_humanoid",
       accepted: true
     });
-    expect(filteredAgents).toEqual(["人形感知哨兵"]);
+    expect(filteredAgents).toEqual([]);
   });
 
-  it("continues a prose-only Motion result inside its own Session", async () => {
+  it("returns a prose-only Motion stall to the outer Harness", async () => {
     let worldRevision = 11;
     const modelRequests: ModelRequest[] = [];
     const followUps: Array<{ agentId: string; attempt: number; reason: string }> = [];
@@ -949,7 +921,7 @@ describe("humanoid agent hierarchy", () => {
       throw new Error("Motion delegation tool is missing");
     }
 
-    const output = await delegate.invoke(
+    await expect(delegate.invoke(
       new RunContext({ runId: "motion-same-session-continuation" }),
       "{}",
       {
@@ -961,23 +933,14 @@ describe("humanoid agent hierarchy", () => {
           status: "completed"
         }
       }
-    );
+    )).rejects.toThrow("did not return its required terminal tool result");
 
-    expect(JSON.parse(String(output))).toMatchObject({
-      agentId: "humanoid-motion-reference",
-      action: "plan_humanoid_skill",
-      accepted: true
-    });
-    expect(invokedActions).toEqual(["observe_humanoid", "plan_humanoid_skill"]);
+    expect(invokedActions).toEqual(["observe_humanoid"]);
     expect(followUps).toEqual([expect.objectContaining({
       agentId: "humanoid-motion-reference",
       attempt: 1
     })]);
-    expect(modelRequests).toHaveLength(3);
-    expect(JSON.stringify(modelRequests[2]?.input)).toContain(
-      "SPECIALIST DECISION RECOVERY V1"
-    );
-    expect(JSON.stringify(modelRequests[2]?.input)).toContain("world_revision\\\":12");
+    expect(modelRequests).toHaveLength(2);
     expect(JSON.stringify(sessionItemsAtFollowUp)).toContain("现在提交正式规划");
     expect(hierarchy.session("humanoid-motion-reference")).toBe(
       sessions.get("humanoid-motion-reference")
@@ -1117,24 +1080,19 @@ describe("humanoid agent hierarchy", () => {
 
     expect(Object.fromEntries(owners)).toEqual({
       "humanoid-goal-manager": "goal-manager",
-      "humanoid-sentry": "sentry",
       "humanoid-motion-reference": "motion",
-      "humanoid-executor": "executor",
       "humanoid-coordinator": "coordinator"
     });
     expect(hierarchy.coordinator.modelSettings.temperature).toBe(0.1);
     expect(hierarchy.goalManager.modelSettings.temperature).toBe(0.15);
     expect(hierarchy.goalManager.modelSettings).not.toHaveProperty("maxTokens");
-    expect(hierarchy.sentry.modelSettings.temperature).toBe(0.2);
     expect(hierarchy.motion.modelSettings.temperature).toBe(0.3);
-    expect(hierarchy.executor.modelSettings.temperature).toBe(0.4);
-    expect(hierarchy.executor.modelSettings.reasoning).toEqual({ effort: "high" });
+    expect(hierarchy.sentry.kind).toBe("deterministic_service");
+    expect(hierarchy.executor.kind).toBe("deterministic_service");
     for (const agent of [
       hierarchy.goalManager,
       hierarchy.coordinator,
-      hierarchy.sentry,
-      hierarchy.motion,
-      hierarchy.executor
+      hierarchy.motion
     ]) {
       expect(agent.modelSettings.toolChoice).toBe("auto");
     }

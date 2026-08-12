@@ -28,6 +28,7 @@ import type {
 import type {
   HumanoidHandSurfaceObservation,
   HumanoidObjectSensorSnapshot,
+  HumanoidPolicyFrameSink,
   HumanoidSimulationSnapshot
 } from "./simulation.js";
 import type { G1HandContactSurfaceName } from "./morphology.js";
@@ -35,11 +36,20 @@ import type { G1HandCoordination } from "./hand-coordination.js";
 import type { HumanoidNavigationArrivalHeading } from "./navigation-arrival.js";
 import type { HumanoidSpatialBeliefObservation } from "./spatial-belief-map.js";
 import type {
+  HumanoidControllerCapabilityEvidenceSummary,
+  HumanoidControllerExecutionState,
   HumanoidWholeBodyControllerFactory
 } from "./whole-body-controller.js";
 import type {
   HumanoidNavigationCollisionEvidence
 } from "./navigation-collision-evidence.js";
+import type {
+  HumanoidEmbodiedSkillStatus
+} from "./embodied-skill-call.js";
+import type {
+  HumanoidSkillEventSink,
+  HumanoidSkillEventStream
+} from "./skill-event-stream.js";
 
 export interface HumanoidWorldSnapshot {
   frame: number;
@@ -158,12 +168,30 @@ export interface HumanoidExecutionReceipt {
     online_replans?: Array<{
       attempt: number;
       trigger: string;
+      failure_class: "dynamic_obstruction";
       world_revision: number;
       accepted: boolean;
       reason: string | null;
       waypoint_count: number;
+      budget: {
+        tier: "local_controller_recovery";
+        limit: number;
+        used_before: number;
+        used_after: number;
+        remaining_after: number;
+        model_calls_consumed: 0;
+      };
       blocking_contacts?: HumanoidNavigationCollisionEvidence[];
     }>;
+    online_replan_budget?: {
+      tier: "local_controller_recovery";
+      limit: number;
+      used: number;
+      remaining: number;
+      terminal_failure_class: "dynamic_obstruction" | "unsafe_state"
+        | "semantic_recovery" | "budget_exhausted" | null;
+      model_calls_consumed: 0;
+    };
     blocking_contacts?: HumanoidNavigationCollisionEvidence[];
     motion?: ReturnType<typeof humanoidMotionArtifactSummary>;
     physical_safety?: HumanoidPhysicalSafetyEvidence;
@@ -197,6 +225,11 @@ export interface HumanoidExecutionReceipt {
       drift_streak: number;
       drift_evidence: HumanoidMotionDriftEvidence | null;
       evidence: HumanoidMotionOptionExecutionState["lastEvidence"];
+    };
+    skill_status?: HumanoidEmbodiedSkillStatus;
+    controller_routing?: {
+      execution: NonNullable<HumanoidControllerExecutionState["routing"]> | null;
+      capability_evidence: HumanoidControllerCapabilityEvidenceSummary[];
     };
   };
 }
@@ -248,6 +281,21 @@ export interface HumanoidExecutionOptions {
   realtime?: boolean;
   retainTerminal?: boolean;
   persistenceSink?: HumanoidPersistenceSink;
+  skillEventSink?: HumanoidSkillEventSink;
+  /** Internal shared lifecycle for a deterministic multi-plan Skill horizon. */
+  skillEventStream?: HumanoidSkillEventStream;
+  /** The horizon owner, rather than an individual plan, emits progress. */
+  deferSkillProgress?: boolean;
+  /** The horizon owner, rather than an individual plan, emits the terminal. */
+  deferSkillTerminal?: boolean;
+  /** The horizon owner records one controller outcome for the complete Skill. */
+  deferSkillControllerOutcome?: boolean;
+  /** Continuous semantic window shared by deterministic multi-plan horizons. */
+  skillWindow?: {
+    maximumSteps: number;
+    stepOffset: number;
+  };
+  policyFrameSink?: HumanoidPolicyFrameSink;
   signal?: AbortSignal;
 }
 

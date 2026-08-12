@@ -165,7 +165,10 @@ import {
   type HumanoidSpatialBeliefMapCheckpoint
 } from "./spatial-belief-map.js";
 import { humanoidSpatialBeliefSolids } from "./spatial-belief-solids.js";
-import { onlineNavigationReplanDecision } from "./online-navigation-replanner.js";
+import {
+  MAXIMUM_ONLINE_NAVIGATION_REPLANS,
+  onlineNavigationReplanDecision
+} from "./online-navigation-replanner.js";
 import type {
   HumanoidWholeBodyControllerFactory
 } from "./whole-body-controller.js";
@@ -174,9 +177,25 @@ import { humanoidControllerTaskCapabilities } from
 import type {
   HumanoidNavigationCollisionEvidence
 } from "./navigation-collision-evidence.js";
+import {
+  HumanoidEmbodiedSkillCallSchema,
+  HumanoidEmbodiedSkillStatusSchema,
+  legacyHumanoidEmbodiedSkillIdentity,
+  type HumanoidEmbodiedSkillIdentity,
+  type HumanoidEmbodiedSkillStatus
+} from "./embodied-skill-call.js";
+import {
+  HumanoidSkillEventStream,
+  type HumanoidSkillProgressEvidence
+} from "./skill-event-stream.js";
 
 export interface WholeBodyMotionPlanningOptions {
   retainTerminalJointTracking?: boolean;
+  skillCallIdentity?: HumanoidEmbodiedSkillIdentity;
+}
+
+export interface HumanoidNavigationPlanningOptions {
+  skillCallIdentity?: HumanoidEmbodiedSkillIdentity;
 }
 import type { HumanoidNavigationArrivalHeading } from "./navigation-arrival.js";
 
@@ -194,6 +213,7 @@ export type {
   WholeBodyCandidatePlanReceipt,
   WholeBodyPlanReceipt
 } from "./world-contract.js";
+export type { HumanoidSkillEventSink } from "./skill-event-stream.js";
 
 type PlanRevalidationEvidence = NonNullable<
   HumanoidExecutionReceipt["detail"]["revalidation"]
@@ -525,6 +545,9 @@ export class HumanoidWorld {
         ...(simulation.handCommandTargets
           ? { handCommandTargets: [...simulation.handCommandTargets] }
           : {}),
+        handPolicyAuthority: simulation.handPolicyAuthority
+          ? structuredClone(simulation.handPolicyAuthority)
+          : null,
         controller: structuredClone(simulation.controller)
       },
       reference: serializeHumanoidReference(this.#reference),
@@ -550,6 +573,12 @@ export class HumanoidWorld {
 
   flushFramePublications(): Promise<void> {
     return this.#authority.flushPublications();
+  }
+
+  recordSkillOutcome(
+    outcome: Parameters<HumanoidSimulation["recordControllerSkillOutcome"]>[0]
+  ): void {
+    this.#simulation.recordControllerSkillOutcome(outcome);
   }
 
   async synchronizeScenarioChunks(
@@ -694,6 +723,19 @@ export class HumanoidWorld {
     ];
   }
 
+  pendingWholeBodyMotionPlanIdForSkillCall(callId: string): string | undefined {
+    const candidates = [...this.#motions.values()].filter((stored) => (
+      stored.terminal === null
+      && stored.skillCallIdentity?.callId === callId
+      && (stored.validatedRevision + stored.progress.nextFrameIndex)
+        === this.#worldRevision
+    ));
+    if (candidates.length > 1) {
+      throw new Error(`Multiple motion plans are active for Skill Call ${callId}`);
+    }
+    return candidates[0]?.plan.id;
+  }
+
   async planWholeBodyMotion(
     rawPlan: HumanoidMotionPlan,
     options: WholeBodyMotionPlanningOptions = {}
@@ -726,6 +768,15 @@ export class HumanoidWorld {
       if (prepared.validation.feasible && prepared.artifact) {
         const stored: StoredHumanoidMotionPlan = {
           plan: structuredClone(plan),
+          skillCallIdentity: options.skillCallIdentity
+            ? structuredClone(options.skillCallIdentity)
+            : legacyHumanoidEmbodiedSkillIdentity({
+                callId: `motion-plan:${plan.id}`,
+                runtimeKind: "legacy_motion",
+                phase: "execute_reference",
+                observedFrame: context.frame,
+                observedWorldRevision: createdRevision
+              }),
           artifact: structuredClone(prepared.artifact),
           rollout: null,
           retainTerminalJointTracking:
@@ -866,6 +917,15 @@ export class HumanoidWorld {
         && selected.result.optionCertificate) {
         const stored: StoredHumanoidMotionPlan = {
         plan: structuredClone(selected.plan),
+        skillCallIdentity: options.skillCallIdentity
+          ? structuredClone(options.skillCallIdentity)
+          : legacyHumanoidEmbodiedSkillIdentity({
+              callId: `motion-option:${batch.termination.option_id}`,
+              runtimeKind: "legacy_motion",
+              phase: "execute_option",
+              observedFrame: context.frame,
+              observedWorldRevision: createdRevision
+            }),
         artifact: structuredClone(selected.result.artifact),
         rollout: structuredClone(selected.result.rollout),
         retainTerminalJointTracking:
@@ -1028,6 +1088,13 @@ export class HumanoidWorld {
       releaseAuthority?.bindings.map((binding) => binding.objectId) ?? []
     );
     let execution: HumanoidMotionExecution | undefined;
+    const skillEvents = stored.skillCallIdentity?.runtimeKind === "semantic_skill"
+      ? options.skillEventStream ?? new HumanoidSkillEventStream(
+          stored.skillCallIdentity,
+          options.skillEventSink
+        )
+      : null;
+    let skillAcceptedEmitted = false;
     let handle: HumanoidAuthorityCommandHandle<HumanoidExecutionReceipt>;
     try {
       handle = await this.#authority.submit({
@@ -1079,6 +1146,11 @@ export class HumanoidWorld {
                 : []
             ),
             carryTaskSpaceTargets: stored.carriedObjectTaskSpaceTargets,
+            ...(options.policyFrameSink
+              && stored.skillCallIdentity?.runtimeKind === "semantic_skill"
+              ? { policyFrameSink: options.policyFrameSink }
+              : {}),
+            ...(options.skillWindow ? { skillWindow: options.skillWindow } : {}),
             detectorInput: (snapshot) => this.#motionOptionDetectorInput(
               snapshot,
               stored.option!.contract,
@@ -1113,8 +1185,20 @@ export class HumanoidWorld {
         step: async () => {
           options.signal?.throwIfAborted();
           if (!execution) throw new Error("Humanoid motion was not admitted");
+          if (!skillAcceptedEmitted && skillEvents && stored.skillCallIdentity) {
+            await skillEvents.accepted(humanoidSkillStatus({
+              identity: stored.skillCallIdentity,
+              state: "accepted",
+              evidence: execution.skillProgressEvidence(),
+              snapshot: this.snapshot()
+            }));
+            skillAcceptedEmitted = true;
+          }
           await this.#ensurePhysicalRegion();
-          const step = await execution.step(this.#simulation);
+          const step = await execution.step(this.#simulation, {
+            worldFrame: this.#frame,
+            worldRevision: this.#worldRevision
+          });
           this.#reference = execution.reference;
           if (step.snapshot) {
             const physicalSafety = storedMotionPhysicalSafety(stored);
@@ -1123,6 +1207,15 @@ export class HumanoidWorld {
           if (!step.done) {
             const snapshot = this.snapshot();
             await options.persistenceSink?.(this.#capturePersistenceState());
+            if (skillEvents && stored.skillCallIdentity
+              && !options.deferSkillProgress) {
+              await skillEvents.progress(humanoidSkillStatus({
+                identity: stored.skillCallIdentity,
+                state: "executing",
+                evidence: execution.skillProgressEvidence(),
+                snapshot
+              }));
+            }
             return {
               ...(frameSink && !options.persistenceSink ? { snapshot } : {}),
               done: false
@@ -1165,13 +1258,46 @@ export class HumanoidWorld {
                   revalidation: evidence
                 }
               );
+          if (stored.skillCallIdentity && !options.deferSkillControllerOutcome) {
+            this.#simulation.recordControllerSkillOutcome({
+              protocol: "humanoid-controller-skill-outcome-v1",
+              identity: stored.skillCallIdentity,
+              outcome: receipt.accepted ? "succeeded" : "failed",
+              terminalReason: receipt.code
+            });
+            receipt.finalSnapshot = this.snapshot();
+            receipt.detail.controller_routing = {
+              execution: receipt.finalSnapshot.robot.controllerExecution?.routing
+                ? structuredClone(
+                    receipt.finalSnapshot.robot.controllerExecution.routing
+                  )
+                : null,
+              capability_evidence: [
+                ...this.#simulation.controllerCapabilityEvidence()
+              ]
+            };
+          }
+          const terminalStatus = stored.skillCallIdentity
+            ? humanoidTerminalSkillStatus({
+                identity: stored.skillCallIdentity,
+                receipt,
+                evidence: execution.skillProgressEvidence(),
+                snapshot: this.snapshot()
+              })
+            : null;
           const finalized = this.#finalizeMotionPlan(
             stored,
-            receipt,
+            terminalStatus ? withHumanoidSkillStatus(receipt, terminalStatus) : receipt,
             options.retainTerminal ?? false
           );
           if (step.snapshot) {
             await options.persistenceSink?.(this.#capturePersistenceState());
+          }
+          if (skillEvents && terminalStatus && !options.deferSkillTerminal) {
+            await skillEvents.terminal(
+              terminalStatus.state === "succeeded" ? "succeeded" : "failed",
+              terminalStatus
+            );
           }
           return {
             ...(step.snapshot && frameSink && !options.persistenceSink
@@ -1196,7 +1322,25 @@ export class HumanoidWorld {
         return this.#finalizeMotionPlan(stored, receipt, options.retainTerminal ?? false);
       });
     }
-    return this.#driveAuthorityCommand(handle, options);
+    try {
+      return await this.#driveAuthorityCommand(handle, options);
+    } catch (error) {
+      if (skillEvents && stored.skillCallIdentity && skillAcceptedEmitted) {
+        await skillEvents.terminal("interrupted", humanoidSkillStatus({
+          identity: stored.skillCallIdentity,
+          state: "interrupted",
+          evidence: execution?.skillProgressEvidence()
+            ?? storedMotionSkillEvidence(stored),
+          snapshot: this.snapshot(),
+          failure: {
+            code: "execution_interrupted",
+            detail: error instanceof Error ? error.message : String(error)
+          },
+          recoverability: "retry_skill"
+        }));
+      }
+      throw error;
+    }
   }
 
   async acknowledgeWholeBodyMotion(
@@ -1604,7 +1748,8 @@ export class HumanoidWorld {
   async planNavigation(
     target: Vec3,
     requestedArrivalHeading: HumanoidNavigationArrivalHeading | null = null,
-    acceptedPositionToleranceMeters: number | null = null
+    acceptedPositionToleranceMeters: number | null = null,
+    options: HumanoidNavigationPlanningOptions = {}
   ): Promise<NavigationPlanReceipt> {
     const context = await this.#authority.capture(() => {
       return this.#captureNavigationPlanningContext();
@@ -1669,6 +1814,15 @@ export class HumanoidWorld {
       planId = `humanoid-route-${this.#routeSequence++}`;
       const stored: StoredHumanoidNavigationPlan = {
         id: planId,
+        skillCallIdentity: options.skillCallIdentity
+          ? structuredClone(options.skillCallIdentity)
+          : legacyHumanoidEmbodiedSkillIdentity({
+              callId: `navigation:${planId}`,
+              runtimeKind: "navigation",
+              phase: "navigate",
+              observedFrame: context.frame,
+              observedWorldRevision: createdRevision
+            }),
         plan,
         requestedTarget: { ...target },
         requestedArrivalHeading: requestedArrivalHeading
@@ -1908,13 +2062,29 @@ export class HumanoidWorld {
       admission_state_sha256: admission.stateSha256
     };
     let execution: HumanoidNavigationExecution | undefined;
+    const skillEvents = stored.skillCallIdentity?.runtimeKind === "semantic_skill"
+      ? options.skillEventStream ?? new HumanoidSkillEventStream(
+          stored.skillCallIdentity,
+          options.skillEventSink
+        )
+      : null;
+    let skillAcceptedEmitted = false;
     const onlineReplans: Array<{
       attempt: number;
       trigger: string;
+      failure_class: "dynamic_obstruction";
       world_revision: number;
       accepted: boolean;
       reason: string | null;
       waypoint_count: number;
+      budget: {
+        tier: "local_controller_recovery";
+        limit: number;
+        used_before: number;
+        used_after: number;
+        remaining_after: number;
+        model_calls_consumed: 0;
+      };
       blocking_contacts?: HumanoidNavigationCollisionEvidence[];
     }> = [];
     let handle: HumanoidAuthorityCommandHandle<HumanoidExecutionReceipt>;
@@ -1946,15 +2116,34 @@ export class HumanoidWorld {
             }),
             carryTaskSpaceTargets: stored.carriedObjectTaskSpaceTargets,
             arrivalHeading: stored.arrivalHeading,
-            acceptedPositionToleranceMeters: stored.acceptedPositionToleranceMeters
+            acceptedPositionToleranceMeters: stored.acceptedPositionToleranceMeters,
+            ...(options.policyFrameSink
+              && stored.skillCallIdentity?.runtimeKind === "semantic_skill"
+              ? { policyFrameSink: options.policyFrameSink }
+              : {}),
+            ...(stored.skillCallIdentity
+              ? { skillIdentity: stored.skillCallIdentity }
+              : {})
           });
           this.#navigationState.status = "executing";
         },
         step: async () => {
           options.signal?.throwIfAborted();
           if (!execution) throw new Error("Humanoid navigation was not admitted");
+          if (!skillAcceptedEmitted && skillEvents && stored.skillCallIdentity) {
+            await skillEvents.accepted(humanoidSkillStatus({
+              identity: stored.skillCallIdentity,
+              state: "accepted",
+              evidence: execution.skillProgressEvidence(),
+              snapshot: this.snapshot()
+            }));
+            skillAcceptedEmitted = true;
+          }
           await this.#ensurePhysicalRegion();
-          const prepared = await execution.prepareFrame(this.#simulation);
+          const prepared = await execution.prepareFrame(this.#simulation, {
+            worldFrame: this.#frame,
+            worldRevision: this.#worldRevision
+          });
           this.#reference = execution.reference;
           const step = prepared
             ? (() => {
@@ -1988,6 +2177,15 @@ export class HumanoidWorld {
           if (!step.done) {
             const snapshot = this.snapshot();
             await options.persistenceSink?.(this.#capturePersistenceState());
+            if (skillEvents && stored.skillCallIdentity
+              && !options.deferSkillProgress) {
+              await skillEvents.progress(humanoidSkillStatus({
+                identity: stored.skillCallIdentity,
+                state: "executing",
+                evidence: execution.skillProgressEvidence(),
+                snapshot
+              }));
+            }
             return {
               ...(frameSink && !options.persistenceSink ? { snapshot } : {}),
               done: false
@@ -2000,6 +2198,14 @@ export class HumanoidWorld {
             attempts: stored.progress.online_replan_count ?? 0
           });
           if (!result.completed && replanDecision.replan) {
+            if (skillEvents && stored.skillCallIdentity) {
+              await skillEvents.environmentChanged(humanoidSkillStatus({
+                identity: stored.skillCallIdentity,
+                state: "executing",
+                evidence: execution.skillProgressEvidence(),
+                snapshot: this.snapshot()
+              }));
+            }
             const context = this.#captureNavigationPlanningContext();
             const replanned = await this.#validateNavigationIntent(
               stored.requestedTarget,
@@ -2011,10 +2217,22 @@ export class HumanoidWorld {
             onlineReplans.push({
               attempt,
               trigger: result.reason ?? "navigation_blocked",
+              failure_class: "dynamic_obstruction",
               world_revision: context.worldRevision,
               accepted: replanned.accepted && replanned.plan !== null,
               reason: replanned.reason ?? null,
               waypoint_count: replanned.plan?.waypoints.length ?? 0,
+              budget: {
+                tier: "local_controller_recovery",
+                limit: MAXIMUM_ONLINE_NAVIGATION_REPLANS,
+                used_before: attempt - 1,
+                used_after: attempt,
+                remaining_after: Math.max(
+                  0,
+                  MAXIMUM_ONLINE_NAVIGATION_REPLANS - attempt
+                ),
+                model_calls_consumed: 0
+              },
               ...(replanned.blockingContacts
                 ? {
                     blocking_contacts: structuredClone(
@@ -2069,7 +2287,14 @@ export class HumanoidWorld {
                 }),
                 carryTaskSpaceTargets: stored.carriedObjectTaskSpaceTargets,
                 arrivalHeading: stored.arrivalHeading,
-                acceptedPositionToleranceMeters: stored.acceptedPositionToleranceMeters
+                acceptedPositionToleranceMeters: stored.acceptedPositionToleranceMeters,
+                ...(options.policyFrameSink
+                  && stored.skillCallIdentity?.runtimeKind === "semantic_skill"
+                  ? { policyFrameSink: options.policyFrameSink }
+                  : {}),
+                ...(stored.skillCallIdentity
+                  ? { skillIdentity: stored.skillCallIdentity }
+                  : {})
               });
               this.#navigationState = {
                 planId,
@@ -2079,6 +2304,15 @@ export class HumanoidWorld {
                 waypointIndex: stored.progress.waypoint_index
               };
               await options.persistenceSink?.(this.#capturePersistenceState());
+              if (skillEvents && stored.skillCallIdentity
+                && !options.deferSkillProgress) {
+                await skillEvents.progress(humanoidSkillStatus({
+                  identity: stored.skillCallIdentity,
+                  state: "executing",
+                  evidence: execution.skillProgressEvidence(),
+                  snapshot: this.snapshot()
+                }));
+              }
               return {
                 ...(prepared && frameSink && !options.persistenceSink
                   ? { snapshot: this.snapshot() }
@@ -2103,6 +2337,24 @@ export class HumanoidWorld {
                 : {}),
               travelledDistance: result.travelledDistance,
               online_replans: onlineReplans,
+              online_replan_budget: {
+                tier: "local_controller_recovery",
+                limit: MAXIMUM_ONLINE_NAVIGATION_REPLANS,
+                used: onlineReplans.at(-1)?.attempt
+                  ?? stored.progress.online_replan_count
+                  ?? 0,
+                remaining: Math.max(
+                  0,
+                  MAXIMUM_ONLINE_NAVIGATION_REPLANS
+                    - (onlineReplans.at(-1)?.attempt
+                      ?? stored.progress.online_replan_count
+                      ?? 0)
+                ),
+                terminal_failure_class: result.completed
+                  ? null
+                  : replanDecision.failure_class,
+                model_calls_consumed: 0
+              },
               carry: {
                 binding_set: structuredClone(stored.carriedObjectBindings),
                 continuation: stored.carriedObjectContinuation
@@ -2115,12 +2367,45 @@ export class HumanoidWorld {
               revalidation
             }
           );
+          if (stored.skillCallIdentity && !options.deferSkillControllerOutcome) {
+            this.#simulation.recordControllerSkillOutcome({
+              protocol: "humanoid-controller-skill-outcome-v1",
+              identity: stored.skillCallIdentity,
+              outcome: receipt.accepted ? "succeeded" : "failed",
+              terminalReason: receipt.code
+            });
+            receipt.finalSnapshot = this.snapshot();
+            receipt.detail.controller_routing = {
+              execution: receipt.finalSnapshot.robot.controllerExecution?.routing
+                ? structuredClone(
+                    receipt.finalSnapshot.robot.controllerExecution.routing
+                  )
+                : null,
+              capability_evidence: [
+                ...this.#simulation.controllerCapabilityEvidence()
+              ]
+            };
+          }
+          const terminalStatus = stored.skillCallIdentity
+            ? humanoidTerminalSkillStatus({
+                identity: stored.skillCallIdentity,
+                receipt,
+                evidence: execution.skillProgressEvidence(),
+                snapshot: this.snapshot()
+              })
+            : null;
           const finalized = this.#finalizeNavigationPlan(
             stored,
-            receipt,
+            terminalStatus ? withHumanoidSkillStatus(receipt, terminalStatus) : receipt,
             options.retainTerminal ?? false
           );
           await options.persistenceSink?.(this.#capturePersistenceState());
+          if (skillEvents && terminalStatus && !options.deferSkillTerminal) {
+            await skillEvents.terminal(
+              terminalStatus.state === "succeeded" ? "succeeded" : "failed",
+              terminalStatus
+            );
+          }
           return {
             ...(step.snapshot && frameSink && !options.persistenceSink
               ? { snapshot: finalized.finalSnapshot }
@@ -2148,7 +2433,25 @@ export class HumanoidWorld {
         );
       });
     }
-    return this.#driveAuthorityCommand(handle, options);
+    try {
+      return await this.#driveAuthorityCommand(handle, options);
+    } catch (error) {
+      if (skillEvents && stored.skillCallIdentity && skillAcceptedEmitted) {
+        await skillEvents.terminal("interrupted", humanoidSkillStatus({
+          identity: stored.skillCallIdentity,
+          state: "interrupted",
+          evidence: execution?.skillProgressEvidence()
+            ?? storedNavigationSkillEvidence(stored, this.snapshot()),
+          snapshot: this.snapshot(),
+          failure: {
+            code: "execution_interrupted",
+            detail: error instanceof Error ? error.message : String(error)
+          },
+          recoverability: "retry_skill"
+        }));
+      }
+      throw error;
+    }
   }
 
   async acknowledgeNavigation(
@@ -2214,9 +2517,21 @@ export class HumanoidWorld {
     retainTerminal: boolean
   ): HumanoidExecutionReceipt {
     const planId = stored.plan.id;
+    const normalizedReceipt = stored.skillCallIdentity
+      && !receipt.detail.skill_status
+      ? withHumanoidSkillStatus(
+          receipt,
+          humanoidTerminalSkillStatus({
+            identity: stored.skillCallIdentity,
+            receipt,
+            evidence: storedMotionSkillEvidence(stored),
+            snapshot: receipt.finalSnapshot
+          })
+        )
+      : receipt;
     if (!retainTerminal) {
       this.#deleteMotionPlan(planId);
-      return receipt;
+      return normalizedReceipt;
     }
     if (stored.terminal) {
       return humanoidPlanTerminalReceipt(stored.terminal, this.snapshot());
@@ -2224,7 +2539,7 @@ export class HumanoidWorld {
     const terminal = createHumanoidPlanTerminal({
       planId,
       totalFrames: stored.progress.nextFrameIndex,
-      receipt
+      receipt: normalizedReceipt
     });
     stored.terminal = terminal;
     if (!this.#motions.has(planId)) {
@@ -2232,7 +2547,7 @@ export class HumanoidWorld {
       this.#planRegistryEpoch += 1;
     }
     return {
-      ...receipt,
+      ...normalizedReceipt,
       terminalResultSha256: terminal.result_sha256
     };
   }
@@ -2249,13 +2564,25 @@ export class HumanoidWorld {
     retainTerminal: boolean
   ): HumanoidExecutionReceipt {
     const planId = stored.id;
+    const normalizedReceipt = stored.skillCallIdentity
+      && !receipt.detail.skill_status
+      ? withHumanoidSkillStatus(
+          receipt,
+          humanoidTerminalSkillStatus({
+            identity: stored.skillCallIdentity,
+            receipt,
+            evidence: storedNavigationSkillEvidence(stored, receipt.finalSnapshot),
+            snapshot: receipt.finalSnapshot
+          })
+        )
+      : receipt;
     if (!retainTerminal) {
       this.#deleteRoutePlan(planId);
       if (this.#navigationState.planId === planId) {
         this.#navigationState.planId = null;
         this.#navigationState.waypointIndex = null;
       }
-      return receipt;
+      return normalizedReceipt;
     }
     if (stored.terminal) {
       return humanoidPlanTerminalReceipt(stored.terminal, this.snapshot());
@@ -2263,7 +2590,7 @@ export class HumanoidWorld {
     const terminal = createHumanoidPlanTerminal({
       planId,
       totalFrames: stored.progress.committed_frame_count,
-      receipt
+      receipt: normalizedReceipt
     });
     stored.terminal = terminal;
     if (!this.#routes.has(planId)) {
@@ -2271,7 +2598,7 @@ export class HumanoidWorld {
       this.#planRegistryEpoch += 1;
     }
     return {
-      ...receipt,
+      ...normalizedReceipt,
       terminalResultSha256: terminal.result_sha256
     };
   }
@@ -2498,15 +2825,56 @@ export class HumanoidWorld {
   }
 
   #stationKeepingTaskCommand() {
-    return {
-      protocol: "humanoid-controller-task-v1" as const,
-      taskId: "station-keeping",
-      source: "motion_option" as const,
+    const identity = legacyHumanoidEmbodiedSkillIdentity({
+      callId: `station-keeping:${this.#frame}:${this.#worldRevision}`,
+      runtimeKind: "station_keeping",
+      phase: "hold",
+      observedFrame: this.#frame,
+      observedWorldRevision: this.#worldRevision
+    });
+    return HumanoidEmbodiedSkillCallSchema.parse({
+      protocol: "humanoid-embodied-skill-call-v2",
+      identity,
+      authority: {
+        source: "deterministic_runtime",
+        worldFrame: this.#frame,
+        worldRevision: this.#worldRevision
+      },
+      window: {
+        mode: "autonomous_closed_loop",
+        replanPolicy: "event_driven",
+        controlStepSeconds:
+          this.#simulation.controllerDescriptor().controlStepSeconds,
+        maximumSteps: 1,
+        stepIndex: 0,
+        remainingSteps: 1
+      },
       requestedCapabilities: humanoidControllerTaskCapabilities(this.#reference),
-      goal: null,
-      endEffectors: [],
-      grasps: []
-    };
+      command: {
+        baseTwist: {
+          forwardMetersPerSecond: this.#reference.rootVelocity[0],
+          lateralMetersPerSecond: this.#reference.rootVelocity[1],
+          yawRadiansPerSecond: this.#reference.rootYawVelocity
+        },
+        rootHeightMeters: this.#reference.rootHeight,
+        leftWristPositionPelvis: null,
+        rightWristPositionPelvis: null,
+        endEffectors: [],
+        grasps: []
+      },
+      contract: null,
+      safety: {
+        authorizedContacts: [],
+        stopOnFall: true,
+        stopOnUnauthorizedContact: true,
+        stopOnContractViolation: true
+      },
+      feedback: {
+        mode: "event_driven",
+        progressDelta: 1,
+        events: ["progress"]
+      }
+    });
   }
 
   #restore(rawCheckpoint: HumanoidWorldCheckpoint): void {
@@ -2544,6 +2912,9 @@ export class HumanoidWorld {
             )
           }
         : {}),
+      handPolicyAuthority: checkpoint.simulation.handPolicyAuthority
+        ? structuredClone(checkpoint.simulation.handPolicyAuthority)
+        : null,
       controller: structuredClone(checkpoint.simulation.controller)
     });
     this.#reference = hydrateHumanoidReference(checkpoint.reference);
@@ -2833,6 +3204,185 @@ export class HumanoidWorld {
       detail
     };
   }
+}
+
+function humanoidSkillStatus(input: {
+  identity: HumanoidEmbodiedSkillIdentity;
+  state: HumanoidEmbodiedSkillStatus["state"];
+  evidence: HumanoidSkillProgressEvidence;
+  snapshot: HumanoidWorldSnapshot;
+  failure?: { code: string; detail: string | null } | null;
+  recoverability?: HumanoidEmbodiedSkillStatus["recoverability"];
+}): HumanoidEmbodiedSkillStatus {
+  const controller = input.snapshot.robot.controllerExecution;
+  return HumanoidEmbodiedSkillStatusSchema.parse({
+    protocol: "humanoid-embodied-skill-status-v1",
+    callId: input.identity.callId,
+    state: input.state,
+    progress: {
+      elapsedRatio: unitRatio(input.evidence.elapsedRatio),
+      physicalCompletionRatio: nullableUnitRatio(
+        input.evidence.physicalCompletionRatio
+      ),
+      satisfiedPredicateRatio: nullableUnitRatio(
+        input.evidence.satisfiedPredicateRatio
+      ),
+      stableSteps: input.evidence.stableSteps,
+      requiredStableSteps: input.evidence.requiredStableSteps
+    },
+    confidence: {
+      value: unitRatio(input.evidence.confidence),
+      basis: "observable_contract_evidence"
+    },
+    failure: input.failure ?? null,
+    recoverability: input.recoverability ?? "not_applicable",
+    worldFrame: input.snapshot.frame,
+    worldRevision: input.snapshot.worldRevision,
+    controller: controller
+      ? {
+          mode: controller.mode,
+          implementation: controller.activeImplementation
+        }
+      : null
+  });
+}
+
+function storedMotionSkillEvidence(
+  stored: StoredHumanoidMotionPlan
+): HumanoidSkillProgressEvidence {
+  const frameLimit = stored.option
+    ? stored.option.certificate.validated_frame_limit
+    : stored.artifact.frames.length;
+  const succeeded = stored.option?.status === "succeeded";
+  return {
+    elapsedRatio: frameLimit <= 0
+      ? 0
+      : Math.min(1, stored.progress.nextFrameIndex / frameLimit),
+    physicalCompletionRatio: succeeded ? 1 : null,
+    satisfiedPredicateRatio: stored.option ? succeeded ? 1 : null : null,
+    stableSteps: stored.option?.monitor.terminalStableSteps ?? 0,
+    requiredStableSteps: stored.option?.contract.stable_steps ?? null,
+    confidence: stored.option ? stored.option.lastEvidence === null ? 0 : 1 : 1
+  };
+}
+
+function storedNavigationSkillEvidence(
+  stored: StoredHumanoidNavigationPlan,
+  snapshot: HumanoidWorldSnapshot
+): HumanoidSkillProgressEvidence {
+  const target = stored.plan.waypoints.at(-1) ?? stored.requestedTarget;
+  const startDistance = Math.hypot(
+    target.x - stored.progress.start_root_position.x,
+    target.z - stored.progress.start_root_position.z
+  );
+  const remainingDistance = Math.hypot(
+    target.x - snapshot.robot.rootPosition.x,
+    target.z - snapshot.robot.rootPosition.z
+  );
+  return {
+    elapsedRatio: stored.progress.committed_frame_count > 0 ? 1 : 0,
+    physicalCompletionRatio: startDistance <= 1e-9
+      ? remainingDistance <= 1e-9 ? 1 : 0
+      : unitRatio(1 - remainingDistance / startDistance),
+    satisfiedPredicateRatio: null,
+    stableSteps: stored.progress.stopping_settled_frame_count ?? 0,
+    requiredStableSteps: null,
+    confidence: 1
+  };
+}
+
+function humanoidTerminalSkillStatus(input: {
+  identity: HumanoidEmbodiedSkillIdentity;
+  receipt: HumanoidExecutionReceipt;
+  evidence: HumanoidSkillProgressEvidence;
+  snapshot: HumanoidWorldSnapshot;
+}): HumanoidEmbodiedSkillStatus {
+  if (input.receipt.accepted) {
+    return humanoidSkillStatus({
+      identity: input.identity,
+      state: "succeeded",
+      evidence: {
+        ...input.evidence,
+        physicalCompletionRatio: 1,
+        satisfiedPredicateRatio:
+          input.evidence.satisfiedPredicateRatio === null
+            ? null
+            : 1,
+        confidence: Math.max(input.evidence.confidence, 1)
+      },
+      snapshot: input.snapshot
+    });
+  }
+  const uncertain = input.receipt.code === "motion_goal_uncertain";
+  return humanoidSkillStatus({
+    identity: input.identity,
+    state: uncertain ? "uncertain" : "failed",
+    evidence: input.evidence,
+    snapshot: input.snapshot,
+    failure: {
+      code: input.receipt.code,
+      detail: terminalSkillFailureDetail(input.receipt)
+    },
+    recoverability: humanoidSkillRecoverability(input.receipt)
+  });
+}
+
+function withHumanoidSkillStatus(
+  receipt: HumanoidExecutionReceipt,
+  status: HumanoidEmbodiedSkillStatus
+): HumanoidExecutionReceipt {
+  return {
+    ...receipt,
+    detail: {
+      ...receipt.detail,
+      skill_status: structuredClone(status)
+    }
+  };
+}
+
+function terminalSkillFailureDetail(
+  receipt: HumanoidExecutionReceipt
+): string | null {
+  if (receipt.detail.reason?.trim()) return receipt.detail.reason;
+  const failure = receipt.detail.failures?.[0];
+  if (!failure) return null;
+  return "message" in failure && failure.message?.trim()
+    ? failure.message
+    : failure.code;
+}
+
+function humanoidSkillRecoverability(
+  receipt: HumanoidExecutionReceipt
+): HumanoidEmbodiedSkillStatus["recoverability"] {
+  const failureCode = receipt.detail.failures?.[0]?.code;
+  const reason = receipt.detail.reason ?? "";
+  if (failureCode === "fallen"
+    || failureCode === "environment_contact"
+    || reason.includes("carried_object_collision")
+    || reason.includes("carried_grasp_lost")) {
+    return "safety_stop";
+  }
+  if (receipt.code === "motion_execution_drifted"
+    || failureCode === "execution_drift") {
+    return "switch_policy";
+  }
+  if (receipt.code === "plan_stale"
+    || receipt.code === "plan_revalidation_failed"
+    || receipt.code === "navigation_blocked"
+    || receipt.code === "motion_goal_unmet"
+    || receipt.code === "motion_goal_uncertain"
+    || receipt.code === "motion_constraint_violated") {
+    return "replan";
+  }
+  return "retry_skill";
+}
+
+function unitRatio(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
+
+function nullableUnitRatio(value: number | null): number | null {
+  return value === null ? null : unitRatio(value);
 }
 
 function manipulationInteractionTargets(

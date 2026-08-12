@@ -55,6 +55,8 @@ import { HumanoidCarriedObjectLifecycleCheckpointSchema } from "./carried-object
 import { HumanoidStationKeepingAnchorSchema } from "./station-keeping.js";
 import { HumanoidNavigationArrivalHeadingSchema } from "./navigation-arrival.js";
 import { HumanoidSpatialBeliefMapCheckpointSchema } from "./spatial-belief-map.js";
+import { HumanoidEmbodiedSkillIdentitySchema } from "./embodied-skill-call.js";
+import { HumanoidHandPolicyAuthorityStateSchema } from "./hand-policy-authority.js";
 
 const FiniteArraySchema = z.array(z.number().finite());
 
@@ -176,6 +178,7 @@ export type HumanoidMotionOptionExecutionState = z.infer<
 
 const StoredMotionSchema = z.object({
   plan: HumanoidMotionPlanSchema,
+  skillCallIdentity: HumanoidEmbodiedSkillIdentitySchema.nullable().default(null),
   artifact: HumanoidMotionArtifactSchema,
   rollout: HumanoidMotionRolloutSchema.nullable().default(null),
   retainTerminalJointTracking: z.boolean().default(false),
@@ -544,6 +547,9 @@ export const HumanoidSimulationStateCheckpointSchema = z.object({
   accelerationWarmstart: FiniteArraySchema,
   requestedActuatorTorques: FiniteArraySchema.optional(),
   handCommandTargets: FiniteArraySchema.optional(),
+  handPolicyAuthority: HumanoidHandPolicyAuthorityStateSchema
+    .nullable()
+    .optional(),
   controller: z.object({
     protocol: z.literal("humanoid-controller-state-v1"),
     version: z.literal(1),
@@ -567,6 +573,7 @@ const HumanoidWorldCheckpointBaseSchema = z.object({
   motions: z.array(StoredMotionSchema),
   routes: z.array(z.object({
     id: z.string().min(1),
+    skillCallIdentity: HumanoidEmbodiedSkillIdentitySchema.nullable().default(null),
     plan: NavigationPlanSchema,
     requestedTarget: Vec3Schema,
     requestedArrivalHeading: HumanoidNavigationArrivalHeadingSchema

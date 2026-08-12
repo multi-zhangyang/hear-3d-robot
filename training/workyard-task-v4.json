@@ -1,0 +1,420 @@
+{
+  "protocol": "hear-workyard-residual-training-contract-v4",
+  "scenario_id": "humanoid_workyard",
+  "environment": {
+    "framework": "mjlab",
+    "task_id": "Hear-Workyard-Frozen-Locomotion-Upper-Body-Residual-G1-v4",
+    "module": "training/workyard_residual_mjlab_env.py",
+    "implementation_status": "implemented"
+  },
+  "morphology": {
+    "id": "unitree_g1_43dof_with_hands",
+    "body_joint_names": [
+      "left_hip_pitch_joint",
+      "left_hip_roll_joint",
+      "left_hip_yaw_joint",
+      "left_knee_joint",
+      "left_ankle_pitch_joint",
+      "left_ankle_roll_joint",
+      "right_hip_pitch_joint",
+      "right_hip_roll_joint",
+      "right_hip_yaw_joint",
+      "right_knee_joint",
+      "right_ankle_pitch_joint",
+      "right_ankle_roll_joint",
+      "waist_yaw_joint",
+      "waist_roll_joint",
+      "waist_pitch_joint",
+      "left_shoulder_pitch_joint",
+      "left_shoulder_roll_joint",
+      "left_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "left_wrist_roll_joint",
+      "left_wrist_pitch_joint",
+      "left_wrist_yaw_joint",
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint",
+      "right_wrist_pitch_joint",
+      "right_wrist_yaw_joint"
+    ],
+    "hand_joint_names": [
+      "left_hand_thumb_0_joint",
+      "left_hand_thumb_1_joint",
+      "left_hand_thumb_2_joint",
+      "left_hand_middle_0_joint",
+      "left_hand_middle_1_joint",
+      "left_hand_index_0_joint",
+      "left_hand_index_1_joint",
+      "right_hand_thumb_0_joint",
+      "right_hand_thumb_1_joint",
+      "right_hand_thumb_2_joint",
+      "right_hand_middle_0_joint",
+      "right_hand_middle_1_joint",
+      "right_hand_index_0_joint",
+      "right_hand_index_1_joint"
+    ]
+  },
+  "timing": {
+    "physics_step_seconds": 0.005,
+    "control_step_seconds": 0.02,
+    "episode_seconds": 12
+  },
+  "teacher": {
+    "protocol": "hear-frozen-locomotion-teacher-v1",
+    "source_task": "Mjlab-Velocity-Flat-Unitree-G1",
+    "runtime": "torchscript_cuda",
+    "artifact": {
+      "file": "g1_velocity_teacher.jit.pt",
+      "identity_report": "training-report.json",
+      "hash_authority": "identity_report"
+    },
+    "observation": {
+      "protocol": "mjlab-g1-velocity-observation-v1",
+      "size": 99,
+      "terms": [
+        { "name": "base_lin_vel", "size": 3 },
+        { "name": "base_ang_vel", "size": 3 },
+        { "name": "projected_gravity", "size": 3 },
+        { "name": "joint_pos", "size": 29 },
+        { "name": "joint_vel", "size": 29 },
+        { "name": "previous_actions", "size": 29 },
+        { "name": "twist_command", "size": 3 }
+      ]
+    },
+    "action": {
+      "protocol": "mjlab-g1-joint-position-residual-v1",
+      "size": 29
+    },
+    "actuation": {
+      "protocol": "hear-frozen-locomotion-residual-task-tracking-actuation-v1",
+      "authority": "partitioned_by_joint_ownership",
+      "runtime_body_model": "frozen_teacher_aligned_upper_body_harness_task_tracking",
+      "body_joint_count": 29,
+      "frozen_source_joint_count": 15,
+      "residual_task_tracking_joint_count": 14,
+      "frozen_protocol": "mjlab-unitree-g1-source-actuation-v1",
+      "residual_protocol": "hear-harness-task-tracking-pd-v1",
+      "task_tracking_stiffness": {
+        "arm": 80.0,
+        "wrist": 40.0
+      },
+      "damping_scaling": "source_damping_sqrt_stiffness_ratio",
+      "joint_effort_limits": "unitree_g1_joint_actuatorfrcrange_unchanged",
+      "generic_xml_position_gains_permitted": false
+    },
+    "frozen_joint_names": [
+      "left_hip_pitch_joint",
+      "left_hip_roll_joint",
+      "left_hip_yaw_joint",
+      "left_knee_joint",
+      "left_ankle_pitch_joint",
+      "left_ankle_roll_joint",
+      "right_hip_pitch_joint",
+      "right_hip_roll_joint",
+      "right_hip_yaw_joint",
+      "right_knee_joint",
+      "right_ankle_pitch_joint",
+      "right_ankle_roll_joint",
+      "waist_yaw_joint",
+      "waist_roll_joint",
+      "waist_pitch_joint"
+    ],
+    "gradient_authority": "none",
+    "inference_device": "same_cuda_device_as_environment",
+    "cpu_round_trip_permitted": false
+  },
+  "reach_teacher": {
+    "protocol": "hear-batched-adaptive-reach-teacher-v15",
+    "runtime": "mujoco_warp_torch_cuda",
+    "solver": "target_conditioned_feasible_posture_servo_with_dls_diagnostics",
+    "target_protocol": "shoulder-ray-side-clearance-pregrasp-v1",
+    "pregrasp_shell_radius_m": 0.1,
+    "pregrasp_lateral_clearance_m": 0.1,
+    "active_hand_allocation": "nearest_lateral_hand_centerline_balanced-v1",
+    "contact_target_activation": "contact_authority_only",
+    "success_metric": "active_wrist_to_command_within_tolerance",
+    "controlled_joint_count": 14,
+    "task_dimension_per_arm": 3,
+    "target_memory": "per_environment_measured_joint_anchored_anti_windup",
+    "base_damping": 0.015,
+    "singularity_damping": 0.12,
+    "singularity_threshold": 0.05,
+    "feasible_posture_protocol": "offline-collision-aware-side-pregrasp-quadratic-map-v3",
+    "feasible_posture_feature_protocol": "normalized-target-pelvis-xy-quadratic-v1",
+    "feasible_posture_feature_order": ["bias", "x", "y", "x2", "xy", "y2"],
+    "feasible_posture_center_xy_m": [
+      [0.13263583228233528, 0.14000000000000004],
+      [0.13263572415421565, -0.14000000000000004]
+    ],
+    "feasible_posture_feature_scale_m": 0.08,
+    "feasible_posture_feature_clamp": 1.25,
+    "feasible_posture_target_memory": "per_environment_episode_initial_typed_target",
+    "feasible_posture_normalized_action_coefficients": [
+      [
+        [-0.3236316382691721, -0.7269514026520584, -0.04775988813874011, 0.05584278071786808, -0.18798323120106536, 0.14551557865887363],
+        [-0.2699949125745273, -0.027718728564417053, 0.13594128464314825, -0.03181348636832727, 0.0324075299109939, 0.2062695277003042],
+        [-0.39950412939533847, 0.11701511048154004, 0.45968141266714, 0.1810428235995469, -0.10696674330447135, 0.06229800881069549],
+        [0.14965182296555227, 0.5649843679474869, 0.11806043528919548, 0.13456306538634613, 0.3383091768712742, -0.2109004504041579],
+        [-0.029151957942836645, -0.39235079896503683, -0.09663351515083662, 0.14209134177260452, 1.5990107821357942, -0.6666907741041069],
+        [0.2637887708319973, 0.7682103419046631, 0.1596505135004741, -0.5867683999238121, -0.38721124601488305, -0.3511044074470446],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      ],
+      [
+        [-0.28236680268540676, -0.7367885476312102, -0.011443925234534458, 0.006972719790887131, -0.14990832612975907, -0.2601152914259319],
+        [0.3015026796092595, 0.07248331591247224, 0.11621100965746214, -0.04614388033749554, 0.11587045003712604, -0.08545750055159942],
+        [0.303337956893984, -0.17363499560754553, 0.7129854461321926, 0.12031120361592144, -0.13748703501984166, 0.020260456916632405],
+        [0.07480369732311799, 0.5831456421521062, -0.055252899162254225, 0.3071904946888029, 0.03802792497394057, 0.31534324483341797],
+        [-0.21816315012281595, 0.162575862696899, 0.20247314665107416, 0.03773055027656547, 1.0216024793804024, 1.174253559771389],
+        [0.19208382190290482, 0.5570066428089783, 0.21177464666366286, -0.822923052734968, 0.5777719064880088, 0.6106207216672586],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      ]
+    ],
+    "feasible_posture_offline_validation": {
+      "command_jitter_m": 0.08,
+      "fit_grid_per_arm": 25,
+      "dense_grid_per_arm": 289,
+      "tolerance_m": 0.06,
+      "collision_clearance_m": 0.005,
+      "success_rate": 0.8875432525951558,
+      "kinematic_tolerance_rate": 1.0,
+      "collision_clear_rate": 0.8875432525951558,
+      "mean_error_m": 0.008503026325955211,
+      "p90_error_m": 0.018600412903803952,
+      "maximum_error_m": 0.034634432043045935,
+      "minimum_clearance_m": 0.0
+    },
+    "posture_attractor_gain": 1.0,
+    "task_space_feedback_gain": 0.0,
+    "max_cartesian_step_m": 0.08,
+    "max_joint_correction_rad": 0.2,
+    "max_solver_target_slew_rad": 0.03,
+    "max_command_lead_rad": 0.16,
+    "hold_enter_error_m": 0.05,
+    "hold_release_error_m": 0.075,
+    "supervision": "online_dagger_and_ppo_rollout_labels_only",
+    "actor_observation_exposure": false,
+    "execution_authority": "none",
+    "cpu_round_trip_per_label": false,
+    "diagnostics_protocol": "hear-reach-teacher-collision-aware-diagnostics-v15"
+  },
+  "warm_start": {
+    "protocol": "hear-online-dagger-warm-start-v1",
+    "algorithm": "online_dagger",
+    "loss": "smooth_l1_plus_excess_std_penalty",
+    "actor_distribution": "beta_bounded_minus_one_one",
+    "maximum_action_std": 0.15,
+    "dispersion_coefficient": 1.0,
+    "teacher_beta": { "initial": 1.0, "final": 0.1 },
+    "actor_normalizer_updates": true,
+    "checkpoint_before_ppo": true,
+    "ppo_handoff": "same_actor_after_supervised_warm_start"
+  },
+  "ppo_retention": {
+    "protocol": "hear-ppo-retention-v2",
+    "default_mode": "critic_warmup_rollout_teacher",
+    "critic_only_warmup": true,
+    "actor_normalizer_after_dagger": "frozen",
+    "optimizer": "separate_actor_critic_learning_rates",
+    "actor_distribution": "beta_bounded_minus_one_one",
+    "teacher_supervision": "every_stored_learner_rollout_state",
+    "teacher_action_scope": "authorized_14d_actor_action",
+    "loss": "smooth_l1_plus_excess_std_penalty",
+    "loss_coupling": "same_ppo_minibatch",
+    "default_teacher_loss_coefficient": 1.0,
+    "maximum_action_std": 0.15,
+    "dispersion_coefficient": 1.0,
+    "entropy_coefficient": 0.0,
+    "acceptance_comparison": "identical_held_out_seed"
+  },
+  "student": {
+    "phase": "task_space_reach_dagger_warm_start",
+    "role": "autonomous_skill_window_executor",
+    "conditioned_by": "humanoid-embodied-skill-call-v2",
+    "entry_state": {
+      "protocol": "hear-workyard-reach-entry-v1",
+      "authority": "harness_prepositioned_stance",
+      "root_position_world": [0.63, 0.0, 0.79],
+      "desired_base_twist": [0.0, 0.0, 0.0],
+      "nominal_object_distance_m": 0.17
+    },
+    "trainable_joint_names": [
+      "left_shoulder_pitch_joint",
+      "left_shoulder_roll_joint",
+      "left_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "left_wrist_roll_joint",
+      "left_wrist_pitch_joint",
+      "left_wrist_yaw_joint",
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint",
+      "right_wrist_pitch_joint",
+      "right_wrist_yaw_joint"
+    ],
+    "forbidden_observations": [
+      "teacher_stage",
+      "teacher_target_stage",
+      "full_task_automaton_state",
+      "curriculum_promotion_state"
+    ],
+    "next_phase": {
+      "name": "hand_synergy_contact_grasp",
+      "action_size": 22,
+      "additional_joint_names": [
+        "left_hand_synergy_0",
+        "left_hand_synergy_1",
+        "left_hand_synergy_2",
+        "left_hand_synergy_3",
+        "right_hand_synergy_0",
+        "right_hand_synergy_1",
+        "right_hand_synergy_2",
+        "right_hand_synergy_3"
+      ],
+      "requires_checkpoint_expansion": true,
+      "activation_gate": "held_out_reach_and_dynamic_com_acceptance"
+    },
+    "later_phase": {
+      "name": "low_amplitude_waist_residual",
+      "action_size": 25,
+      "additional_joint_names": [
+        "waist_yaw_joint",
+        "waist_roll_joint",
+        "waist_pitch_joint"
+      ],
+      "requires_checkpoint_expansion": true,
+      "activation_gate": "held_out_contact_grasp_and_dynamic_com_acceptance"
+    }
+  },
+  "composition": {
+    "protocol": "hear-teacher-residual-composition-v1",
+    "teacher_reference": "default_joint_position_plus_teacher_action_times_teacher_scale",
+    "frozen_joint_command": "teacher_reference",
+    "trainable_joint_command": "neutral_joint_position_plus_student_residual",
+    "hand_command": "fixed_neutral_open_pose",
+    "attribution": {
+      "teacher_action_count": 29,
+      "frozen_teacher_joint_count": 15,
+      "upper_body_residual_joint_count": 14,
+      "hand_synergy_count": 0,
+      "segments_reported_separately": true
+    }
+  },
+  "observation": {
+    "protocol": "hear-workyard-residual-observation-v4",
+    "size": 231,
+    "history_steps": 1,
+    "terms": [
+      { "name": "body_joint_position_offset", "size": 29 },
+      { "name": "body_joint_velocity", "size": 29 },
+      { "name": "previous_upper_body_residual", "size": 14 },
+      { "name": "hand_joint_position_fraction", "size": 14 },
+      { "name": "hand_joint_velocity", "size": 14 },
+      { "name": "support_relative_dynamic_com", "size": 4 },
+      { "name": "locomotion_teacher_action", "size": 29 },
+      { "name": "root_linear_velocity_pelvis", "size": 3 },
+      { "name": "root_angular_velocity_pelvis", "size": 3 },
+      { "name": "projected_gravity_pelvis", "size": 3 },
+      { "name": "end_effector_pose_pelvis", "size": 28 },
+      { "name": "support_contact_features", "size": 6 },
+      { "name": "hand_object_contact_features", "size": 6 },
+      { "name": "target_object_pose_pelvis", "size": 7 },
+      { "name": "target_object_twist_pelvis", "size": 6 },
+      { "name": "target_zone_relation", "size": 5 },
+      { "name": "requested_capabilities_multi_hot", "size": 5 },
+      { "name": "skill_window_progress", "size": 1 },
+      { "name": "active_hand_one_hot", "size": 2 },
+      { "name": "desired_base_twist", "size": 3 },
+      { "name": "wrist_pose_targets_pelvis", "size": 14 },
+      { "name": "wrist_position_tolerances", "size": 2 },
+      { "name": "grasp_requirements", "size": 4 }
+    ]
+  },
+  "action": {
+    "protocol": "hear-workyard-upper-body-residual-action-v4",
+    "size": 14,
+    "terms": [
+      {
+        "name": "upper_body_joint_position_residual",
+        "size": 14,
+        "minimum": -1,
+        "maximum": 1,
+        "scale": 0.5
+      }
+    ]
+  },
+  "rewards": {
+    "phase_scope": "balance_and_reach_only",
+    "terms": [
+      { "id": "upright_support", "objective": "maximize", "weight": 1.0, "authority": "humanoid_physical_safety" },
+      { "id": "teacher_lower_body_tracking", "objective": "maximize", "weight": 2.0, "authority": "locomotion_teacher" },
+      { "id": "teacher_waist_tracking", "objective": "maximize", "weight": 0.5, "authority": "locomotion_teacher" },
+      { "id": "wrist_position_tracking", "objective": "maximize", "weight": 4.0, "authority": "mujoco_state" },
+      { "id": "wrist_distance_progress", "objective": "maximize", "weight": 25.0, "authority": "mujoco_state" },
+      { "id": "wrist_orientation_tracking", "objective": "maximize", "weight": 0.25, "authority": "mujoco_state" },
+      { "id": "reach_teacher_action_tracking", "objective": "maximize", "weight": 0.3, "authority": "analytic_teacher" },
+      { "id": "dynamic_com_support", "objective": "maximize", "weight": 1.0, "authority": "humanoid_physical_safety" },
+      { "id": "upper_body_residual_l2", "objective": "minimize", "weight": 0.02, "authority": "policy_action" },
+      { "id": "action_rate", "objective": "minimize", "weight": 0.02, "authority": "policy_action" },
+      { "id": "joint_limit_proximity", "objective": "minimize", "weight": 0.5, "authority": "humanoid_physical_safety" },
+      { "id": "actuator_saturation", "objective": "minimize", "weight": 0.5, "authority": "humanoid_physical_safety" },
+      { "id": "fall", "objective": "minimize", "weight": 25.0, "authority": "humanoid_physical_safety" },
+      { "id": "non_foot_collision", "objective": "minimize", "weight": 2.0, "authority": "mujoco_state" },
+      { "id": "foot_slip", "objective": "minimize", "weight": 0.2, "authority": "humanoid_physical_safety" }
+    ],
+    "excluded_until_later_phase": [
+      "qualified_hand_contact",
+      "opposing_contact",
+      "grasp_verified",
+      "lift_height_progress",
+      "object_to_zone_progress",
+      "object_inside_zone",
+      "object_released_and_settled"
+    ]
+  },
+  "randomization": {
+    "object_position_jitter_m": 0.05,
+    "target_position_jitter_m": 0.0,
+    "object_mass_scale": [0.9, 1.1],
+    "friction_scale": [0.9, 1.1],
+    "actuator_strength_scale": [0.95, 1.05],
+    "observation_latency_control_steps": [0, 1]
+  },
+  "evaluation": {
+    "seeds": {
+      "training": { "first": 0, "last": 4999 },
+      "validation": { "first": 5000, "last": 5199 },
+      "held_out": { "first": 10000, "last": 10499 }
+    },
+    "episodes": 500,
+    "dynamic_com_settling_control_steps": 10,
+    "analytic_teacher_preflight_success_rate_minimum": 0.85,
+    "analytic_teacher_preflight_minimum_mean_error_maximum_m": 0.06,
+    "wrist_target_success_rate_minimum": 0.85,
+    "fall_rate_maximum": 0.02,
+    "teacher_frozen_joint_rms_error_maximum_rad": 0.18,
+    "maximum_joint_velocity_rad_s": 8.0,
+    "maximum_requested_effort_utilization": 1.0,
+    "teacher_frame_ratio_minimum": 1.0,
+    "upper_body_residual_frame_ratio_minimum": 0.95,
+    "teacher_gradient_parameter_count": 0,
+    "reach_teacher_label_coverage_minimum": 1.0,
+    "ppo_rollout_teacher_label_coverage_minimum": 1.0,
+    "ppo_rollout_mean_action_std_maximum": 0.15,
+    "ppo_success_rate_delta_minimum": 0.0,
+    "ppo_minimum_mean_wrist_error_delta_maximum_m": 0.0,
+    "ppo_minimum_support_margin_delta_minimum_m": 0.0,
+    "ppo_maximum_foot_slip_delta_maximum_m_s": 0.0,
+    "ppo_action_clipped_element_rate_maximum": 0.0,
+    "minimum_support_margin_m": -0.04,
+    "maximum_capture_point_norm_m": 0.30,
+    "maximum_foot_planar_displacement_m": 0.08,
+    "maximum_foot_slip_speed_m_s": 0.20,
+    "double_support_loss_rate_maximum": 0.10,
+    "no_foot_contact_rate_maximum": 0.01
+  }
+}
