@@ -65,6 +65,7 @@
     ],
     "closure_authority_latch": "episode_local_after_first_geometry_gate",
     "pose_hold": "closure_gate_then_measured_contact_pose",
+    "terminal_pocket_max_joint_target_slew_rad_per_control_step": 0.001,
     "force_release_threshold_n": 6,
     "emergency_force_release_threshold_n": 12,
     "maximum_closing_joint_lead_rad": 0.25,

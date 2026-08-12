@@ -89,7 +89,7 @@ describe("carried-object release authority", () => {
           graspPredicateIndex: 0,
           releasedPredicateIndex: 1,
           settledPredicateIndex: 2,
-          zonePredicateIndex: 3
+          destinationPredicateIndex: 3
         }]
       });
   });

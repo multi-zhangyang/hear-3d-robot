@@ -18,7 +18,7 @@ describe("provider context budget", () => {
     });
     expect(config).toMatchObject({
       contextWindowTokens: 32768,
-      compactTriggerTokens: Math.floor(32768 * 0.85),
+      compactTriggerTokens: 28_672,
       compactRecentModelTurns: 4,
       compactMaxOutputTokens: 1024
     });
@@ -35,7 +35,7 @@ describe("provider context budget", () => {
     expect(config.toolChoice).toBe("auto");
     expect(config.requestTimeoutMs).toBe(300_000);
     expect(config.streamEventIdleTimeoutMs).toBe(300_000);
-    expect(config.compactTriggerTokens).toBe(Math.floor(262_144 * 0.85));
+    expect(config.compactTriggerTokens).toBe(249_037);
     expect(config.maxOutputTokens).toBeUndefined();
     expect(config.compactMaxOutputTokens).toBeUndefined();
     expect(config.agentModels?.executor.maxOutputTokens).toBeUndefined();
@@ -64,11 +64,11 @@ describe("provider context budget", () => {
     });
 
     expect(config.contextWindowTokens).toBe(1_000_000);
-    expect(config.compactTriggerTokens).toBe(850_000);
+    expect(config.compactTriggerTokens).toBe(983_616);
     expect(config.reasoningEffort).toBe("high");
     for (const profile of Object.values(config.agentModels ?? {})) {
       expect(profile.contextWindowTokens).toBe(1_000_000);
-      expect(profile.compactTriggerTokens).toBe(850_000);
+      expect(profile.compactTriggerTokens).toBe(983_616);
       expect(profile.reasoningEffort).toBe("high");
     }
   });
@@ -102,20 +102,20 @@ describe("provider context budget", () => {
     expect(() => loadProviderConfig({
       ...required,
       AI_CONTEXT_WINDOW_TOKENS: "16000",
-      AI_COMPACT_TRIGGER_TOKENS: "11000",
+      AI_COMPACT_TRIGGER_TOKENS: "11001",
       AI_MAX_OUTPUT_TOKENS: "5000",
       AI_COMPACT_MAX_OUTPUT_TOKENS: "2000"
     })).toThrow("explicitly configured AI_MAX_OUTPUT_TOKENS");
   });
 
-  it("reserves the model window for every turn in a fresh compactor attempt", () => {
+  it("rejects a compactor output budget that consumes its entire model window", () => {
     expect(() => loadProviderConfig({
       ...required,
       AI_CONTEXT_WINDOW_TOKENS: "16000",
       AI_COMPACT_TRIGGER_TOKENS: "1000",
       AI_MAX_OUTPUT_TOKENS: "1000",
-      AI_COMPACT_MAX_OUTPUT_TOKENS: "8000"
-    })).toThrow("compactor repair turns");
+      AI_COMPACT_MAX_OUTPUT_TOKENS: "16000"
+    })).toThrow("one compactor request");
   });
 
   it("inherits AI defaults while resolving independent provider-neutral agent profiles", () => {
@@ -163,7 +163,7 @@ describe("provider context budget", () => {
     });
   });
 
-  it("derives an independent 85% trigger when a role overrides its window", () => {
+  it("derives an independent output-reserved trigger when a role overrides its window", () => {
     const config = loadProviderConfig({
       ...required,
       AI_EXECUTOR_CONTEXT_WINDOW_TOKENS: "131072"
@@ -171,24 +171,24 @@ describe("provider context budget", () => {
 
     expect(config.agentModels?.executor).toMatchObject({
       contextWindowTokens: 131072,
-      compactTriggerTokens: Math.floor(131072 * 0.85)
+      compactTriggerTokens: 124_519
     });
   });
 
-  it("uses the same 85% high-water mark for every configured window", () => {
+  it("reserves output capacity for every configured window", () => {
     const config = loadProviderConfig({
       ...required,
       AI_CONTEXT_WINDOW_TOKENS: "16000"
     });
 
-    expect(config.compactTriggerTokens).toBe(Math.floor(16000 * 0.85));
+    expect(config.compactTriggerTokens).toBe(11_904);
   });
 
   it("validates every agent profile before the runtime can create a model", () => {
     expect(() => loadProviderConfig({
       ...required,
       AI_SENTRY_CONTEXT_WINDOW_TOKENS: "16000",
-      AI_SENTRY_COMPACT_TRIGGER_TOKENS: "11000",
+      AI_SENTRY_COMPACT_TRIGGER_TOKENS: "11001",
       AI_SENTRY_MAX_OUTPUT_TOKENS: "5000",
       AI_SENTRY_COMPACT_MAX_OUTPUT_TOKENS: "2000"
     })).toThrow("explicitly configured AI_MAX_OUTPUT_TOKENS");

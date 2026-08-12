@@ -102,6 +102,15 @@ function skillPredicateRelation(
     if (objectPrerequisiteSkill(invocation, predicate.object_id)) {
       return "prerequisite";
     }
+    if (invocation.skill === "place"
+      && invocation.object_id === predicate.object_id
+      && invocation.destination.type === "semantic_zone") {
+      const expectedInside = predicate.type === "object_placed" || predicate.expected;
+      return expectedInside
+        && invocation.destination.zone_id === predicate.zone_id
+        && invocation.destination.tolerance_m <= predicate.tolerance
+        ? "direct" : undefined;
+    }
     const zone = observedZone(observation, predicate.zone_id);
     const current = observedObjectPosition(observation, predicate.object_id);
     const target = objectMotionTarget(invocation, predicate.object_id, observation);
@@ -190,6 +199,15 @@ function navigationTarget(
   if (invocation.skill === "navigate_to_zone") {
     return observedZone(observation, invocation.zone_id)?.center;
   }
+  if (invocation.skill === "carry_to_zone") {
+    const zone = observedZone(observation, invocation.zone_id);
+    const object = observedObjectPosition(observation, invocation.object_id);
+    return zone && object ? {
+      x: observation.robot.rootPosition.x + zone.center.x - object.x,
+      y: observation.robot.rootPosition.y,
+      z: observation.robot.rootPosition.z + zone.center.z - object.z
+    } : undefined;
+  }
   if (invocation.skill === "carry"
     || invocation.skill === "bimanual_carry"
     || invocation.skill === "retreat") {
@@ -247,7 +265,13 @@ function objectMotionTarget(
   if (invocation.skill === "carry" || invocation.skill === "bimanual_carry") {
     return invocation.target;
   }
+  if (invocation.skill === "carry_to_zone") {
+    return observedZone(observation, invocation.zone_id)?.center;
+  }
   if (invocation.skill === "place") {
+    if (invocation.destination.type === "semantic_zone") {
+      return observedZone(observation, invocation.destination.zone_id)?.center;
+    }
     if (invocation.destination.type === "world_pose") {
       return invocation.destination.position;
     }

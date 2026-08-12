@@ -43,7 +43,6 @@ import {
   assertHumanoidControllerSourceCompatible,
   resolveHumanoidControllerSourceForRun,
   humanoidModelProgressSnapshot,
-  nextModelDecisionFollowUpState,
   recoverableDynamicToolRunStateError,
   resumeHumanoidMission,
   startHumanoidMission,
@@ -350,11 +349,11 @@ describe("humanoid mission initialization recovery", () => {
     const checkpoint = await store.readHumanoidCheckpoint();
     expect(checkpoint.status).toBe("interrupted");
     expect(checkpoint.error).toContain("connection reset");
-    expect(runnerControl.run).toHaveBeenCalledTimes(9);
+    expect(runnerControl.run).toHaveBeenCalledTimes(3);
     const providerEvents = await store.readJournal("provider");
     expect(providerEvents.filter((entry) => (
       isRecord(entry) && entry.status === "transport_interrupted"
-    ))).toHaveLength(8);
+    ))).toHaveLength(2);
     for (const [agentId, items] of sessionItems) {
       expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual(items);
     }
@@ -379,7 +378,7 @@ describe("humanoid mission initialization recovery", () => {
     const inspected = new Error("rebased branch inspected");
     runnerControl.run.mockImplementation(async () => {
       const attempt = runnerControl.run.mock.calls.length;
-      if (attempt <= 3) throw serverError;
+      if (attempt <= 2) throw serverError;
       expect(await missionSession(
         store,
         manifest.epoch_id,
@@ -400,13 +399,13 @@ describe("humanoid mission initialization recovery", () => {
 
     await expect(resume(store, config)).rejects.toBe(inspected);
 
-    expect(runnerControl.run).toHaveBeenCalledTimes(4);
+    expect(runnerControl.run).toHaveBeenCalledTimes(3);
     const recoveries = (await store.readJournal("provider")).filter((entry) => (
       isRecord(entry) && entry.status === "transport_interrupted"
     ));
-    expect(recoveries).toHaveLength(3);
+    expect(recoveries).toHaveLength(2);
     expect(recoveries.at(-1)).toMatchObject({
-      recovery_attempt: 3,
+      recovery_attempt: 2,
       sdk_branch_rebased: true,
       raw_history_preserved: true,
       session_history_preserved: true,
@@ -491,7 +490,7 @@ describe("humanoid mission initialization recovery", () => {
     }
   });
 
-  it("bounds prose-only decision recovery at one physical authority", async () => {
+  it("interrupts a prose-only coordinator result without a synthetic follow-up", async () => {
     const store = await createCheckpointedRun();
     const config = provider();
     const manifest = createManifest(config);
@@ -531,84 +530,49 @@ describe("humanoid mission initialization recovery", () => {
       "Humanoid coordinator did not return a formal tool result"
     );
 
-    expect(runnerControl.run).toHaveBeenCalledTimes(3);
+    expect(runnerControl.run).toHaveBeenCalledTimes(1);
     expect(String(inputs[0])).toContain("推进人形自主闭环的下一个层级步骤");
-    for (const input of inputs.slice(1)) {
-      expect(String(input)).toContain("上一次模型分支没有产生 Harness 可验收的正式工具决策");
-    }
     const followUps = (await store.readJournal("provider")).filter((entry) => (
       isRecord(entry) && entry.status === "model_decision_follow_up"
     ));
-    expect(followUps).toEqual([1, 2].map((attempt) => expect.objectContaining({
-      agent_id: HUMANOID_AGENT_IDS.coordinator,
-      follow_up_attempt: attempt,
-      recovery_sequence: attempt,
-      recovery_scope: "authority_state_and_context_lifecycle",
-      tool_choice_protocol: "required",
-      invalid_response_logged: true,
-      invalid_response_retained_in_session: false,
-      session_branch_rolled_back: true,
-      session_history_preserved: true,
-      continuation: "same_agent_model_and_session",
-      automatic_actuation: false
-    })));
+    expect(followUps).toEqual([]);
     expect((await missionSession(
       store,
       manifest.epoch_id,
       HUMANOID_AGENT_IDS.coordinator
     ).getItems()).map((item) => item.content)).toEqual([
-      "durable-prefix"
+      "durable-prefix",
+      "prose-only-response:1"
     ]);
   }, 30_000);
 
-  it("routes a specialist stall back through the original coordinator without a repair Agent", async () => {
+  it("surfaces a specialist decision stall without an outer coordinator retry", async () => {
     const store = await createCheckpointedRun();
     const config = provider();
     const manifest = createManifest(config);
     await store.writeAgentManifest(manifest);
-    const inspectionComplete = new Error("same-session follow-up inspected");
-    let firstAgent: unknown;
-    let firstSession: FileSession | undefined;
-    runnerControl.run.mockImplementation(async (
-      agent,
-      runInput,
-      options: { session?: FileSession; maxTurns?: number | null }
-    ) => {
-      const attempt = runnerControl.run.mock.calls.length;
-      if (attempt === 1) {
-        firstAgent = agent;
-        firstSession = options.session;
-        return {
-          state: { toString: () => "specialist-stall-state" },
-          completed: Promise.resolve(),
-          finalOutput: undefined,
-          async *[Symbol.asyncIterator]() {
-            throw new ModelDecisionStallError(
-              HUMANOID_AGENT_IDS.motion,
-              "motion returned no terminal tool receipt"
-            );
-          }
-        };
-      }
-      expect(agent).toBe(firstAgent);
-      expect(options.session).toBe(firstSession);
-      expect(options.maxTurns).toBeNull();
-      expect(String(runInput)).toContain("上一次模型分支没有产生 Harness 可验收的正式工具决策");
-      throw inspectionComplete;
+    runnerControl.run.mockImplementation(async () => {
+      return {
+        state: { toString: () => "specialist-stall-state" },
+        completed: Promise.resolve(),
+        finalOutput: undefined,
+        async *[Symbol.asyncIterator]() {
+          throw new ModelDecisionStallError(
+            HUMANOID_AGENT_IDS.motion,
+            "motion returned no terminal tool receipt"
+          );
+        }
+      };
     });
 
-    await expect(resume(store, config)).rejects.toBe(inspectionComplete);
-    expect(runnerControl.run).toHaveBeenCalledTimes(2);
+    await expect(resume(store, config)).rejects.toThrow(
+      "motion returned no terminal tool receipt"
+    );
+    expect(runnerControl.run).toHaveBeenCalledTimes(1);
     const followUps = (await store.readJournal("provider")).filter((entry) => (
       isRecord(entry) && entry.status === "model_decision_follow_up"
     ));
-    expect(followUps).toEqual([
-      expect.objectContaining({
-        agent_id: HUMANOID_AGENT_IDS.motion,
-        follow_up_attempt: 1,
-        continuation: "same_agent_model_and_session"
-      })
-    ]);
+    expect(followUps).toEqual([]);
   }, 30_000);
 
   it("recovers an admitted physical transaction before any model decision follow-up", async () => {
@@ -677,110 +641,6 @@ describe("humanoid mission initialization recovery", () => {
       recovery.mockRestore();
     }
   }, 30_000);
-
-  it("keeps decision recovery epochs independent for each hierarchy node", async () => {
-    const store = await createCheckpointedRun();
-    const config = provider();
-    const manifest = createManifest(config);
-    await store.writeAgentManifest(manifest);
-    const inputs: unknown[] = [];
-    const stalls = [
-      HUMANOID_AGENT_IDS.coordinator,
-      HUMANOID_AGENT_IDS.motion,
-      HUMANOID_AGENT_IDS.coordinator
-    ];
-    const inspectionComplete = new Error("per-agent follow-up budgets inspected");
-    runnerControl.run.mockImplementation(async (_agent, runInput) => {
-      inputs.push(runInput);
-      const stalledAgentId = stalls[runnerControl.run.mock.calls.length - 1];
-      if (!stalledAgentId) throw inspectionComplete;
-      return {
-        state: { toString: () => `stall:${stalledAgentId}` },
-        completed: Promise.resolve(),
-        finalOutput: undefined,
-        async *[Symbol.asyncIterator]() {
-          throw new ModelDecisionStallError(
-            stalledAgentId,
-            `${stalledAgentId} returned no formal decision`
-          );
-        }
-      };
-    });
-
-    await expect(resume(store, config)).rejects.toBe(inspectionComplete);
-    expect(runnerControl.run).toHaveBeenCalledTimes(4);
-    expect(String(inputs[1])).toContain(
-      `未完成正式决策的节点：${HUMANOID_AGENT_IDS.coordinator}`
-    );
-    expect(String(inputs[1])).toContain("续行轮次：1");
-    expect(String(inputs[2])).toContain(
-      `未完成正式决策的节点：${HUMANOID_AGENT_IDS.motion}`
-    );
-    expect(String(inputs[2])).toContain("续行轮次：1");
-    expect(String(inputs[3])).toContain(
-      `未完成正式决策的节点：${HUMANOID_AGENT_IDS.coordinator}`
-    );
-    expect(String(inputs[3])).toContain("续行轮次：2");
-    const followUps = (await store.readJournal("provider")).filter((entry) => (
-      isRecord(entry) && entry.status === "model_decision_follow_up"
-    ));
-    expect(followUps).toEqual([
-      expect.objectContaining({
-        agent_id: HUMANOID_AGENT_IDS.coordinator,
-        follow_up_attempt: 1
-      }),
-      expect.objectContaining({
-        agent_id: HUMANOID_AGENT_IDS.motion,
-        follow_up_attempt: 1
-      }),
-      expect.objectContaining({
-        agent_id: HUMANOID_AGENT_IDS.coordinator,
-        follow_up_attempt: 2
-      })
-    ]);
-  }, 30_000);
-
-  it("scopes decision follow-ups to one authoritative progress state", () => {
-    const first = nextModelDecisionFollowUpState(undefined, "authority-a");
-    const second = nextModelDecisionFollowUpState(first ?? undefined, "authority-a");
-    const third = nextModelDecisionFollowUpState(second ?? undefined, "authority-a");
-    expect(first).toEqual({
-      authorityFingerprint: "authority-a",
-      contextCompactionCount: 0,
-      attempt: 1,
-      sequence: 1
-    });
-    expect(second).toEqual({
-      authorityFingerprint: "authority-a",
-      contextCompactionCount: 0,
-      attempt: 2,
-      sequence: 2
-    });
-    expect(third).toBeUndefined();
-    expect(nextModelDecisionFollowUpState(
-      second ?? undefined,
-      "authority-a"
-    )).toBeUndefined();
-    expect(nextModelDecisionFollowUpState(
-      second ?? undefined,
-      "authority-b"
-    )).toEqual({
-      authorityFingerprint: "authority-b",
-      contextCompactionCount: 0,
-      attempt: 1,
-      sequence: 3
-    });
-    expect(nextModelDecisionFollowUpState(
-      second ?? undefined,
-      "authority-a",
-      1
-    )).toEqual({
-      authorityFingerprint: "authority-a",
-      contextCompactionCount: 1,
-      attempt: 1,
-      sequence: 3
-    });
-  });
 
   it("restores Sessions to the last persisted RunState before retrying", async () => {
     const store = await createCheckpointedRun();

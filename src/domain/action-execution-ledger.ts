@@ -399,7 +399,7 @@ export function recordActionExecutionProgress(
   if (progress.committed_frame_count === entry.progress.committed_frame_count) {
     if (progress.world_frame !== entry.progress.world_frame
       || progress.world_revision !== entry.progress.world_revision
-      || progress.authority_state_sha256 !== entry.progress.authority_state_sha256
+      || !sameFrameTerminalAuthorityTransition(entry.progress, progress)
       || progress.committed_frame_count === 0) {
       throw new Error(`Action execution progress identity conflict: ${transactionId}`);
     }
@@ -543,6 +543,24 @@ function sameProgress(
   right: z.infer<typeof ActionExecutionProgressSchema>
 ): boolean {
   return actionCommitPayloadSha256(json(left)) === actionCommitPayloadSha256(json(right));
+}
+
+function sameFrameTerminalAuthorityTransition(
+  previous: z.infer<typeof ActionExecutionProgressSchema>,
+  next: z.infer<typeof ActionExecutionProgressSchema>
+): boolean {
+  if (next.authority_state_sha256 === previous.authority_state_sha256) return true;
+  const terminal = next.completed_plan_terminals.at(-1);
+  return terminal !== undefined
+    && terminal.final_frame === next.world_frame
+    && terminal.final_world_revision === next.world_revision
+    && next.physical_checkpoint_sha256 !== previous.physical_checkpoint_sha256
+    && previous.completed_plan_terminals.length
+      <= next.completed_plan_terminals.length
+    && previous.completed_plan_terminals.every((entry, index) => (
+      actionCommitPayloadSha256(json(entry))
+        === actionCommitPayloadSha256(json(next.completed_plan_terminals[index]))
+    ));
 }
 
 function sameTerminal(

@@ -31,7 +31,7 @@ import {
 
 const COMPACTOR_AGENT_ID = "humanoid-context-compactor";
 const COMPACTOR_AGENT_NAME = "Context Compactor";
-const HUMANOID_HARNESS_CONTRACT_VERSION = 18;
+const HUMANOID_HARNESS_CONTRACT_VERSION = 21;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
@@ -51,6 +51,8 @@ const PROTOCOL_ADAPTER_PACKAGE = {
 const RECEIPT_TERMINAL_TOOLS = {
   sentry: ["observe_humanoid"],
   motion: [
+    "submit_humanoid_skill_plan",
+    "begin_humanoid_skill",
     "plan_humanoid_skill",
     "plan_whole_body_motion_candidates",
     "plan_humanoid_navigation"
@@ -130,7 +132,7 @@ export function createHumanoidAgentManifest(input: {
         ? {}
         : { maxTokens: compactorOutputLimit }),
       parallelToolCalls: false,
-      toolChoice: compactorTool.name
+      toolChoice: "auto"
     }),
     resetToolChoice: false,
     toolUseBehavior: {

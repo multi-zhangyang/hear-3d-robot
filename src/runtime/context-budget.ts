@@ -1,11 +1,6 @@
-/**
- * A compatible endpoint may ignore a required tool choice and emit reasoning
- * only. Correction turns stay bounded, but they are split across fresh SDK
- * runs so failed prose from one attempt cannot inflate every later request.
- */
-export const CONTEXT_COMPACTOR_MAX_ATTEMPTS = 4;
-export const CONTEXT_COMPACTOR_TURNS_PER_ATTEMPT = 2;
-const DEFAULT_CONTEXT_COMPACTION_FRACTION = 0.85;
+/** Long-run compaction is one model transaction, not a retry workflow. */
+export const CONTEXT_COMPACTOR_MAX_ATTEMPTS = 1;
+export const CONTEXT_COMPACTOR_TURNS_PER_ATTEMPT = 1;
 
 export function defaultOutputTokenReserve(contextWindowTokens: number): number {
   return Math.min(
@@ -15,7 +10,7 @@ export function defaultOutputTokenReserve(contextWindowTokens: number): number {
 }
 
 export function defaultCompactTriggerTokens(contextWindowTokens: number): number {
-  return Math.floor(contextWindowTokens * DEFAULT_CONTEXT_COMPACTION_FRACTION);
+  return contextWindowTokens - defaultOutputTokenReserve(contextWindowTokens);
 }
 
 export function configuredOutputTokenLimit(

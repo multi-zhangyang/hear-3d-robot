@@ -458,7 +458,7 @@ class WorkyardContactActionCfg(reach.WorkyardResidualActionCfg):
   # Contact is sampled once per 20 ms control update.  Slow only the final
   # open-hand pocket insertion so reach/retreat/alignment retain their proven
   # convergence rate while first-contact impulse remains bounded.
-  contact_pocket_max_solver_target_slew_rad: float = 0.0020
+  contact_pocket_max_solver_target_slew_rad: float = 0.0010
   contact_approach_max_command_lead_rad: float = 0.10
   # Bound stored position-servo energy in the final pocket independently of
   # the outer reach/alignment lead.  A slow target can still build a large

@@ -108,13 +108,15 @@ function restoreMotions(input: {
       || entry.progress.nextFrameIndex === 0
       || restoredContinuation?.continued === true
         && restoredUnauthorizedContacts.length === 0;
-    const recoverable = carryRecoverable && (entry.terminal !== null
-      || entry.progress.nextFrameIndex > 0
+    const recoverable = carryRecoverable && (
+      entry.terminal !== null
+      || (entry.progress.nextFrameIndex > 0
         ? expectedRevision === input.checkpoint.worldRevision
         : humanoidPlanIntentIsActive(
             input.checkpoint.worldRevision,
             expiresRevision
-          ));
+          ))
+    );
     if (!recoverable) {
       pruned = true;
       continue;
@@ -228,13 +230,19 @@ function restoreRoutes(input: {
       || progress.committed_frame_count === 0
       || restoredContinuation?.continued === true
         && restoredUnauthorizedContacts.length === 0;
-    const recoverable = carryRecoverable && (entry.terminal !== null
-      || progress.committed_frame_count > 0
+    const recoverable = carryRecoverable && (
+      // Every terminal remains consumable until the enclosing physical action
+      // is durably committed. A semantic Skill horizon can contain several
+      // terminal routes, so only retaining the segment ending at the current
+      // revision destroys the earlier terminal receipts during crash recovery.
+      entry.terminal !== null
+      || (progress.committed_frame_count > 0
         ? expectedRevision === input.checkpoint.worldRevision
         : humanoidPlanIntentIsActive(
             input.checkpoint.worldRevision,
             expiresRevision
-          ));
+          ))
+    );
     if (!recoverable) {
       pruned = true;
       continue;

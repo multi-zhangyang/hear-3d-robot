@@ -1,5 +1,11 @@
 import { z } from "zod";
-import type { JsonValue } from "../../domain/schema.js";
+import {
+  QuaternionSchema,
+  Vec3Schema,
+  type JsonValue,
+  type Quaternion,
+  type Vec3
+} from "../../domain/schema.js";
 import {
   HUMANOID_SKILL_CONTRACTS,
   type HumanoidSkillInvocation
@@ -21,6 +27,28 @@ export interface RegisteredHumanoidSkillPlan {
   selected_strategy_id: string;
   observed_frame: number;
   world_revision: number;
+  physical_anchor?: {
+    root_position: Vec3;
+    root_rotation: Quaternion;
+    carried_object_ids: string[];
+    carried_bindings?: Array<{
+      object_id: string;
+      hand: "left" | "right";
+    }> | undefined;
+    object_poses: Array<{
+      object_id: string;
+      position: Vec3;
+      rotation: Quaternion;
+      articulation?: {
+        joint_id: string;
+        position: number | null;
+      } | null | undefined;
+    }>;
+  } | undefined;
+  in_progress_phase?: {
+    node_id: string;
+    phase: string;
+  } | undefined;
   completed_node_ids: string[];
   completed_phases_by_node: Record<string, string[]>;
 }
@@ -34,6 +62,62 @@ export const RegisteredHumanoidSkillPlanSchema = z.object({
   selected_strategy_id: z.string().trim().min(1),
   observed_frame: z.number().int().nonnegative(),
   world_revision: z.number().int().nonnegative(),
+  physical_anchor: z.object({
+    root_position: Vec3Schema,
+    root_rotation: QuaternionSchema,
+    carried_object_ids: z.array(z.string().trim().min(1)).max(16),
+    carried_bindings: z.array(z.object({
+      object_id: z.string().trim().min(1),
+      hand: z.enum(["left", "right"])
+    }).strict()).max(32).optional(),
+    object_poses: z.array(z.object({
+      object_id: z.string().trim().min(1),
+      position: Vec3Schema,
+      rotation: QuaternionSchema,
+      articulation: z.object({
+        joint_id: z.string().trim().min(1),
+        position: z.number().finite().nullable()
+      }).strict().nullable().optional()
+    }).strict()).max(16)
+  }).strict().superRefine((anchor, context) => {
+    const sorted = [...anchor.carried_object_ids].sort();
+    if (new Set(sorted).size !== sorted.length
+      || JSON.stringify(anchor.carried_object_ids) !== JSON.stringify(sorted)) {
+      context.addIssue({
+        code: "custom",
+        path: ["carried_object_ids"],
+        message: "Skill plan carried-object anchor must be unique and sorted"
+      });
+    }
+    if (anchor.carried_bindings) {
+      const bindingKeys = anchor.carried_bindings.map(
+        ({ object_id: objectId, hand }) => `${objectId}\0${hand}`
+      );
+      const sortedBindingKeys = [...bindingKeys].sort();
+      if (new Set(sortedBindingKeys).size !== sortedBindingKeys.length
+        || JSON.stringify(bindingKeys) !== JSON.stringify(sortedBindingKeys)) {
+        context.addIssue({
+          code: "custom",
+          path: ["carried_bindings"],
+          message: "Skill plan carried-object bindings must be unique and sorted"
+        });
+      }
+    }
+    const objectIds = anchor.object_poses.map(({ object_id }) => object_id);
+    const sortedObjectIds = [...objectIds].sort();
+    if (new Set(sortedObjectIds).size !== sortedObjectIds.length
+      || JSON.stringify(objectIds) !== JSON.stringify(sortedObjectIds)) {
+      context.addIssue({
+        code: "custom",
+        path: ["object_poses"],
+        message: "Skill plan object-pose anchors must be unique and sorted"
+      });
+    }
+  }).optional(),
+  in_progress_phase: z.object({
+    node_id: z.string().trim().min(1),
+    phase: z.string().trim().min(1)
+  }).strict().optional(),
   completed_node_ids: z.array(z.string().trim().min(1)).max(16),
   completed_phases_by_node: z.record(
     z.string().trim().min(1),
@@ -89,6 +173,25 @@ export const RegisteredHumanoidSkillPlanSchema = z.object({
       });
     }
   }
+  if (plan.in_progress_phase) {
+    const node = selected?.nodes.find(
+      ({ node_id: nodeId }) => nodeId === plan.in_progress_phase?.node_id
+    );
+    const completed = node
+      ? plan.completed_phases_by_node[node.node_id] ?? []
+      : [];
+    const expectedPhase = node
+      ? actionableSkillPhases(node.invocation)[completed.length]
+      : undefined;
+    if (!node || plan.completed_node_ids.includes(node.node_id)
+      || expectedPhase !== plan.in_progress_phase.phase) {
+      context.addIssue({
+        code: "custom",
+        path: ["in_progress_phase"],
+        message: "Registered Skill in-progress phase is not the next incomplete DAG phase"
+      });
+    }
+  }
 });
 
 export function registerHumanoidSkillPlan(input: {
@@ -97,6 +200,7 @@ export function registerHumanoidSkillPlan(input: {
   proposal: HumanoidSkillPlanProposal;
   observedFrame: number;
   worldRevision: number;
+  physicalAnchor: NonNullable<RegisteredHumanoidSkillPlan["physical_anchor"]>;
 }): RegisteredHumanoidSkillPlan {
   const proposal = compileHumanoidSkillDependencies(
     HumanoidSkillPlanProposalSchema.parse(input.proposal)
@@ -110,8 +214,46 @@ export function registerHumanoidSkillPlan(input: {
     selected_strategy_id: proposal.selected_strategy_id,
     observed_frame: input.observedFrame,
     world_revision: input.worldRevision,
+    physical_anchor: structuredClone(input.physicalAnchor),
     completed_node_ids: [],
     completed_phases_by_node: {}
+  });
+}
+
+/**
+ * Returns the exact bindings the Motion Agent may choose next from the
+ * selected strategy.  This is a projection of the model-authored DAG, not a
+ * scheduler decision: parallel dependency-ready nodes are all preserved so
+ * the model still owns the semantic choice.
+ */
+export function readyHumanoidSkillPlanBindings(
+  plan: RegisteredHumanoidSkillPlan
+): Array<{
+  skill_plan_transaction_id: string;
+  skill_node_id: string;
+  invocation: HumanoidSkillInvocation;
+  phase: string;
+}> {
+  const strategy = plan.proposal.strategies.find(
+    ({ strategy_id: strategyId }) => strategyId === plan.selected_strategy_id
+  );
+  if (!strategy) return [];
+  return strategy.nodes.flatMap((node) => {
+    if (plan.completed_node_ids.includes(node.node_id)
+      || node.depends_on_node_ids.some((dependency) => (
+        !plan.completed_node_ids.includes(dependency)
+      ))) return [];
+    const phases = actionableSkillPhases(node.invocation);
+    const completed = completedSkillPhases(plan, node.node_id, node.invocation);
+    const phase = phases[completed.length];
+    return phase === undefined
+      ? []
+      : [{
+          skill_plan_transaction_id: plan.transaction_id,
+          skill_node_id: node.node_id,
+          invocation: structuredClone(node.invocation),
+          phase
+        }];
   });
 }
 
@@ -242,11 +384,14 @@ export function advanceHumanoidSkillPlan(input: {
   plan: RegisteredHumanoidSkillPlan;
   binding: ActiveHumanoidSkillBinding;
   worldRevision: number;
+  physicalAnchor: NonNullable<RegisteredHumanoidSkillPlan["physical_anchor"]>;
   executionSucceeded: boolean;
+  phasePostconditionSatisfied: boolean;
 }): RegisteredHumanoidSkillPlan | null {
   if (!input.executionSucceeded) return null;
   const next = structuredClone(input.plan);
   next.world_revision = input.worldRevision;
+  next.physical_anchor = structuredClone(input.physicalAnchor);
   const nodeId = input.binding.skill_node_id;
   const strategy = next.proposal.strategies.find(
     ({ strategy_id: strategyId }) => strategyId === next.selected_strategy_id
@@ -264,6 +409,19 @@ export function advanceHumanoidSkillPlan(input: {
       + `received ${input.binding.phase}`
     );
   }
+  // A successful controller transaction can be only one bounded physical
+  // chunk of a semantic phase (for example, 3 m of navigate_to_zone).  Keep
+  // the model-authored DAG and refresh its physical anchor, but do not claim
+  // phase or node completion until the phase's world-state postcondition is
+  // actually true.
+  if (!input.phasePostconditionSatisfied) {
+    next.in_progress_phase = {
+      node_id: nodeId,
+      phase: input.binding.phase
+    };
+    return RegisteredHumanoidSkillPlanSchema.parse(next);
+  }
+  delete next.in_progress_phase;
   const advancedPhases = [...completedPhases, input.binding.phase];
   next.completed_phases_by_node = {
     ...next.completed_phases_by_node,

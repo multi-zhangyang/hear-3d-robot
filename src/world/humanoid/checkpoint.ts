@@ -576,6 +576,7 @@ const HumanoidWorldCheckpointBaseSchema = z.object({
     skillCallIdentity: HumanoidEmbodiedSkillIdentitySchema.nullable().default(null),
     plan: NavigationPlanSchema,
     requestedTarget: Vec3Schema,
+    remainingDistance: z.number().finite().nonnegative().optional(),
     requestedArrivalHeading: HumanoidNavigationArrivalHeadingSchema
       .nullable()
       .default(null),

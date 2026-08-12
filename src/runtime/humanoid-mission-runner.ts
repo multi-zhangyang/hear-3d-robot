@@ -17,10 +17,6 @@ import {
 import type { Goal } from "../domain/schema.js";
 import { humanoidActionReceiptsInCommitOrder } from "../domain/humanoid-run.js";
 import {
-  HUMANOID_ACTION_NAMES,
-  type HumanoidActionName
-} from "../domain/humanoid-action.js";
-import {
   humanoidRunShouldFinish,
   type HumanoidRunMode
 } from "../domain/run-mode.js";
@@ -41,6 +37,7 @@ import {
   createHumanoidAgentManifest
 } from "../harness/agent-manifest.js";
 import {
+  coordinatorInvocationInput,
   createHumanoidAgentHierarchy,
   humanoidAgentRole,
   HUMANOID_AGENT_IDS
@@ -56,10 +53,6 @@ import {
   modelTransportInterruptionAgentIdFrom,
   withModelTelemetry
 } from "../harness/model-telemetry.js";
-import {
-  ModelDecisionProtocolRecovery,
-  withModelDecisionProtocolRecovery
-} from "../harness/model-decision-protocol.js";
 import { providerEventJson, sdkEventJson } from "../harness/sdk-events.js";
 import {
   createConfiguredModel,
@@ -67,6 +60,7 @@ import {
   providerIdentity,
   type PromptCacheRequestTrace
 } from "../model/factory.js";
+import { agentsModelRetrySettings } from "../model/retry.js";
 import { FileSession } from "../persistence/file-session.js";
 import type { MutationFence } from "../persistence/mutation-fence.js";
 import { RunStore } from "../persistence/run-store.js";
@@ -98,10 +92,10 @@ import { drawSeed } from "../world/world-generator.js";
 
 setTracingDisabled(true);
 
-const MAX_MODEL_DECISION_FOLLOW_UPS_PER_AUTHORITY = 2;
-
-const MAX_TRANSPORT_RECOVERIES = 8;
-const SERVER_ERROR_CONTEXT_RECOVERY_ATTEMPT = 3;
+// The SDK owns retries for one model request. This smaller outer window only
+// resumes a durable mission boundary after the SDK could not safely finish it.
+const MAX_MISSION_CONTINUITY_RECOVERIES = 2;
+const SERVER_ERROR_CONTEXT_RECOVERY_ATTEMPT = 2;
 const HUMANOID_PROMPT_CACHE_NAMESPACE = "hear-humanoid-agent-profile-v1";
 
 export interface HumanoidMissionRunResult {
@@ -295,7 +289,9 @@ async function executeHumanoidMission(input: {
   resumed: boolean;
   signal?: AbortSignal;
 }): Promise<HumanoidMissionRunResult> {
-  const transportRecovery = new PerAgentTransportRecovery(MAX_TRANSPORT_RECOVERIES);
+  const transportRecovery = new PerAgentTransportRecovery(
+    MAX_MISSION_CONTINUITY_RECOVERIES
+  );
   let modelProgressRecoveryEpoch = 0;
   let initialized = false;
   try {
@@ -420,15 +416,6 @@ async function executeHumanoidMission(input: {
       ),
       modelProgressRecoveryEpoch: () => modelProgressRecoveryEpoch
     };
-    const humanoidActionNames = new Set<string>(HUMANOID_ACTION_NAMES);
-    const decisionProtocolRecovery = new ModelDecisionProtocolRecovery(
-      () => humanoidAgentStateFingerprint(input.runtime.checkpoint),
-      (agentId, exposedToolNames) => exposedToolNames.filter((toolName) => (
-        !humanoidActionNames.has(toolName)
-          || input.runtime.isActionAvailable(toolName as HumanoidActionName, agentId)
-      ))
-    );
-
     const persistAgentEvent = async (
       agentId: string,
       event: RunStreamEvent
@@ -440,8 +427,8 @@ async function executeHumanoidMission(input: {
       }
     };
     const hierarchy = createHumanoidAgentHierarchy({
-      createModel: (agentId, provider) => withModelDecisionProtocolRecovery(
-        withModelTelemetry(createConfiguredModel(provider, {
+      createModel: (agentId, provider) => withModelTelemetry(
+        createConfiguredModel(provider, {
           promptCacheKey: promptCacheKeyFor(agentId, provider),
           onPromptCacheRequest: (event) => recordPromptCacheRequest(
             input.runtime,
@@ -460,73 +447,13 @@ async function executeHumanoidMission(input: {
         onModelResponseCompleted,
         provider.streamEventIdleTimeoutMs
           ?? DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS,
-        provider.requestTimeoutMs),
-        agentId,
-        decisionProtocolRecovery,
-        (event) => (
-          input.runtime.recordProvider({
-            status: event.mode === "named"
-              ? "tool_choice_named_unsupported"
-              : "tool_choice_required_unsupported",
-            source: "protocol_capability_negotiation",
-            configured_tool_choice: provider.toolChoice ?? "auto",
-            rejected_tool_choice: event.mode,
-            ...(event.toolName ? { rejected_tool_name: event.toolName } : {}),
-            ...(event.reason ? { negotiation_outcome: event.reason } : {}),
-            continuation: "same_agent_model_and_session",
-            thinking_preserved: true,
-            automatic_actuation: false
-          }, event.agentId)
-        ),
-        (event) => input.runtime.recordProvider({
-          status: "native_tool_decision_retry",
-          source: "model_decision_protocol",
-          completed_response_count: event.completedResponseCount,
-          available_tool_names: event.availableToolNames,
-          constraint: event.constraint,
-          same_request_context: true,
-          invalid_response_exposed_to_sdk: false,
-          model_selects_tool_and_arguments: true,
-          automatic_actuation: false
-        }, event.agentId)
+        provider.requestTimeoutMs
       ),
       createSession: sessionForAgent,
       callModelInputFilter: contextManager.filter,
       provider: input.provider,
       runtime: input.runtime,
-      onAgentStream: persistAgentEvent,
-      onDelegatedDecisionFollowUp: async (event) => {
-        const protocolStrengthened = decisionProtocolRecovery.requireToolDecision(
-          event.agentId
-        );
-        const decisionBaseline = modelRequestSessionBaseline
-          ?? await captureHumanoidSessionBaseline(sessions);
-        const restoredAgentIds = await restoreHumanoidSessionBaseline(
-          sessions,
-          decisionBaseline
-        );
-        acceptRestoredSessions(restoredAgentIds, decisionBaseline);
-        await input.runtime.recordProvider({
-          status: "model_decision_follow_up",
-          agent_id: event.agentId,
-          follow_up_attempt: event.attempt,
-          recovery_scope: "delegated_agent_session",
-          reason: event.reason,
-          invalid_response_logged: true,
-          invalid_response_retained_in_session: false,
-          session_branch_rolled_back: restoredAgentIds.includes(event.agentId),
-          session_history_preserved: true,
-          prompt_cache_prefix_preserved: true,
-          continuation: "same_specialist_model_and_session",
-          tool_choice_protocol: decisionProtocolRecovery.requiresToolDecision(event.agentId)
-            ? "required"
-            : "configured",
-          stalled_agent_protocol_strengthened: protocolStrengthened,
-          context_compaction_count:
-            contextManager.snapshot.scopes[event.agentId]?.compaction_count ?? 0,
-          automatic_actuation: false
-        }, event.agentId);
-      }
+      onAgentStream: persistAgentEvent
     });
     const currentManifest = createHumanoidAgentManifest({
       hierarchy,
@@ -537,10 +464,17 @@ async function executeHumanoidMission(input: {
     const runner = new Runner({
       tracingDisabled: true,
       traceIncludeSensitiveData: false,
-      modelSettings: { parallelToolCalls: false },
+      modelSettings: {
+        parallelToolCalls: false,
+        retry: agentsModelRetrySettings()
+      },
       callModelInputFilter: contextManager.filter,
       toolExecution: { maxFunctionToolConcurrency: 1 },
       toolNotFoundBehavior: "return_error_to_model",
+      // Provider reasoning ids are response-local on OpenAI-compatible chat
+      // transports. Omitting them from durable history preserves exact
+      // append-only prefixes across coordinator turns and SDK Session replay.
+      reasoningItemIdPolicy: "omit",
       workflowName: "HEAR humanoid autonomy"
     });
     const coordinatorSession = hierarchy.coordinatorSession as FileSession;
@@ -634,14 +568,14 @@ async function executeHumanoidMission(input: {
     ): Promise<HumanoidMissionRunResult | undefined> => {
       const completion = assertCoordinatorStepOutput(output);
       if (completion.status === "step_completed") return undefined;
-      await contextManager.compactSessionHistories(sessionForAgent);
+      await contextManager.commitPendingSessionRewrites(sessionForAgent);
       if (completion.status === "cycle_completed") {
         const activeGoalCompleted = await input.runtime.completeCycle(output);
         if (input.runtime.checkpoint.status === "succeeded") {
           return {
             runId: input.runtime.runId,
             runDir: input.runtime.store.runDir,
-            output
+            output: input.runtime.checkpoint.final_output ?? output
           };
         }
         if (humanoidRunShouldFinish({
@@ -662,7 +596,7 @@ async function executeHumanoidMission(input: {
           return {
             runId: input.runtime.runId,
             runDir: input.runtime.store.runDir,
-            output
+            output: input.runtime.checkpoint.final_output ?? output
           };
         }
         if (humanoidRunShouldFinish({
@@ -681,15 +615,10 @@ async function executeHumanoidMission(input: {
       return undefined;
     };
 
-    const decisionFollowUps = new Map<string, ModelDecisionFollowUpState>();
     const contextCompactionRecoveries = new Map<string, {
       compactionCount: number;
       attempt: number;
     }>();
-    let pendingDecisionFollowUp: {
-      agentId: string;
-      state: ModelDecisionFollowUpState;
-    } | undefined;
     for (;;) {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
@@ -721,20 +650,13 @@ async function executeHumanoidMission(input: {
             }, input.runtime.rootAgentId);
             continue;
           }
-        } else {
-          runInput = pendingDecisionFollowUp
-            ? autonomousDecisionFollowUpInput(
-                input.runtime,
-                pendingDecisionFollowUp.agentId,
-                pendingDecisionFollowUp.state.attempt
-              )
-            : autonomousCycleInput(input.runtime);
-        }
+        } else runInput = autonomousCycleInput(input.runtime);
         serializedState = undefined;
         const stream = await runner.run(hierarchy.coordinator, runInput, {
           stream: true,
           session: coordinatorSession,
           maxTurns: null,
+          reasoningItemIdPolicy: "omit",
           toolExecution: { maxFunctionToolConcurrency: 1 },
           toolNotFoundBehavior: "return_error_to_model",
           ...(input.signal ? { signal: input.signal } : {})
@@ -765,9 +687,6 @@ async function executeHumanoidMission(input: {
         const result = await acceptVerifiedTransition(output);
         if (result) return result;
         await input.runtime.store.clearAgentState();
-        decisionFollowUps.clear();
-        decisionProtocolRecovery.clear();
-        pendingDecisionFollowUp = undefined;
         await input.runtime.setActiveAgent(input.runtime.rootAgentId);
       } catch (error) {
         if (input.signal?.aborted) throw error;
@@ -789,9 +708,6 @@ async function executeHumanoidMission(input: {
           );
           acceptRestoredSessions(restoredAgentIds, decisionBaseline);
           await input.runtime.store.clearAgentState();
-          decisionFollowUps.clear();
-          decisionProtocolRecovery.clear();
-          pendingDecisionFollowUp = undefined;
           serializedState = undefined;
           await input.runtime.recordProvider({
             status: "physical_execution_recovered_before_model_follow_up",
@@ -804,69 +720,6 @@ async function executeHumanoidMission(input: {
             automatic_actuation: false
           }, receipt.agentId);
           await input.runtime.setActiveAgent(input.runtime.rootAgentId);
-          continue;
-        }
-        const previousDecisionFollowUp = decisionStall
-          ? decisionFollowUps.get(decisionStall.agentId)
-          : undefined;
-        const nextDecisionFollowUp = decisionStall
-          ? nextModelDecisionFollowUpState(
-              previousDecisionFollowUp,
-              humanoidAgentStateFingerprint(input.runtime.checkpoint),
-              contextManager.snapshot.scopes[decisionStall.agentId]?.compaction_count ?? 0
-            )
-          : undefined;
-        if (decisionStall && nextDecisionFollowUp) {
-          const recoveryEpochChanged = previousDecisionFollowUp !== undefined
-            && (previousDecisionFollowUp.authorityFingerprint
-                !== nextDecisionFollowUp.authorityFingerprint
-              || previousDecisionFollowUp.contextCompactionCount
-                !== nextDecisionFollowUp.contextCompactionCount);
-          const stalledAgentToolChoiceStrengthened =
-            decisionProtocolRecovery.requireToolDecision(decisionStall.agentId);
-          const coordinatorToolChoiceStrengthened =
-            decisionProtocolRecovery.requireToolDecision(input.runtime.rootAgentId);
-          const requiredToolChoiceActive =
-            decisionProtocolRecovery.requiresToolDecision(decisionStall.agentId)
-            || decisionProtocolRecovery.requiresToolDecision(input.runtime.rootAgentId);
-          decisionFollowUps.set(decisionStall.agentId, nextDecisionFollowUp);
-          pendingDecisionFollowUp = {
-            agentId: decisionStall.agentId,
-            state: nextDecisionFollowUp
-          };
-          const decisionBaseline = modelRequestSessionBaseline ?? sessionBaseline;
-          const restoredAgentIds = await restoreHumanoidSessionBaseline(
-            sessions,
-            decisionBaseline
-          );
-          acceptRestoredSessions(restoredAgentIds, decisionBaseline);
-          await input.runtime.store.clearAgentState();
-          await input.runtime.recordProvider({
-            status: "model_decision_follow_up",
-            agent_id: decisionStall.agentId,
-            follow_up_attempt: nextDecisionFollowUp.attempt,
-            recovery_sequence: nextDecisionFollowUp.sequence,
-            context_compaction_count: nextDecisionFollowUp.contextCompactionCount,
-            recovery_scope: "authority_state_and_context_lifecycle",
-            recovery_epoch_changed: recoveryEpochChanged,
-            reason: decisionStall.message,
-            invalid_response_logged: true,
-            invalid_response_retained_in_session: false,
-            session_branch_rolled_back: restoredAgentIds.includes(
-              decisionStall.agentId
-            ),
-            session_history_preserved: true,
-            prompt_cache_prefix_preserved: true,
-            continuation: "same_agent_model_and_session",
-            tool_choice_protocol: requiredToolChoiceActive ? "required" : "configured",
-            stalled_agent_protocol_strengthened: stalledAgentToolChoiceStrengthened,
-            coordinator_protocol_strengthened: coordinatorToolChoiceStrengthened,
-            ...(decisionStall.evidence
-              ? { stall_evidence: decisionStall.evidence }
-              : {}),
-            automatic_actuation: false
-          }, decisionStall.agentId);
-          serializedState = undefined;
           continue;
         }
         if (isRetryableContextCompactionInterruption(error)
@@ -954,7 +807,7 @@ async function executeHumanoidMission(input: {
         await input.runtime.recordProvider({
           status: "transport_interrupted",
           recovery_attempt: recoveryAttempt,
-          maximum_recoveries: MAX_TRANSPORT_RECOVERIES,
+          maximum_recoveries: MAX_MISSION_CONTINUITY_RECOVERIES,
           retry_after_ms: retry.waitMs,
           exponential_backoff_ms: retry.backoffMs,
           ...(retry.retryAfterMs === null
@@ -1196,58 +1049,16 @@ function autonomousCycleInput(runtime: HumanoidRunRuntime): string {
     "必须根据当前传感、目标、历史回执和物理反馈自主决定动作；不得使用固定动作表、预设路径或假执行。",
     goalDirection,
     runtime.store.definition.run_mode === "mission"
-      ? "运行模式：有限任务。只有精确完成 mission_goal 才会结束；阶段子目标完成后若长期条件尚未达成，必须继续选择下一 Goal。"
+      ? "运行模式：有限任务。只有完整满足 mission_goal 的物理 predicates 才会结束；summary 不参与物理语义，阶段子目标完成后若长期条件尚未达成，必须继续选择下一 Goal。"
       : "运行模式：持续自主。完成当前 Goal 后继续从新的物理观察中选择下一 Goal，直到外部明确暂停。",
     `任务：${runtime.store.definition.mission}`,
     `当前循环：${checkpoint.cycle_index + 1}`,
     ...(checkpoint.active_cycle
       ? [`循环身份：${checkpoint.active_cycle.cycle_id}`]
       : []),
-    "当前 frame、revision、阶段和待执行 transactionId 只以每次请求重建的 CURRENT HARNESS AUTHORITY 为准；忽略会话中的旧值。",
-    "完成一次真实物理执行后，必须先委派感知哨兵重新观察；只有 cycle_completion.observed_after_execution=true 且 coordinator_phase=complete_cycle 时，才用 Harness 给出的 accepted 因果证据调用 complete_autonomous_cycle。若 coordinator_phase=complete_satisfied_goal，必须直接提交物理 checker 验证，禁止为了制造本周期执行回执而重复移动。"
+    "完成一次真实物理执行后，必须先委派感知哨兵重新观察；只有 cycle_completion.observed_after_execution=true 且 coordinator_phase=complete_cycle 时，才用 Harness 给出的 accepted 因果证据调用 complete_autonomous_cycle。若 coordinator_phase=complete_satisfied_goal，必须直接提交物理 checker 验证，禁止为了制造本周期执行回执而重复移动。",
+    coordinatorInvocationInput(runtime.contextAnchor(runtime.rootAgentId))
   ].join("\n");
-}
-
-function autonomousDecisionFollowUpInput(
-  runtime: HumanoidRunRuntime,
-  stalledAgentId: string,
-  followUpAttempt: number
-): string {
-  return [
-    "继续当前人形自主闭环。上一次模型分支没有产生 Harness 可验收的正式工具决策。",
-    `未完成正式决策的节点：${stalledAgentId}`,
-    `当前恢复周期内的续行轮次：${followUpAttempt}`,
-    `当前循环：${runtime.checkpoint.cycle_index + 1}`,
-    "保留此前已完成的各 Agent 会话、工具回执和物理证据；根据末尾 CURRENT HARNESS AUTHORITY 直接选择当前阶段允许的正式工具。",
-    "若上一条完整响应只用普通文字描述了选择，现在必须把该选择改为真正的 function_call；不要把工具名或参数继续写在普通 content 中。",
-    "不得复述任务、输出普通说明或重复已经失败且没有新证据的参数。"
-  ].join("\n");
-}
-
-export interface ModelDecisionFollowUpState {
-  authorityFingerprint: string;
-  contextCompactionCount: number;
-  attempt: number;
-  sequence: number;
-}
-
-export function nextModelDecisionFollowUpState(
-  previous: ModelDecisionFollowUpState | undefined,
-  authorityFingerprint: string,
-  contextCompactionCount = 0
-): ModelDecisionFollowUpState | undefined {
-  const sameRecoveryEpoch = previous?.authorityFingerprint === authorityFingerprint
-    && previous.contextCompactionCount === contextCompactionCount;
-  const attempt = sameRecoveryEpoch
-    ? previous.attempt + 1
-    : 1;
-  if (attempt > MAX_MODEL_DECISION_FOLLOW_UPS_PER_AUTHORITY) return undefined;
-  return {
-    authorityFingerprint,
-    contextCompactionCount,
-    attempt,
-    sequence: (previous?.sequence ?? 0) + 1
-  };
 }
 
 class CompletedResponseDecisionStallError extends ModelDecisionStallError {}

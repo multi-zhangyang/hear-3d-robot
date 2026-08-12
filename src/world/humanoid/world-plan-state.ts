@@ -55,6 +55,7 @@ export interface StoredHumanoidNavigationPlan {
   skillCallIdentity: HumanoidEmbodiedSkillIdentity | null;
   plan: NavigationPlan;
   requestedTarget: Vec3;
+  remainingDistance?: number | undefined;
   requestedArrivalHeading: HumanoidNavigationArrivalHeading | null;
   arrivalHeading: HumanoidNavigationArrivalHeading | null;
   acceptedPositionToleranceMeters: number | null;

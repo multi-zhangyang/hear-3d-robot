@@ -35,8 +35,7 @@ import {
   scopeAgentToolInvocation
 } from "../agent-scope.js";
 import { createToolInputRecovery } from "../tool-input-recovery.js";
-import { DelegatedDecisionRecovery } from "../delegated-decision-recovery.js";
-import { modelDecisionStallFrom } from "../model-telemetry.js";
+import { ModelDecisionStallError } from "../model-telemetry.js";
 import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.js";
 import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
 import { GOAL_HISTORY_PREDICATE_TYPES } from "./goal-history.js";
@@ -217,7 +216,7 @@ export function motionInvocationInput(authority: JsonValue): string {
   const root = jsonRecord(authority);
   const goalDAG = jsonRecord(root.goal_dag);
   return [
-    "请独立决定并规划推进当前 active Goal 的下一个可真实执行阶段。必要时先重新观察；不得沿用上级坐标或动作参数。",
+    "请基于本次 Sentry Grounding Snapshot，独立决定并提交推进当前 active Goal 的下一个可真实执行事务；不得沿用上级坐标或动作参数。",
     "CURRENT MOTION DELEGATION",
     JSON.stringify({
       run_mode: root.run_mode ?? null,
@@ -225,9 +224,47 @@ export function motionInvocationInput(authority: JsonValue): string {
       active_goal: root.active_goal ?? null,
       coordinator_phase: root.coordinator_phase ?? null,
       active_cycle: root.active_cycle ?? null,
-      planning_tool_state: root.planning_tool_state ?? null
+      planning_tool_state: root.planning_tool_state ?? null,
+      grounding_snapshot: root.grounding_snapshot ?? null
     })
   ].join("\n\n");
+}
+
+export function coordinatorInvocationInput(authority: JsonValue): string {
+  return [
+    "CURRENT COORDINATOR STEP",
+    "This is the only authoritative state at the start of this run. After a tool call, use the latest coordinator_step_result.coordinator_state instead; older state is history.",
+    JSON.stringify(coordinatorAuthorityProjection(authority)),
+    "END CURRENT COORDINATOR STEP"
+  ].join("\n");
+}
+
+export function coordinatorAuthorityProjection(authority: JsonValue): JsonValue {
+  const root = jsonRecord(authority);
+  const goalDAG = jsonRecord(root.goal_dag);
+  const robot = jsonRecord(root.robot);
+  return {
+    run_mode: root.run_mode ?? null,
+    mission_goal: root.mission_goal ?? null,
+    goal_dag: {
+      status: goalDAG.status ?? null,
+      current_epoch_id: goalDAG.current_epoch_id ?? null
+    },
+    active_goal: root.active_goal ?? null,
+    active_cycle: root.active_cycle ?? null,
+    coordinator_phase: root.coordinator_phase ?? null,
+    cycle_completion: root.cycle_completion ?? null,
+    execution_authority: root.execution_authority ?? null,
+    recovery_authority: root.recovery_authority ?? null,
+    world_frame: root.world_frame ?? null,
+    world_revision: root.world_revision ?? null,
+    robot: {
+      fallen: robot.fallen ?? null,
+      balance: robot.balance ?? null,
+      navigation: robot.navigation ?? null
+    },
+    recent_receipts: root.recent_receipts ?? []
+  };
 }
 
 export const HUMANOID_AGENT_TOOL_CONTRACTS = {
@@ -346,12 +383,6 @@ interface HumanoidDeterministicService {
   implementationContract: string;
 }
 
-export interface DelegatedDecisionFollowUp {
-  agentId: string;
-  attempt: number;
-  reason: string;
-}
-
 export function createHumanoidAgentHierarchy(input: {
   createModel: (agentId: string, provider: ModelProviderConfig) => Model;
   createSession: (agentId: string) => Session;
@@ -359,14 +390,10 @@ export function createHumanoidAgentHierarchy(input: {
   provider: ProviderConfig;
   runtime: HumanoidHierarchyRuntime;
   onAgentStream?: (agentId: string, event: RunStreamEvent) => void | Promise<void>;
-  onDelegatedDecisionFollowUp?: (
-    event: DelegatedDecisionFollowUp
-  ) => void | Promise<void>;
 }): HumanoidAgentHierarchy {
   const models = new Set<Model>();
   const sessions = new Map<string, Session>();
   const sessionOwners = new Set<Session>();
-  const delegatedDecisionRecovery = new DelegatedDecisionRecovery();
   const ownModel = (agentId: string): Model => {
     const model = input.createModel(
       agentId,
@@ -397,7 +424,22 @@ export function createHumanoidAgentHierarchy(input: {
       ...(provider.maxOutputTokens === undefined
         ? {}
         : { maxTokens: provider.maxOutputTokens }),
+      ...(provider.protocol === "openai_compatible"
+        && provider.model.toLowerCase().includes("deepseek")
+        ? {
+            // DeepSeek returns reasoning_content even when its gateway exposes no
+            // explicit reasoning-effort switch. Tell the official AI SDK adapter
+            // to keep that reasoning attached to its tool-call message when the
+            // history is replayed; this marker is adapter metadata, not an extra
+            // provider request parameter.
+            providerData: { thinking: { type: "enabled" } }
+          }
+        : {}),
       parallelToolCalls: false,
+      // The Harness targets the OpenAI-compatible Chat Completions capability
+      // baseline. Some thinking models reject `required`, so provider capability
+      // selection stays at the transport boundary instead of leaking a
+      // Responses-only assumption into Agent orchestration.
       toolChoice: provider.toolChoice ?? "auto"
     };
   };
@@ -424,12 +466,6 @@ export function createHumanoidAgentHierarchy(input: {
     model: ownModel(HUMANOID_AGENT_IDS.motion),
     modelSettings: modelSettings(HUMANOID_AGENT_IDS.motion),
     tools: [
-      ...createHumanoidActionTools(
-        input.runtime,
-        HUMANOID_AGENT_IDS.motion,
-        ["observe_humanoid"],
-        { availability: "stable" }
-      ),
       createHumanoidEmbodiedRecallTool(input.runtime),
       ...createHumanoidActionTools(
         input.runtime,
@@ -446,6 +482,8 @@ export function createHumanoidAgentHierarchy(input: {
     ],
     resetToolChoice: false,
     toolUseBehavior: receiptToolUseBehavior([
+      "submit_humanoid_skill_plan",
+      "begin_humanoid_skill",
       "plan_humanoid_skill",
       "plan_whole_body_motion_candidates",
       "plan_humanoid_navigation"
@@ -490,32 +528,28 @@ export function createHumanoidAgentHierarchy(input: {
       recoverAgentToolInput(scopeAgentToolInvocation(
         HUMANOID_AGENT_IDS.goalManager,
         requireDelegatedDecision(
-          delegatedDecisionRecovery,
           HUMANOID_AGENT_IDS.goalManager,
           goalManager.asTool({
         toolName: goalManagerContract.toolName,
         toolDescription: "让独立目标管理智能体基于当前物理证据提交 2–3 个候选并显式选择下一 Goal，或证据化退役当前不可达 Goal。",
         customOutputExtractor: ({ finalOutput }) => serializeAgentToolOutput(finalOutput),
-        errorFunction: null,
         parameters: SpecialistDelegationSchema,
-        inputBuilder: () => delegatedDecisionRecovery.invocationInput(
-          HUMANOID_AGENT_IDS.goalManager,
-          goalManagerInvocationInput(
-            input.runtime.contextAnchor(HUMANOID_AGENT_IDS.goalManager)
-          )
+        inputBuilder: () => goalManagerInvocationInput(
+          input.runtime.contextAnchor(HUMANOID_AGENT_IDS.goalManager)
         ),
         includeInputSchema: goalManagerContract.includeInputSchema,
         needsApproval: goalManagerContract.needsApproval,
         runConfig: { callModelInputFilter: input.callModelInputFilter },
         runOptions: {
           session: agentToolSession(goalManagerContract),
-          maxTurns: null
+          maxTurns: null,
+          // OpenAI-compatible chat adapters commonly emit response-local
+          // reasoning ids such as `reasoning-0`. They are not durable global
+          // identities; persisting them lets the SDK deduplicator replace an
+          // older reasoning item and breaks the append-only cache prefix.
+          reasoningItemIdPolicy: "omit"
         },
         resumeState: { contextStrategy: goalManagerContract.resumeContextStrategy },
-        isEnabled: () => coordinatorToolAvailable(
-          goalManagerContract.toolName,
-          input.runtime
-        ),
         ...(input.onAgentStream
           ? {
               onStream: ({ event }) => input.onAgentStream!(
@@ -525,34 +559,29 @@ export function createHumanoidAgentHierarchy(input: {
             }
           : {})
           }),
-          isFormalGoalManagerResult,
-          input.onDelegatedDecisionFollowUp
+          isFormalGoalManagerResult
         )
       ), SpecialistDelegationSchema),
       groundingMonitorTool(input.runtime),
       recoverAgentToolInput(scopeAgentToolInvocation(
         HUMANOID_AGENT_IDS.motion,
         requireDelegatedDecision(
-          delegatedDecisionRecovery,
           HUMANOID_AGENT_IDS.motion,
           motion.asTool({
         toolName: motionContract.toolName,
         toolDescription: "让独立运动参考智能体读取当前状态，提出多个按偏好排序且分别经过完整物理预演的连续全身动作候选，或规划双足路线。",
         customOutputExtractor: ({ finalOutput }) => serializeAgentToolOutput(finalOutput),
-        errorFunction: null,
         parameters: SpecialistDelegationSchema,
-        inputBuilder: () => delegatedDecisionRecovery.invocationInput(
-          HUMANOID_AGENT_IDS.motion,
-          motionInvocationInput(
-            input.runtime.contextAnchor(HUMANOID_AGENT_IDS.motion)
-          )
+        inputBuilder: () => motionInvocationInput(
+          input.runtime.contextAnchor(HUMANOID_AGENT_IDS.motion)
         ),
         includeInputSchema: motionContract.includeInputSchema,
         needsApproval: motionContract.needsApproval,
         runConfig: { callModelInputFilter: input.callModelInputFilter },
         runOptions: {
           session: agentToolSession(motionContract),
-          maxTurns: null
+          maxTurns: null,
+          reasoningItemIdPolicy: "omit"
         },
         resumeState: { contextStrategy: motionContract.resumeContextStrategy },
         ...(input.onAgentStream
@@ -563,12 +592,13 @@ export function createHumanoidAgentHierarchy(input: {
             output,
             HUMANOID_AGENT_IDS.motion,
             [
+              "submit_humanoid_skill_plan",
+              "begin_humanoid_skill",
               "plan_humanoid_skill",
               "plan_whole_body_motion_candidates",
               "plan_humanoid_navigation"
             ]
-          ),
-          input.onDelegatedDecisionFollowUp
+          )
         )
       ), SpecialistDelegationSchema),
       executionGateTool(input.runtime),
@@ -686,26 +716,122 @@ function guardCoordinatorToolExecution(
   for (const coordinatorTool of coordinator.tools) {
     if (coordinatorTool.type !== "function") continue;
     const name = coordinatorTool.name;
-    const isEnabled = coordinatorTool.isEnabled;
-    coordinatorTool.isEnabled = async (context, agent) => (
-      coordinatorToolAvailable(name, runtime)
-        && (isEnabled ? await isEnabled(context, agent) : true)
-    );
     const invoke = coordinatorTool.invoke;
     coordinatorTool.invoke = async (context, toolInput, details) => {
       if (coordinatorToolAvailable(name, runtime)) {
-        return invoke(context, toolInput, details);
+        const output = await invoke(context, toolInput, details);
+        if (name === "complete_autonomous_cycle"
+          || name === "complete_satisfied_goal") {
+          return output;
+        }
+        return coordinatorStepResult(name, output, runtime);
       }
       return JSON.stringify({
-        accepted: false,
-        code: "coordinator_phase_rejected",
+        status: "coordinator_step_result",
         tool: name,
-        coordinator_phase: runtime.coordinatorPhase(),
-        automatic_actuation: false,
-        recovery: "Use a coordinator tool authorized by the current Harness phase."
+        result: {
+          accepted: false,
+          code: "coordinator_phase_rejected",
+          automatic_actuation: false
+        },
+        coordinator_state: coordinatorAuthorityProjection(
+          runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator)
+        )
       });
     };
   }
+}
+
+function coordinatorStepResult(
+  toolName: string,
+  output: unknown,
+  runtime: HumanoidHierarchyRuntime
+): string {
+  let result = output;
+  if (typeof output === "string") {
+    try {
+      result = JSON.parse(output) as JsonValue;
+    } catch {
+      // Preserve a non-JSON recall result as text; the authority projection is
+      // still the only source for the next physical phase.
+    }
+  }
+  return JSON.stringify({
+    status: "coordinator_step_result",
+    tool: toolName,
+    result: coordinatorDelegationResult(toolName, result),
+    coordinator_state: coordinatorAuthorityProjection(
+      runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator)
+    )
+  });
+}
+
+/**
+ * Manager-facing result of a delegation. Specialist observations, geometry,
+ * and planner diagnostics remain owned by the specialist Session or the
+ * deterministic Runtime; the Manager receives only the control-plane result
+ * and obtains current authority from coordinator_state.
+ */
+function coordinatorDelegationResult(
+  toolName: string,
+  output: unknown
+): JsonValue {
+  const value = output !== null && typeof output === "object" && !Array.isArray(output)
+    ? output as Record<string, unknown>
+    : undefined;
+  if (!value) return {
+    kind: "delegation_result",
+    tool: toolName,
+    accepted: false,
+    code: "invalid_delegation_result"
+  };
+  if (toolName === "recall_embodied_history") {
+    return JSON.parse(JSON.stringify({
+      kind: "recall_result",
+      tool: toolName,
+      ...value
+    })) as JsonValue;
+  }
+  if (typeof value.transactionId === "string"
+    && typeof value.action === "string"
+    && typeof value.accepted === "boolean") {
+    return JSON.parse(JSON.stringify({
+      kind: "delegation_result",
+      tool: toolName,
+      owner_agent_id: value.agentId ?? null,
+      transaction_id: value.transactionId,
+      action: value.action,
+      accepted: value.accepted,
+      code: value.code ?? null,
+      world_before_revision: value.worldBeforeRevision ?? null,
+      world_after_revision: value.worldAfterRevision ?? null,
+      frame_count: value.frameCount ?? null,
+      channels: value.channels ?? []
+    })) as JsonValue;
+  }
+  if (typeof value.accepted === "boolean" || typeof value.code === "string") {
+    return JSON.parse(JSON.stringify({
+      kind: "delegation_result",
+      tool: toolName,
+      accepted: value.accepted ?? false,
+      code: value.code ?? null,
+      status: value.status ?? null,
+      ...(value.validation_issues === undefined
+        ? {}
+        : { validation_issues: value.validation_issues }),
+      automatic_actuation: value.automatic_actuation ?? false
+    })) as JsonValue;
+  }
+  return JSON.parse(JSON.stringify({
+    kind: "delegation_result",
+    tool: toolName,
+    status: value.status ?? null,
+    epoch_id: value.epoch_id ?? null,
+    cycle_id: value.cycle_id ?? null,
+    candidate_id: value.candidate_id ?? null,
+    retirement_status: value.retirement_status ?? null,
+    world_revision: value.world_revision ?? value.resolved_world_revision ?? null
+  })) as JsonValue;
 }
 
 function coordinatorToolAvailable(
@@ -879,11 +1005,6 @@ function coordinatorStepToolUseBehavior(): ToolUseBehavior {
     complete_autonomous_cycle: "cycle_completed",
     complete_satisfied_goal: "satisfied_goal_completed"
   };
-  const receiptTools = new Set([
-    "delegate_humanoid_sentry",
-    "delegate_motion_reference",
-    "delegate_physics_executor"
-  ]);
   return (_context, results) => {
     for (const result of results) {
       if (result.type !== "function_output") continue;
@@ -895,15 +1016,7 @@ function coordinatorStepToolUseBehavior(): ToolUseBehavior {
       const terminalStatus = terminalStatusByTool[result.tool.name];
       const terminal = terminalStatus !== undefined
         && parsed.status === terminalStatus;
-      const goalTransition = result.tool.name === "delegate_goal_manager"
-        && (parsed.status === "goal_candidate_selected"
-          || parsed.status === "goal_epoch_retired"
-          || parsed.status === "goal_epoch_continued");
-      const physicalStep = receiptTools.has(result.tool.name)
-        && typeof parsed.transactionId === "string"
-        && typeof parsed.action === "string"
-        && typeof parsed.accepted === "boolean";
-      if (terminal || goalTransition || physicalStep) {
+      if (terminal) {
         return {
           isFinalOutput: true,
           isInterrupted: undefined,
@@ -921,35 +1034,19 @@ function requireDelegatedDecision<
   TResult,
   TTool extends FunctionTool<TContext, TParameters, TResult>
 >(
-  recovery: DelegatedDecisionRecovery,
   agentId: string,
   agentTool: TTool,
-  isFormalDecision: (output: unknown) => boolean,
-  onFollowUp?: (event: DelegatedDecisionFollowUp) => void | Promise<void>
+  isFormalDecision: (output: unknown) => boolean
 ): TTool {
   const invoke = agentTool.invoke;
   agentTool.invoke = async (context, input, details) => {
     details?.signal?.throwIfAborted();
-    try {
-      const output = await invoke(context, input, details);
-      return recovery.accept(agentId, output, isFormalDecision);
-    } catch (error) {
-      const stall = modelDecisionStallFrom(error);
-      if (!stall || stall.agentId !== agentId || stall.evidence) throw error;
-      // A delegated Agent gets one bounded SDK invocation for the current
-      // physical authority. Return a missing-decision stall to the outer
-      // Harness instead of polling the same specialist forever without a new
-      // world observation. The next hierarchy step may invoke it again with
-      // strengthened native tool-choice and a freshly rebuilt authority.
-      if (recovery.attempt(agentId) === 0) recovery.recordFailure(agentId, stall);
-      await onFollowUp?.({
-        agentId,
-        attempt: recovery.attempt(agentId),
-        reason: stall.message
-      });
-      details?.signal?.throwIfAborted();
-      throw error;
-    }
+    const output = await invoke(context, input, details);
+    if (isFormalDecision(output)) return output;
+    throw new ModelDecisionStallError(
+      agentId,
+      `${agentId} did not return its required terminal tool result`
+    );
   };
   return agentTool;
 }
@@ -1012,28 +1109,16 @@ function recoverAgentToolInput<
 
 function coordinatorInstructions(): string {
   return [
-    "你是持续运行的人形层级智能体协调节点。Goal Manager、Coordinator 与 Motion 是拥有独立模型和 Session 的推理节点；Grounding Monitor 与 Execution Gate 是零模型调用的确定性服务。",
-    "每次响应必须调用一个正式工具；你不能直接改变物理世界，也不能输出普通聊天作为执行结果。",
-    "goal_dag.status=awaiting_model_selection 时，第一步必须以空参数调用 delegate_goal_manager，让独立目标管理模型从自己的实时权威上下文审查仍为 proposed 的既有候选：它可以直接显式选择当前仍适合且依赖已完成的候选；若没有合适候选，再提交 2–3 个新候选并在后续模型响应中显式选择。你不能向它夹带候选、坐标或依赖；Harness 只绑定本次物理证据，不得替它创建、打分或选择目标。",
-    "active Goal 的唯一来源是 goal_dag 当前 epoch 对应 candidate；mission 与 mission_goal 只是长期约束，不能被当成 active Goal 或自动候选。",
-    "若真实物理拒绝和当前观察证明 active Goal 本身不可继续，可委派目标管理智能体将其退役为 blocked、abandoned、superseded 或 expired。coordinator_phase=goal_transition 表示当前物理状态已直接满足完整 mission_goal、但 active Goal 仍是阶段目标；此阶段只能委派目标管理智能体用当前世界证据将阶段目标 supersede，禁止继续移动，随后由 Harness 在下一层级步骤重新委派 Goal Manager 选择完整 mission_goal 进行最终验收。Goal Manager 的正式退役回执本身完成该层级步骤，不需要额外 transition 完成动作。coordinator_phase=complete_satisfied_goal 表示当前 active Goal 已经被实时物理 checker 满足且本周期没有需要消费的新执行，此时必须调用 complete_satisfied_goal，禁止为了制造新回执而重复移动。零物理帧的规划拒绝、plan_revalidation_failed、repeated_planning_failure 只否定当前策略，不证明 Goal blocked；此时必须保留 active Goal 并委派运动参考智能体改变 Skill、语义目标或路线。manipulation_base_placement_required 且 reachable_base_placements 非空同样表示仍有经过 IK 验证的恢复路径。",
-    "根据最新人形状态、环境、历史回执和模型采样自主选择有意义的下一步，不得从固定动作表、预设剧本或程序随机列表中选择。",
-    "recent_physical_episodes 是带物理执行回执的历史记忆，可用于避免重复失败；它不是当前传感事实，禁止复用其中的 transaction_id、坐标或动作参数。",
-    "需要更早或指定来源的事件时可调用 recall_embodied_history。它支持 episode:N、action:transactionId 精确召回，也支持按真实 outcome、Goal predicate、object_id、solid_id 和 zone_id 检索持久经验；结果全是 historical_only，绝不能据此声称当前可见、当前接触或当前坐标，任何当前事实必须重新委派感知哨兵观察。",
-    "需要当前事实时以空参数调用 Grounding Monitor；它直接读取物理状态，不经过模型。需要动作时以空参数调用运动参考智能体，它必须从自己的实时权威上下文独立产生并返回物理预演回执。",
-    "物理世界在模型调用期间仍持续推进；处于 plan 阶段但最近观察已过时、对象离开视野或子智能体传输中断时，应先重新委派感知哨兵，再基于新 revision 规划。重新感知不改变 active Goal，也不构成动作执行。",
-    "委派运动参考智能体的参数必须是 {}。active Goal、当前阶段和权威约束由运行时直接提供给该节点；你不得替专职节点预选手、Link、坐标、接触谓词或候选参数。Goal 已显式绑定的手等身份仍由运动节点从权威 Goal 读取，连续目标和候选排序属于它基于实时几何作出的独立模型决策。",
-    "只有 accepted=true 的规划回执可以交给确定性 Execution Gate，并且必须传递其原始 transactionId，不得猜测内部 plan_id；多候选回执还会明确被物理筛选选中的模型候选。",
-    "coordinator_phase=execute_plan 时，CURRENT HARNESS AUTHORITY.execution_authority 是唯一待执行授权；accepted 规划回执已经包含经过物理预演的路线、全身轨迹或导航碰撞后的净空姿态。委派时逐字复制 planning_action 与 planning_transaction_id，其他历史 frame、内部 plan_id 或被拒绝回执不能替代。",
-    "一旦收到 accepted 且租约仍有效的规划回执，下一步必须调用确定性 Execution Gate，并令 execution.kind=execute_plan；Gate 只映射并重验证同一模型意图，不调用模型、不重新规划。在执行回执返回前，不要重复规划、召回历史或重新感知。",
-    "若模型选择 break_block，必须先执行该 Skill 的 contact 阶段并以同一 solid_id 获得稳定掌指接触；只有 motion_option_succeeded 后，才再次委派同一执行智能体调用 remove_world_block，逐字传递 solid_id 与执行 transactionId。拆除拒绝时不得宣称世界已改变。",
-    "规划拒绝时应依据失败分类和物理证据重新观察、选择恢复 Skill 或改变模型策略，不得让程序替换成默认动作。",
-    "物理执行失败或规划被拒绝后，coordinator_phase=post_failure_observation 时必须先调用 Grounding Monitor 获取失败后的真实姿态、接触和世界状态；不得直接复用失败前观察。这次确定性感知不消耗 compact replan。随后进入 replan_or_retire。coordinator_phase=replan_or_retire 时，CURRENT HARNESS AUTHORITY.recovery_authority 是本周期唯一恢复预算。controller 局部恢复和 capability router 策略切换不消耗模型预算；compact_replan 每次消耗一个协调决策额度并受恢复 deadline 约束。compact_replan 不可用或 deadline 超时后，只能升级为 goal_re_evaluation，不得通过额外模型轮次绕过预算。",
-    "全身运动只有 motion_option_succeeded 才表示物理目标达成；motion_goal_unmet、motion_goal_uncertain、motion_constraint_violated、motion_execution_drifted、motion_failed 都必须重新观察和规划。导航只有 navigation_completed 才可验收。",
-    "执行后必须让感知哨兵重新观察；若调用 remove_world_block 成功，观察还必须发生在世界修改之后。只有引用最近一次未被后续物理执行取代的成功回执，才可调用 complete_autonomous_cycle；evidence_transaction_ids 必须同时包含该执行与对应拆除回执。正常静止物理帧不会伪造或取代动作证据。",
-    "只有 CURRENT HARNESS AUTHORITY 的 cycle_completion.status=ready、observed_after_execution=true 且 coordinator_phase=complete_cycle 同时成立时，evidence_transaction_ids 才是本轮可提交的真实因果证据；此时必须立即调用 complete_autonomous_cycle，不能继续规划。Harness 只暂停冲突工具权限，不会替你调用完成工具。",
-    "CURRENT HARNESS AUTHORITY 的 coordinator_phase 是当前事务阶段：一次有效观察后进入 plan；accepted 规划后进入 execute_plan；成功执行后依次进入 post_execution 与 complete_cycle；失败执行后依次进入 post_failure_observation 与 replan_or_retire；阶段 Goal 被已满足的 mission_goal 超越时进入 goal_transition；新选择的 active Goal 已由现有物理状态满足时进入 complete_satisfied_goal。不可见的冲突工具由 Harness 暂停，阶段中的具体目标、规划参数与最终工具调用仍必须由模型决定。",
-    "人类可读摘要使用简洁中文；工具名、标识符和回执字段保持原样。"
+    "你是人形机器人的 Manager Agent。你始终拥有任务；Goal Manager 和 Motion 仅作为有界 agent-as-tool 专家，Grounding Monitor 与 Execution Gate 是确定性服务。",
+    "每次模型响应必须且只能调用一个正式工具。不要在工具调用之前或之后输出说明、摘要或普通聊天；你不能直接改变物理世界。",
+    "运行开始时读取 CURRENT COORDINATOR STEP。每次工具返回后，只读取最新 coordinator_step_result.coordinator_state 作为当前权威状态；更早的状态、回执和召回内容均为历史。",
+    "严格按 coordinator_phase 选择下一层级动作：goal_selection 或 goal_transition 调用 delegate_goal_manager；observe_or_plan 或 post_failure_observation 调用 delegate_humanoid_sentry；plan 调用 delegate_motion_reference；execute_plan 调用 delegate_physics_executor；post_execution 调用 delegate_humanoid_sentry；complete_cycle 调用 complete_autonomous_cycle；complete_satisfied_goal 调用 complete_satisfied_goal。",
+    "replan_or_retire 时依据最新失败观察和 recovery_authority 自主选择 delegate_motion_reference 重新规划，或在物理证据证明 Goal 本身不可继续时调用 delegate_goal_manager。规划失败本身只否定策略，不自动证明 Goal blocked。",
+    "delegate_goal_manager、delegate_humanoid_sentry 和 delegate_motion_reference 的参数必须是 {}。不得替专家预选 Goal、坐标、手、Link、接触、Skill、路线或动作参数。",
+    "execute_plan 时只使用最新 execution_authority，逐字复制 planning_action 与 planning_transaction_id；不得使用历史 transactionId、内部 plan_id 或被拒绝回执。",
+    "物理执行后必须重新感知。只有最新 coordinator_state 同时给出 coordinator_phase=complete_cycle、cycle_completion.status=ready 和 observed_after_execution=true 时，才逐字提交其中的 evidence_transaction_ids。",
+    "召回结果只用于避免重复失败，不能代替当前传感或授权。工具被阶段拒绝时，读取同一回执中的最新 coordinator_state 并改用该阶段合法工具。",
+    "不得使用固定动作表、预设路径、程序随机列表或假执行；运动意图必须由 Motion 基于实时几何生成，低层控制器负责逐帧运动。"
   ].join("\n");
 }
 
@@ -1041,7 +1126,7 @@ function goalManagerInstructions(): string {
   return [
     "你是人形层级智能体的自主目标管理节点，拥有独立模型、独立 Session 和长期 Goal DAG。",
     "mission 与 mission_goal 是长期约束，不是当前 active Goal。你必须自行决定下一阶段如何推进它，并在每个候选的 mission_link 中说明关联；Harness 不会生成、补全、排序或替换候选。",
-    "run_mode=mission 时，任务只有在一个经过物理验收且内容与 mission_goal 完全一致的 Goal 完成后才会结束；一个 active Goal 可以跨越多次观察、规划、抓取、导航和执行周期，不需要把每个动作阶段都改写成新 Goal。只有当前物理证据证明最终 Goal 尚不可观察或存在必须先独立验收的因果前置条件时，才选择阶段 Goal；条件成熟后必须提交并选择精确的 mission_goal。run_mode=continuous 时，完成当前 Goal 后继续基于新观察选择下一 Goal。",
+    "run_mode=mission 时，任务只有在一个经过物理验收且 predicates 与 mission_goal 完全一致的 Goal 完成后才会结束；summary 只是说明文本，不改变物理语义。一个 active Goal 可以跨越多次观察、规划、抓取、导航和执行周期，不需要把每个动作阶段都改写成新 Goal。只有当前物理证据证明最终 Goal 尚不可观察或存在必须先独立验收的因果前置条件时，才选择阶段 Goal；条件成熟后必须提交并选择完整 mission predicates。run_mode=continuous 时，完成当前 Goal 后继续基于新观察选择下一 Goal。",
     "阶段 Goal 必须有当前证据支持且确实有助于 mission_goal；不要把普通障碍物想象成必经阻塞。导航能够绕行时优先选择直接可验收的移动或 mission_goal，只有真实规划/接触证据表明具名静态方块必须被处理时，才选择 block_removed。",
     "Goal 中每个 predicate 都是必须真实完成的合取义务，不是说明或确认字段。不得为了显得完整而加入 mission_goal 未要求的物体、接触、抓取、方块或区域谓词；若候选包含 mission_goal 的任一谓词，该候选必须逐字段保持完整 mission_goal，不得改 tolerance、删减谓词或拼接额外条件。",
     "run_mode=mission 且 mission_goal 的谓词已有对应能力、当前没有规划拒绝证明其受阻时，候选中必须包含完整 mission_goal，并优先选择它；阶段 Goal 只用于有当前物理证据的必要前置条件，不能无端扩大任务范围。",
@@ -1061,17 +1146,19 @@ function goalManagerInstructions(): string {
 
 function motionInstructions(): string {
   return [
-    "你是全身 Skill 规划智能体，拥有独立模型、独立 Session，并只决定语义目标与策略。",
-    "每次响应必须调用一个正式工具，不输出普通聊天；新委派和任何物理执行后都先调用 observe_humanoid，不能借用其他 Agent 或历史记忆充当当前传感事实。",
+    "你是全身 Skill 规划智能体，拥有独立模型、独立 Session，并只决定语义目标与策略。每次委派只提交一个正式工具事务，不输出普通聊天。",
+    "CURRENT MOTION DELEGATION.grounding_snapshot 是 Sentry 在本次 coordinator phase 捕获并由 Harness 绑定给你的唯一当前物理事实。你没有感知工具；快照缺失或 world_revision 不匹配时不得规划。",
     "根据 active Goal、实时空间信念、对象世界模型、Affordance、关节状态、掌指几何、平衡和近期真实失败，自主选择当前局部阶段。不得使用固定巡逻点、预设动作序列、随机电机噪声或猜测坐标。",
     "每个 Skill 必须对 active Goal 具有可验证因果关系：空间目标应推进对应位置或区域谓词，操作 Skill 应匹配 Goal 中的对象、方块或关节，准备阶段应建立同一实体的真实前置条件。与 Goal 无关或令目标距离增加的另一 frontier 会被 Harness 拒绝；真实物理失败授权的安全恢复除外。",
     "观察中的 control_authority 区分 MuJoCo 物理后端、已加载学习策略的真实能力和任务空间生成器。active_control 是当前物理帧实际执行的控制来源：learned_policy 为学习控制，reference_control 为参考控制，hybrid_control 为学习式下肢运动与参考式上肢跟踪的同帧组合；transition 表示尚未结束的连续交接。只有 learned_policy.capabilities 明确列出的能力才能称为已经由策略学习；未列出的接触操作能力不能靠叙述冒充已训练，是否可执行仍以当前控制后端的完整 MuJoCo 预演为准。",
-    "skill_catalog 的 learned_policy_ready 与 learned_policy_missing_capabilities 表示当前训练策略是否完整覆盖该 Skill；false 不等于物理成功或失败，而是说明本次将使用 reference_control_fallback 并仍须通过完整 MuJoCo 预演。begin_humanoid_skill 回执中的 control_mode 是该具体阶段和手数约束下的最终控制来源声明。",
-    "观察后若当前没有仍与 world_revision 一致的 Skill 计划，调用 submit_humanoid_skill_plan 提交短程 Skill DAG；已有有效计划时继续其中依赖已满足的节点。你必须自己选择策略、Skill、目标对象或 frontier、交互点、手、操作方向及依赖；同一 Skill 的多个可执行 phase 按 process 顺序在后续观察中重新绑定同一节点，只有最后一个可执行 phase 才完成该节点。未知阶段留到执行并重新观察后决定。",
-    "调用 begin_humanoid_skill 时逐字引用已选策略中的节点、invocation 和当前可执行 phase。只绑定 navigation、whole_body 或 grasp 权限阶段；sensor 和 checker 阶段不能伪装成动作。",
-    "随后只调用 plan_humanoid_skill，并逐字传递 begin_humanoid_skill 回执中的 transactionId。通用求解层会从实时几何生成可达站位、任务空间轨迹和终止契约，再通过 Recast、IK 与 MuJoCo 完整预演；你不能提交关节角、关键帧或低层路线绕过它。planning_tool_state.transit_clearance.status=required 时，collision_target 与 collision_contact 是本次预演的真实 MuJoCo 接触几何，不是 Harness 选择的恢复目标。你必须自主选择策略：可以调用 plan_humanoid_navigation 并逐字传递 transit_clearance.skill_transaction_id，提交一个会形成不同物理路线的中间根目标；也可以调用 plan_whole_body_motion_candidates，以相同 skill_transaction_id 提交 1–4 个短时固定基座净空姿态。选择全身净空时，每个关键帧必须使用 fixed_foot_world_targets 的双脚踝世界坐标，把 required_end_effector 移到模型选择的新世界坐标，不得授权 collision_target 接触，并用匹配的 end_effector_near_point 作为终止条件。任何策略都必须通过新的 MuJoCo 预演，Harness 不会生成坐标或替你选择。",
+    "观察回执的 interaction.available_skills 中 learned_policy_ready 与 learned_policy_missing_capabilities 表示训练策略是否完整覆盖该 Skill；false 只表示使用 reference_control_fallback，仍须通过完整 MuJoCo 预演。",
+    "观察后若当前没有仍与 world_revision 一致的 Skill 计划，调用 submit_humanoid_skill_plan 提交短程 Skill DAG；已有有效计划时继续其中依赖已满足的节点。你必须自己选择策略、Skill、目标对象或 frontier、交互点、手、操作方向及依赖。",
+    "submit_humanoid_skill_plan 被接受后，本次委派立即结束。下一次委派从 planning_tool_state.ready_skill_bindings 自主选择一项，并将其中 skill_plan_transaction_id、skill_node_id、invocation、phase 原样复制到 begin_humanoid_skill。若有多个 ready binding，选择权属于你而非 Harness。",
+    "长程语义 Skill 可能由多个真实物理 chunk 完成。物理 chunk 成功不等于 Skill phase 完成；若下一次委派的 planning_tool_state 保留 skill_plan 且给出 ready_skill_bindings，从中选择并原样调用 begin_humanoid_skill，继续同一模型提交的 DAG，禁止重复提交整个 DAG。",
+    "begin_humanoid_skill 被接受后，本次委派立即结束。下一次委派只调用 planning_tool_state.active_skill.planning_action，并逐字复制该绑定要求的事务标识。",
+    "plan_humanoid_skill 会从实时几何生成站位、任务空间轨迹和终止契约，再通过 Recast、IK 与 MuJoCo 完整预演；不能提交关节角或低层路线绕过它。planning_tool_state.transit_clearance.status=required 时，可调用 plan_humanoid_navigation 或 plan_whole_body_motion_candidates，并逐字传递其中 skill_transaction_id；候选仍必须由你选择且通过新的 MuJoCo 预演。",
     "explore 必须选择当前 spatial_belief.frontiers 中真实存在的 frontier；自主差异来自模型对信息增益、路程、覆盖率、近期经历和长期 Goal 的判断，不得由程序随机替代。",
-    "操作物体时保持模型选定的对象、手、交互点和策略。approach、reach、grasp、lift、carry、place、push、pull、press、open、close、turn、regrasp 与双手 Skill 的低层几何由求解器从当前状态计算，物理拒绝不会被伪装为成功。",
+    "操作物体时保持模型选定的对象、手、交互点和策略。向语义区域搬运已持握物体时使用 carry_to_zone 并逐字引用 zone_id；确定性导航层会根据当前物体相对根节点的真实偏移计算机器人终点，禁止把 zone.center 直接当作机器人根目标。对 object_in_zone 或 object_placed Goal，place.destination 使用 semantic_zone 并逐字引用 zone_id，让确定性求解器从区域支撑面和物体尺寸计算落点；不得把 zone.center 猜成 world_pose。approach、reach、grasp、lift、carry、carry_to_zone、place、push、pull、press、open、close、turn、regrasp 与双手 Skill 的低层几何由求解器从当前状态计算，物理拒绝不会被伪装为成功。",
     "break_block 只能选择当前 solid_tokens 中 kind=block 的实体，并由你选择手、strike 或 press 策略；必须先完成可达接近，再以真实稳定掌指接触取得拆除权限。固定物体不能拆除。",
     "planning_tool_state.recovery_policy 来自真实失败分类；从其中允许的恢复 Skill 中作出新的模型选择。不得重复完全相同的失败方案，也不得让 Harness 改换语义目标、对象、手或策略。",
     "recall_embodied_history 只用于比较过去策略结果。召回内容始终是 historical_only；任何新动作都必须重新观察并绑定当前 world_revision。",

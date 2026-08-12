@@ -19,7 +19,7 @@ interface HumanoidCarriedObjectReleaseBindingAuthority {
   graspPredicateIndex: number;
   releasedPredicateIndex: number;
   settledPredicateIndex: number;
-  zonePredicateIndex: number;
+  destinationPredicateIndex: number;
 }
 
 export interface HumanoidCarriedObjectReleaseAuthority {
@@ -104,12 +104,9 @@ export function authorizeHumanoidCarriedObjectRelease(input: {
         && predicate.object_id === binding.object_id,
       `settled support for ${binding.object_id}`
     );
-    const zonePredicateIndex = uniquePredicateIndex(
+    const destinationPredicateIndex = destinationRelationPredicateIndex(
       contract.predicates,
-      (predicate) => predicate.type === "object_in_zone"
-        && predicate.object_id === binding.object_id
-        && predicate.expected,
-      `destination zone for ${binding.object_id}`
+      binding.object_id
     );
     if (!preconditionPositive.has(graspPredicateIndex)) {
       throw new Error(
@@ -124,7 +121,7 @@ export function authorizeHumanoidCarriedObjectRelease(input: {
     for (const [index, label] of [
       [releasedPredicateIndex, "physical separation"],
       [settledPredicateIndex, "settled support"],
-      [zonePredicateIndex, "destination zone"]
+      [destinationPredicateIndex, "destination relation"]
     ] as const) {
       if (!terminalPositive.has(index)) {
         throw new Error(
@@ -138,7 +135,7 @@ export function authorizeHumanoidCarriedObjectRelease(input: {
       graspPredicateIndex,
       releasedPredicateIndex,
       settledPredicateIndex,
-      zonePredicateIndex
+      destinationPredicateIndex
     };
   }).sort((left, right) => bindingKey(left.objectId, left.hand)
     .localeCompare(bindingKey(right.objectId, right.hand)));
@@ -215,6 +212,36 @@ function uniquePredicateIndex(
     throw new Error(`Object release requires exactly one ${label} predicate`);
   }
   return indexes[0]!;
+}
+
+function destinationRelationPredicateIndex(
+  predicates: ReturnType<typeof HumanoidMotionOptionContractSchema.parse>["predicates"],
+  objectId: string
+): number {
+  const destinationTypes = [
+    "object_in_zone",
+    "object_inside",
+    "object_on",
+    "object_near_point"
+  ] as const;
+  for (const type of destinationTypes) {
+    const indexes = predicates.flatMap((predicate, index) => (
+      "object_id" in predicate
+        && predicate.object_id === objectId
+        && predicate.type === type
+        && (!("expected" in predicate) || predicate.expected)
+        ? [index] : []
+    ));
+    if (indexes.length === 1) return indexes[0]!;
+    if (indexes.length > 1) {
+      throw new Error(
+        `Object release requires exactly one destination relation for ${objectId}`
+      );
+    }
+  }
+  throw new Error(
+    `Object release requires exactly one destination relation for ${objectId}`
+  );
 }
 
 function bindingKey(objectId: string, hand: "left" | "right"): string {

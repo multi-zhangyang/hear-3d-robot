@@ -14,10 +14,6 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { ModelTelemetryRuntime } from "./context-runtime.js";
-import {
-  ModelDecisionProtocolRecovery,
-  withModelDecisionProtocolRecovery
-} from "./model-decision-protocol.js";
 import { withModelTelemetry } from "./model-telemetry.js";
 import { isTransportInterruption } from "../runtime/transport-recovery.js";
 import {
@@ -258,54 +254,6 @@ describe("agent invocation scope", () => {
       new RunContext(),
       JSON.stringify({ input: "inspect" })
     )).resolves.toBe("retry completed");
-    expect(workerCalls).toBe(2);
-  });
-
-  it("surfaces a nested worker decision stall instead of returning tool error text", async () => {
-    let workerCalls = 0;
-    const runtime: ModelTelemetryRuntime = {
-      rootAgentId: "coordinator",
-      activeNode: () => ({}) as never,
-      recordModelCallStarted: async () => undefined
-    };
-    const workerModel = withModelDecisionProtocolRecovery(
-      withModelTelemetry({
-        getResponse: async () => {
-          throw new Error("non-stream path is outside this test");
-        },
-        getStreamedResponse: async function* () {
-          workerCalls += 1;
-          yield responseDone(reasoningResponse(`worker-reasoning-${workerCalls}`));
-        }
-      } satisfies Model, runtime, "worker"),
-      "worker",
-      new ModelDecisionProtocolRecovery(() => "authority")
-    );
-    const worker = new Agent({
-      name: "worker",
-      instructions: `${agentInvocationMarker("worker")}\nCall a tool.`,
-      model: workerModel,
-      modelSettings: { toolChoice: "required" },
-      tools: [tool({
-        name: "observe",
-        description: "Observe the live state",
-        parameters: z.object({}).strict(),
-        execute: async () => "observed"
-      })]
-    });
-    const delegate = scopeAgentToolInvocation("worker", worker.asTool({
-      toolName: "delegate_stalled_worker",
-      toolDescription: "delegate a required decision",
-      onStream: async () => undefined
-    }));
-
-    await expect(delegate.invoke(
-      new RunContext(),
-      JSON.stringify({ input: "decide" })
-    )).rejects.toMatchObject({
-      name: "ModelDecisionStallError",
-      agentId: "worker"
-    });
     expect(workerCalls).toBe(2);
   });
 

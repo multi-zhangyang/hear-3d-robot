@@ -137,6 +137,16 @@ describe("humanoid interaction observation", () => {
         authority: "carried_contact"
       })
     ]);
+    expect(observation.object_world_model.objects).toEqual([
+      expect.objectContaining({
+        id: "parcel",
+        status: "visible",
+        authority: "carried_contact",
+        pose: expect.objectContaining({
+          position: { x: 2.4, y: 0.2, z: 2.3 }
+        })
+      })
+    ]);
   });
 });
 

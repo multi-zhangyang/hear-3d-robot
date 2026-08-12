@@ -24,12 +24,12 @@ import {
 
 const CandidateIdSchema = z.string().regex(/^goal-candidate:[a-f0-9]{64}$/)
   .describe(
-    "只能逐字复制 CURRENT HARNESS AUTHORITY 的 existing_goal_candidate_ids；"
+    "只能逐字复制 CURRENT GOAL MANAGER INVOCATION 的 existing_goal_candidate_ids；"
     + "不能填写本批 proposal_id，列表为空时依赖必须为空"
   );
 
 const CandidateSequenceSchema = z.number().int().positive().describe(
-  "逐字复制候选提交回执或 CURRENT HARNESS AUTHORITY 中的 candidate_sequence"
+  "逐字复制候选提交回执或 CURRENT GOAL MANAGER INVOCATION 中的 candidate_sequence"
 );
 
 const SubmitGoalCandidatesSchema = z.object({
@@ -310,7 +310,7 @@ function goalTool(
           error: error instanceof Error ? error.message : String(error),
           automatic_selection: false,
           automatic_actuation: false,
-          recovery: "根据本回执与最新 CURRENT HARNESS AUTHORITY 重新调用正确的 Goal 工具；Harness 不会修补候选、选择替代目标或执行动作。"
+          recovery: "根据本回执与本次 CURRENT GOAL MANAGER INVOCATION 重新调用正确的 Goal 工具；Harness 不会修补候选、选择替代目标或执行动作。"
         });
       }
     }

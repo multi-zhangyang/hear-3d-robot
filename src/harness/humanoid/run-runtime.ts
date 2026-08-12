@@ -8,7 +8,10 @@ import type {
   Scenario,
   TaskNode
 } from "../../domain/schema.js";
-import { goalSha256 } from "../../domain/goal-identity.js";
+import {
+  goalConstraintSha256,
+  goalSha256
+} from "../../domain/goal-identity.js";
 import {
   autonomousCycleRef,
   createActiveAutonomousCycle,
@@ -85,6 +88,7 @@ import {
   humanoidGoalControlStateSha256,
   humanoidActionReceiptsInCommitOrder,
   PersistedHumanoidActionReceiptSchema,
+  type HumanoidCheckerResult,
   type HumanoidEmbodiedEpisode,
   type HumanoidEmbodiedExperience,
   type HumanoidRunCheckpoint
@@ -877,13 +881,26 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         transactionId,
         agentId
       );
-      const decision = this.#actionModelSource(
-        authority,
-        action,
-        rawInput,
-        transactionId,
-        agentId
-      );
+      const decision = options.recoveryDecision
+        ? structuredClone(options.recoveryDecision)
+        : this.#actionModelSource(
+            authority,
+            action,
+            rawInput,
+            transactionId,
+            agentId
+          );
+      if (options.recoveryDecision) {
+        this.#assertActionDecisionRef(
+          decision,
+          action,
+          rawInput,
+          transactionId,
+          agentId,
+          this.#requiredActiveCycleRef(),
+          authority
+        );
+      }
       const durableReceipt = await this.#durableReceiptForInvocation(
         action,
         rawInput,
@@ -1019,7 +1036,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const activeGoal = this.#activeGoal();
     if (this.#store.definition.run_mode === "mission"
       && activeGoal
-      && goalSha256(activeGoal) !== goalSha256(this.#missionGoal)
+      // Goal summaries are model-authored descriptions, not physical
+      // obligations. Keep the full Goal hash for candidate identity and
+      // evidence integrity, but classify a mission Goal by its predicates.
+      && goalConstraintSha256(activeGoal)
+        !== goalConstraintSha256(this.#missionGoal)
       && this.#missionGoalPhysicallySatisfied()) {
       return "goal_transition";
     }
@@ -1233,7 +1254,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     if (agentId !== "humanoid-motion-reference") return result.anchor;
     return json({
       ...(object(result.anchor) ?? {}),
-      planning_tool_state: this.#actions.planningToolState(agentId)
+      planning_tool_state: this.#actions.planningToolState(agentId),
+      grounding_snapshot: this.#actions.planningGroundingState(agentId)
     });
   }
 
@@ -1500,7 +1522,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
     this.#checkpoint.active_agent_id = agentId;
     this.#checkpoint.active_agent_ids = [agentId];
-    await this.#persist();
+    // Hierarchy focus is execution telemetry, not physical or Goal authority.
+    // Persisting it used to take a fresh MuJoCo/Goal cut for every SDK stream
+    // event. In a standard nested Agent loop those events can arrive while a
+    // specialist tool is atomically selecting a Goal or committing an action,
+    // allowing the telemetry write to pair an older anchor with newer state.
+    // The durable focus event below is sufficient; the next authoritative
+    // state transition checkpoints the latest focus together with its own cut.
     await this.emit("hierarchy_focus_changed", {
       active_agent_id: agentId,
       nodes: json(this.#checkpoint.nodes)
@@ -1613,7 +1641,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       input,
       execution.transaction_id,
       execution.agent_id,
-      authority
+      authority,
+      { recoveryDecision: execution.admission.decision }
     );
     await this.emit("physical_execution_recovered", json({
       transaction_id: receipt.transactionId,
@@ -1715,20 +1744,30 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         : this.#checkpoint.goal_progress;
       this.#checkpoint.checker = checker.success ? null : checker;
       this.#checkpoint.cycle_index = activeCycle.cycle_index;
-      this.#checkpoint.last_cycle = cycle;
+      const missionCompleted = checker.success
+        && this.#store.definition.run_mode === "mission"
+        && this.missionGoalCompleted();
+      const committedCycle = missionCompleted
+        ? verifiedMissionCompletionOutput({
+            missionGoal: this.#missionGoal,
+            modelCycle: cycle,
+            checker,
+            evidenceTransactionIds: [...evidence],
+            worldFrame: world.frame,
+            worldRevision: world.worldRevision
+          })
+        : cycle;
+      this.#checkpoint.last_cycle = committedCycle;
       this.#checkpoint.embodied_memory = memory.state;
       this.#checkpoint.active_cycle = null;
       this.#checkpoint.committed_actions = actionWindow.receipts;
       this.#pruneRuntimeAuthority();
 
-      const missionCompleted = checker.success
-        && this.#store.definition.run_mode === "mission"
-        && this.missionGoalCompleted();
       if (missionCompleted) {
         this.#continuousPhysicsEnabled = false;
         this.#stageFinish(
           "succeeded",
-          output,
+          JSON.stringify(committedCycle),
           null,
           "run_succeeded"
         );
@@ -1748,7 +1787,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         cycle_index: this.#checkpoint.cycle_index,
         cycle: json(activeCycle),
         causal_trace: json(memory.episode.causal_trace ?? null),
-        output: cycle,
+        output: committedCycle,
         checker: json(checker),
         goal_epoch_completed: checker.success
       });
@@ -1817,22 +1856,37 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       this.#checkpoint.goal_progress = null;
       this.#checkpoint.checker = null;
       this.#checkpoint.cycle_index = activeCycle.cycle_index;
-      this.#checkpoint.last_cycle = cycleOutput;
+      const missionCompleted = this.#store.definition.run_mode === "mission"
+        && this.missionGoalCompleted();
+      const committedCycle = missionCompleted
+        ? verifiedMissionCompletionOutput({
+            missionGoal: this.#missionGoal,
+            modelCycle: cycleOutput,
+            checker,
+            evidenceTransactionIds: [],
+            worldFrame: captured.world.frame,
+            worldRevision: captured.world.worldRevision
+          })
+        : cycleOutput;
+      this.#checkpoint.last_cycle = committedCycle;
       this.#checkpoint.active_cycle = null;
       this.#pruneRuntimeAuthority();
 
-      const missionCompleted = this.#store.definition.run_mode === "mission"
-        && this.missionGoalCompleted();
       if (missionCompleted) {
         this.#continuousPhysicsEnabled = false;
-        this.#stageFinish("succeeded", output, null, "run_succeeded");
+        this.#stageFinish(
+          "succeeded",
+          JSON.stringify(committedCycle),
+          null,
+          "run_succeeded"
+        );
       }
 
       await this.#persist();
       await this.#store.append("checker", json(checker));
       await this.emit("autonomous_goal_satisfied", {
         cycle: json(activeCycle),
-        output: cycleOutput,
+        output: committedCycle,
         checker: json(checker),
         physical_execution_required: false,
         goal_epoch_completed: true
@@ -3692,6 +3746,32 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
   }
 
+}
+
+function verifiedMissionCompletionOutput(input: {
+  missionGoal: Goal;
+  modelCycle: JsonValue;
+  checker: HumanoidCheckerResult;
+  evidenceTransactionIds: readonly string[];
+  worldFrame: number;
+  worldRevision: number;
+}): JsonValue {
+  if (!input.checker.success
+    || input.checker.worldFrame !== input.worldFrame
+    || input.checker.worldRevision !== input.worldRevision
+    || goalConstraintSha256(input.checker.goal)
+      !== goalConstraintSha256(input.missionGoal)) {
+    throw new Error("Mission completion output requires a successful current-world checker");
+  }
+  return {
+    status: "mission_completed",
+    mission_goal: json(input.missionGoal),
+    checker: json(input.checker),
+    world_frame: input.worldFrame,
+    world_revision: input.worldRevision,
+    evidence_transaction_ids: [...input.evidenceTransactionIds],
+    model_summary: cycleSummary(input.modelCycle)
+  };
 }
 
 function assertHumanoidPhysicalStateAnchorEvent(

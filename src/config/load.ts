@@ -95,7 +95,7 @@ function validateProviderBudget(
   const fallbackReserve = defaultOutputTokenReserve(config.contextWindowTokens);
   const exceedsWindow = config.compactTriggerTokens >= config.contextWindowTokens;
   const exceedsConfiguredOutputHeadroom = config.maxOutputTokens !== undefined
-    && config.compactTriggerTokens + config.maxOutputTokens >= config.contextWindowTokens;
+    && config.compactTriggerTokens + config.maxOutputTokens > config.contextWindowTokens;
   if (exceedsWindow || exceedsConfiguredOutputHeadroom) {
     context.addIssue({
       code: "custom",
@@ -110,7 +110,7 @@ function validateProviderBudget(
     context.addIssue({
       code: "custom",
       path: ["compactMaxOutputTokens"],
-      message: "AI_COMPACT_MAX_OUTPUT_TOKENS leaves no room for bounded compactor repair turns"
+      message: "AI_COMPACT_MAX_OUTPUT_TOKENS leaves no room for one compactor request"
     });
   }
 }

@@ -169,6 +169,26 @@ function navigationSkillPlan(
       }]
     };
   }
+  if (invocation.skill === "carry_to_zone") {
+    const zone = observation.interaction.zones.find(
+      ({ zone_id: zoneId }) => zoneId === invocation.zone_id
+    );
+    if (!zone) throw new Error("Selected carry destination zone is no longer observable");
+    const object = objectEntry(observation, invocation.object_id);
+    return {
+      kind: "navigation",
+      targets: [{
+        target: requiredTargetPosition(binding),
+        arrivalHeading: null,
+        acceptedPositionToleranceMeters: carriedObjectZoneArrivalTolerance(
+          invocation.tolerance_m,
+          zone,
+          object
+        ),
+        score: 1
+      }]
+    };
+  }
   if (invocation.skill === "retreat") {
     return {
       kind: "navigation",
@@ -246,6 +266,33 @@ function navigationSkillPlan(
   };
 }
 
+function carriedObjectZoneArrivalTolerance(
+  requestedTolerance: number,
+  zone: HumanoidWorldObservation["interaction"]["zones"][number],
+  object: ReturnType<typeof objectEntry>
+): number {
+  const horizontalMargin = Math.min(
+    zone.size.x / 2 - objectExtentAlong(
+      object.size,
+      object.pose.rotation,
+      { x: 1, y: 0, z: 0 }
+    ),
+    zone.size.z / 2 - objectExtentAlong(
+      object.size,
+      object.pose.rotation,
+      { x: 0, y: 0, z: 1 }
+    )
+  );
+  if (horizontalMargin <= 0) {
+    throw new Error("Carried object cannot fit inside the selected semantic zone");
+  }
+  const settlingReserve = Math.min(0.05, horizontalMargin * 0.25);
+  return Math.min(
+    requestedTolerance,
+    Math.max(0.02, horizontalMargin - settlingReserve)
+  );
+}
+
 function approachLateralOffsets(hand: "left" | "right" | null): number[] {
   if (hand === "right") return [0.2, 0.14, 0.26, 0, -0.18];
   if (hand === "left") return [-0.2, -0.14, -0.26, 0, 0.18];
@@ -287,9 +334,53 @@ function motionSkillPlan(
         ? MINIMUM_BLOCK_REMOVAL_STABLE_FRAMES
         : motion.contactEstablishment ? 4
         : predicates.some(({ type }) => type === "grasp_verified") ? 8 : 4,
-      phases: null
+      phases: skillTerminationPhases(invocation, phase, predicates)
     },
     candidates
+  };
+}
+
+function skillTerminationPhases(
+  invocation: HumanoidSkillInvocation,
+  phase: string,
+  predicates: HumanoidMotionOptionPredicate[]
+): HumanoidMotionCandidateBatch["termination"]["phases"] {
+  if (invocation.skill !== "place" || phase !== "settle_and_release"
+    || !invocation.release_after_settled) return null;
+  const graspIndexes = predicates.flatMap((predicate, index) => (
+    predicate.type === "grasp_verified"
+      && predicate.object_id === invocation.object_id ? [index] : []
+  ));
+  if (graspIndexes.length === 0) {
+    throw new Error("Place release requires a verified-grasp precondition");
+  }
+  const predicate = (predicateIndex: number) => ({
+    op: "predicate" as const,
+    predicate_index: predicateIndex
+  });
+  return {
+    precondition: {
+      condition: {
+        op: "all",
+        conditions: graspIndexes.map(predicate)
+      },
+      stable_steps: 1
+    },
+    during: null,
+    terminal: {
+      condition: {
+        op: "all",
+        conditions: [
+          ...graspIndexes.map((predicateIndex) => ({
+            op: "not" as const,
+            condition: predicate(predicateIndex)
+          })),
+          ...predicates.flatMap((_, predicateIndex) => (
+            graspIndexes.includes(predicateIndex) ? [] : [predicate(predicateIndex)]
+          ))
+        ]
+      }
+    }
   };
 }
 
@@ -1668,22 +1759,30 @@ function placePredicates(
   if (!motion.objectTarget) throw new Error("Place Skill has no object target");
   const hands = invocation.hands === "both"
     ? ["left", "right"] as const : [invocation.hands];
-  const handState: HumanoidMotionOptionPredicate[] = hands.map((hand) => (
-    invocation.release_after_settled
+  const graspState: HumanoidMotionOptionPredicate[] = hands.map((hand) => ({
+    type: "grasp_verified" as const,
+    object_id: invocation.object_id,
+    hand,
+    grasp_contract_sha256:
+      observation.interaction.grasp_authority.contract_sha256
+  }));
+  const releaseState: HumanoidMotionOptionPredicate[] = invocation.release_after_settled
+    ? hands.map((hand) => ({
+        type: "object_released" as const,
+        object_id: invocation.object_id,
+        hand
+      }))
+    : [];
+  const relation: HumanoidMotionOptionPredicate =
+    invocation.destination.type === "semantic_zone"
       ? {
-          type: "object_released" as const,
+          type: "object_in_zone",
           object_id: invocation.object_id,
-          hand
+          zone_id: invocation.destination.zone_id,
+          expected: true,
+          tolerance_m: invocation.destination.tolerance_m
         }
-      : {
-          type: "grasp_verified" as const,
-          object_id: invocation.object_id,
-          hand,
-          grasp_contract_sha256:
-            observation.interaction.grasp_authority.contract_sha256
-        }
-  ));
-  const relation: HumanoidMotionOptionPredicate = invocation.destination.type === "container"
+      : invocation.destination.type === "container"
     ? {
         type: "object_inside",
         object_id: invocation.object_id,
@@ -1726,7 +1825,8 @@ function placePredicates(
       : {})
   };
   return [
-    ...handState,
+    ...graspState,
+    ...releaseState,
     ...(invocation.release_after_settled
       ? [{
           type: "object_settled_on_support" as const,
@@ -1749,6 +1849,28 @@ function placementTarget(
   observation: HumanoidWorldObservation
 ): PlacementTarget {
   const object = objectEntry(observation, invocation.object_id);
+  if (invocation.destination.type === "semantic_zone") {
+    const destination = invocation.destination;
+    const zone = observation.interaction.zones.find(
+      ({ zone_id: zoneId }) => zoneId === destination.zone_id
+    );
+    if (!zone) throw new Error("Place destination semantic zone is unavailable");
+    const worldUp = { x: 0, y: 1, z: 0 };
+    const finalPosition = {
+      x: zone.center.x,
+      y: zone.center.y + zone.size.y / 2
+        + objectExtentAlong(object.size, object.pose.rotation, worldUp),
+      z: zone.center.z
+    };
+    return {
+      finalPosition,
+      stagingPosition: add(finalPosition, {
+        x: 0,
+        y: placementClearance(object),
+        z: 0
+      })
+    };
+  }
   if (invocation.destination.type === "world_pose") {
     const finalPosition = { ...invocation.destination.position };
     return {

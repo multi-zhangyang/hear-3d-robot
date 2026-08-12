@@ -24,8 +24,8 @@ describe("context summary fidelity", () => {
     expect(effectiveContextSummaryOutputTokens(150, 120, 70)).toBe(70);
   });
 
-  it("budgets one fresh compactor attempt rather than accumulating independent retries", () => {
-    expect(compactorInputTokenLimit(65_536, 4_096)).toBe(57_344);
+  it("budgets one compactor request rather than accumulating repair turns", () => {
+    expect(compactorInputTokenLimit(65_536, 4_096)).toBe(61_440);
   });
 
   it("rebases durable model semantics while removing stale evidence and action arguments", () => {
@@ -318,7 +318,7 @@ describe("context summary fidelity", () => {
     }]);
   });
 
-  it("feeds structured schema failures into the next fresh model attempt", async () => {
+  it("interrupts on a schema-invalid checkpoint without starting another request", async () => {
     const summary = {
       mission_state: "Continue the task.",
       constraints: [],
@@ -361,7 +361,7 @@ describe("context summary fidelity", () => {
       temperature: 0
     });
 
-    const result = await generator.generate({
+    const failure = await generator.generate({
       priorSummary: null,
       sourceItems: [{ role: "user", content: "Preserve the unfinished goal." }],
       authority: { world_revision: 12 },
@@ -369,13 +369,11 @@ describe("context summary fidelity", () => {
       blockerTransactionIds: [],
       maxInputTokens: 16_000,
       maxOutputTokens: 256
-    });
+    }).catch((error: unknown) => error);
 
-    expect(result.summary).toEqual(summary);
-    expect(calls).toBe(CONTEXT_COMPACTOR_TURNS_PER_ATTEMPT + 1);
-    expect(requests[CONTEXT_COMPACTOR_TURNS_PER_ATTEMPT]).toContain(
-      "constraints:invalid_type"
-    );
+    expect(failure).toBeInstanceOf(ContextCompactionInterruption);
+    expect(calls).toBe(1);
+    expect(requests).toHaveLength(1);
   });
 
   it("surfaces an observed provider context ceiling after a length-truncated tool call", async () => {

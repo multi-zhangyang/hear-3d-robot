@@ -13,6 +13,7 @@ export const HUMANOID_SKILL_IDS = [
   "grasp",
   "lift",
   "carry",
+  "carry_to_zone",
   "place",
   "push",
   "pull",
@@ -45,6 +46,11 @@ const ObjectPointParameters = {
 } as const;
 
 const PlacementDestinationSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("semantic_zone"),
+    zone_id: ObjectIdSchema,
+    tolerance_m: z.number().finite().nonnegative().max(1)
+  }).strict(),
   z.object({
     type: z.literal("support_surface"),
     object_id: ObjectIdSchema,
@@ -114,6 +120,13 @@ export const HumanoidSkillInvocationSchema = z.discriminatedUnion("skill", [
     object_id: ObjectIdSchema,
     hands: HandsSchema,
     target: Vec3Schema,
+    tolerance_m: z.number().finite().positive().max(1)
+  }).strict(),
+  z.object({
+    skill: z.literal("carry_to_zone"),
+    object_id: ObjectIdSchema,
+    hands: HandsSchema,
+    zone_id: ObjectIdSchema,
     tolerance_m: z.number().finite().positive().max(1)
   }).strict(),
   z.object({
@@ -225,7 +238,8 @@ export function humanoidSkillPhaseLearnedPolicyCapabilities(
   );
   if (!process) return [];
   const capabilities = [...process.learned_policy_capabilities];
-  if ((invocation.skill === "carry" || invocation.skill === "place")
+  if ((invocation.skill === "carry" || invocation.skill === "carry_to_zone"
+      || invocation.skill === "place")
     && invocation.hands === "both") {
     capabilities.push("bimanual_manipulation");
   }
@@ -327,8 +341,13 @@ export const HUMANOID_SKILL_CONTRACTS: Readonly<Record<
     [["observe", "sensor"], ["carry_route", "navigation"], ["verify_binding", "checker"]],
     ["robot reaches target and carried-object continuation stays verified"],
     ["path_blocked", "object_slipped"], ["regrasp", "bimanual_support", "retreat"]),
+  carry_to_zone: contract("carry_to_zone", ["object_id", "hands", "zone_id", "tolerance_m"], ["movable"],
+    ["verified carried-object binding exists", "semantic destination zone is observable", "route available"],
+    [["observe", "sensor"], ["carry_route", "navigation"], ["verify_binding", "checker"]],
+    ["carried object reaches the semantic zone while continuation stays verified"],
+    ["path_blocked", "object_slipped"], ["regrasp", "bimanual_support", "retreat"]),
   place: contract("place", ["object_id", "hands", "destination", "release_after_settled"], ["movable"],
-    ["verified carried-object binding exists", "destination constraint observable"],
+    ["verified carried-object binding exists", "destination object, slot, pose or semantic zone is observable"],
     [["observe", "sensor"], ["align_destination", "whole_body"], ["lower", "whole_body"], ["settle_and_release", "grasp"], ["verify_relation", "checker"]],
     ["destination relation satisfied; object settles after release or remains physically grasped when release is not requested"],
     ["placement_misaligned", "object_slipped"], ["regrasp", "place"]),
@@ -420,11 +439,12 @@ function prerequisiteSkillGroups(skill: HumanoidSkillId): HumanoidSkillId[][] {
   if (skill === "reach") return [["approach"]];
   if (skill === "grasp") return [["reach"], ["approach"]];
   if (skill === "lift") return [["grasp", "regrasp", "bimanual_support"]];
-  if (skill === "carry" || skill === "bimanual_carry") {
+  if (skill === "carry" || skill === "carry_to_zone"
+    || skill === "bimanual_carry") {
     return [["lift", "grasp", "regrasp", "bimanual_support"]];
   }
   if (skill === "place") {
-    return [["carry", "bimanual_carry", "lift", "grasp", "regrasp"]];
+    return [["carry", "carry_to_zone", "bimanual_carry", "lift", "grasp", "regrasp"]];
   }
   if (["push", "pull", "press", "open", "close", "turn"].includes(skill)) {
     return [["reach"], ["approach"]];
@@ -439,7 +459,8 @@ function learnedPolicyCapabilities(
 ): HumanoidLearnedPolicyCapability[] {
   if (authority === "sensor" || authority === "checker") return [];
   if (authority === "navigation") {
-    return skill === "carry" || skill === "bimanual_carry"
+    return skill === "carry" || skill === "carry_to_zone"
+      || skill === "bimanual_carry"
       ? ["locomotion", "contact_rich_manipulation"]
       : ["locomotion"];
   }

@@ -167,7 +167,7 @@ describe("object-centered humanoid world model", () => {
       learned_policy_missing_capabilities: ["contact_rich_manipulation"]
     });
     expect(catalog.entries.find(({ id }) => id === "place")).toMatchObject({
-      destination_ids: ["bin"]
+      destination_ids: ["assembly-zone", "bin"]
     });
     expect(catalog.entries.find(({ id }) => id === "explore")).toMatchObject({
       available: true,

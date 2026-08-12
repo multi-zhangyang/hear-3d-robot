@@ -233,6 +233,11 @@ describe("humanoid agent hierarchy", () => {
       channels: ["left_arm"]
     });
     const runtime = {
+      contextAnchor: () => ({
+        coordinator_phase: coordinatorPhase,
+        world_frame: 20,
+        world_revision: 20
+      }),
       invoke: async (action: string) => {
         invokedActions.push(action);
         return { ...execution, action } as HumanoidActionReceipt;
@@ -332,12 +337,12 @@ describe("humanoid agent hierarchy", () => {
       "execute_whole_body_motion"
     );
     expect(hierarchy.motion.tools.map((entry) => entry.name)).toEqual([
-      "observe_humanoid",
       "recall_embodied_history",
       "submit_humanoid_skill_plan",
       "begin_humanoid_skill",
       "plan_humanoid_skill",
-      "plan_whole_body_motion_candidates"
+      "plan_whole_body_motion_candidates",
+      "plan_humanoid_navigation"
     ]);
 
     const coordinatorTool = (name: string) => {
@@ -352,17 +357,13 @@ describe("humanoid agent hierarchy", () => {
         new RunContext({ runId: "stable-coordinator-tools" })
       )
     ).map((entry) => entry.name);
-    expect(await visibleCoordinatorTools()).toEqual([
-      "recall_embodied_history",
-      "delegate_humanoid_sentry",
-      "delegate_motion_reference"
-    ]);
+    const stableCoordinatorToolNames = hierarchy.coordinator.tools.map(
+      (entry) => entry.name
+    );
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     coordinatorPhase = "plan";
     sentryDelegationAvailable = false;
-    expect(await visibleCoordinatorTools()).toEqual([
-      "recall_embodied_history",
-      "delegate_motion_reference"
-    ]);
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     coordinatorPhase = "observe_or_plan";
     sentryDelegationAvailable = true;
     const smuggledMotionParameters = await coordinatorTool(
@@ -383,10 +384,12 @@ describe("humanoid agent hierarchy", () => {
       }
     );
     expect(JSON.parse(String(smuggledMotionParameters))).toMatchObject({
-      accepted: false,
-      code: "invalid_tool_input",
       tool: "delegate_motion_reference",
-      automatic_actuation: false
+      result: {
+        accepted: false,
+        code: "invalid_tool_input",
+        automatic_actuation: false
+      }
     });
     const unavailableExecutorDelegation = await coordinatorTool(
       "delegate_physics_executor"
@@ -411,14 +414,16 @@ describe("humanoid agent hierarchy", () => {
       }
     );
     expect(JSON.parse(String(unavailableExecutorDelegation))).toMatchObject({
-      accepted: false,
-      code: "coordinator_phase_rejected",
       tool: "delegate_physics_executor",
-      automatic_actuation: false
+      result: {
+        accepted: false,
+        code: "coordinator_phase_rejected",
+        automatic_actuation: false
+      }
     });
     coordinatorPhase = "replan_or_retire";
     goalRetirementDelegationAvailable = false;
-    expect(await visibleCoordinatorTools()).not.toContain("delegate_goal_manager");
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     const recoverableGoalRetirement = await coordinatorTool(
       "delegate_goal_manager"
     ).invoke(
@@ -435,25 +440,27 @@ describe("humanoid agent hierarchy", () => {
       }
     );
     expect(JSON.parse(String(recoverableGoalRetirement))).toMatchObject({
-      accepted: false,
-      code: "coordinator_phase_rejected",
       tool: "delegate_goal_manager",
-      coordinator_phase: "replan_or_retire",
-      automatic_actuation: false
+      result: {
+        accepted: false,
+        code: "coordinator_phase_rejected",
+        automatic_actuation: false
+      },
+      coordinator_state: { coordinator_phase: "replan_or_retire" }
     });
     goalRetirementDelegationAvailable = true;
-    expect(await visibleCoordinatorTools()).toContain("delegate_goal_manager");
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     coordinatorPhase = "goal_transition";
-    expect(await visibleCoordinatorTools()).toEqual(["delegate_goal_manager"]);
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     coordinatorPhase = "goal_selection";
     goalRetirementDelegationAvailable = false;
-    expect(await visibleCoordinatorTools()).toEqual(["delegate_goal_manager"]);
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     goalTransitionCompletionAvailable = true;
-    expect(await visibleCoordinatorTools()).toEqual(["complete_goal_transition"]);
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     goalTransitionCompletionAvailable = false;
     coordinatorPhase = "complete_satisfied_goal";
     goalRetirementDelegationAvailable = false;
-    expect(await visibleCoordinatorTools()).toEqual(["complete_satisfied_goal"]);
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     const satisfiedGoalCompletion = await coordinatorTool(
       "complete_satisfied_goal"
     ).invoke(
@@ -468,7 +475,7 @@ describe("humanoid agent hierarchy", () => {
     });
     coordinatorPhase = "observe_or_plan";
     goalRetirementDelegationAvailable = false;
-    expect(await visibleCoordinatorTools()).not.toContain("delegate_goal_manager");
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     executorDelegationAvailable = true;
     const invalidExecutorDelegation = await coordinatorTool(
       "delegate_physics_executor"
@@ -493,12 +500,14 @@ describe("humanoid agent hierarchy", () => {
       }
     );
     expect(JSON.parse(String(invalidExecutorDelegation))).toMatchObject({
-      accepted: false,
-      code: "invalid_tool_input",
       tool: "delegate_physics_executor",
-      validation_issues: [expect.objectContaining({
-        path: "execution.planning_transaction_id"
-      })]
+      result: {
+        accepted: false,
+        code: "invalid_tool_input",
+        validation_issues: [expect.objectContaining({
+          path: "execution.planning_transaction_id"
+        })]
+      }
     });
     coordinatorPhase = "execute_plan";
     const validExecutorDelegation = await coordinatorTool(
@@ -534,10 +543,7 @@ describe("humanoid agent hierarchy", () => {
       reason: null
     };
     coordinatorPhase = "post_execution";
-    expect(await visibleCoordinatorTools()).toEqual([
-      "delegate_humanoid_sentry",
-      "delegate_physics_executor"
-    ]);
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     const prematureCompletionInput = JSON.stringify({
       summary: "不能跳过执行后感知",
       evidence_transaction_ids: [execution.transactionId]
@@ -548,11 +554,13 @@ describe("humanoid agent hierarchy", () => {
       new RunContext({ runId: "premature-cycle-completion" }),
       prematureCompletionInput
     )))).toMatchObject({
-      accepted: false,
-      code: "coordinator_phase_rejected",
       tool: "complete_autonomous_cycle",
-      coordinator_phase: "post_execution",
-      automatic_actuation: false
+      result: {
+        accepted: false,
+        code: "coordinator_phase_rejected",
+        automatic_actuation: false
+      },
+      coordinator_state: { coordinator_phase: "post_execution" }
     });
     cycleCompletion.observed_after_execution = true;
     expect(JSON.parse(String(await coordinatorTool(
@@ -561,23 +569,23 @@ describe("humanoid agent hierarchy", () => {
       new RunContext({ runId: "inconsistent-cycle-completion-phase" }),
       prematureCompletionInput
     )))).toMatchObject({
-      accepted: false,
-      code: "coordinator_phase_rejected",
-      coordinator_phase: "post_execution"
+      result: {
+        accepted: false,
+        code: "coordinator_phase_rejected"
+      },
+      coordinator_state: { coordinator_phase: "post_execution" }
     });
     coordinatorPhase = "complete_cycle";
     executorDelegationAvailable = false;
-    expect(await visibleCoordinatorTools()).toEqual([
-      "complete_autonomous_cycle"
-    ]);
+    expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
       "submit_humanoid_skill_plan 提交短程 Skill DAG"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "只调用 plan_humanoid_skill"
+      "只调用 planning_tool_state.active_skill.planning_action"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "不能提交关节角、关键帧或低层路线绕过它"
+      "不能提交关节角或低层路线绕过它"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
       "break_block 只能选择当前 solid_tokens 中 kind=block 的实体"
@@ -586,7 +594,7 @@ describe("humanoid agent hierarchy", () => {
       "不得使用固定巡逻点、预设动作序列、随机电机噪声"
     ));
     expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "不能借用其他 Agent 或历史记忆充当当前传感事实"
+      "grounding_snapshot 是 Sentry 在本次 coordinator phase 捕获并由 Harness 绑定给你的唯一当前物理事实"
     ));
     expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
       "不得改 tolerance、删减谓词或拼接额外条件"
@@ -631,7 +639,6 @@ describe("humanoid agent hierarchy", () => {
       finalOutput: expect.stringContaining("rejected-motion-step")
     });
     for (const [index, action] of [
-      "observe_humanoid",
       "submit_humanoid_skill_plan",
       "begin_humanoid_skill"
     ].entries()) {
@@ -647,9 +654,9 @@ describe("humanoid agent hierarchy", () => {
           })
         }] as never
       );
-      expect(acceptedMotionStep).toEqual({
-        isFinalOutput: false,
-        isInterrupted: undefined
+      expect(acceptedMotionStep).toMatchObject({
+        isFinalOutput: true,
+        finalOutput: expect.stringContaining(`accepted-motion-step-${index}`)
       });
     }
     const acceptedMotionPlan = await motionBehavior(
@@ -685,18 +692,6 @@ describe("humanoid agent hierarchy", () => {
       isFinalOutput: false,
       isInterrupted: undefined
     });
-    const acceptedTerminal = await coordinatorBehavior(
-      new RunContext({ runId: "accepted-terminal" }),
-      [{
-        type: "function_output",
-        tool: { name: "complete_goal_transition" },
-        output: JSON.stringify({ status: "goal_transition_completed" })
-      }] as never
-    );
-    expect(acceptedTerminal).toMatchObject({
-      isFinalOutput: true,
-      finalOutput: JSON.stringify({ status: "goal_transition_completed" })
-    });
     const acceptedSatisfiedGoal = await coordinatorBehavior(
       new RunContext({ runId: "accepted-satisfied-goal" }),
       [{
@@ -722,8 +717,12 @@ describe("humanoid agent hierarchy", () => {
       JSON.stringify({ source_refs: ["episode:7"], limit: 1 })
     );
     expect(JSON.parse(String(recalled))).toMatchObject({
-      historical_only: true,
-      episodes: [{ source_ref: "episode:7", sequence: 7 }]
+      status: "coordinator_step_result",
+      result: {
+        kind: "recall_result",
+        historical_only: true,
+        episodes: [{ source_ref: "episode:7", sequence: 7 }]
+      }
     });
     expect(recallRequests).toEqual([{ source_refs: ["episode:7"], limit: 1 }]);
 
@@ -801,7 +800,7 @@ describe("humanoid agent hierarchy", () => {
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
       runtime: {
-        contextAnchor: () => ({}),
+        contextAnchor: () => ({ coordinator_phase: "replan_or_retire" }),
         invoke: async (name: string, input: unknown, transactionId: string, agentId: string) => (
           receipt({
             transactionId,
@@ -850,9 +849,16 @@ describe("humanoid agent hierarchy", () => {
       }
     );
     expect(JSON.parse(String(output))).toMatchObject({
-      agentId: "humanoid-sentry",
-      action: "observe_humanoid",
-      accepted: true
+      status: "coordinator_step_result",
+      tool: "delegate_humanoid_sentry",
+      result: {
+        owner_agent_id: "humanoid-sentry",
+        action: "observe_humanoid",
+        accepted: true
+      },
+      coordinator_state: {
+        coordinator_phase: "replan_or_retire"
+      }
     });
     expect(filteredAgents).toEqual([]);
   });
@@ -860,10 +866,8 @@ describe("humanoid agent hierarchy", () => {
   it("returns a prose-only Motion stall to the outer Harness", async () => {
     let worldRevision = 11;
     const modelRequests: ModelRequest[] = [];
-    const followUps: Array<{ agentId: string; attempt: number; reason: string }> = [];
     const invokedActions: string[] = [];
     const sessions = new Map<string, MemorySession>();
-    let sessionItemsAtFollowUp: unknown[] = [];
     let motionResponse = 0;
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
@@ -891,8 +895,7 @@ describe("humanoid agent hierarchy", () => {
             getResponse: async (request) => {
               modelRequests.push(request);
               motionResponse += 1;
-              if (motionResponse === 1) return functionCallResponse("observe_humanoid");
-              if (motionResponse === 2) return textResponse("现在提交正式规划。");
+              if (motionResponse === 1) return textResponse("现在提交正式规划。");
               return functionCallResponse(
                 "plan_humanoid_skill",
                 JSON.stringify({ skill_transaction_id: "skill-binding-12" })
@@ -908,11 +911,7 @@ describe("humanoid agent hierarchy", () => {
         sessions.set(agentId, session);
         return session;
       },
-      callModelInputFilter: ({ modelData }) => modelData,
-      onDelegatedDecisionFollowUp: async (event) => {
-        followUps.push(event);
-        sessionItemsAtFollowUp = await sessions.get(event.agentId)?.getItems() ?? [];
-      }
+      callModelInputFilter: ({ modelData }) => modelData
     });
     const delegate = hierarchy.coordinator.tools.find(
       (entry) => entry.name === "delegate_motion_reference"
@@ -935,20 +934,17 @@ describe("humanoid agent hierarchy", () => {
       }
     )).rejects.toThrow("did not return its required terminal tool result");
 
-    expect(invokedActions).toEqual(["observe_humanoid"]);
-    expect(followUps).toEqual([expect.objectContaining({
-      agentId: "humanoid-motion-reference",
-      attempt: 1
-    })]);
-    expect(modelRequests).toHaveLength(2);
-    expect(JSON.stringify(sessionItemsAtFollowUp)).toContain("现在提交正式规划");
+    expect(invokedActions).toEqual([]);
+    expect(modelRequests).toHaveLength(1);
+    expect(JSON.stringify(
+      await sessions.get("humanoid-motion-reference")?.getItems()
+    )).toContain("现在提交正式规划");
     expect(hierarchy.session("humanoid-motion-reference")).toBe(
       sessions.get("humanoid-motion-reference")
     );
   });
 
   it("lets cancellation stop delegated continuation without another model call", async () => {
-    const controller = new AbortController();
     let modelCalls = 0;
     let actionCalls = 0;
     const hierarchy = createHumanoidAgentHierarchy({
@@ -971,10 +967,7 @@ describe("humanoid agent hierarchy", () => {
           } as Model
         : modelStub(),
       createSession: (agentId) => new MemorySession({ sessionId: agentId }),
-      callModelInputFilter: ({ modelData }) => modelData,
-      onDelegatedDecisionFollowUp: () => controller.abort(
-        new Error("operator paused delegated continuation")
-      )
+      callModelInputFilter: ({ modelData }) => modelData
     });
     const delegate = hierarchy.coordinator.tools.find(
       (entry) => entry.name === "delegate_motion_reference"
@@ -987,7 +980,6 @@ describe("humanoid agent hierarchy", () => {
       new RunContext({ runId: "cancel-motion-continuation" }),
       "{}",
       {
-        signal: controller.signal,
         toolCall: {
           type: "function_call",
           callId: "delegate-motion-cancel",
@@ -996,52 +988,9 @@ describe("humanoid agent hierarchy", () => {
           status: "completed"
         }
       }
-    )).rejects.toThrow("operator paused delegated continuation");
+    )).rejects.toThrow("did not return its required terminal tool result");
     expect(modelCalls).toBe(1);
     expect(actionCalls).toBe(0);
-  });
-
-  it("does not classify a delegated transport failure as decision recovery", async () => {
-    const followUps: unknown[] = [];
-    const modelError = new TypeError("fetch failed");
-    const hierarchy = createHumanoidAgentHierarchy({
-      provider,
-      runtime: delegatedMotionRuntime(),
-      createModel: (agentId) => agentId === "humanoid-motion-reference"
-        ? {
-            getResponse: async () => { throw modelError; },
-            getStreamedResponse: () => {
-              throw new Error("Streaming is outside this test");
-            }
-          } as Model
-        : modelStub(),
-      createSession: (agentId) => new MemorySession({ sessionId: agentId }),
-      callModelInputFilter: ({ modelData }) => modelData,
-      onDelegatedDecisionFollowUp: (event) => {
-        followUps.push(event);
-      }
-    });
-    const delegate = hierarchy.coordinator.tools.find(
-      (entry) => entry.name === "delegate_motion_reference"
-    );
-    if (!delegate || delegate.type !== "function") {
-      throw new Error("Motion delegation tool is missing");
-    }
-
-    await expect(delegate.invoke(
-      new RunContext({ runId: "motion-transport-failure" }),
-      "{}",
-      {
-        toolCall: {
-          type: "function_call",
-          callId: "delegate-motion-transport",
-          name: "delegate_motion_reference",
-          arguments: "{}",
-          status: "completed"
-        }
-      }
-    )).rejects.toBe(modelError);
-    expect(followUps).toEqual([]);
   });
 
   it("applies each resolved profile to only its owning Agent", () => {

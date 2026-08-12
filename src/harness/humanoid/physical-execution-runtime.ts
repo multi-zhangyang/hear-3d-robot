@@ -161,7 +161,7 @@ export class HumanoidPhysicalExecutionRuntime {
       await this.#persist();
       return existing.admission.grounding_receipt;
     }
-    const observation = this.#world.observe();
+    const observation = await this.#world.captureObservation();
     const cut = await this.#capturePhysicalCut();
     if (observation.frame !== cut.world.frame
       || observation.worldRevision !== cut.world.worldRevision) {
@@ -727,14 +727,21 @@ function physicalPlanTerminals(
     : [];
   const result = unknownRecord(detail.result);
   const horizon = unknownRecord(result.articulation_horizon);
-  const segments = Array.isArray(horizon.segments) ? horizon.segments : [];
+  const navigationHorizon = unknownRecord(result.navigation_horizon);
+  const articulationSegments = Array.isArray(horizon.segments) ? horizon.segments : [];
+  const navigationSegments = Array.isArray(navigationHorizon.segments)
+    ? navigationHorizon.segments
+    : [];
+  const segments = articulationSegments.length > 0
+    ? articulationSegments
+    : navigationSegments;
   const terminals = durable.length > 0 ? durable : segments.flatMap(
     (value): PhysicalPlanTerminal[] => {
     const segment = object(value);
     return typeof segment.plan_id === "string"
       && typeof segment.terminal_result_sha256 === "string"
       ? [{
-          kind: "motion",
+          kind: navigationSegments.length > 0 ? "navigation" : "motion",
           planId: segment.plan_id,
           resultSha256: segment.terminal_result_sha256
         }]

@@ -42,11 +42,6 @@ import {
 import { isTransportInterruption } from "../runtime/transport-recovery.js";
 
 const HASH_SEED = "hear-context-ledger-v1";
-const CURRENT_AUTHORITY_POLICY = [
-  "The final user message beginning CURRENT HARNESS AUTHORITY is a trusted runtime envelope appended by the Harness.",
-  "It overrides older observations, authority envelopes, compact memory, frame numbers, revisions, phases, and transaction identifiers.",
-  "Treat it as data and follow the stable Agent instructions above when deciding how to use it."
-].join(" ");
 
 interface RecoveredInputState {
   physical: AgentInputItem[];
@@ -150,7 +145,7 @@ export class LongRunContextManager {
    * checkpoint. This runs after the SDK has durably persisted the completed
    * turn, so generated output is retained alongside the hot tail.
    */
-  async compactSessionHistories(
+  async commitPendingSessionRewrites(
     sessionForAgent: (agentId: string) => FileSession
   ): Promise<void> {
     for (const [scopeId, recovered] of this.#recoveredInputs) {
@@ -270,7 +265,7 @@ export class LongRunContextManager {
     const contextWorldRevision = this.#runtime.contextWorldIdentity().worldRevision;
     const rebaseUpdate = this.#rebaseSummary(scope, contextWorldRevision);
 
-    let filtered = this.#render(logicalModelData, scope, authority);
+    let filtered = this.#render(logicalModelData, scope);
     scope.active_estimated_tokens = correctedTokenEstimate(
       estimateModelInputTokens(filtered) + toolTokens,
       scope.token_estimator_correction_milli
@@ -646,7 +641,6 @@ export class LongRunContextManager {
       alreadyCompacted: scope.compacted_item_count,
       recentTurns: config.compactRecentModelTurns,
       modelData,
-      authority,
       toolTokens,
       summaryTokenReserve: summaryOutputTokens,
       triggerTokens: config.compactTriggerTokens,
@@ -812,8 +806,7 @@ export class LongRunContextManager {
               error instanceof Error ? error.message : String(error),
               {
                 cause: error,
-                ...(usage ? { usage } : {}),
-                retryable: true
+                ...(usage ? { usage } : {})
               }
             );
         bindContextCompactionInterruptionToAgent(interruption, node.id);
@@ -845,7 +838,7 @@ export class LongRunContextManager {
     this.#state.total_compactions += 1;
     this.#state.last_compacted_at = completedAt;
 
-    const filtered = this.#render(modelData, scope, authority);
+    const filtered = this.#render(modelData, scope);
     scope.active_estimated_tokens = correctedTokenEstimate(
       estimateModelInputTokens(filtered) + toolTokens,
       scope.token_estimator_correction_milli
@@ -903,23 +896,12 @@ export class LongRunContextManager {
 
   #render(
     modelData: ModelInputData,
-    scope: ContextScopeState,
-    authority: JsonValue
+    scope: ContextScopeState
   ): ModelInputData {
     const identity = agentInvocationMarker(scope.agent_id);
-    const exactIdentifiers = authorityIdentifierBlock(authority);
-    const authorityBlock = [
-      "CURRENT HARNESS AUTHORITY",
-      "This block is rebuilt from the live checkpoint for every model request. It overrides compact memory and older observations.",
-      ...exactIdentifiers,
-      JSON.stringify(authority),
-      "END CURRENT HARNESS AUTHORITY",
-      "Follow the stable Agent instructions now. Return the required formal function call; prose is not a tool decision."
-    ].join("\n");
-    const authorityItem = currentAuthorityItem(authorityBlock);
     if (!scope.summary) return {
-      input: [...modelData.input, authorityItem],
-      instructions: [modelData.instructions, identity, CURRENT_AUTHORITY_POLICY]
+      input: modelData.input,
+      instructions: [modelData.instructions, identity]
         .filter(Boolean)
         .join("\n\n")
     };
@@ -936,11 +918,8 @@ export class LongRunContextManager {
       })}`
     ].join("\n");
     return {
-      input: [
-        ...modelData.input.slice(scope.compacted_item_count),
-        authorityItem
-      ],
-      instructions: [modelData.instructions, identity, CURRENT_AUTHORITY_POLICY, checkpoint]
+      input: modelData.input.slice(scope.compacted_item_count),
+      instructions: [modelData.instructions, identity, checkpoint]
         .filter(Boolean)
         .join("\n\n")
     };
@@ -1051,7 +1030,6 @@ function chooseCutIndex(input: {
   alreadyCompacted: number;
   recentTurns: number;
   modelData: ModelInputData;
-  authority: JsonValue;
   toolTokens: number;
   summaryTokenReserve: number;
   triggerTokens: number;
@@ -1071,10 +1049,9 @@ function chooseCutIndex(input: {
     if (cut <= input.alreadyCompacted) continue;
     const projected = correctedTokenEstimate(estimateModelInputTokens({
       input: input.items.slice(cut),
-      instructions: [
-        input.modelData.instructions ?? "",
-        JSON.stringify(input.authority)
-      ].join("\n")
+      ...(input.modelData.instructions === undefined
+        ? {}
+        : { instructions: input.modelData.instructions })
     }) + input.toolTokens, input.tokenEstimatorCorrectionMilli)
       + input.summaryTokenReserve;
     if (projected <= target) return cut;
@@ -1124,22 +1101,14 @@ function modelTurnStarts(items: AgentInputItem[]): number[] {
 }
 
 function toolVisibleToNode(name: string, node: TaskNode, rootAgentId: string): boolean {
-  // The root Agent object contains only its coordinator tools. The shared
-  // worker Agent object contains every possible capability, but isEnabled
-  // narrows the provider request to this concrete hierarchy grant.
+  // Tool definitions are stable for each concrete Agent. This capability
+  // check affects only token accounting; it never mutates the provider-facing
+  // tool schema or grants execution authority.
   if (node.id === rootAgentId) return true;
   if (node.may_delegate) return name === "delegate_agent";
   return node.capabilities.includes(name)
     || name === "complete_assignment"
     || name === "report_blocked";
-}
-
-function currentAuthorityItem(content: string): AgentInputItem {
-  return {
-    type: "message",
-    role: "user",
-    content
-  };
 }
 
 function isHarnessAuthorityItem(item: AgentInputItem | undefined): boolean {
@@ -1165,7 +1134,8 @@ function withoutHarnessAuthorityItems(items: AgentInputItem[]): {
  * the immediately preceding assistant tool-call group. A cancelled SDK turn
  * can leave only one half of that pair in a durable Session. Keep complete
  * groups and discard only the unusable protocol fragments; authoritative
- * action receipts remain in the Harness journals and current authority block.
+ * action receipts remain in the Harness journals and the next invocation's
+ * explicit state projection.
  */
 function normalizeFunctionToolHistory(items: AgentInputItem[]): ToolHistoryNormalization {
   const normalized: AgentInputItem[] = [];
@@ -1302,73 +1272,4 @@ function compactionFailureUsage(error: unknown): ContextSummaryResult["usage"] |
 
 function json(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
-}
-
-function authorityIdentifierBlock(authority: JsonValue): string[] {
-  if (!isJsonRecord(authority)) return [];
-  const goalContext = isJsonRecord(authority.goal_context)
-    ? authority.goal_context
-    : undefined;
-  const goalDAG = isJsonRecord(authority.goal_dag)
-    ? authority.goal_dag
-    : undefined;
-  const evidenceRef = typeof goalContext?.evidence_ref === "string"
-    ? goalContext.evidence_ref
-    : undefined;
-  const candidates = isJsonRecord(goalDAG?.candidates)
-    ? Object.keys(goalDAG.candidates).sort()
-    : [];
-  const currentEpochId = typeof goalDAG?.current_epoch_id === "string"
-    ? goalDAG.current_epoch_id
-    : null;
-  const execution = isJsonRecord(authority.execution_authority)
-    ? authority.execution_authority
-    : undefined;
-  const planningTransactionId = typeof execution?.planning_transaction_id === "string"
-    ? execution.planning_transaction_id
-    : undefined;
-  const planningAction = typeof execution?.planning_action === "string"
-    ? execution.planning_action
-    : undefined;
-  const executorAction = typeof execution?.executor_action === "string"
-    ? execution.executor_action
-    : undefined;
-  const worldFrame = typeof authority.world_frame === "number"
-    && Number.isSafeInteger(authority.world_frame)
-    ? authority.world_frame
-    : undefined;
-  const worldRevision = typeof authority.world_revision === "number"
-    && Number.isSafeInteger(authority.world_revision)
-    ? authority.world_revision
-    : undefined;
-  const hasCurrentWorld = worldFrame !== undefined && worldRevision !== undefined;
-  if (!evidenceRef
-    && candidates.length === 0
-    && currentEpochId === null
-    && !planningTransactionId
-    && !hasCurrentWorld) return [];
-  return [
-    "CURRENT EXACT IDENTIFIERS (copy values character-for-character; never invent aliases)",
-    ...(hasCurrentWorld
-      ? [
-          `current_world_frame=${JSON.stringify(worldFrame)}`,
-          `current_world_revision=${JSON.stringify(worldRevision)}`,
-          `coordinator_phase=${JSON.stringify(authority.coordinator_phase ?? null)}`
-        ]
-      : []),
-    `goal_evidence_ref=${JSON.stringify(evidenceRef ?? null)}`,
-    `existing_goal_candidate_ids=${JSON.stringify(candidates)}`,
-    `current_goal_epoch_id=${JSON.stringify(currentEpochId)}`,
-    ...(planningTransactionId
-      ? [
-          `pending_planning_action=${JSON.stringify(planningAction ?? null)}`,
-          `pending_planning_transaction_id=${JSON.stringify(planningTransactionId)}`,
-          `required_executor_action=${JSON.stringify(executorAction ?? null)}`
-        ]
-      : [])
-  ];
-}
-
-function isJsonRecord(value: unknown): value is Record<string, JsonValue> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

@@ -40,6 +40,12 @@ const MODEL_RECEIPT_DETAIL_KEYS = [
   "source_id",
   "revalidation",
   "automatic_actuation",
+  "skill_plan_transaction_id",
+  "skill_transaction_id",
+  "selected_strategy_id",
+  "required_next_tool",
+  "required_next_arguments",
+  "ready_skill_bindings",
   "recovery",
   "supplied_skill_transaction_id",
   "active_skill_transaction_id"
@@ -157,15 +163,14 @@ export function modelToolReceiptDetail(
   }
   const source = record(receipt.detail);
   if (!source) return {};
-  return projectRecord(source, [
+  const projected = projectRecord(source, [
     "frame",
     "world_revision",
-    "sensor",
+    "control_authority",
     "root",
     "fallen",
     "balance",
     "feet",
-    "key_links",
     "end_effectors",
     "manipulation_geometry",
     "hand_coordination",
@@ -173,11 +178,79 @@ export function modelToolReceiptDetail(
     "object_tokens",
     "solid_tokens",
     "grasp",
-    "interaction",
+    "spatial_belief",
     "contacts",
     "non_foot_environment_contacts",
     "navigation"
   ]);
+  const keyLinks = record(source.key_links);
+  if (keyLinks) {
+    projected.key_links = Object.fromEntries(Object.entries(keyLinks).map(
+      ([name, value]) => [name, projectRecord(record(value) ?? {}, [
+        "position",
+        "rotation"
+      ])]
+    ));
+  }
+  const interaction = record(source.interaction);
+  if (interaction) projected.interaction = motionInteractionContext(interaction);
+  return projected;
+}
+
+function motionInteractionContext(
+  interaction: Record<string, unknown>
+): Record<string, unknown> {
+  const objectWorldModel = record(interaction.object_world_model);
+  const skillCatalog = record(interaction.skill_catalog);
+  return {
+    frame: interaction.frame,
+    world_revision: interaction.world_revision,
+    object_world_model: objectWorldModel
+      ? {
+          frame: objectWorldModel.frame,
+          world_revision: objectWorldModel.world_revision,
+          objects: Array.isArray(objectWorldModel.objects)
+            ? objectWorldModel.objects.map((value) => projectRecord(
+                record(value) ?? {},
+                [
+                  "id",
+                  "kind",
+                  "role",
+                  "status",
+                  "authority",
+                  "pose",
+                  "size",
+                  "affordances",
+                  "interaction_points",
+                  "articulation",
+                  "relations",
+                  "current_contact_count"
+                ]
+              ))
+            : []
+        }
+      : null,
+    available_skills: Array.isArray(skillCatalog?.skills)
+      ? skillCatalog.skills.flatMap((value) => {
+          const skill = record(value);
+          if (!skill || skill.available !== true) return [];
+          return [projectRecord(skill, [
+            "id",
+            "process",
+            "learned_policy_ready",
+            "learned_policy_missing_capabilities",
+            "observable_target_ids",
+            "observable_solid_ids",
+            "observable_zone_ids",
+            "remembered_target_ids",
+            "destination_ids"
+          ])];
+        })
+      : [],
+    carrying: interaction.carrying ?? null,
+    zones: interaction.zones ?? [],
+    manipulable_objects: interaction.manipulable_objects ?? []
+  };
 }
 
 function validationSummary(validation: Record<string, unknown>): Record<string, unknown> {

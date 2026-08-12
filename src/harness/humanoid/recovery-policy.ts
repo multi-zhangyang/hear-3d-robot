@@ -190,6 +190,7 @@ function physicalFailureReason(
     return "grasp_unstable";
   }
   if (binding.invocation.skill === "lift" || binding.invocation.skill === "carry"
+    || binding.invocation.skill === "carry_to_zone"
     || binding.invocation.skill === "bimanual_carry") return "object_slipped";
   if (binding.invocation.skill === "place") return "placement_misaligned";
   if (["open", "close", "turn", "press", "push", "pull"].includes(

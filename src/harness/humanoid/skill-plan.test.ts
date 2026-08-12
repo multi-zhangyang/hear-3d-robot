@@ -102,7 +102,8 @@ describe("registered humanoid Skill DAG", () => {
       agentId: "motion",
       proposal,
       observedFrame: 4,
-      worldRevision: 5
+      worldRevision: 5,
+      physicalAnchor: physicalAnchor()
     });
     expect(authorizeHumanoidSkillPlanNode({
       plan: registered,
@@ -144,7 +145,9 @@ describe("registered humanoid Skill DAG", () => {
       plan: registered,
       binding: approachBinding,
       worldRevision: 6,
-      executionSucceeded: true
+      physicalAnchor: physicalAnchor(),
+      executionSucceeded: true,
+      phasePostconditionSatisfied: true
     });
     expect(advanced).toMatchObject({
       world_revision: 6,
@@ -174,7 +177,9 @@ describe("registered humanoid Skill DAG", () => {
       plan: advanced!,
       binding: reachHandle,
       worldRevision: 7,
-      executionSucceeded: true
+      physicalAnchor: physicalAnchor(),
+      executionSucceeded: true,
+      phasePostconditionSatisfied: true
     });
     expect(reached).toMatchObject({
       world_revision: 7,
@@ -214,7 +219,9 @@ describe("registered humanoid Skill DAG", () => {
       plan: reached!,
       binding: establishGrasp,
       worldRevision: 8,
-      executionSucceeded: true
+      physicalAnchor: physicalAnchor(["door"]),
+      executionSucceeded: true,
+      phasePostconditionSatisfied: true
     });
     expect(grasped).toMatchObject({
       world_revision: 8,
@@ -243,7 +250,9 @@ describe("registered humanoid Skill DAG", () => {
       plan: grasped!,
       binding: actuateJoint,
       worldRevision: 9,
-      executionSucceeded: true
+      physicalAnchor: physicalAnchor(["door"]),
+      executionSucceeded: true,
+      phasePostconditionSatisfied: true
     })).toMatchObject({
       world_revision: 9,
       completed_node_ids: ["approach", "open"],
@@ -253,3 +262,12 @@ describe("registered humanoid Skill DAG", () => {
     });
   });
 });
+
+function physicalAnchor(carriedObjectIds: string[] = []) {
+  return {
+    root_position: { x: 0, y: 0.8, z: 0 },
+    root_rotation: { x: 0, y: 0, z: 0, w: 1 },
+    carried_object_ids: carriedObjectIds,
+    object_poses: []
+  };
+}

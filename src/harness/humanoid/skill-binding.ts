@@ -247,11 +247,13 @@ export function bindHumanoidSkill(input: {
       )
     : undefined;
   const targetZone = invocation.skill === "navigate_to_zone"
+    || invocation.skill === "carry_to_zone"
     ? input.observation.interaction.zones.find(
         ({ zone_id: id }) => id === invocation.zone_id
       )
     : undefined;
-  if (invocation.skill === "navigate_to_zone" && !targetZone) {
+  if ((invocation.skill === "navigate_to_zone"
+      || invocation.skill === "carry_to_zone") && !targetZone) {
     return rejection("skill_zone_unavailable", {
       skill: invocation.skill,
       zone_id: invocation.zone_id,
@@ -369,7 +371,15 @@ export function bindHumanoidSkill(input: {
         ? { active_goal_sha256: modelPayloadSha256(input.activeGoal) }
         : {}),
       ...(input.recoveryAuthorized ? { recovery_authorized: true } : {}),
-      target_position: target
+      target_position: invocation.skill === "carry_to_zone" && target && targetZone
+        ? {
+            x: input.observation.robot.rootPosition.x
+              + targetZone.center.x - target.pose.position.x,
+            y: input.observation.robot.rootPosition.y,
+            z: input.observation.robot.rootPosition.z
+              + targetZone.center.z - target.pose.position.z
+          }
+        : target
         ? { ...target.pose.position }
         : targetZone ? { ...targetZone.center }
         : explorationFrontier ? { ...explorationFrontier.target }
@@ -571,7 +581,22 @@ function validateSkillSemantics(
     }
   }
   if (invocation.skill === "place") {
-    if (invocation.destination.type !== "world_pose") {
+    if (invocation.destination.type === "semantic_zone") {
+      const destination = invocation.destination;
+      const zone = observation.interaction.zones.find(
+        ({ zone_id: zoneId }) => zoneId === destination.zone_id
+      );
+      if (!zone) {
+        return rejection("skill_destination_unavailable", {
+          skill: invocation.skill,
+          destination_id: destination.zone_id,
+          required_affordance: "semantic_zone",
+          observable_zone_ids: observation.interaction.zones.map(
+            ({ zone_id: zoneId }) => zoneId
+          )
+        });
+      }
+    } else if (invocation.destination.type !== "world_pose") {
       const destinationId = invocation.destination.object_id;
       const destination = objects.get(destinationId);
       const expected = invocation.destination.type === "container"
@@ -635,14 +660,16 @@ function validateSkillSemantics(
     }
   }
   const carrying = observation.interaction.carrying.bindings;
-  if (invocation.skill === "carry" || invocation.skill === "place"
+  if (invocation.skill === "carry" || invocation.skill === "carry_to_zone"
+    || invocation.skill === "place"
     || invocation.skill === "bimanual_carry") {
     const boundHands = carrying
       .filter(({ object_id }) => object_id === invocation.object_id)
       .map(({ hand }) => hand);
     const requiredHands = invocation.skill === "bimanual_carry"
       ? ["left", "right"]
-      : invocation.skill === "carry" || invocation.skill === "place"
+      : invocation.skill === "carry" || invocation.skill === "carry_to_zone"
+        || invocation.skill === "place"
         ? invocation.hands === "both" ? ["left", "right"] : [invocation.hands]
         : [];
     if (!requiredHands.every((hand) => boundHands.includes(hand as "left" | "right"))) {
@@ -683,6 +710,8 @@ function validateNavigationOutcome(
     || invocation.skill === "bimanual_carry"
     || invocation.skill === "retreat"
     ? invocation.target
+    : invocation.skill === "carry_to_zone"
+      ? binding.target_position
     : invocation.skill === "explore" || invocation.skill === "navigate_to_zone"
       ? binding.target_position
     : null;
@@ -1075,6 +1104,13 @@ function placeRelationPredicatePresent(
 ): boolean {
   const relation = predicates.some((predicate) => {
     if (!predicate || predicate.object_id !== invocation.object_id) return false;
+    if (invocation.destination.type === "semantic_zone") {
+      return predicate.type === "object_in_zone"
+        && predicate.zone_id === invocation.destination.zone_id
+        && predicate.expected === true
+        && typeof predicate.tolerance_m === "number"
+        && predicate.tolerance_m <= invocation.destination.tolerance_m;
+    }
     if (invocation.destination.type === "container") {
       return predicate.type === "object_inside"
         && predicate.container_id === invocation.destination.object_id
@@ -1100,6 +1136,7 @@ function placeRelationPredicatePresent(
 function placeRelationPredicateName(
   invocation: Extract<HumanoidSkillInvocation, { skill: "place" }>
 ): string {
+  if (invocation.destination.type === "semantic_zone") return "object_in_zone";
   if (invocation.destination.type === "container") return "object_inside";
   if (invocation.destination.type === "support_surface") return "object_on";
   return "object_near_point";

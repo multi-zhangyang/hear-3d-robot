@@ -80,11 +80,12 @@ function catalogEntry(
     .filter((object) => object.status === "remembered")
     .map((object) => object.id)
     .sort();
-  const destinations = destinationIds(contract.id, objects);
+  const destinations = destinationIds(contract.id, objects, zoneIds);
   const observableSolids = contract.id === "break_block"
     ? solids.filter(({ kind }) => kind === "block").map(({ id }) => id).sort()
     : [];
   const observableZones = contract.id === "navigate_to_zone"
+    || contract.id === "carry_to_zone"
     ? [...new Set(zoneIds)].sort()
     : [];
   const reasons: string[] = [];
@@ -99,8 +100,11 @@ function catalogEntry(
   if (contract.id === "navigate_to_zone" && observableZones.length === 0) {
     reasons.push("no semantic zone is currently observable");
   }
+  if (contract.id === "carry_to_zone" && zoneIds.length === 0) {
+    reasons.push("no semantic destination zone is currently observable");
+  }
   if (contract.id === "place" && destinations.length === 0) {
-    reasons.push("no observable container, support surface or insertion point");
+    reasons.push("no observable semantic zone, container, support surface or insertion point");
   }
   const learnedPolicyRequiredCapabilities = [...new Set(
     contract.process.flatMap(({ learned_policy_capabilities: capabilities }) => (
@@ -139,19 +143,20 @@ function skillTargetCompatible(
 
 function destinationIds(
   skill: HumanoidSkillId,
-  objects: readonly HumanoidObjectWorldModelEntry[]
+  objects: readonly HumanoidObjectWorldModelEntry[],
+  zoneIds: readonly string[]
 ): string[] {
   if (skill !== "place") return [];
-  return objects.filter((object) => object.status === "visible" && (
+  return [...new Set([...zoneIds, ...objects.filter((object) => object.status === "visible" && (
     object.affordances.includes("container")
       || object.affordances.includes("support_surface")
       || object.interaction_points.some((point) => point.kind === "insert")
-  )).map((object) => object.id).sort();
+  )).map((object) => object.id)])].sort();
 }
 
 function skillNeedsObject(skill: HumanoidSkillId): boolean {
   return [
-    "approach", "reach", "grasp", "lift", "carry", "place", "push", "pull",
+    "approach", "reach", "grasp", "lift", "carry", "carry_to_zone", "place", "push", "pull",
     "press", "open", "close", "turn", "regrasp", "bimanual_support", "bimanual_carry"
   ].includes(skill);
 }

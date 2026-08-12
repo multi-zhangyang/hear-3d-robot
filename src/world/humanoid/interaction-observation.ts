@@ -175,7 +175,8 @@ export function createHumanoidInteractionObservation(input: {
     worldRevision: input.worldRevision,
     scenario: input.scenario,
     robot: input.robot,
-    objectTokens: input.objectTokens
+    objectTokens: input.objectTokens,
+    contactGroundedObjectIds: [...carriedByObject.keys()]
   });
   return {
     frame: input.frame,

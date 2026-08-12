@@ -18,6 +18,7 @@ import {
   CONTEXT_COMPACTOR_TURNS_PER_ATTEMPT
 } from "../runtime/context-budget.js";
 import { errorMessage } from "../runtime/error-message.js";
+import { agentsModelRetrySettings } from "../model/retry.js";
 import { isTransportInterruption } from "../runtime/transport-recovery.js";
 import {
   estimateModelInputTokens,
@@ -106,11 +107,10 @@ interface ContextModelResponse {
 }
 
 /**
- * A real Agents SDK model run that turns historical model/tool items into a
- * typed checkpoint. Prose-only failures are retried in fresh bounded turns so
- * one bad branch cannot recursively consume the provider window. Failed model
- * attempts never become a synthetic durable checkpoint: callers must preserve
- * the uncompressed Session and resume when a real checkpoint can be produced.
+ * A real Agents SDK model run that turns one Agent's own historical items into
+ * a typed checkpoint. It sends one compatible model request. A failed request
+ * never becomes synthetic memory: callers preserve that Agent's uncompressed
+ * Session and interrupt the current run.
  */
 export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator {
   readonly #runner: Runner;
@@ -144,7 +144,10 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
     this.#runner = new Runner({
       tracingDisabled: true,
       traceIncludeSensitiveData: false,
-      modelSettings: { parallelToolCalls: false },
+      modelSettings: {
+        parallelToolCalls: false,
+        retry: { ...agentsModelRetrySettings(), maxRetries: 0 }
+      },
       toolExecution: { maxFunctionToolConcurrency: 1 },
       toolNotFoundBehavior: "raise_error",
       workflowName: "HEAR context compaction"
@@ -283,7 +286,7 @@ export class AgentsSdkContextSummaryGenerator implements ContextSummaryGenerator
 
     throw new ContextCompactionInterruption(
       lastFailure ?? "Context Compactor returned no valid checkpoint",
-      { usage, retryable: true }
+      { usage }
     );
   }
 }
@@ -406,9 +409,10 @@ function compactorAgent(input: {
         ? {}
         : { maxTokens: input.maxOutputTokens }),
       parallelToolCalls: false,
-      // This agent exposes exactly one terminal tool. Naming it gives the
-      // provider a stronger, SDK-native constraint than generic "required".
-      toolChoice: COMMIT_CONTEXT_TOOL
+      // Compatible thinking models commonly support `auto` but reject named
+      // or required tool choice. This Agent exposes only this terminal tool,
+      // so auto preserves the smallest possible legal tool surface.
+      toolChoice: "auto"
     },
     tools: [commit],
     resetToolChoice: false,

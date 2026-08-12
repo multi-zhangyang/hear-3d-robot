@@ -56,7 +56,7 @@ export function createConfiguredModel(
       apiKey: config.apiKey,
       fetch: openAICompatibleRequestFetch(timedFetch)
     });
-    model = aisdk(provider.chatModel(config.model));
+    model = agentsModelFromAiSdk(provider.chatModel(config.model));
   } else if (config.protocol === "openai_responses") {
     const provider = createOpenAI({
       name: "configured-openai-responses",
@@ -64,7 +64,7 @@ export function createConfiguredModel(
       apiKey: config.apiKey,
       fetch: timedFetch
     });
-    model = aisdk(provider.responses(config.model));
+    model = agentsModelFromAiSdk(provider.responses(config.model));
   } else {
     const provider = createAnthropic({
       name: "configured-anthropic-messages",
@@ -72,7 +72,7 @@ export function createConfiguredModel(
       apiKey: config.apiKey,
       fetch: timedFetch
     });
-    model = aisdk(provider.messages(config.model));
+    model = agentsModelFromAiSdk(provider.messages(config.model));
   }
   return options.promptCacheKey
     ? withPromptCacheAffinity(
@@ -82,6 +82,31 @@ export function createConfiguredModel(
         options.onPromptCacheStatus
       )
     : model;
+}
+
+/**
+ * The 0.15 AI SDK adapter can materialize `rawUsage: undefined`, while the
+ * Agents `Model` contract requires an absent optional property. Keep that
+ * package-level declaration mismatch at this integration boundary and retain
+ * the adapter's native retry advice for the Agents runner.
+ */
+function agentsModelFromAiSdk(
+  model: Parameters<typeof aisdk>[0]
+): Model {
+  const adapted = aisdk(model);
+  const getResponse: Model["getResponse"] = async (request) => {
+    const response = await adapted.getResponse(request);
+    if (response.rawUsage === undefined) {
+      const { rawUsage: _rawUsage, ...normalized } = response;
+      return normalized;
+    }
+    return { ...response, rawUsage: response.rawUsage };
+  };
+  return {
+    getResponse,
+    getStreamedResponse: (request) => adapted.getStreamedResponse(request),
+    getRetryAdvice: (input) => adapted.getRetryAdvice(input)
+  };
 }
 
 export function openAICompatibleRequestFetch(

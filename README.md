@@ -116,7 +116,7 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 
 命令会创建独立 Colab 会话，训练真实 PPO checkpoint，由 mjlab 导出带控制元数据的 ONNX，并在 GPU MuJoCo 环境中执行无界面策略评估。checkpoint、ONNX、环境配置、评估指标和 SHA-256 报告下载到 `artifacts/training/`，同时解包为可直接运行的策略目录。将 `HEAR_MJLAB_G1_POLICY_DIRECTORY` 指向该目录即可替换随附策略；训练、下载、解包或校验失败都会直接返回错误，不生成替代策略。结束或失败后 Colab 会话都会释放。
 
-程序化场景生成开阔区域、方块障碍、可动物体和目标区域。头部相机以真实水平与垂直视场持续更新 0.5 米空间信念网格；可见物理几何会截断其后的地面射线，墙后区域保持未知，移动或拆除实体留下的占据只有在重新进入视野后才会清除。模型从这种未知区域边界选择探索目标。Recast 根据当前静态与动态几何生成导航路径，每段路线都先在当前物理状态副本中完整执行；执行中出现新的几何阻塞时，执行监控层保持原 Skill 目标并从真实终态重新规划，最多进行两次有界尝试。预演碰撞会携带 MuJoCo 接触面、静态或动态实体身份、世界接触点、机器人相对分离法向与法向力，模型据此自行选择绕行或任务空间净空动作。跌倒、物体滑脱或语义前提失效不会被低层重规划掩盖，而是返回模型选择恢复 Skill。
+程序化场景生成开阔区域、方块障碍、可动物体和目标区域。头部相机以真实水平与垂直视场持续更新 0.5 米空间信念网格；可见物理几何会截断其后的地面射线，墙后区域保持未知，移动或拆除实体留下的占据只有在重新进入视野后才会清除。模型从这种未知区域边界选择探索目标。Recast 根据当前静态与动态几何生成导航路径，每段路线都先在当前物理状态副本中完整执行。Motion Agent 一次选择并绑定完整语义 Skill；Execution Gate 一次准入后，确定性 navigation horizon 会连续消费多个有界路线段，并在每段真实终态重新观察、重规划和预演，直到阶段后置条件满足、真实阻塞、安全失败、取消或有限执行 horizon 耗尽，模型不再逐段调用“下一步”。单段执行中出现新的几何阻塞时，执行监控层保持原 Skill 目标并从真实终态重新规划，最多进行两次有界尝试。预演碰撞会携带 MuJoCo 接触面、静态或动态实体身份、世界接触点、机器人相对分离法向与法向力，模型据此自行选择绕行或任务空间净空动作。跌倒、物体滑脱或语义前提失效不会被低层重规划掩盖，而是返回模型选择恢复 Skill。
 
 可动物体的抓取不是吸附或坐标绑定。系统从当前掌指接触面、接触力、对向接触、离开支撑面的高度、手物相对位姿稳定性和连续抬升帧建立抓取证据；只有通过证据的手物关系才能进入携带状态。持物导航逐帧验证抓取延续和未授权碰撞，放置动作必须由模型产生张手与撤手运动，并同时满足物体进入目标区域、手部脱离和非人形支撑面稳定承托。
 
@@ -239,7 +239,7 @@ HEAR_WORKYARD_CONTACT_TARGET_ZONE_ID=assembly_bay
 | `openai_responses` | OpenAI Responses API |
 | `anthropic_messages` | Anthropic Messages API |
 
-`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required` 和 `auto`，默认值为 `auto`；`none` 会在启动前被拒绝，因为所有业务节点和压缩节点都必须产生正式工具结果。当前阶段只有一个合法工具时，Harness 使用协议原生的命名工具约束；端点明确拒绝该能力时只协商一次并回到配置模式。业务节点没有产生正式工具结果时，会保留同一个 Agent、模型门面和 Session，在原会话继续恢复；多工具阶段的恢复通过标准 `required` 约束要求模型自行选择，端点不支持时自动回到原配置，保留模型思考，不替模型选择工具、参数或动作。恢复不使用固定次数终止，而由物理与 Goal 权威状态、上下文压缩生命周期和外部取消划分边界。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时固定取各智能体实际上下文窗口的 `85%`；角色覆盖自己的窗口后也会独立重算，不继承其他模型的低阈值。
+`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required` 和 `auto`，默认值为 `auto`；`none` 会在启动前被拒绝，因为业务节点必须产生正式工具结果。各 reasoning Agent 拥有独立 Session 和独立上下文预算；Manager 调用专家时只接收有界 delegation result，专家完整历史不会并入 Manager Session。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时按各 Agent 的实际窗口减去输出预留计算；压缩仅总结该 Agent 自己的旧历史并保留最近完整模型轮次。OpenAI-compatible thinking 模型使用 `tool_choice=auto`，不依赖 Responses 专属的 opaque compaction item。
 
 `AI_REQUEST_TIMEOUT_MS` 默认是 `300000`，表示 HTTP 建连或相邻响应数据之间允许的最长静默时间。`AI_STREAM_EVENT_IDLE_TIMEOUT_MS` 默认同为 `300000`，约束相邻 Agents SDK 模型事件之间的静默时间；只有真实模型事件会续期。两者均可按端点能力在 5 秒至 10 分钟之间调整，任务总时限、人工停止和进程恢复仍独立生效。
 

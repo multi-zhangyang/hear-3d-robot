@@ -176,6 +176,8 @@ export class HumanoidNavigationExecution {
   readonly #onlineReplanCount: number;
   readonly #skillIdentity: HumanoidEmbodiedSkillIdentity;
   readonly #policyFrameSink: HumanoidPolicyFrameSink | undefined;
+  readonly #skillWindowMaximumSteps: number | undefined;
+  readonly #skillWindowStepOffset: number;
   readonly #initialTargetDistance: number;
   #reference: HumanoidReference;
   #final: HumanoidSimulationSnapshot;
@@ -186,6 +188,23 @@ export class HumanoidNavigationExecution {
   #arrivalPositionLatched = false;
   #result: HumanoidNavigationExecutionResult | undefined;
   #pendingFrame: HumanoidNavigationPreparedFrame | undefined;
+
+  #skillWindow(): {
+    maximumSteps: number;
+    stepIndex: number;
+    remainingSteps: number;
+  } {
+    const maximumSteps = this.#skillWindowMaximumSteps ?? Math.max(
+      1,
+      this.#maximumTravelFrames + this.#maximumStoppingFrames
+    );
+    const stepIndex = this.#skillWindowStepOffset + this.#frames;
+    return {
+      maximumSteps,
+      stepIndex,
+      remainingSteps: Math.max(0, maximumSteps - stepIndex)
+    };
+  }
 
   constructor(input: {
     plan: NavigationPlan;
@@ -199,6 +218,10 @@ export class HumanoidNavigationExecution {
     acceptedPositionToleranceMeters?: number | null;
     skillIdentity?: HumanoidEmbodiedSkillIdentity;
     policyFrameSink?: HumanoidPolicyFrameSink;
+    skillWindow?: {
+      maximumSteps: number;
+      stepOffset: number;
+    };
   }) {
     this.#plan = structuredClone(input.plan);
     this.#policyFrameSink = input.policyFrameSink;
@@ -209,7 +232,8 @@ export class HumanoidNavigationExecution {
     const carrying = (input.graspTargets?.length ?? 0) > 0
       || (input.carryTaskSpaceTargets?.length ?? 0) > 0;
     this.#carrying = carrying;
-    if (!carrying && (!progress || progress.committed_frame_count === 0)) {
+    if (!carrying && (!progress || progress.committed_frame_count === 0)
+      && (input.skillWindow?.stepOffset ?? 0) === 0) {
       input.simulation.resetController(input.reference);
     }
     this.#final = input.simulation.snapshot();
@@ -222,6 +246,15 @@ export class HumanoidNavigationExecution {
           observedFrame: progress?.committed_frame_count ?? 0,
           observedWorldRevision: progress?.committed_frame_count ?? 0
         });
+    this.#skillWindowStepOffset = input.skillWindow?.stepOffset ?? 0;
+    this.#skillWindowMaximumSteps = input.skillWindow?.maximumSteps;
+    if (!Number.isSafeInteger(this.#skillWindowStepOffset)
+      || this.#skillWindowStepOffset < 0
+      || (this.#skillWindowMaximumSteps !== undefined
+        && (!Number.isSafeInteger(this.#skillWindowMaximumSteps)
+          || this.#skillWindowMaximumSteps <= this.#skillWindowStepOffset))) {
+      throw new Error("Navigation Skill window is invalid");
+    }
     this.#arrivalHeading = input.arrivalHeading === null
       || input.arrivalHeading === undefined
       ? null
@@ -415,8 +448,20 @@ export class HumanoidNavigationExecution {
       }
     }
     while (this.#waypointIndex < this.#plan.waypoints.length) {
+      const waypoint = this.#plan.waypoints[this.#waypointIndex]!;
+      const dx = waypoint.x - this.#final.rootPosition.x;
+      const dz = waypoint.z - this.#final.rootPosition.z;
+      const distance = Math.hypot(dx, dz);
+      if (this.#waypointIndex < this.#plan.waypoints.length - 1
+        ? distance <= NAVIGATION_WAYPOINT_TOLERANCE_METERS
+        : this.#finalWaypointSatisfied()) {
+        this.#waypointIndex += 1;
+        continue;
+      }
+      // A committed control step can enter the terminal envelope on the exact
+      // budget boundary.  Evaluate that physical state before declaring a
+      // timeout; otherwise a valid arrival is discarded one frame later.
       if (this.#frames >= this.#maximumTravelFrames) {
-        const waypoint = this.#plan.waypoints[this.#waypointIndex]!;
         this.#finish(
           false,
           `navigation_timeout:position=${point(this.#final.rootPosition)},target=${point(waypoint)}`
@@ -436,16 +481,6 @@ export class HumanoidNavigationExecution {
             + `;upright=${this.#final.balance.upright.toFixed(3)}`
         );
         return null;
-      }
-      const waypoint = this.#plan.waypoints[this.#waypointIndex]!;
-      const dx = waypoint.x - this.#final.rootPosition.x;
-      const dz = waypoint.z - this.#final.rootPosition.z;
-      const distance = Math.hypot(dx, dz);
-      if (this.#waypointIndex < this.#plan.waypoints.length - 1
-        ? distance <= NAVIGATION_WAYPOINT_TOLERANCE_METERS
-        : this.#finalWaypointSatisfied()) {
-        this.#waypointIndex += 1;
-        continue;
       }
       const yaw = yawFromQuaternion(this.#final.rootRotation);
       const finalWaypoint = this.#waypointIndex === this.#plan.waypoints.length - 1;
@@ -764,15 +799,7 @@ export class HumanoidNavigationExecution {
           mode: "autonomous_closed_loop",
           replanPolicy: "event_driven",
           controlStepSeconds: this.#controlStepSeconds,
-          maximumSteps: Math.max(
-            1,
-            this.#maximumTravelFrames + this.#maximumStoppingFrames
-          ),
-          stepIndex: this.#frames,
-          remainingSteps: Math.max(
-            0,
-            this.#maximumTravelFrames + this.#maximumStoppingFrames - this.#frames
-          )
+          ...this.#skillWindow()
         },
         requestedCapabilities: humanoidControllerTaskCapabilities(
           this.#reference,

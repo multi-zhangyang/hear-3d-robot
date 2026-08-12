@@ -133,7 +133,7 @@ describe("HumanoidRunRuntime", () => {
     }
   }, 30_000);
 
-  it("completes a newly selected Goal that the current physical state already satisfies", async () => {
+  it("completes a mission-equivalent Goal even when its summary text differs", async () => {
     const root = await mkdtemp(join(tmpdir(), "hear-satisfied-goal-"));
     temporaryDirectories.push(root);
     const store = await RunStore.create(root, {
@@ -159,7 +159,10 @@ describe("HumanoidRunRuntime", () => {
         world,
         checkpoint: initial
       });
-      await activateGoal(runtime, scenario.default_goal);
+      await activateGoal(runtime, {
+        ...scenario.default_goal,
+        summary: `${scenario.default_goal.summary}（同一物理约束）`
+      });
       await runtime.start(false);
       await runtime.stopContinuousPhysics();
 
@@ -180,6 +183,12 @@ describe("HumanoidRunRuntime", () => {
       expect(checkpoint.goal_dag.status).toBe("awaiting_model_selection");
       expect(checkpoint.goal_dag.epochs.at(-1)?.status).toBe("completed");
       expect(checkpoint.committed_actions).toEqual({});
+      expect(JSON.parse(checkpoint.final_output!)).toMatchObject({
+        status: "mission_completed",
+        mission_goal: scenario.default_goal,
+        checker: { success: true },
+        model_summary: "当前 MuJoCo 状态已经满足选中的目标"
+      });
       expect(await store.readJournal("episodes")).toEqual([]);
       expect(await store.readJournal("checker")).toEqual([
         expect.objectContaining({ success: true })

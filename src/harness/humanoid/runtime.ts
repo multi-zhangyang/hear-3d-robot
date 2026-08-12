@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   HUMANOID_END_EFFECTORS,
   type Goal,
+  JsonValueSchema,
   type JsonValue,
   type Vec3
 } from "../../domain/schema.js";
@@ -13,6 +14,7 @@ import type { HumanoidGroundingReceipt } from
   "../../domain/humanoid-grounding.js";
 import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
+import { HUMANOID_SKILL_CONTRACTS } from "../../domain/humanoid-skill.js";
 import { yawFromQuaternion } from "../../world/geometry.js";
 import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.js";
 import type { HumanoidBodyChannel } from "../../world/humanoid/motion-plan.js";
@@ -57,11 +59,14 @@ import {
 import {
   advanceHumanoidSkillPlan,
   authorizeHumanoidSkillPlanNode,
+  readyHumanoidSkillPlanBindings,
   registerHumanoidSkillPlan,
   RegisteredHumanoidSkillPlanSchema,
   type RegisteredHumanoidSkillPlan
 } from "./skill-plan.js";
 import { planAutonomousHumanoidSkill } from "./autonomous-skill-planner.js";
+import { planAutonomousHumanoidNavigation } from
+  "./autonomous-navigation-planning.js";
 import {
   executeHumanoidArticulationHorizon,
   isHumanoidArticulationActuation
@@ -70,6 +75,15 @@ import {
   HUMANOID_ARTICULATION_HORIZON,
   humanoidArticulationSegmentBudgetExhausted
 } from "./articulation-control.js";
+import {
+  executeHumanoidNavigationHorizon,
+  isHumanoidNavigationSkill,
+  navigationPlanForHorizon
+} from "./navigation-horizon-executor.js";
+import {
+  HUMANOID_NAVIGATION_HORIZON,
+  humanoidNavigationSegmentBudgetExhausted
+} from "./navigation-control.js";
 import { HumanoidSkillEventStream } from
   "../../world/humanoid/skill-event-stream.js";
 import {
@@ -125,7 +139,8 @@ export const HumanoidActionRuntimeStateSchema = z.object({
   navigation_transit_clearance_requirements: z.array(z.object({
     agent_id: z.string().trim().min(1),
     requirement: NavigationTransitClearanceRequirementSchema
-  }).strict()).default([])
+  }).strict()).default([]),
+  latest_grounding_observation: JsonValueSchema.nullable().default(null)
 }).strict().superRefine((state, context) => {
   const planIds = new Set(state.skill_plans.map(({ transaction_id }) => transaction_id));
   if (planIds.size !== state.skill_plans.length) {
@@ -179,6 +194,11 @@ const MANIPULATION_APPROACH_RADIUS_METERS = 1;
 const MANIPULATION_BASE_TARGET_TOLERANCE_METERS = 0.04;
 const SKILL_AUTHORITY_OBJECT_DRIFT_METERS = 0.015;
 const SKILL_AUTHORITY_ORIENTATION_DRIFT_RADIANS = 0.05;
+const MOTION_GROUNDING_OBJECT_LIMIT = 32;
+const MOTION_GROUNDING_SOLID_LIMIT = 32;
+const MOTION_GROUNDING_FRONTIER_LIMIT = 16;
+const MOTION_GROUNDING_INTERACTION_POINT_LIMIT = 8;
+const MOTION_GROUNDING_BASE_PLACEMENT_LIMIT = 8;
 
 export interface HumanoidPhysicalExecutionIntent {
   transactionId: string;
@@ -206,6 +226,8 @@ export interface HumanoidActionToolCallAuthority {
 export interface HumanoidActionInvocationOptions {
   signal?: AbortSignal;
   toolAuthority?: HumanoidActionToolCallAuthority;
+  /** Internal crash recovery only: replay the decision persisted at admission. */
+  recoveryDecision?: ModelDecisionRef;
 }
 
 export interface HumanoidActionInvoker {
@@ -313,6 +335,7 @@ export class HumanoidActionRuntime {
   readonly #inFlightTransactions = new Set<string>();
   readonly #observationRevisionByAgent = new Map<string, number>();
   readonly #observationByAgent = new Map<string, HumanoidWorldObservation>();
+  #latestGroundingObservation: HumanoidWorldObservation | null = null;
   readonly #activeSkillByAgent = new Map<string, ActiveHumanoidSkillBinding>();
   readonly #skillByPlanningTransactionId = new Map<
     string,
@@ -462,7 +485,8 @@ export class HumanoidActionRuntime {
       ].map(([agentId, requirement]) => ({
         agent_id: agentId,
         requirement: structuredClone(requirement)
-      }))
+      })),
+      latest_grounding_observation: this.#latestGroundingObservation
     }));
   }
 
@@ -499,6 +523,18 @@ export class HumanoidActionRuntime {
       );
     }
     this.#latestPhysicalExecutionRevision = state.latest_physical_execution_revision;
+    const grounding = persistedGroundingObservation(
+      state.latest_grounding_observation,
+      currentWorldRevision,
+      this.#latestPhysicalExecutionRevision
+    );
+    if (grounding) {
+      this.#latestGroundingObservation = grounding;
+      for (const agentId of ["humanoid-sentry", "humanoid-motion-reference"]) {
+        this.#observationRevisionByAgent.set(agentId, grounding.worldRevision);
+        this.#observationByAgent.set(agentId, structuredClone(grounding));
+      }
+    }
     for (const plan of state.skill_plans) {
       this.#skillPlansByTransactionId.set(
         plan.transaction_id,
@@ -629,6 +665,10 @@ export class HumanoidActionRuntime {
   planningToolState(agentId: string): JsonValue {
     const normalizedAgentId = agentId.trim();
     const activeSkill = this.#activeSkillByAgent.get(normalizedAgentId);
+    const activePlan = this.#activeSkillPlan(normalizedAgentId);
+    const readySkillBindings = activePlan && !activeSkill
+      ? readyHumanoidSkillPlanBindings(activePlan)
+      : [];
     const latestFailureKey = this.#latestPlanningFailureKeyByAgent.get(
       normalizedAgentId
     );
@@ -671,7 +711,11 @@ export class HumanoidActionRuntime {
         ? navigationTransitClearanceContext(transitClearance)
         : null,
       recovery_policy: this.#recoveryPolicyByAgent.get(normalizedAgentId) ?? null,
-      skill_plan: this.#activeSkillPlan(normalizedAgentId),
+      skill_plan: activePlan,
+      ready_skill_bindings: readySkillBindings,
+      required_next_tool: readySkillBindings.length > 0
+        ? "begin_humanoid_skill"
+        : null,
       active_skill: activeSkill
         ? {
             transaction_id: activeSkill.transaction_id,
@@ -685,6 +729,13 @@ export class HumanoidActionRuntime {
           }
         : null
     });
+  }
+
+  planningGroundingState(agentId: string): JsonValue {
+    const observation = this.#renewObservationAuthority(agentId.trim());
+    return observation
+      ? jsonValue(motionPlanningObservation(observation, this.#activeGoal?.()))
+      : null;
   }
 
   async invoke(
@@ -868,6 +919,7 @@ export class HumanoidActionRuntime {
         this.#latestPlanningFailureKeyByAgent.clear();
         this.#activeSkillByAgent.clear();
         this.#observationByAgent.clear();
+        this.#latestGroundingObservation = null;
       }
       if (skill && receipt.accepted) {
         this.#recoveryPolicyByAgent.delete(skill.agent_id);
@@ -889,11 +941,22 @@ export class HumanoidActionRuntime {
         ? this.#skillPlansByTransactionId.get(skillPlanTransactionId)
         : undefined;
       if (skill && skillPlan && receipt.accepted && !transitClearanceRecovery) {
+        const observation = this.#world.observe();
         const advanced = advanceHumanoidSkillPlan({
           plan: skillPlan,
           binding: skill,
           worldRevision: receipt.worldAfterRevision,
-          executionSucceeded: true
+          physicalAnchor: skillPlanPhysicalAnchor(
+            observation,
+            skillPlanObjectIds(skillPlan)
+          ),
+          executionSucceeded: true,
+          phasePostconditionSatisfied: humanoidSkillPhasePostconditionSatisfied({
+            binding: skill,
+            observation,
+            planningReceipt,
+            executionReceipt: receipt
+          })
         });
         if (advanced) {
           this.#skillPlansByTransactionId.set(skillPlan.transaction_id, advanced);
@@ -1037,11 +1100,13 @@ export class HumanoidActionRuntime {
       : undefined;
     if (!plan) return;
     if (plan.world_revision === current.worldRevision) return;
-    if (previous && plan.world_revision === previous.worldRevision && compatible) {
+    if ((previous && plan.world_revision === previous.worldRevision && compatible)
+      || skillPlanAnchorCompatible(plan, current)) {
       this.#skillPlansByTransactionId.set(plan.transaction_id, {
         ...plan,
         observed_frame: current.frame,
-        world_revision: current.worldRevision
+        world_revision: current.worldRevision,
+        physical_anchor: skillPlanPhysicalAnchor(current, skillPlanObjectIds(plan))
       });
       return;
     }
@@ -1248,52 +1313,51 @@ export class HumanoidActionRuntime {
     }
     if (name === "observe_humanoid") {
       HumanoidActionInputs.observe_humanoid.parse(rawInput);
-      const observation = invocation.agentId === "humanoid-motion-reference"
+      const observation = invocation.agentId === "humanoid-sentry"
+        || invocation.agentId === "humanoid-motion-reference"
         ? await this.#world.observeManipulationReachability()
-        : this.#world.observe();
-      const previousObservation = this.#observationByAgent.get(invocation.agentId);
-      this.#reconcileSkillPlanWorldAuthority(
-        invocation.agentId,
-        previousObservation,
-        observation
-      );
-      this.#observationRevisionByAgent.set(
-        invocation.agentId,
-        observation.worldRevision
-      );
-      this.#observationByAgent.set(invocation.agentId, observation);
-      const clearance = this.#navigationTransitClearanceRequirementByAgent.get(
-        invocation.agentId
-      );
-      if (clearance) {
-        this.#navigationTransitClearanceRequirementByAgent.set(
-          invocation.agentId,
-          refreshNavigationTransitClearanceRequirement({
-            requirement: clearance,
-            worldRevision: observation.worldRevision,
-            snapshot: this.#world.snapshot(),
-            solidTokens: observation.solidTokens
-          })
+        : await this.#world.captureObservation();
+      const authorityOwners = invocation.agentId === "humanoid-sentry"
+        ? [invocation.agentId, "humanoid-motion-reference"]
+        : [invocation.agentId];
+      for (const ownerId of authorityOwners) {
+        const previousObservation = this.#observationByAgent.get(ownerId);
+        this.#reconcileSkillPlanWorldAuthority(
+          ownerId,
+          previousObservation,
+          observation
         );
-      } else {
-        this.#activeSkillByAgent.delete(invocation.agentId);
-      }
-      const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
-      if (recovery && recovery.world_revision !== observation.worldRevision) {
-        this.#recoveryPolicyByAgent.delete(invocation.agentId);
-      }
-      if (invocation.agentId === "humanoid-motion-reference") {
-        const requirement = manipulationBasePlacementRequirement(observation);
-        if (requirement) {
-          this.#manipulationBasePlacementRequirementByAgent.set(
-            invocation.agentId,
-            requirement
+        this.#observationRevisionByAgent.set(ownerId, observation.worldRevision);
+        this.#observationByAgent.set(ownerId, structuredClone(observation));
+        const clearance = this.#navigationTransitClearanceRequirementByAgent.get(ownerId);
+        if (clearance) {
+          this.#navigationTransitClearanceRequirementByAgent.set(
+            ownerId,
+            refreshNavigationTransitClearanceRequirement({
+              requirement: clearance,
+              worldRevision: observation.worldRevision,
+              snapshot: this.#world.snapshot(),
+              solidTokens: observation.solidTokens
+            })
           );
         } else {
-          this.#manipulationBasePlacementRequirementByAgent.delete(
-            invocation.agentId
-          );
+          this.#activeSkillByAgent.delete(ownerId);
         }
+        const recovery = this.#recoveryPolicyByAgent.get(ownerId);
+        if (recovery && recovery.world_revision !== observation.worldRevision) {
+          this.#recoveryPolicyByAgent.delete(ownerId);
+        }
+        if (ownerId === "humanoid-motion-reference") {
+          const requirement = manipulationBasePlacementRequirement(observation);
+          if (requirement) {
+            this.#manipulationBasePlacementRequirementByAgent.set(ownerId, requirement);
+          } else {
+            this.#manipulationBasePlacementRequirementByAgent.delete(ownerId);
+          }
+        }
+      }
+      if (invocation.agentId === "humanoid-sentry") {
+        this.#latestGroundingObservation = structuredClone(observation);
       }
       return {
         accepted: true,
@@ -1326,7 +1390,11 @@ export class HumanoidActionRuntime {
         agentId: invocation.agentId,
         proposal,
         observedFrame: observation.frame,
-        worldRevision: observation.worldRevision
+        worldRevision: observation.worldRevision,
+        physicalAnchor: skillPlanPhysicalAnchor(
+          observation,
+          skillPlanProposalObjectIds(proposal)
+        )
       });
       this.#skillPlansByTransactionId.set(invocation.transactionId, plan);
       this.#activeSkillPlanTransactionByAgent.set(
@@ -1335,13 +1403,17 @@ export class HumanoidActionRuntime {
       );
       this.#activeSkillByAgent.delete(invocation.agentId);
       this.#latestPlanningFailureKeyByAgent.delete(invocation.agentId);
+      const readyBindings = readyHumanoidSkillPlanBindings(plan);
       return {
         accepted: true,
         code: "humanoid_skill_plan_registered",
         channels: [],
         detail: {
           automatic_actuation: false,
-          skill_plan: plan
+          skill_plan_transaction_id: plan.transaction_id,
+          selected_strategy_id: plan.selected_strategy_id,
+          required_next_tool: "begin_humanoid_skill",
+          ready_skill_bindings: readyBindings
         }
       };
     }
@@ -1428,6 +1500,11 @@ export class HumanoidActionRuntime {
         channels: [],
         detail: {
           automatic_actuation: false,
+          skill_transaction_id: result.binding.transaction_id,
+          required_next_tool: "plan_humanoid_skill",
+          required_next_arguments: {
+            skill_transaction_id: result.binding.transaction_id
+          },
           binding: result.binding,
           recovery_policy: recovery ?? null
         }
@@ -1512,42 +1589,11 @@ export class HumanoidActionRuntime {
           }
         };
       }
-      const attempts: Array<{
-        target: Vec3;
-        accepted_position_tolerance_m: number | null;
-        score: number;
-        accepted: boolean;
-        reason: string | null;
-        blocking_contacts?: NonNullable<
-          Awaited<ReturnType<HumanoidWorld["planNavigation"]>>["blockingContacts"]
-        >;
-      }> = [];
-      let selected: Awaited<ReturnType<HumanoidWorld["planNavigation"]>> | null = null;
-      for (const candidate of plan.targets.slice(0, 8)) {
-        const result = await this.#world.planNavigation(
-          candidate.target,
-          candidate.arrivalHeading,
-          candidate.acceptedPositionToleranceMeters ?? null,
-          { skillCallIdentity: humanoidEmbodiedSkillIdentity(binding) }
-        );
-        attempts.push({
-          target: { ...candidate.target },
-          accepted_position_tolerance_m:
-            candidate.acceptedPositionToleranceMeters ?? null,
-          score: candidate.score,
-          accepted: result.accepted,
-          reason: result.reason ?? null,
-          ...(result.blockingContacts
-            ? {
-                blocking_contacts: structuredClone(result.blockingContacts)
-              }
-            : {})
-        });
-        if (result.accepted) {
-          selected = result;
-          break;
-        }
-      }
+      const { selected, attempts } = await planAutonomousHumanoidNavigation({
+        world: this.#world,
+        binding,
+        plan
+      });
       if (!selected) {
         return {
           accepted: false,
@@ -1655,13 +1701,18 @@ export class HumanoidActionRuntime {
       const articulationHorizon = isHumanoidArticulationActuation(skill)
         ? skillEventStream
         : null;
-      const skillFrameOffset = articulationHorizon
+      const navigationHorizon = planKind === "navigation"
+        && isHumanoidNavigationSkill(skill)
+        ? skillEventStream
+        : null;
+      const deterministicHorizon = articulationHorizon ?? navigationHorizon;
+      const skillFrameOffset = deterministicHorizon
         ? this.#physicalExecutionFrameOffset(invocation.transactionId)
         : 0;
-      const completedPlanFrameCount = articulationHorizon
+      const completedPlanFrameCount = deterministicHorizon
         ? this.#completedPhysicalPlanFrameCount(invocation.transactionId)
         : 0;
-      const completedPlanCount = articulationHorizon
+      const completedPlanCount = deterministicHorizon
         ? this.#completedPhysicalPlanCount(invocation.transactionId)
         : 0;
       const continuationPlanId = articulationHorizon && skill
@@ -1674,7 +1725,19 @@ export class HumanoidActionRuntime {
         && continuationPlanId === undefined;
       const articulationSegmentBudgetExhausted = articulationHorizon !== null
         && humanoidArticulationSegmentBudgetExhausted(completedPlanCount);
-      const executionPlanId = continuationPlanId ?? reference.planId;
+      const navigationContinuationPlanId = navigationHorizon && skill
+        ? this.#world.pendingNavigationPlanIdForSkillCall(
+            humanoidEmbodiedSkillIdentity(skill).callId
+          )
+        : undefined;
+      const resumeBetweenNavigationSegments = navigationHorizon !== null
+        && skillFrameOffset > 0
+        && navigationContinuationPlanId === undefined;
+      const navigationSegmentBudgetExhausted = navigationHorizon !== null
+        && humanoidNavigationSegmentBudgetExhausted(completedPlanCount);
+      const executionPlanId = continuationPlanId
+        ?? navigationContinuationPlanId
+        ?? reference.planId;
       const options = {
         realtime: this.#realtimeExecution,
         retainTerminal: this.#retainPhysicalTerminals,
@@ -1685,14 +1748,15 @@ export class HumanoidActionRuntime {
           ? { skillEventSink: this.#skillEventSink }
           : {}),
         ...(skillEventStream ? { skillEventStream } : {}),
-        ...(articulationHorizon
+        ...(deterministicHorizon
           ? {
               deferSkillProgress: true,
               deferSkillTerminal: true,
               deferSkillControllerOutcome: true,
               skillWindow: {
-                maximumSteps:
-                  HUMANOID_ARTICULATION_HORIZON.maximum_control_steps,
+                maximumSteps: articulationHorizon
+                  ? HUMANOID_ARTICULATION_HORIZON.maximum_control_steps
+                  : HUMANOID_NAVIGATION_HORIZON.maximum_control_steps,
                 stepOffset: completedPlanFrameCount
               }
             }
@@ -1702,8 +1766,11 @@ export class HumanoidActionRuntime {
           : {}),
         ...(executionSignal ? { signal: executionSignal } : {})
       };
+      const initialRootPosition = this.#world.snapshot().robot.rootPosition;
       const initialResult = resumeBetweenArticulationSegments
         || articulationSegmentBudgetExhausted
+        || resumeBetweenNavigationSegments
+        || navigationSegmentBudgetExhausted
         ? {
             accepted: true,
             code: "motion_option_succeeded" as const,
@@ -1718,7 +1785,7 @@ export class HumanoidActionRuntime {
             options
           )
         : await this.#world.executeNavigation(
-            reference.planId,
+            executionPlanId,
             this.#frameSink,
             options
           );
@@ -1741,10 +1808,32 @@ export class HumanoidActionRuntime {
             : executionPlanId,
           initialExecution: initialResult,
           skillEventStream: articulationHorizon!,
-          initialCommittedFrames: skillFrameOffset,
+          initialCommittedFrames: completedPlanFrameCount,
           initialCompletedSegments: completedPlanCount,
           ...(this.#frameSink ? { frameSink: this.#frameSink } : {}),
           executionOptions: options
+        });
+      }
+      if (planKind === "navigation" && result.accepted
+        && isHumanoidNavigationSkill(skill)) {
+        const horizonGoal = this.#activeGoal?.();
+        const initialNavigationPlan = resumeBetweenNavigationSegments
+          || navigationSegmentBudgetExhausted
+          ? null
+          : navigationPlanForHorizon(this.#world, executionPlanId);
+        result = await executeHumanoidNavigationHorizon({
+          world: this.#world,
+          binding: skill,
+          initialPlan: initialNavigationPlan,
+          initialExecution: initialResult,
+          initialRootPosition,
+          skillEventStream: navigationHorizon!,
+          initialCommittedFrames: completedPlanFrameCount,
+          initialCompletedSegments: completedPlanCount,
+          ...(this.#frameSink ? { frameSink: this.#frameSink } : {}),
+          executionOptions: options,
+          ...(horizonGoal ? { activeGoal: horizonGoal } : {}),
+          ...(skill.recovery_authorized ? { recoveryAuthorized: true } : {})
         });
       }
       if (!this.#retainPhysicalTerminals) this.#planChannels.delete(reference.planId);
@@ -2475,9 +2564,538 @@ function sameBindings(
   return JSON.stringify(identity(left)) === JSON.stringify(identity(right));
 }
 
+function skillPlanPhysicalAnchor(
+  observation: HumanoidWorldObservation,
+  objectIds: readonly string[]
+): NonNullable<RegisteredHumanoidSkillPlan["physical_anchor"]> {
+  const objects = new Map(
+    observation.interaction.object_world_model.objects.map((object) => [object.id, object])
+  );
+  return {
+    root_position: { ...observation.robot.rootPosition },
+    root_rotation: { ...observation.robot.rootRotation },
+    carried_object_ids: [...new Set(
+      observation.interaction.carrying.bindings.map(({ object_id }) => object_id)
+    )].sort(),
+    carried_bindings: observation.interaction.carrying.bindings
+      .map(({ object_id: objectId, hand }) => ({ object_id: objectId, hand }))
+      .sort((left, right) => (
+        `${left.object_id}\0${left.hand}`.localeCompare(
+          `${right.object_id}\0${right.hand}`
+        )
+      )),
+    object_poses: [...new Set(objectIds)].sort().flatMap((objectId) => {
+      const object = objects.get(objectId);
+      return object?.status === "visible" ? [{
+        object_id: objectId,
+        position: { ...object.pose.position },
+        rotation: { ...object.pose.rotation },
+        articulation: object.articulation
+          ? {
+              joint_id: object.articulation.joint_id,
+              position: object.articulation.position
+            }
+          : null
+      }] : [];
+    })
+  };
+}
+
+function skillPlanObjectIds(plan: RegisteredHumanoidSkillPlan): string[] {
+  return skillPlanProposalObjectIds(plan.proposal);
+}
+
+function skillPlanProposalObjectIds(
+  proposal: RegisteredHumanoidSkillPlan["proposal"]
+): string[] {
+  const strategy = proposal.strategies.find(
+    ({ strategy_id }) => strategy_id === proposal.selected_strategy_id
+  );
+  return [...new Set(strategy?.nodes.flatMap(({ invocation }) => {
+    const objectIds = "object_id" in invocation ? [invocation.object_id] : [];
+    if (invocation.skill !== "place"
+      || invocation.destination.type === "semantic_zone"
+      || invocation.destination.type === "world_pose") return objectIds;
+    return [...objectIds, invocation.destination.object_id];
+  }) ?? [])].sort();
+}
+
+function skillPlanAnchorCompatible(
+  plan: RegisteredHumanoidSkillPlan,
+  current: HumanoidWorldObservation
+): boolean {
+  const anchor = plan.physical_anchor;
+  if (!anchor) return false;
+  const currentCarriedObjectIds = [...new Set(
+    current.interaction.carrying.bindings.map(({ object_id }) => object_id)
+  )].sort();
+  const currentObjects = new Map(
+    current.interaction.object_world_model.objects.map((object) => [object.id, object])
+  );
+  const mutationDomain = skillPlanMutationDomain(plan);
+  const currentBindingKeys = current.interaction.carrying.bindings
+    .map(({ object_id: objectId, hand }) => `${objectId}\0${hand}`)
+    .sort();
+  const anchorBindingKeys = anchor.carried_bindings
+    ?.map(({ object_id: objectId, hand }) => `${objectId}\0${hand}`)
+    .sort();
+  const rootCompatible = mutationDomain.rootPose
+    || (pointDistance(anchor.root_position, current.robot.rootPosition)
+        <= MANIPULATION_BASE_TARGET_TOLERANCE_METERS
+      && quaternionDistance(anchor.root_rotation, current.robot.rootRotation)
+        <= SKILL_AUTHORITY_ORIENTATION_DRIFT_RADIANS);
+  const carryingCompatible = anchorBindingKeys
+    ? JSON.stringify(anchorBindingKeys) === JSON.stringify(currentBindingKeys)
+    : JSON.stringify(anchor.carried_object_ids)
+      === JSON.stringify(currentCarriedObjectIds);
+  return rootCompatible
+    && carryingCompatible
+    && anchor.object_poses.every((before) => {
+      const after = currentObjects.get(before.object_id);
+      if (after?.status !== "visible") return false;
+      const poseCompatible = mutationDomain.objectPoseIds.has(before.object_id)
+        || (pointDistance(before.position, after.pose.position)
+            <= SKILL_AUTHORITY_OBJECT_DRIFT_METERS
+          && quaternionDistance(before.rotation, after.pose.rotation)
+            <= SKILL_AUTHORITY_ORIENTATION_DRIFT_RADIANS);
+      const articulationCompatible = before.articulation === undefined
+        || (before.articulation === null && after.articulation === null)
+        || (before.articulation !== null
+          && after.articulation !== null
+          && before.articulation.joint_id === after.articulation.joint_id
+          && nullableDistance(
+            before.articulation.position,
+            after.articulation.position
+          ) <= SKILL_AUTHORITY_OBJECT_DRIFT_METERS);
+      return poseCompatible && articulationCompatible;
+    });
+}
+
+/**
+ * A Skill DAG is durable semantic state.  Only the phase already in physical
+ * progress may relax its anchor, and only for entities that phase is allowed
+ * to mutate.  This prevents ordinary navigation/station-keeping motion from
+ * invalidating the DAG without making manipulation anchors permissive.
+ */
+function skillPlanMutationDomain(plan: RegisteredHumanoidSkillPlan): {
+  rootPose: boolean;
+  objectPoseIds: ReadonlySet<string>;
+} {
+  const active = plan.in_progress_phase;
+  if (!active) return { rootPose: false, objectPoseIds: new Set() };
+  const strategy = plan.proposal.strategies.find(
+    ({ strategy_id: strategyId }) => strategyId === plan.selected_strategy_id
+  );
+  const node = strategy?.nodes.find(
+    ({ node_id: nodeId }) => nodeId === active.node_id
+  );
+  if (!node) return { rootPose: false, objectPoseIds: new Set() };
+  const process = HUMANOID_SKILL_CONTRACTS[node.invocation.skill].process.find(
+    ({ phase }) => phase === active.phase
+  );
+  if (process?.authority !== "navigation") {
+    return { rootPose: false, objectPoseIds: new Set() };
+  }
+  const carriedObjectId = node.invocation.skill === "carry"
+      || node.invocation.skill === "carry_to_zone"
+      || node.invocation.skill === "bimanual_carry"
+    ? node.invocation.object_id
+    : undefined;
+  return {
+    rootPose: true,
+    objectPoseIds: new Set(carriedObjectId ? [carriedObjectId] : [])
+  };
+}
+
+function humanoidSkillPhasePostconditionSatisfied(input: {
+  binding: ActiveHumanoidSkillBinding;
+  observation: HumanoidWorldObservation;
+  planningReceipt: HumanoidActionReceipt | undefined;
+  executionReceipt: HumanoidActionReceipt;
+}): boolean {
+  const { binding, observation } = input;
+  const invocation = binding.invocation;
+  if (binding.phase_authority !== "navigation") return true;
+
+  if (invocation.skill === "navigate_to_zone") {
+    const zone = observation.interaction.zones.find(
+      ({ zone_id: zoneId }) => zoneId === invocation.zone_id
+    );
+    return zone?.robot_inside_horizontal === true;
+  }
+
+  if (invocation.skill === "carry_to_zone") {
+    const carried = observation.interaction.carrying.bindings.some(
+      ({ object_id: objectId }) => objectId === invocation.object_id
+    );
+    const relation = observation.interaction.manipulable_objects
+      .find(({ object_id: objectId }) => objectId === invocation.object_id)
+      ?.zone_relations.find(({ zone_id: zoneId }) => zoneId === invocation.zone_id);
+    return carried && relation !== undefined
+      && relation.minimum_horizontal_clearance_m + invocation.tolerance_m >= 0
+      && Math.abs(relation.support_height_error_m)
+        <= Math.max(invocation.tolerance_m, 0.025);
+  }
+
+  const executionDetail = jsonObject(input.executionReceipt.detail);
+  const executionResult = executionDetail?.result === undefined
+    ? undefined
+    : jsonObject(executionDetail.result);
+  const navigationHorizon = executionResult?.navigation_horizon === undefined
+    ? undefined
+    : jsonObject(executionResult.navigation_horizon);
+  if (navigationHorizon?.completed === true) return true;
+
+  const remainingDistance = input.planningReceipt
+    ? jsonObject(input.planningReceipt.detail)?.remaining_distance
+    : undefined;
+  return typeof remainingDistance !== "number"
+    || !Number.isFinite(remainingDistance)
+    || remainingDistance <= 1e-9;
+}
+
 function planIdFromReceipt(receipt: HumanoidActionReceipt): string | undefined {
   const planId = jsonObject(receipt.detail)?.plan_id;
   return typeof planId === "string" && planId ? planId : undefined;
+}
+
+/**
+ * Model-facing projection for Motion. The full observation remains in the
+ * deterministic runtime and is still used by every planner, admission check,
+ * and physical execution guard. This projection only carries the semantic and
+ * geometric facts needed to choose the next Skill transaction.
+ */
+function motionPlanningObservation(
+  snapshot: HumanoidWorldObservation,
+  activeGoal: Goal | undefined
+): unknown {
+  const robot = snapshot.robot;
+  const rootYaw = yawFromQuaternion(robot.rootRotation);
+  const controllerExecution = robot.controllerExecution ?? {
+    protocol: "humanoid-controller-execution-v1" as const,
+    mode: robot.controller.learnedPolicy
+      ? "learned_policy" as const
+      : "reference_control" as const,
+    activeImplementation: robot.controller.implementation,
+    transition: null
+  };
+  const relevant = groundingGoalEntities(activeGoal);
+  for (const binding of snapshot.interaction.carrying.bindings) {
+    relevant.objectIds.add(binding.object_id);
+  }
+  const tokenById = new Map(snapshot.objectTokens.map((token) => [token.id, token]));
+  const objects = [...(snapshot.interaction.object_world_model?.objects ?? [])]
+    .sort((left, right) => compareGroundingObjects(
+      left.id,
+      right.id,
+      relevant.objectIds,
+      tokenById
+    ))
+    .slice(0, MOTION_GROUNDING_OBJECT_LIMIT)
+    .map((object) => ({
+      id: object.id,
+      kind: object.kind,
+      role: object.role,
+      status: object.status,
+      authority: object.authority,
+      pose: object.pose,
+      size: object.size,
+      shape: object.shape,
+      physical: {
+        mass_kg: object.physical.mass_kg,
+        friction: object.physical.friction,
+        mobility: object.physical.mobility
+      },
+      belief: {
+        observation_age_frames: object.belief.observation_age_frames,
+        pose_confidence: object.belief.pose_confidence
+      },
+      affordances: object.affordances,
+      interaction_points: object.interaction_points
+        .slice(0, MOTION_GROUNDING_INTERACTION_POINT_LIMIT),
+      container: object.container ?? null,
+      support_surface: object.support_surface ?? null,
+      articulation: object.articulation,
+      relations: object.relations,
+      current_contact_count: object.current_contact_count
+    }));
+  const projectedObjectIds = new Set(objects.map(({ id }) => id));
+  const objectTokens = [...snapshot.objectTokens]
+    .sort((left, right) => compareGroundingObjects(
+      left.id,
+      right.id,
+      relevant.objectIds,
+      tokenById
+    ))
+    .filter((token) => projectedObjectIds.has(token.id))
+    .map((token) => ({
+      id: token.id,
+      role: token.role,
+      kind: token.kind,
+      portable: token.portable,
+      status: token.status,
+      state: token.state,
+      authority: token.authority,
+      observable: token.observable,
+      pose: token.pose,
+      velocity: {
+        linear: token.linearVelocity,
+        angular: token.angularVelocity
+      },
+      observation: {
+        frame: token.observedFrame,
+        world_revision: token.observedWorldRevision,
+        age_revisions: token.ageRevisions
+      },
+      relation: {
+        distance_to_robot_m: token.relation.distanceToRobot,
+        bearing_radians: token.relation.bearingRadians,
+        vertical_offset_m: token.relation.verticalOffset,
+        distance_to_left_wrist_m: token.relation.distanceToLeftWrist,
+        distance_to_right_wrist_m: token.relation.distanceToRightWrist
+      },
+      contacts: token.currentContacts
+    }));
+  const exposeHandGeometry = requiresHandSurfaceGeometry(snapshot);
+  const geometryObjects = exposeHandGeometry
+    ? objects.filter((object) => (
+        object.status === "visible"
+          && (object.role === "manipulable" || object.articulation !== null)
+      )).map((object) => ({
+        object_id: object.id,
+        object_center_world: object.pose.position,
+        object_size: object.size,
+        reachable_base_placements: snapshot.manipulationBasePlacements
+          .filter((entry) => entry.objectId === object.id)
+          .sort((left, right) => left.ikResidualMeters - right.ikResidualMeters)
+          .slice(0, MOTION_GROUNDING_BASE_PLACEMENT_LIMIT)
+          .map((entry) => ({
+            interaction_point_id: entry.interactionPointId ?? null,
+            hand_surface: entry.handSurface,
+            root_world_target: entry.rootWorldTarget,
+            root_yaw_radians: entry.rootYawRadians,
+            wrist_world_target: entry.wristWorldTarget,
+            ik_residual_m: entry.ikResidualMeters,
+            navigation_validation_required: true
+          })),
+        hands: Object.fromEntries(([
+          "left",
+          "right"
+        ] as const).map((hand) => {
+          const wrist = robot.links[
+            hand === "left" ? "left_wrist_yaw_link" : "right_wrist_yaw_link"
+          ];
+          return [hand, {
+            current_wrist_world: wrist.position,
+            interaction_alignments: modelInteractionAlignments(
+              snapshot,
+              object.id,
+              hand,
+              wrist.position
+            ).slice(0, MOTION_GROUNDING_INTERACTION_POINT_LIMIT)
+          }];
+        }))
+      }))
+    : [];
+  const skillCatalog = snapshot.interaction.skill_catalog;
+  const currentWaypoint = snapshot.navigation.waypointIndex === null
+    ? null
+    : snapshot.navigation.waypoints[snapshot.navigation.waypointIndex] ?? null;
+  return {
+    protocol: "humanoid-motion-grounding-v1",
+    frame: snapshot.frame,
+    world_revision: snapshot.worldRevision,
+    control_authority: {
+      physics_backend: "mujoco",
+      learned_policy: robot.controller.learnedPolicy
+        ? {
+            runtime: robot.controller.learnedPolicy.runtime,
+            capabilities: robot.controller.learnedPolicy.capabilities,
+            observation_space: robot.controller.learnedPolicy.observationSpace,
+            action_space: robot.controller.learnedPolicy.actionSpace
+          }
+        : null,
+      reference_control: robot.controller.capabilityRouting
+        ? {
+            strategy: robot.controller.capabilityRouting.strategy,
+            implementation: robot.controller.capabilityRouting.fallback.implementation
+          }
+        : null,
+      active_control: {
+        mode: controllerExecution.mode,
+        implementation: controllerExecution.activeImplementation,
+        transition: controllerExecution.transition
+          ? {
+              from_implementation: controllerExecution.transition.fromImplementation,
+              to_implementation: controllerExecution.transition.toImplementation,
+              progress: controllerExecution.transition.progress
+            }
+          : null
+      },
+      motion_generator: snapshot.motionGenerator
+    },
+    sensor: {
+      position: snapshot.sensor.position,
+      maximum_range_m: snapshot.sensor.maximumRange,
+      horizontal_field_of_view_radians: snapshot.sensor.horizontalFieldOfView,
+      vertical_field_of_view_radians: snapshot.sensor.verticalFieldOfView
+    },
+    robot: {
+      root: {
+        position: robot.rootPosition,
+        rotation: robot.rootRotation,
+        heading: {
+          yaw_radians: rootYaw,
+          forward_world: { x: Math.sin(rootYaw), y: 0, z: Math.cos(rootYaw) }
+        }
+      },
+      fallen: robot.fallen,
+      balance: robot.balance,
+      feet: robot.feet,
+      end_effectors: Object.fromEntries(HUMANOID_END_EFFECTORS.map((endEffector) => [
+        endEffector,
+        {
+          world_position: humanoidEndEffectorPosition(robot, endEffector, "world"),
+          pelvis_relative_position: humanoidEndEffectorPosition(
+            robot,
+            endEffector,
+            "pelvis"
+          )
+        }
+      ])),
+      non_foot_environment_contacts: robot.nonFootEnvironmentContacts,
+      relevant_contacts: modelRelevantContacts(robot)
+    },
+    navigation: {
+      plan_id: snapshot.navigation.planId,
+      status: snapshot.navigation.status,
+      target: snapshot.navigation.target,
+      waypoint_index: snapshot.navigation.waypointIndex,
+      waypoint_count: snapshot.navigation.waypoints.length,
+      current_waypoint: currentWaypoint
+    },
+    spatial_belief: {
+      ...snapshot.spatialBelief,
+      frontiers: snapshot.spatialBelief.frontiers
+        .slice(0, MOTION_GROUNDING_FRONTIER_LIMIT)
+    },
+    zones: [...snapshot.interaction.zones]
+      .sort((left, right) => (
+        Number(relevant.zoneIds.has(right.zone_id))
+          - Number(relevant.zoneIds.has(left.zone_id))
+          || left.robot_planar_distance_m - right.robot_planar_distance_m
+          || left.zone_id.localeCompare(right.zone_id)
+      )),
+    objects: {
+      world_model: objects,
+      tokens: objectTokens
+    },
+    solids: [...snapshot.solidTokens]
+      .sort((left, right) => (
+        Number(relevant.solidIds.has(right.id))
+          - Number(relevant.solidIds.has(left.id))
+          || planarDistance(left.center, robot.rootPosition)
+            - planarDistance(right.center, robot.rootPosition)
+          || left.id.localeCompare(right.id)
+      ))
+      .slice(0, MOTION_GROUNDING_SOLID_LIMIT)
+      .map((solid) => ({
+        id: solid.id,
+        source_id: solid.sourceId,
+        kind: solid.kind,
+        center: solid.center,
+        size: solid.size,
+        contact_count: solid.currentContacts.length
+      })),
+    carrying: snapshot.interaction.carrying,
+    grasp: {
+      contract_sha256: snapshot.grasp.contractSha256,
+      assessments: snapshot.grasp.assessments
+        .filter((assessment) => projectedObjectIds.has(assessment.object_id))
+        .map((assessment) => ({
+          object_id: assessment.object_id,
+          hand: assessment.hand,
+          phase: assessment.phase,
+          verified: assessment.grasp_verified,
+          reason: assessment.reason,
+          contact: {
+            status: assessment.evidence.contact.status,
+            observed_contact_count:
+              assessment.evidence.contact.observed_contact_count,
+            force_qualified_contact_count:
+              assessment.evidence.contact.force_qualified_contact_count,
+            distinct_force_qualified_links:
+              assessment.evidence.contact.distinct_force_qualified_links
+          },
+          support: assessment.evidence.support,
+          relative_pose: assessment.evidence.relative_pose,
+          lifted_hold_frames: assessment.evidence.lifted_hold_frames
+        }))
+    },
+    manipulation_geometry: geometryObjects.length > 0
+      ? { objects: geometryObjects }
+      : null,
+    skill_authority: {
+      protocol: skillCatalog.protocol,
+      contract_sha256: skillCatalog.contract_sha256,
+      world_frame: skillCatalog.world_frame,
+      world_revision: skillCatalog.world_revision,
+      skills: skillCatalog.entries.map((entry) => ({
+        id: entry.id,
+        parameters: entry.parameters,
+        required_affordances: entry.required_affordances,
+        available: entry.available,
+        unavailable_reasons: entry.unavailable_reasons,
+        observable_target_ids: entry.observable_target_ids,
+        observable_solid_ids: entry.observable_solid_ids,
+        observable_zone_ids: entry.observable_zone_ids,
+        remembered_target_ids: entry.remembered_target_ids,
+        destination_ids: entry.destination_ids,
+        learned_policy_ready: entry.learned_policy_ready,
+        learned_policy_required_capabilities:
+          entry.learned_policy_required_capabilities,
+        learned_policy_missing_capabilities:
+          entry.learned_policy_missing_capabilities
+      }))
+    }
+  };
+}
+
+function groundingGoalEntities(goal: Goal | undefined): {
+  objectIds: Set<string>;
+  solidIds: Set<string>;
+  zoneIds: Set<string>;
+} {
+  const objectIds = new Set<string>();
+  const solidIds = new Set<string>();
+  const zoneIds = new Set<string>();
+  for (const predicate of goal?.predicates ?? []) {
+    if ("object_id" in predicate) objectIds.add(predicate.object_id);
+    if (predicate.type === "object_inside") objectIds.add(predicate.container_id);
+    if (predicate.type === "object_on") objectIds.add(predicate.support_id);
+    if (predicate.type === "block_removed") solidIds.add(predicate.block_id);
+    if (predicate.type === "robot_in_zone"
+      || predicate.type === "object_in_zone"
+      || predicate.type === "object_placed") {
+      zoneIds.add(predicate.zone_id);
+    }
+  }
+  return { objectIds, solidIds, zoneIds };
+}
+
+function compareGroundingObjects(
+  leftId: string,
+  rightId: string,
+  relevantIds: ReadonlySet<string>,
+  tokens: ReadonlyMap<string, HumanoidWorldObservation["objectTokens"][number]>
+): number {
+  const left = tokens.get(leftId);
+  const right = tokens.get(rightId);
+  return Number(relevantIds.has(rightId)) - Number(relevantIds.has(leftId))
+    || Number(right?.status === "visible") - Number(left?.status === "visible")
+    || (left?.relation.distanceToRobot ?? Number.POSITIVE_INFINITY)
+      - (right?.relation.distanceToRobot ?? Number.POSITIVE_INFINITY)
+    || leftId.localeCompare(rightId);
 }
 
 function modelObservation(snapshot: HumanoidWorldObservation): unknown {
@@ -2502,6 +3120,9 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
       assessment.evidence.contact.status === "missing"
         ? []
         : [assessment.object_id]
+    )),
+    ...snapshot.interaction.carrying.bindings.map(({ object_id: objectId }) => (
+      objectId
     ))
   ]);
   const contactReferenceObjects = (snapshot.interaction.object_world_model?.objects ?? [])
@@ -3119,6 +3740,25 @@ function jsonValue(value: unknown): JsonValue {
   const serialized = JSON.stringify(value);
   if (serialized === undefined) throw new Error("Humanoid action detail is not serializable");
   return JSON.parse(serialized) as JsonValue;
+}
+
+function persistedGroundingObservation(
+  value: JsonValue,
+  currentWorldRevision: number,
+  latestPhysicalExecutionRevision: number
+): HumanoidWorldObservation | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const frame = value.frame;
+  const worldRevision = value.worldRevision;
+  if (typeof frame !== "number"
+    || !Number.isSafeInteger(frame)
+    || typeof worldRevision !== "number"
+    || !Number.isSafeInteger(worldRevision)
+    || worldRevision > currentWorldRevision
+    || worldRevision < latestPhysicalExecutionRevision) {
+    return null;
+  }
+  return structuredClone(value) as unknown as HumanoidWorldObservation;
 }
 
 function jsonObject(value: JsonValue): Record<string, JsonValue> | undefined {

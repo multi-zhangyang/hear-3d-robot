@@ -270,7 +270,7 @@ export async function executeHumanoidArticulationHorizon(input: {
 async function finishHorizon(
   input: Pick<
     Parameters<typeof executeHumanoidArticulationHorizon>[0],
-    "world" | "binding" | "skillEventStream"
+    "world" | "binding" | "skillEventStream" | "executionOptions"
   >,
   result: HumanoidArticulationHorizonResult,
   goal: HumanoidArticulationGoal | null,
@@ -288,6 +288,9 @@ async function finishHorizon(
     outcome: status.state === "succeeded" ? "succeeded" : "failed",
     terminalReason: result.code
   });
+  await input.executionOptions?.persistenceSink?.(
+    await input.world.capturePersistenceState()
+  );
   await input.skillEventStream.terminal(
     status.state === "succeeded" ? "succeeded" : "failed",
     status

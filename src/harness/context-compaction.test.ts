@@ -79,7 +79,7 @@ describe("LongRunContextManager hierarchy identity", () => {
     expect(filtered.instructions).toContain(agentInvocationMarker("humanoid-motion-reference"));
   });
 
-  it("surfaces revision-bound Goal identifiers in the final authority envelope", async () => {
+  it("does not inject runtime authority into every model request", async () => {
     let memory = structuredClone(EmptyContextMemoryState);
     const node = taskNode("humanoid-goal-manager", "目标管理");
     const evidenceRef = `goal-world:41:41:${"a".repeat(64)}`;
@@ -133,33 +133,12 @@ describe("LongRunContextManager hierarchy identity", () => {
       agent: { name: node.name, tools: [] }
     } as never);
 
-    const authorityItem = filtered.input.at(-1);
-    expect(authorityItem).toMatchObject({
-      type: "message",
-      role: "user"
-    });
-    const authorityText = authorityItem && "content" in authorityItem
-      && typeof authorityItem.content === "string"
-      ? authorityItem.content
-      : "";
-    expect(authorityText).toContain(
-      "CURRENT EXACT IDENTIFIERS (copy values character-for-character; never invent aliases)"
-    );
-    expect(authorityText).toContain(`goal_evidence_ref=${JSON.stringify(evidenceRef)}`);
-    expect(authorityText).toContain(
-      `existing_goal_candidate_ids=${JSON.stringify([candidateId])}`
-    );
-    expect(authorityText).toContain("current_world_revision=41");
-    expect(authorityText).toContain(
-      'pending_planning_transaction_id="planning-call-41"'
-    );
-    expect(authorityText).toContain(
-      'required_executor_action="execute_humanoid_navigation"'
-    );
-    expect(authorityText).toMatch(
-      /END CURRENT HARNESS AUTHORITY\nFollow the stable Agent instructions now\. Return the required formal function call; prose is not a tool decision\.$/
-    );
-    expect(filtered.instructions).not.toContain("current_world_revision=41");
+    expect(filtered.input).toEqual([
+      { role: "user", content: "Choose the next Goal." }
+    ]);
+    expect(JSON.stringify(filtered)).not.toContain(evidenceRef);
+    expect(JSON.stringify(filtered)).not.toContain(candidateId);
+    expect(JSON.stringify(filtered)).not.toContain("planning-call-41");
   });
 
   it("keeps the semantic prefix stable with only the current authority suffix", async () => {
@@ -221,15 +200,11 @@ describe("LongRunContextManager hierarchy identity", () => {
 
     expect(second.instructions).toBe(first.instructions);
     expect(second.instructions).not.toContain("world_revision");
-    expect(second.input.slice(0, -1)).toEqual([
+    expect(second.input).toEqual([
       ...modelData.input,
       { role: "assistant", content: "Previous decision." }
     ]);
-    expect(second.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
-    const current = second.input.at(-1);
-    expect(current && "content" in current ? current.content : "")
-      .toContain("current_world_revision=2");
-    expect(JSON.stringify(second.input)).not.toContain("current_world_revision=1");
+    expect(second.input.filter(isHarnessAuthorityItem)).toHaveLength(0);
     expect(manager.snapshot.scopes[node.id]).toMatchObject({
       raw_item_count: 2,
       retained_item_count: 2
@@ -251,15 +226,13 @@ describe("LongRunContextManager hierarchy identity", () => {
       agent: { name: node.name, tools: [] }
     } as never);
 
-    expect(third.input.slice(0, -1)).toEqual([
+    expect(third.input).toEqual([
       ...modelData.input,
       { role: "assistant", content: "Previous decision." },
       terminal,
       nextDelegation
     ]);
-    expect(third.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
-    expect(JSON.stringify(third.input)).not.toContain("current_world_revision=1");
-    expect(JSON.stringify(third.input.at(-1))).toContain("current_world_revision=3");
+    expect(third.input.filter(isHarnessAuthorityItem)).toHaveLength(0);
   });
 
   it("removes incomplete function-tool fragments before an OpenAI-compatible request", async () => {
@@ -336,7 +309,7 @@ describe("LongRunContextManager hierarchy identity", () => {
       agent: { name: node.name, tools: [] }
     } as never);
 
-    expect(filtered.input.slice(0, -1)).toEqual([
+    expect(filtered.input).toEqual([
       input[0],
       input[1],
       input[2],
@@ -498,7 +471,6 @@ describe("LongRunContextManager hierarchy identity", () => {
     } as AgentInputItem;
     let persisted = [
       ...structuredClone(physical),
-      structuredClone(filtered.input.at(-1)!),
       completion
     ];
     let replacements = 0;
@@ -515,12 +487,12 @@ describe("LongRunContextManager hierarchy identity", () => {
       summary_origin: "model",
       summary_world_revision: 0
     });
-    await manager.compactSessionHistories(() => session as never);
+    await manager.commitPendingSessionRewrites(() => session as never);
 
     expect(replacements).toBe(1);
-    expect(isHarnessAuthorityItem(filtered.input.at(-1))).toBe(true);
+    expect(filtered.input.filter(isHarnessAuthorityItem)).toHaveLength(0);
     expect(persisted).toEqual([
-      ...filtered.input.filter((item) => !isHarnessAuthorityItem(item)),
+      ...filtered.input,
       completion
     ]);
     const next = await manager.filter({
@@ -529,7 +501,7 @@ describe("LongRunContextManager hierarchy identity", () => {
     });
     expect(next.instructions).toBe(filtered.instructions);
     expect(next.input.slice(0, persisted.length)).toEqual(persisted);
-    expect(next.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
+    expect(next.input.filter(isHarnessAuthorityItem)).toHaveLength(0);
     expect(manager.snapshot.scopes[node.id]).toMatchObject({
       compaction_count: 1,
       summary_origin: "model",
@@ -609,7 +581,7 @@ describe("LongRunContextManager hierarchy identity", () => {
 
     expect(compactorCalls).toBe(1);
     expect(JSON.stringify(retried.input)).not.toContain("x".repeat(3_000));
-    expect(JSON.stringify(retried.input)).toContain("world_revision\\\":4");
+    expect(JSON.stringify(retried.input)).not.toContain("world_revision");
     expect(manager.snapshot.scopes[node.id]).toMatchObject({
       compaction_count: 1,
       summary_origin: "model",
@@ -712,7 +684,7 @@ describe("LongRunContextManager hierarchy identity", () => {
     expect(JSON.stringify(filtered.input)).not.toContain("old-prefix:");
     expect(JSON.stringify(filtered.input)).not.toContain("abandoned-response-suffix");
     expect(JSON.stringify(filtered.input)).toContain("当前规划轮");
-    expect(filtered.input.filter(isHarnessAuthorityItem)).toHaveLength(1);
+    expect(filtered.input.filter(isHarnessAuthorityItem)).toHaveLength(0);
     expect(recovered.snapshot.scopes[node.id]).toMatchObject({
       compaction_count: 1,
       summary_origin: "model",

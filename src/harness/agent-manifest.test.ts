@@ -89,7 +89,7 @@ describe("agent manifest", () => {
       "@openai/agents": "test-sdk",
       "@openai/agents-extensions": "test-bridge"
     });
-    expect(manifest.harness_contract_version).toBe(16);
+    expect(manifest.harness_contract_version).toBe(21);
     expect(manifest.agents.sentry).toMatchObject({
       execution_kind: "deterministic_service",
       agent_id: "humanoid-sentry",

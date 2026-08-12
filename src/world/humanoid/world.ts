@@ -415,10 +415,27 @@ export class HumanoidWorld {
   }
 
   observe(): HumanoidWorldObservation {
+    return this.#observation(false);
+  }
+
+  captureObservation(): Promise<HumanoidWorldObservation> {
+    return this.#authority.capture(() => this.#observation(true));
+  }
+
+  #observation(commit: boolean): HumanoidWorldObservation {
     const snapshot = this.snapshot();
-    const sensed = this.#refreshCurrentObjectMemory();
+    const sensed = this.#simulation.senseObjects(this.#scenario.visibility_radius);
     const sensedSolids = this.#simulation.senseSolids(this.#scenario.visibility_radius);
-    const objectTokens = this.#objectMemory.tokens(
+    const objectMemory = commit
+      ? this.#objectMemory
+      : new HumanoidObjectMemory(this.#scenario, this.#objectMemory.checkpoint());
+    objectMemory.refresh(
+      snapshot.frame,
+      snapshot.worldRevision,
+      snapshot.robot.objects,
+      new Set(Object.keys(sensed.objects))
+    );
+    const objectTokens = objectMemory.tokens(
       snapshot.robot,
       snapshot.frame,
       snapshot.worldRevision
@@ -434,7 +451,13 @@ export class HumanoidWorld {
         ({ object_id }) => object_id
       ) ?? []
     );
-    this.#spatialBelief.observe({
+    const spatialBelief = commit
+      ? this.#spatialBelief
+      : new HumanoidSpatialBeliefMap(
+          this.#scenario,
+          this.#spatialBelief.checkpoint()
+        );
+    spatialBelief.observe({
       frame: snapshot.frame,
       rootPosition: snapshot.robot.rootPosition,
       sensor: sensed.sensor,
@@ -467,7 +490,7 @@ export class HumanoidWorld {
       manipulationBasePlacements: [],
       objectTokens,
       solidTokens,
-      spatialBelief: this.#spatialBelief.observation(snapshot.robot.rootPosition),
+      spatialBelief: spatialBelief.observation(snapshot.robot.rootPosition),
       grasp: structuredClone(snapshot.grasp),
       interaction: createHumanoidInteractionObservation({
         frame: snapshot.frame,
@@ -485,7 +508,7 @@ export class HumanoidWorld {
   }
 
   async observeManipulationReachability(): Promise<HumanoidWorldObservation> {
-    const observation = this.observe();
+    const observation = await this.captureObservation();
     const cached = this.#manipulationReachabilityCache;
     if (cached?.worldRevision === observation.worldRevision) {
       observation.manipulationReachability = structuredClone(
@@ -734,6 +757,19 @@ export class HumanoidWorld {
       throw new Error(`Multiple motion plans are active for Skill Call ${callId}`);
     }
     return candidates[0]?.plan.id;
+  }
+
+  pendingNavigationPlanIdForSkillCall(callId: string): string | undefined {
+    const candidates = [...this.#routes.values()].filter((stored) => (
+      stored.terminal === null
+      && stored.skillCallIdentity?.callId === callId
+      && (stored.validatedRevision + stored.progress.committed_frame_count)
+        === this.#worldRevision
+    ));
+    if (candidates.length > 1) {
+      throw new Error(`Multiple navigation plans are active for Skill Call ${callId}`);
+    }
+    return candidates[0]?.id;
   }
 
   async planWholeBodyMotion(
@@ -1825,6 +1861,7 @@ export class HumanoidWorld {
             }),
         plan,
         requestedTarget: { ...target },
+        remainingDistance: validation.remainingDistance,
         requestedArrivalHeading: requestedArrivalHeading
           ? structuredClone(requestedArrivalHeading)
           : null,
@@ -2121,10 +2158,11 @@ export class HumanoidWorld {
               && stored.skillCallIdentity?.runtimeKind === "semantic_skill"
               ? { policyFrameSink: options.policyFrameSink }
               : {}),
-            ...(stored.skillCallIdentity
-              ? { skillIdentity: stored.skillCallIdentity }
-              : {})
-          });
+             ...(stored.skillCallIdentity
+               ? { skillIdentity: stored.skillCallIdentity }
+               : {}),
+             ...(options.skillWindow ? { skillWindow: options.skillWindow } : {})
+           });
           this.#navigationState.status = "executing";
         },
         step: async () => {
@@ -2245,6 +2283,7 @@ export class HumanoidWorld {
               validationRevision = context.worldRevision;
               validationStateSha256 = context.stateSha256;
               stored.plan = structuredClone(replanned.plan);
+              stored.remainingDistance = replanned.remainingDistance;
               stored.arrivalHeading = replanned.arrivalHeading
                 ? structuredClone(replanned.arrivalHeading)
                 : null;
@@ -2292,10 +2331,11 @@ export class HumanoidWorld {
                   && stored.skillCallIdentity?.runtimeKind === "semantic_skill"
                   ? { policyFrameSink: options.policyFrameSink }
                   : {}),
-                ...(stored.skillCallIdentity
-                  ? { skillIdentity: stored.skillCallIdentity }
-                  : {})
-              });
+                 ...(stored.skillCallIdentity
+                   ? { skillIdentity: stored.skillCallIdentity }
+                   : {}),
+                 ...(options.skillWindow ? { skillWindow: options.skillWindow } : {})
+               });
               this.#navigationState = {
                 planId,
                 status: "executing",

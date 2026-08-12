@@ -14,7 +14,7 @@ export interface HumanoidObjectWorldModelEntry {
   kind: string;
   role: "manipulable" | "fixture";
   status: "visible" | "remembered";
-  authority: "sensor_observation" | "sensor_history";
+  authority: "sensor_observation" | "carried_contact" | "sensor_history";
   pose: HumanoidObjectToken["pose"];
   size: Vec3;
   shape: "box" | "sphere" | "cylinder" | "capsule";
@@ -112,9 +112,11 @@ export function createHumanoidObjectWorldModel(input: {
   scenario: Scenario;
   robot: HumanoidSimulationSnapshot;
   objectTokens: readonly HumanoidObjectToken[];
+  contactGroundedObjectIds?: readonly string[];
 }): HumanoidObjectWorldModel {
   const descriptors = new Map(input.scenario.objects.map((object) => [object.id, object]));
   const tokens = new Map(input.objectTokens.map((token) => [token.id, token]));
+  const contactGrounded = new Set(input.contactGroundedObjectIds ?? []);
   const relationSets = new Map<string, {
     containedBy: Set<string>;
     contains: Set<string>;
@@ -162,7 +164,9 @@ export function createHumanoidObjectWorldModel(input: {
       const descriptor = descriptors.get(token.id);
       if (!descriptor) throw new Error(`Object world model is missing descriptor: ${token.id}`);
       const capability = humanoidObjectCapability(descriptor);
-      const snapshot = token.observable ? input.robot.objects[token.id] : undefined;
+      const groundedByContact = contactGrounded.has(token.id);
+      const currentlyObserved = token.observable || groundedByContact;
+      const snapshot = currentlyObserved ? input.robot.objects[token.id] : undefined;
       const relations = relationSets.get(token.id)!;
       const pose = objectTokenPose(token, snapshot ?? {
         position: descriptor.position,
@@ -172,9 +176,11 @@ export function createHumanoidObjectWorldModel(input: {
         id: token.id,
         kind: descriptor.kind,
         role: token.role,
-        status: token.status,
-        authority: token.status === "visible"
-          ? "sensor_observation" : "sensor_history",
+        status: currentlyObserved ? "visible" : "remembered",
+        authority: groundedByContact
+          ? "carried_contact"
+          : token.status === "visible"
+            ? "sensor_observation" : "sensor_history",
         pose: structuredClone(pose),
         size: { ...descriptor.size },
         shape: capability.shape,
@@ -187,7 +193,8 @@ export function createHumanoidObjectWorldModel(input: {
           frame: input.frame,
           token,
           size: descriptor.size,
-          mobility: capability.mobility
+          mobility: capability.mobility,
+          currentlyObserved
         }),
         affordances: [...capability.affordances],
         interaction_points: capability.interactionPoints.map((point) => ({
@@ -265,9 +272,10 @@ function objectPhysicalBelief(input: {
   token: HumanoidObjectToken;
   size: Vec3;
   mobility: HumanoidObjectWorldModelEntry["physical"]["mobility"];
+  currentlyObserved: boolean;
 }): HumanoidObjectWorldModelEntry["belief"] {
   const age = Math.max(0, input.frame - input.token.observedFrame);
-  const visible = input.token.status === "visible";
+  const visible = input.currentlyObserved;
   const relativeSizeUncertainty = visible ? 0.04 : Math.min(0.35, 0.12 + age * 0.002);
   const sizeBelief: VectorBelief = {
     estimate: { ...input.size },
