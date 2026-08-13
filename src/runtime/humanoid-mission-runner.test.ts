@@ -21,12 +21,12 @@ import {
 } from "../config/load.js";
 import { ScenarioSchema } from "../domain/schema.js";
 import {
-  createHumanoidAgentManifest
-} from "../harness/agent-manifest.js";
-import {
-  createHumanoidAgentHierarchy,
-  HUMANOID_AGENT_IDS
-} from "../harness/humanoid/agents.js";
+  createHumanoidNeuralAgentHierarchy
+} from "../harness/humanoid/neural-agents.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from
+  "../harness/humanoid/neural-hierarchy-contract.js";
+import { createHumanoidNeuralAgentManifest } from
+  "../harness/neural-agent-manifest.js";
 import { createHumanoidRunCheckpoint } from "../harness/humanoid/run-checkpoint.js";
 import { HumanoidRunRuntime } from "../harness/humanoid/run-runtime.js";
 import { ModelDecisionStallError } from "../harness/model-telemetry.js";
@@ -107,9 +107,9 @@ const catalog: RuntimeCatalog = {
   materialize: () => structuredClone(scenario)
 };
 const HUMANOID_REASONING_AGENT_IDS = [
-  HUMANOID_AGENT_IDS.goalManager,
-  HUMANOID_AGENT_IDS.motion,
-  HUMANOID_AGENT_IDS.coordinator
+  HUMANOID_NEURAL_AGENT_IDS.goalManager,
+  HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+  HUMANOID_NEURAL_AGENT_IDS.executive
 ] as const;
 const temporaryDirectories: string[] = [];
 
@@ -173,33 +173,33 @@ describe("humanoid mission initialization recovery", () => {
 
   it("scopes no-progress receipts to the Agent that produced them", () => {
     const runtime = {
-      rootAgentId: HUMANOID_AGENT_IDS.coordinator,
+      rootAgentId: HUMANOID_NEURAL_AGENT_IDS.executive,
       checkpoint: {
         world: { worldRevision: 42 },
         cycle_index: 3,
         checker: { success: false },
         goal_dag: { state_sha256: "goal-state" },
         committed_actions: {
-          motion: progressReceipt("motion", HUMANOID_AGENT_IDS.motion),
-          sentry: progressReceipt("sentry", HUMANOID_AGENT_IDS.sentry)
+          motion: progressReceipt("motion", HUMANOID_NEURAL_AGENT_IDS.motorIntent),
+          risk: progressReceipt("risk", HUMANOID_NEURAL_AGENT_IDS.risk)
         }
       }
     } as unknown as Parameters<typeof humanoidModelProgressSnapshot>[0];
 
     expect(humanoidModelProgressSnapshot(
       runtime,
-      HUMANOID_AGENT_IDS.motion
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     ).receipts.map((receipt) => receipt.transactionId)).toEqual(["motion"]);
     expect(humanoidModelProgressSnapshot(
       runtime,
-      HUMANOID_AGENT_IDS.goalManager
+      HUMANOID_NEURAL_AGENT_IDS.goalManager
     ).receipts).toEqual([]);
     expect(humanoidModelProgressSnapshot(
       runtime,
-      HUMANOID_AGENT_IDS.coordinator
+      HUMANOID_NEURAL_AGENT_IDS.executive
     ).receipts.map((receipt) => receipt.transactionId)).toEqual([
       "motion",
-      "sentry"
+      "risk"
     ]);
   });
 
@@ -382,13 +382,13 @@ describe("humanoid mission initialization recovery", () => {
       expect(await missionSession(
         store,
         manifest.epoch_id,
-        HUMANOID_AGENT_IDS.coordinator
+        HUMANOID_NEURAL_AGENT_IDS.executive
       ).getItems()).toEqual([{
         role: "user",
-        content: `baseline:${HUMANOID_AGENT_IDS.coordinator}`
+        content: `baseline:${HUMANOID_NEURAL_AGENT_IDS.executive}`
       }]);
       for (const agentId of HUMANOID_REASONING_AGENT_IDS) {
-        if (agentId === HUMANOID_AGENT_IDS.coordinator) continue;
+        if (agentId === HUMANOID_NEURAL_AGENT_IDS.executive) continue;
         expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual([{
           role: "user",
           content: `baseline:${agentId}`
@@ -423,7 +423,7 @@ describe("humanoid mission initialization recovery", () => {
         "real compactor omitted its checkpoint tool",
         { retryable: true }
       ),
-      HUMANOID_AGENT_IDS.motion
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     const inspectionComplete = new Error("compaction recovery lifecycle inspected");
     runnerControl.run.mockImplementation(async () => {
@@ -439,7 +439,7 @@ describe("humanoid mission initialization recovery", () => {
     ));
     expect(recoveries).toEqual(Array.from({ length: 10 }, (_, index) => (
       expect.objectContaining({
-        agent_id: HUMANOID_AGENT_IDS.motion,
+        agent_id: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
         recovery_attempt: index + 1,
         raw_history_preserved: true,
         session_history_preserved: true,
@@ -490,17 +490,17 @@ describe("humanoid mission initialization recovery", () => {
     }
   });
 
-  it("interrupts a prose-only coordinator result without a synthetic follow-up", async () => {
+  it("interrupts a prose-only Executive result without a synthetic follow-up", async () => {
     const store = await createCheckpointedRun();
     const config = provider();
     const manifest = createManifest(config);
     await store.writeAgentManifest(manifest);
-    const coordinatorSession = missionSession(
+    const executiveSession = missionSession(
       store,
       manifest.epoch_id,
-      HUMANOID_AGENT_IDS.coordinator
+      HUMANOID_NEURAL_AGENT_IDS.executive
     );
-    await coordinatorSession.addItems([{ role: "user", content: "durable-prefix" }]);
+    await executiveSession.addItems([{ role: "user", content: "durable-prefix" }]);
     const inputs: unknown[] = [];
     let activeSession: FileSession | undefined;
     runnerControl.run.mockImplementation(async (
@@ -508,7 +508,7 @@ describe("humanoid mission initialization recovery", () => {
       runInput,
       options: { session?: FileSession; maxTurns?: number | null }
     ) => {
-      expect(agent.name).toBe("人形自主协调智能体");
+      expect(agent.name).toBe("Executive Goal Valuation Manager");
       expect(options.maxTurns).toBeNull();
       inputs.push(runInput);
       if (activeSession) expect(options.session).toBe(activeSession);
@@ -527,11 +527,11 @@ describe("humanoid mission initialization recovery", () => {
     });
 
     await expect(resume(store, config)).rejects.toThrow(
-      "Humanoid coordinator did not return a formal tool result"
+      "Humanoid Executive did not return a formal hierarchical result"
     );
 
     expect(runnerControl.run).toHaveBeenCalledTimes(1);
-    expect(String(inputs[0])).toContain("推进人形自主闭环的下一个层级步骤");
+    expect(String(inputs[0])).toContain("推进神经启发式层级 Agent Harness");
     const followUps = (await store.readJournal("provider")).filter((entry) => (
       isRecord(entry) && entry.status === "model_decision_follow_up"
     ));
@@ -539,7 +539,7 @@ describe("humanoid mission initialization recovery", () => {
     expect((await missionSession(
       store,
       manifest.epoch_id,
-      HUMANOID_AGENT_IDS.coordinator
+      HUMANOID_NEURAL_AGENT_IDS.executive
     ).getItems()).map((item) => item.content)).toEqual([
       "durable-prefix",
       "prose-only-response:1"
@@ -558,15 +558,15 @@ describe("humanoid mission initialization recovery", () => {
         finalOutput: undefined,
         async *[Symbol.asyncIterator]() {
           throw new ModelDecisionStallError(
-            HUMANOID_AGENT_IDS.motion,
-            "motion returned no terminal tool receipt"
+            HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+            "Motor Intent returned no terminal planning receipt"
           );
         }
       };
     });
 
     await expect(resume(store, config)).rejects.toThrow(
-      "motion returned no terminal tool receipt"
+      "Motor Intent returned no terminal planning receipt"
     );
     expect(runnerControl.run).toHaveBeenCalledTimes(1);
     const followUps = (await store.readJournal("provider")).filter((entry) => (
@@ -591,7 +591,7 @@ describe("humanoid mission initialization recovery", () => {
       "recoverPendingPhysicalExecution"
     ).mockResolvedValueOnce(undefined).mockResolvedValueOnce({
       transactionId,
-      agentId: HUMANOID_AGENT_IDS.executor,
+      agentId: HUMANOID_NEURAL_AGENT_IDS.executor,
       action: "execute_whole_body_motion",
       input: { planning_transaction_id: "pending-physical-plan" },
       fingerprint: "pending-physical-fingerprint",
@@ -613,7 +613,7 @@ describe("humanoid mission initialization recovery", () => {
           finalOutput: undefined,
           async *[Symbol.asyncIterator]() {
             throw new ModelDecisionStallError(
-              HUMANOID_AGENT_IDS.executor,
+              HUMANOID_NEURAL_AGENT_IDS.executor,
               "executor tool branch ended before its terminal receipt"
             );
           }
@@ -631,7 +631,7 @@ describe("humanoid mission initialization recovery", () => {
       expect(providerJournal).toContainEqual(expect.objectContaining({
         status: "physical_execution_recovered_before_model_follow_up",
         transaction_id: transactionId,
-        agent_id: HUMANOID_AGENT_IDS.executor,
+        agent_id: HUMANOID_NEURAL_AGENT_IDS.executor,
         accepted: true,
         code: "motion_completed",
         automatic_actuation: false
@@ -663,7 +663,7 @@ describe("humanoid mission initialization recovery", () => {
     ) => {
       await options.session.addItems([{
         role: "user",
-        content: "aligned:humanoid-coordinator"
+        content: `aligned:${HUMANOID_NEURAL_AGENT_IDS.executive}`
       }]);
       return {
         state: { toString: () => "invalid-but-persisted-sdk-state" },
@@ -680,7 +680,7 @@ describe("humanoid mission initialization recovery", () => {
           };
           await options.session.addItems([{
             role: "user",
-            content: "suffix-after-state:humanoid-coordinator"
+            content: `suffix-after-state:${HUMANOID_NEURAL_AGENT_IDS.executive}`
           }]);
           throw transportError;
         }
@@ -693,7 +693,7 @@ describe("humanoid mission initialization recovery", () => {
     for (const [agentId, items] of baselineItems) {
       expect(await missionSession(store, manifest.epoch_id, agentId).getItems()).toEqual([
         ...items,
-        ...(agentId === HUMANOID_AGENT_IDS.coordinator
+        ...(agentId === HUMANOID_NEURAL_AGENT_IDS.executive
           ? [{ role: "user" as const, content: `aligned:${agentId}` }]
           : [])
       ]);
@@ -702,7 +702,7 @@ describe("humanoid mission initialization recovery", () => {
       state: "invalid-but-persisted-sdk-state",
       sessionBaseline: Object.fromEntries(HUMANOID_REASONING_AGENT_IDS.map(
         (agentId) => [agentId, {
-          item_count: agentId === HUMANOID_AGENT_IDS.coordinator ? 2 : 1
+          item_count: agentId === HUMANOID_NEURAL_AGENT_IDS.executive ? 2 : 1
         }]
       ))
     });
@@ -771,9 +771,9 @@ function runtimeStateCases(): Array<[
     ["serialized Agent state", async (store) => {
       await store.writeAgentState("persisted-sdk-state");
     }],
-    ["a coordinator Session", async (store) => {
+    ["an Executive Session", async (store) => {
       const session = new FileSession(store.sessionPath(), "orphaned-session");
-      await session.addItems([{ role: "user", content: "persisted coordinator context" }]);
+      await session.addItems([{ role: "user", content: "persisted Executive context" }]);
     }],
     ["a worker Session", async (store) => {
       const session = new FileSession(
@@ -827,8 +827,8 @@ function controllerSource(sourceSha256: string): HumanoidControllerSource {
 }
 
 function createManifest(config: ProviderConfig) {
-  return createHumanoidAgentManifest({
-    hierarchy: createHumanoidAgentHierarchy({
+  return createHumanoidNeuralAgentManifest({
+    hierarchy: createHumanoidNeuralAgentHierarchy({
       provider: config,
       runtime: {
         invoke: async () => { throw new Error("outside manifest construction"); },
@@ -850,7 +850,7 @@ function missionSession(
   agentId: string
 ): FileSession {
   return new FileSession(
-    agentId === HUMANOID_AGENT_IDS.coordinator
+    agentId === HUMANOID_NEURAL_AGENT_IDS.executive
       ? store.sessionPath()
       : store.workerSessionPath(agentId),
     `${store.definition.run_id}:${epochId}:${agentId}`

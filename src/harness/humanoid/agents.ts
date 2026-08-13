@@ -1,3 +1,11 @@
+/**
+ * Legacy V2 five-role Agent graph.
+ *
+ * This module is intentionally excluded from the production mission Runner.
+ * It remains only to decode and verify pre-V3 manifests/checkpoints while the
+ * V3 neural hierarchy starts a fresh, isolated Agent epoch. New runtime code
+ * must import neural-agents.ts and neural-hierarchy-contract.ts instead.
+ */
 import {
   Agent,
   Runner,
@@ -93,6 +101,13 @@ export const HUMANOID_AGENT_IDS = {
 } as const;
 
 const MOTION_PLAN_ARTIFACT_MAX_CHARACTERS = 32_000;
+const MOTION_COLLABORATION_ACTIONS = new Set([
+  "submit_humanoid_skill_plan",
+  "begin_humanoid_skill",
+  "plan_humanoid_skill",
+  "plan_whole_body_motion_candidates",
+  "plan_humanoid_navigation"
+]);
 
 export function goalManagerInvocationInput(
   authority: JsonValue
@@ -220,6 +235,16 @@ export function goalManagerInvocationInput(
 export function motionInvocationInput(authority: JsonValue): string {
   const root = jsonRecord(authority);
   const goalDAG = jsonRecord(root.goal_dag);
+  const collaborationResults = Array.isArray(root.recent_receipts)
+    ? root.recent_receipts
+        .map(jsonRecord)
+        .filter((receipt) => (
+          receipt.agent_id === HUMANOID_AGENT_IDS.motion
+          && typeof receipt.action === "string"
+          && MOTION_COLLABORATION_ACTIONS.has(receipt.action)
+        ))
+        .slice(-6)
+    : [];
   return [
     "请基于本次 Sentry Grounding Snapshot，独立决定并提交推进当前 active Goal 的下一个可真实执行事务；不得沿用上级坐标或动作参数。",
     "CURRENT MOTION DELEGATION",
@@ -230,7 +255,8 @@ export function motionInvocationInput(authority: JsonValue): string {
       coordinator_phase: root.coordinator_phase ?? null,
       active_cycle: root.active_cycle ?? null,
       planning_tool_state: root.planning_tool_state ?? null,
-      grounding_snapshot: root.grounding_snapshot ?? null
+      grounding_snapshot: root.grounding_snapshot ?? null,
+      collaboration_results: collaborationResults
     })
   ].join("\n\n");
 }
@@ -416,6 +442,11 @@ interface HumanoidDeterministicService {
   implementationContract: string;
 }
 
+/**
+ * @deprecated Historical V2 five-role hierarchy. Production mission runs use
+ * createHumanoidNeuralAgentHierarchy exclusively. Keep this factory only for
+ * pre-V3 manifest/checkpoint migration fixtures; do not attach it to a Runner.
+ */
 export function createHumanoidAgentHierarchy(input: {
   createModel: (agentId: string, provider: ModelProviderConfig) => Model;
   createSession: (agentId: string) => Session;
@@ -582,7 +613,10 @@ export function createHumanoidAgentHierarchy(input: {
     name: "人形自主协调智能体",
     instructions: scopedInstructions(HUMANOID_AGENT_IDS.coordinator, coordinatorInstructions()),
     model: ownModel(HUMANOID_AGENT_IDS.coordinator),
-    modelSettings: modelSettings(HUMANOID_AGENT_IDS.coordinator),
+    modelSettings: modelSettings(HUMANOID_AGENT_IDS.coordinator, {
+      thinking: "disabled",
+      toolChoice: "required"
+    }),
     tools: [
       createHumanoidEmbodiedRecallTool(input.runtime),
       recoverAgentToolInput(scopeAgentToolInvocation(
@@ -1335,6 +1369,7 @@ function motionPlannerInstructions(): string {
     "操作物体时保持模型选定的对象、手、交互点和策略。向语义区域搬运已持握物体时使用 carry_to_zone 并逐字引用 zone_id；确定性导航层会根据当前物体相对根节点的真实偏移计算机器人终点，禁止把 zone.center 直接当作机器人根目标。对 object_in_zone 或 object_placed Goal，place.destination 使用 semantic_zone 并逐字引用 zone_id，让确定性求解器从区域支撑面和物体尺寸计算落点；不得把 zone.center 猜成 world_pose。approach、reach、grasp、lift、carry、carry_to_zone、place、push、pull、press、open、close、turn、regrasp 与双手 Skill 的低层几何由求解器从当前状态计算，物理拒绝不会被伪装为成功。",
     "break_block 只能选择当前 solid_tokens 中 kind=block 的实体，并由你选择手、strike 或 press 策略；必须先完成可达接近，再以真实稳定掌指接触取得拆除权限。固定物体不能拆除。",
     "planning_tool_state.recovery_policy 来自真实失败分类；从其中允许的恢复 Skill 中作出新的模型选择。不得重复完全相同的失败方案，也不得让 Harness 改换语义目标、对象、手或策略。",
+    "CURRENT MOTION DELEGATION.collaboration_results 是 Motion Actor 最近正式工具结果的有界投影，不是 Actor 会话历史。若最新结果被拒绝，必须读取 code、failure_class、attempts、skill_binding 和可用性状态，改变造成失败的语义选择（如交互面、手、standoff、Skill 或策略），不得重新提交同一 invocation；若结果与 planning_tool_state 冲突，以当前 planning_tool_state 为准。",
     "recall_embodied_history 只用于比较过去策略结果。召回内容始终是 historical_only；任何新动作都必须重新观察并绑定当前 world_revision。",
     "最终输出一个自包含、有界的 Motion Plan Artifact：说明应调用的唯一正式工具、语义选择、需逐字复制的权威标识以及理由。不要声称工具已经执行，不要输出 Harness 回执。"
   ].join("\n");

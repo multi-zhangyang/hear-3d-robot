@@ -45,10 +45,14 @@ import {
   PreGraspHumanoidWorldSnapshotSchema
 } from "../world/humanoid/snapshot-schema.js";
 import type { HumanoidWorldSnapshot } from "../world/humanoid/world-contract.js";
+import {
+  NeuralHierarchyStateSchema,
+  createNeuralHierarchyState
+} from "./neural-hierarchy.js";
 
 const HumanoidActionNameSchema = z.enum(HUMANOID_ACTION_NAMES);
 
-export const HumanoidPhysicalStateAnchorSchema = z.object({
+const HumanoidPhysicalStateAnchorV1Schema = z.object({
   version: z.literal(1),
   event_id: z.string().trim().min(1),
   world_frame: z.number().int().nonnegative(),
@@ -56,6 +60,20 @@ export const HumanoidPhysicalStateAnchorSchema = z.object({
   world_checkpoint_sha256: z.string().regex(/^[a-f0-9]{64}$/),
   anchored_at: z.string().datetime()
 }).strict();
+
+const HumanoidPhysicalStateAnchorV2Schema = z.object({
+  version: z.literal(2),
+  event_id: z.string().trim().min(1),
+  world_frame: z.number().int().nonnegative(),
+  world_revision: z.number().int().nonnegative(),
+  physical_state_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  anchored_at: z.string().datetime()
+}).strict();
+
+export const HumanoidPhysicalStateAnchorSchema = z.discriminatedUnion(
+  "version",
+  [HumanoidPhysicalStateAnchorV1Schema, HumanoidPhysicalStateAnchorV2Schema]
+);
 
 export type HumanoidPhysicalStateAnchor = z.infer<
   typeof HumanoidPhysicalStateAnchorSchema
@@ -622,6 +640,9 @@ const HumanoidRunCheckpointBaseShape = {
   action_runtime_state: JsonValueSchema.nullable().default(null),
   context_memory: ContextMemoryStateSchema,
   embodied_memory: HumanoidEmbodiedMemoryStateSchema,
+  neural_hierarchy_state: NeuralHierarchyStateSchema.default(
+    () => createNeuralHierarchyState()
+  ),
   pending_lifecycle_events: z.array(RunLifecycleEventSchema),
   cycle_index: z.number().int().nonnegative(),
   total_model_calls: z.number().int().nonnegative(),
@@ -735,8 +756,11 @@ const HumanoidRunCheckpointV6Schema = z.object({
   if (physicalAnchor && (
     physicalAnchor.world_frame !== checkpoint.world.frame
       || physicalAnchor.world_revision !== checkpoint.world.worldRevision
-      || physicalAnchor.world_checkpoint_sha256
-        !== actionCommitPayloadSha256(checkpoint.world_checkpoint as JsonValue)
+      || (physicalAnchor.version === 1
+        ? physicalAnchor.world_checkpoint_sha256
+          !== actionCommitPayloadSha256(checkpoint.world_checkpoint as JsonValue)
+        : physicalAnchor.physical_state_sha256
+          !== humanoidPhysicalStateSha256(checkpoint.world_checkpoint))
   )) {
     context.addIssue({
       code: "custom",
@@ -860,6 +884,41 @@ const HumanoidRunCheckpointV6Schema = z.object({
         message: "Active physical execution requires durable Coordinator delegation"
       });
     }
+    const neuralAdmission = execution.admission.neural_rollout_certificate;
+    if (neuralAdmission) {
+      const certificate = checkpoint.neural_hierarchy_state
+        .rollout_certificates[neuralAdmission.certificate_id];
+      if (!certificate
+        || certificate.status !== "consumed"
+        || certificate.execution_transaction_id !== transactionId
+        || certificate.commitment_id !== neuralAdmission.commitment_id
+        || certificate.goal_epoch_id !== neuralAdmission.goal_epoch_id
+        || certificate.planning_transaction_id
+          !== execution.admission.planning_transaction_id
+        || certificate.planning_transaction_id
+          !== neuralAdmission.planning_transaction_id
+        || certificate.planning_action !== neuralAdmission.planning_action
+        || certificate.rollout_signal_id !== neuralAdmission.rollout_signal_id
+        || certificate.predictive_signal_id !== neuralAdmission.predictive_signal_id
+        || certificate.rollout_invocation_id
+          !== neuralAdmission.rollout_invocation_id
+        || certificate.predictive_invocation_id
+          !== neuralAdmission.predictive_invocation_id
+        || certificate.rollout_payload_sha256
+          !== neuralAdmission.rollout_payload_sha256) {
+        context.addIssue({
+          code: "custom",
+          path: [
+            "action_execution_ledger",
+            "active",
+            transactionId,
+            "admission",
+            "neural_rollout_certificate"
+          ],
+          message: "Physical execution is not atomically bound to its consumed neural rollout certificate"
+        });
+      }
+    }
     if (execution.status !== "terminal") {
       if (checkpoint.committed_actions[transactionId]) {
         context.addIssue({
@@ -956,6 +1015,27 @@ export function humanoidGoalControlStateSha256(
   checkpoint: Parameters<typeof humanoidGoalControlState>[0]
 ): string {
   return actionCommitPayloadSha256(humanoidGoalControlState(checkpoint));
+}
+
+/**
+ * Hashes only the embodied authority needed to resume the physical control
+ * loop. Planning registries, navigation UI state, perception caches and
+ * motion-generator metadata belong to slower hierarchy layers and may be
+ * rebuilt or pruned during recovery without changing the robot body.
+ */
+export function humanoidPhysicalStateSha256(
+  checkpoint: HumanoidWorldCheckpoint
+): string {
+  return actionCommitPayloadSha256({
+    protocol: "humanoid-physical-state-v2",
+    frame: checkpoint.frame,
+    world_revision: checkpoint.worldRevision,
+    simulation: checkpoint.simulation,
+    reference: checkpoint.reference,
+    station_keeping: checkpoint.stationKeeping,
+    grasp_registry: checkpoint.graspRegistry,
+    carried_object_lifecycle: checkpoint.carriedObjectLifecycle
+  } as JsonValue);
 }
 
 export function humanoidEmbodiedMemoryStateSha256(

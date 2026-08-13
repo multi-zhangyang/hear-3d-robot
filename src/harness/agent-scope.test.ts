@@ -23,6 +23,7 @@ import {
   currentAgentInvocationIsRecovery,
   recordAgentInvocationTransportInterruption,
   scopeAgentToolInvocation,
+  stableAgentToolInvocationId,
   withAgentInvocation
 } from "./agent-scope.js";
 
@@ -85,6 +86,16 @@ describe("agent invocation scope", () => {
       expect(currentAgentInvocationIsRecovery()).toBe(false);
     });
     expect(currentAgentInvocationIsRecovery()).toBe(false);
+  });
+
+  it("derives one stable child episode per structural node and SDK tool call", () => {
+    const first = stableAgentToolInvocationId("sensor_fusion", "call-42");
+    expect(first).toBe(stableAgentToolInvocationId("sensor_fusion", "call-42"));
+    expect(first).not.toBe(stableAgentToolInvocationId("rollout_gate", "call-42"));
+    expect(first).not.toBe(stableAgentToolInvocationId("sensor_fusion", "call-43"));
+    expect(first).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
   });
 
   it("does not expose one failed invocation to a concurrent sibling", async () => {

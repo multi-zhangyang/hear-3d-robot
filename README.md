@@ -8,7 +8,7 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 ## 核心能力
 
-- OpenAI Agents SDK 层级编排：Goal Manager、Coordinator、Motion 各有独立 Model 与持久 Session；Grounding Monitor 和 Execution Gate 为零模型调用的确定性服务
+- 神经启发式层级 Agent Harness：18 个结构节点组成严格单父控制树，其中 13 个 OpenAI Agents SDK 模型 Agent 各自拥有独立 Model 与持久 Session，5 个低层节点是确定性服务、控制器或物理本体
 - 遮挡感知的持久空间信念、未知区域 frontier、对象中心世界模型、可供性目录与模型提交的 Skill DAG
 - G1 29 个全身关节与 14 个手部关节、双足接触、质心、支撑面和跌倒检测
 - 模型选择 Goal、Skill、对象、手、交互点和策略；通用求解层自动生成可达站位与任务空间轨迹
@@ -32,32 +32,50 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 ## 运行链路
 
 ```text
-任务目标
-  └─ 自主目标管理智能体
-       │ Goal
-       ▼
-人形自主协调智能体
-  ├─ 异步物理 Grounding Monitor（确定性）
-  ├─ 全身运动参考智能体
-  └─ 物理 Execution Gate（确定性）
-       │
-       ▼
-模型选择的 Goal → 局部 Skill DAG
-       │
-       ▼
-通用 Skill 求解器 → Recast / 任务空间 IK 候选
-       │ 独立 MuJoCo 预演
-       ▼
-已验证路线或全身物理 Option
-       │
-       ▼
-能力路由 → 学习式全身控制 / 参考控制 → MuJoCo 实际执行
-       │ 达成 / 在线重规划 / 语义恢复
-       ▼
-权威世界帧与动作回执 → 目标检查 / 滚动重规划
+Executive
+├─ Goal Valuation
+└─ Action Selection
+   ├─ Perception Manager
+   │  ├─ Sensor Fusion（确定性）
+   │  ├─ Scene Interpreter
+   │  └─ Memory Retriever
+   └─ Sensorimotor Manager
+      ├─ Affordance
+      ├─ Risk / Interoception
+      ├─ Predictive Critic
+      ├─ Premotor
+      │  └─ Motor Intent（最低 LLM 边界）
+      │     └─ MuJoCo Rollout Gate（确定性）
+      ├─ Serial Executor（唯一物理写入者）
+      │  └─ Controller / Reflex（训练策略 + 快速闭环）
+      │     └─ MuJoCo Body
+      └─ Recovery（父级签发的独占 authority lease episode）
 ```
 
-层级中只有目标管理、协调和运动参考三个节点调用模型。Grounding Monitor 直接从 MuJoCo、本体感觉、接触与头部传感器生成受限观察；Execution Gate 只把 Coordinator 已签名的委派确定性映射到唯一正式执行动作。协调模型不能直接修改世界，两个服务也不能生成目标、重写规划或制造新的模型 authority。动作回执保留服务 actor 身份，同时把 Coordinator 的外层工具调用保存为真实决策来源。
+这是控制权树，不是平级多 Agent 网络。除 Executive 外，每个节点只有一个直接父级；父级通常通过 `Agent.asTool()` 调用模型子级并保留控制权。兄弟节点不互相通信、不共享 Session，只允许由共同父级发起并汇合两组只读并行：Scene + Memory、Affordance + Risk。每次直接子级调用都有独立 `invocation_id`，并绑定共同父级的 `parent_episode_id`；共同父级只能汇合属于自己本次 episode 的返回，禁止依靠队列顺序、payload 相等或“第一个 pending 信号”猜测配对。反馈信号可以沿白名单回路唤醒最近责任层，但不会生成第二父级。
+
+Action Selection 使用两阶段技能协议：Sensorimotor 第一次只能返回
+`skill_proposal`；Action Selection 独占建立一个与 Goal epoch、世界版本和
+终止条件绑定的 durable commitment，然后用新的父子 authority lease 再次下发。
+真实 MuJoCo rollout 被 Predictive 显式以 `accepted=true` 接受后，Harness 才会
+签发一次性、载荷哈希绑定的 rollout certificate；仍只有 Action Selection 能把
+同一 commitment 转为 `executing`。Serial Executor 在此之前不可见。certificate
+的消费与 physical execution ledger 准入在同一个持久提交点完成，崩溃恢复也只
+允许同一个 transaction 继续。执行结果沿原树逐层返回，完成或失败也只能由
+Action Selection 根据真实回执解析 commitment。
+
+事件 Scheduler 不是 Agent、不是 Manager，也不是第二根。它只把世界变化、
+rollout、执行反馈和预测误差解析为“期望责任层”，再沿单父树上溯到最近仍有
+有效 lease 的责任祖先，并把唤醒计划交给唯一 Executive。真正的子 Agent
+episode 仍只能由其直接父级通过 `Agent.asTool()` 打开。
+
+Recovery 也没有第二父级，更不是 SDK handoff。Sensorimotor Manager 冻结
+普通分支后，以独占 lease 启动一个上下文隔离的 Recovery episode；它只能返回
+恢复提案或升级，lease 关闭后控制仍回到同一个 Sensorimotor 父级。
+
+控制树、反馈图和执行状态机的完整定义见 [`docs/architecture/neural-hierarchy-v3.md`](docs/architecture/neural-hierarchy-v3.md)。模型认知在 Motor Intent 截止；规划求解、MuJoCo 预演、唯一串行执行、训练策略和控制器闭环都位于其下。Harness 按事件唤醒路径，并在代码层强制“感知 → 父级并行汇合 → 技能 → rollout → 预测评估 → 串行执行 → 反馈”，不依赖模型按提示词自行维持安全顺序。
+
+层级协议升级不会静默复用旧 Agent Session。普通 resume 会明确拒绝旧 neural contract；显式 `hear resume --run RUN_ID --fresh-agent-epoch --confirm` 会在没有未完成物理事务或 action commit 时归档旧 Manifest、RunState 与各节点 Session，重建 neural hierarchy/context epoch，同时原样保留物理世界、Goal DAG、已提交动作账本和 embodied memory。若机器人仍处于 admitted/executing transaction，该切换会拒绝执行，必须先恢复同一物理事务。
 
 一次动作需要同时满足以下条件才会改变世界：
 
@@ -66,8 +84,9 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 3. Skill、对象、手、交互点与策略来自当前运动智能体的真实模型响应。
 4. 通用求解器至少生成一个与该语义身份一致的可达任务空间候选。
 5. 被选候选的完整 MuJoCo 预演没有跌倒、非法接触、持续条件违规或缺失的必需接触。
-6. 运动制品、终止合约和逐帧预演轨迹与规划证书一致。
-7. 真实执行逐帧满足物理 Option；目标稳定达成后立即停止，持续偏离预演或违反条件时立即交回重规划。
+6. Predictive 对该精确 rollout 显式接受，并由 Harness 签发绑定 Goal、commitment、规划事务、rollout/Predictive invocation、两个因果信号与 payload SHA-256 的一次性 certificate。
+7. certificate 消费与 Serial Executor 的 durable physical admission 原子提交；同一证书不能驱动第二个物理事务。
+8. 真实执行逐帧满足物理 Option；目标稳定达成后立即停止，持续偏离预演或违反条件时立即交回重规划。
 
 自主差异来自模型对实时观察、空间 frontier、对象可供性、目标和历史回执的决策，以及每次任务独立生成的世界。程序不会从预设动作表挑选行为，也不会用随机电机噪声代替自主决策。Harness 只把模型选定的语义 Skill 求解为物理候选，不会改换目标、对象、手或策略。
 
@@ -116,19 +135,21 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 
 命令会创建独立 Colab 会话，训练真实 PPO checkpoint，由 mjlab 导出带控制元数据的 ONNX，并在 GPU MuJoCo 环境中执行无界面策略评估。checkpoint、ONNX、环境配置、评估指标和 SHA-256 报告下载到 `artifacts/training/`，同时解包为可直接运行的策略目录。将 `HEAR_MJLAB_G1_POLICY_DIRECTORY` 指向该目录即可替换随附策略；训练、下载、解包或校验失败都会直接返回错误，不生成替代策略。结束或失败后 Colab 会话都会释放。
 
-程序化场景生成开阔区域、方块障碍、可动物体和目标区域。头部相机以真实水平与垂直视场持续更新 0.5 米空间信念网格；可见物理几何会截断其后的地面射线，墙后区域保持未知，移动或拆除实体留下的占据只有在重新进入视野后才会清除。模型从这种未知区域边界选择探索目标。Recast 根据当前静态与动态几何生成导航路径，每段路线都先在当前物理状态副本中完整执行。Motion Agent 一次选择并绑定完整语义 Skill；Execution Gate 一次准入后，确定性 navigation horizon 会连续消费多个有界路线段，并在每段真实终态重新观察、重规划和预演，直到阶段后置条件满足、真实阻塞、安全失败、取消或有限执行 horizon 耗尽，模型不再逐段调用“下一步”。单段执行中出现新的几何阻塞时，执行监控层保持原 Skill 目标并从真实终态重新规划，最多进行两次有界尝试。预演碰撞会携带 MuJoCo 接触面、静态或动态实体身份、世界接触点、机器人相对分离法向与法向力，模型据此自行选择绕行或任务空间净空动作。跌倒、物体滑脱或语义前提失效不会被低层重规划掩盖，而是返回模型选择恢复 Skill。
+程序化场景生成开阔区域、方块障碍、可动物体和目标区域。头部相机以真实水平与垂直视场持续更新 0.5 米空间信念网格；可见物理几何会截断其后的地面射线，墙后区域保持未知，移动或拆除实体留下的占据只有在重新进入视野后才会清除。模型从这种未知区域边界选择探索目标。Recast 根据当前静态与动态几何生成导航路径，每段路线都先在当前物理状态副本中完整执行。Premotor 与 Motor Intent 一次选择并绑定完整语义 Skill；Serial Executor 一次准入后，确定性 navigation horizon 会连续消费多个有界路线段，并在每段真实终态重新观察、重规划和预演，直到阶段后置条件满足、真实阻塞、安全失败、取消或有限执行 horizon 耗尽，模型不再逐段调用“下一步”。单段执行中出现新的几何阻塞时，执行监控层保持原 Skill 目标并从真实终态重新规划，最多进行两次有界尝试。预演碰撞会携带 MuJoCo 接触面、静态或动态实体身份、接触点、法向和法向力，模型据此选择替代路线或全身净空姿态。跌倒、物体滑脱或语义前提失效不会被低层重规划掩盖，而是通过 Risk / Prediction 信号进入有界 Recovery authority lease。
 
 可动物体的抓取不是吸附或坐标绑定。系统从当前掌指接触面、接触力、对向接触、离开支撑面的高度、手物相对位姿稳定性和连续抬升帧建立抓取证据；只有通过证据的手物关系才能进入携带状态。持物导航逐帧验证抓取延续和未授权碰撞，放置动作必须由模型产生张手与撤手运动，并同时满足物体进入目标区域、手部脱离和非人形支撑面稳定承托。
 
 ## 长期运行
 
-三个推理节点各自拥有独立的 Agents SDK Session。Grounding Monitor 与 Execution Gate 不创建 Model facade、Session 或上下文压缩状态。稳定指令和历史位于请求前缀，实时世界权限位于末尾；缓存亲和键按凭证、协议、模型和 Agent 角色保持稳定，因此完全一致的公共前缀可以跨任务复用。亲和键只影响供应商缓存路由，不承载对话内容；不同 Run 的 Session 和物理状态始终隔离。端点明确拒绝缓存扩展参数时，该节点的 Model facade 只协商一次并继续使用协议自身的自动前缀缓存。界面和日志中的缓存读取量直接来自模型服务返回的 usage，不使用本地估算。活动上下文接近配置阈值时，系统调用模型生成结构化压缩记录，并保留近期原始轮次。压缩结果必须引用真实动作回执；完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。Goal DAG 把同一次模型调用产生的候选视为一个决策批次：显式选择一个候选时，其余候选以未采用结果绑定同一选择证据。检查点只保留当前工作集、仍被依赖的已完成候选和近期 epoch；更早的完整决策批次会先写入哈希链式追加日志，再从检查点裁剪，进程中断后可幂等恢复。检查点还原子维护按谓词、对象、区域、方块和末端聚合的终身 Goal 结果，目标管理智能体在每次选择时都能看到归档与当前工作集的真实终态；旧版日志会在恢复时从完整哈希链重建，未保存候选批次的早期记录会明确标记为不完整，而不会补造数据。目标管理智能体可按状态、谓词、对象、方块、语义区域、世界空间范围或候选标识分页召回归档 Goal。模型生成的经历摘要不会进入权威状态块。协调与运动智能体可以按 `episode:N` 或 `action:<transactionId>` 精确召回成功、拒绝、漂移、约束违规和停滞记录，也可以按 Goal 谓词、对象、静态实体、区域和真实结果检索具身经验；所有召回结果均标记为历史信息，不能代替当前传感。
+十三个模型节点分别拥有独立的 Agents SDK Session 和 Model facade；Sensor Fusion、Rollout Gate、Serial Executor、Controller / Reflex 与 MuJoCo Body 不创建模型 Session。稳定指令和各节点自己的历史位于请求前缀，实时世界权限与定向神经信号位于末尾；缓存亲和键按凭证、协议、模型和结构 Agent ID 保持稳定。亲和键只影响供应商缓存路由，不承载对话内容；不同 Agent、不同 Run 的 Session 和物理状态始终隔离，父子间只交换有世界版本、TTL 和因果来源的类型化信号。
+
+每个 Agent 的上下文只压缩自己的历史，不接收兄弟或父子 Agent 的压缩摘要。完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。Goal DAG 与可寻址具身记忆仍是长期事实来源；历史召回只能作为带来源的旧证据，不能替代当前 Sensor Fusion。结构 Agent、其 Session、工具 Schema、输出 Schema、控制边、反馈合同和运行时服务身份全部写入 V2 Agent Manifest，恢复时不允许旧 Coordinator epoch 静默复用新层级 Session。
 
 上下文压缩本身由独立模型完成。无效输出可以在同一压缩回合内重新生成；网络中断会立即交还原业务 Agent 的标准传输恢复流程，原始历史和 Session 不会被替代摘要覆盖。只有通过 schema、来源引用和当前世界权限校验的压缩记录才会成为新基线；基线提交后的业务请求若中断，恢复只保留该基线和真实热历史，不会重新灌入已经裁剪的旧前缀。配置窗口不足属于明确的容量错误，不会无限重试。
 
 运行时按权威世界版本、真实物理帧和动作回执检测长期无进展循环。守卫只中断并重建停滞的模型上下文，不生成默认动作，也不替模型选择行为。目标稳定进度随检查点持久化；恢复时只接受与 Goal 哈希、世界快照和 MuJoCo 检查点一致的证据。
 
-模型传输中断时，可序列化的 Agents SDK RunState 只在 Goal、动作账本、上下文压缩和自主循环身份仍兼容时继续使用。每份 RunState 绑定三个推理 Session 的精确历史前缀；恢复会先核验全部前缀，再统一移除断线后未形成新状态的会话后缀。任一前缀分歧都会拒绝该 RunState，已经提交的物理动作、Goal 证据和追加式日志不会回滚。OpenAI-compatible 传输还会在请求边界清理进程中断留下的半边工具协议片段，完整工具调用与结果保持原顺序，动作事实继续由当前 Harness 权威块提供。
+模型传输中断时，可序列化的 Agents SDK RunState 只在 Goal、动作账本、上下文压缩、神经 hierarchy epoch 和自主循环身份仍兼容时继续使用。每份 RunState 绑定其实际涉及的结构 Agent Session 精确历史前缀；恢复会先核验这些前缀，再移除断线后未形成新状态的会话后缀。任一前缀分歧都会拒绝该 RunState，已经提交的物理动作、Goal 证据和追加式日志不会回滚。OpenAI-compatible 传输还会在请求边界清理进程中断留下的半边工具协议片段，完整工具调用与结果保持原顺序，动作事实继续由当前 Harness 权威块提供。
 
 运行检查点包含：
 
@@ -138,7 +159,7 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 - 具名末端目标的逐帧稳定进度与 Goal 身份校验
 - 已提交动作回执、候选筛选证据和待处理生命周期事件
 - 不可变运动制品、物理预演轨迹、Option 监控状态与执行游标
-- 三个推理智能体的独立 Session、确定性服务身份与可恢复 SDK 状态
+- 十三个模型智能体的独立 Session、五个非模型节点身份、控制树、反馈合同、authority lease 与可恢复 SDK 状态
 
 Operator 异常退出后，未完成任务会转为可恢复状态。恢复操作从持久化物理状态和上下文继续，不播放录制动画。尚未完成的物理动作使用原 transaction ID 和原规划制品续接，完成后才恢复上层模型循环；正常暂停会把不足周期的执行尾帧一并写入账本。旧检查点若已保存更靠后的精确 MuJoCo 状态，只在规划进度与世界版本完全一致时从该状态继续，无法重建的中间轨迹明确标记为不完整。有限任务的最终 Goal 验收、Run 成功状态和生命周期事件在同一检查点事务中提交，恢复后不会继续创建多余 Goal。
 
@@ -148,7 +169,7 @@ Operator 异常退出后，未完成任务会转为可恢复状态。恢复操�
 
 3D 世界始终保持在主视图。界面提供跟随、世界和头部三个观察视角，并实时显示：
 
-- 当前活动智能体与五节点层级
+- 当前活动节点与 18 节点单父层级
 - 身体通道活动状态
 - 世界版本、物理时间、双脚法向力、支撑和直立度
 - 当前实际执行的学习或参考控制器，以及连续交接进度
@@ -239,24 +260,23 @@ HEAR_WORKYARD_CONTACT_TARGET_ZONE_ID=assembly_bay
 | `openai_responses` | OpenAI Responses API |
 | `anthropic_messages` | Anthropic Messages API |
 
-`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required` 和 `auto`，默认值为 `auto`；`none` 会在启动前被拒绝，因为业务节点必须产生正式工具结果。各 reasoning Agent 拥有独立 Session 和独立上下文预算；Manager 调用专家时只接收有界 delegation result，专家完整历史不会并入 Manager Session。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；通常不建议设置，只有端点明确要求限制时才填写。压缩阈值留空时按各 Agent 的实际窗口减去输出预留计算；压缩仅总结该 Agent 自己的旧历史并保留最近完整模型轮次。OpenAI-compatible thinking 模型使用 `tool_choice=auto`，不依赖 Responses 专属的 opaque compaction item。
+`AI_CONTEXT_WINDOW_TOKENS` 应填写模型实际上下文上限，默认值为 `262144`。`AI_REASONING_EFFORT` 可按模型能力设置为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`，留空则不发送该参数。`AI_TOOL_CHOICE` 支持 `required` 和 `auto`，默认值为 `auto`；`none` 会在启动前被拒绝。各 reasoning Agent 拥有独立 Session 和独立上下文预算；Manager 调用专家时只接收有界 delegation result，专家完整历史不会并入 Manager Session。节点间只传类型化信号、当前权威状态和正式工具结果，不传另一节点的 reasoning、对话历史或压缩摘要。`AI_MAX_OUTPUT_TOKENS` 与 `AI_COMPACT_MAX_OUTPUT_TOKENS` 默认留空，运行时不会向模型请求发送输出上限；压缩阈值留空时按各 Agent 的实际窗口减去输出预留计算，且仅总结该 Agent 自己的旧历史。不依赖 Responses 专属的 opaque compaction item。
 
 `AI_REQUEST_TIMEOUT_MS` 默认是 `300000`，表示 HTTP 建连或相邻响应数据之间允许的最长静默时间。`AI_STREAM_EVENT_IDLE_TIMEOUT_MS` 默认同为 `300000`，约束相邻 Agents SDK 模型事件之间的静默时间；只有真实模型事件会续期。两者均可按端点能力在 5 秒至 10 分钟之间调整，任务总时限、人工停止和进程恢复仍独立生效。
 
-目标管理、协调、运动和压缩可以使用彼此独立的模型配置。未设置的角色变量继承同名 `AI_*` 默认值；设置时使用 `AI_<ROLE>_<SETTING>`。`SENTRY` 与 `EXECUTOR` 配置键仅为旧运行配置解析兼容而保留，新 Harness 不会为这两个确定性服务创建模型请求：
+模型节点按四个可独立配置的结构 profile 选择供应商参数；未设置的 profile 变量继承同名 `AI_*` 默认值。旧 `GOAL_MANAGER`、`COORDINATOR`、`MOTION`、`SENTRY` 与 `EXECUTOR` 键只用于读取 V1 运行或兼容旧部署，不再表示 V2 的结构身份：
 
-| `ROLE` | 运行职责 |
+| `PROFILE` | V2 结构职责 |
 |---|---|
-| `GOAL_MANAGER` | 自主 Goal 候选与选择 |
-| `COORDINATOR` | 自主循环协调 |
-| `SENTRY` | 旧版兼容；当前为确定性 Grounding Monitor |
-| `MOTION` | 全身运动规划 |
-| `EXECUTOR` | 旧版兼容；当前为确定性 Execution Gate |
+| `EXECUTIVE` | Executive、Goal Valuation、Action Selection |
+| `ASSOCIATIVE` | Perception、Scene、Memory、Affordance、Risk |
+| `SENSORIMOTOR` | Sensorimotor、Predictive、Premotor、Recovery |
+| `MOTOR_INTENT` | 最低模型层的语义运动编译 |
 | `COMPACTOR` | 长期上下文压缩 |
 
-`SETTING` 支持 `PROVIDER`、`BASE_URL`、`MODEL`、`API_KEY`、`REQUEST_TIMEOUT_MS`、`STREAM_EVENT_IDLE_TIMEOUT_MS`、`TEMPERATURE`、`REASONING_EFFORT`、`TOOL_CHOICE`、`MAX_OUTPUT_TOKENS`、`CONTEXT_WINDOW_TOKENS`、`COMPACT_TRIGGER_TOKENS`、`COMPACT_RECENT_MODEL_TURNS` 和 `COMPACT_MAX_OUTPUT_TOKENS`。例如 `AI_MOTION_MODEL` 配置强制工具调用的 Motion Actor；`AI_MOTION_PLANNER_MODEL` 可单独配置语义规划 Agent，未提供时继承完整 `AI_MOTION_*` profile；`AI_COMPACTOR_CONTEXT_WINDOW_TOKENS` 只描述压缩模型的真实上下文上限。配置仍基于协议能力，不绑定服务商或模型名称。
+`SETTING` 支持 `PROVIDER`、`BASE_URL`、`MODEL`、`API_KEY`、`REQUEST_TIMEOUT_MS`、`STREAM_EVENT_IDLE_TIMEOUT_MS`、`TEMPERATURE`、`REASONING_EFFORT`、`TOOL_CHOICE`、`MAX_OUTPUT_TOKENS`、`CONTEXT_WINDOW_TOKENS`、`COMPACT_TRIGGER_TOKENS`、`COMPACT_RECENT_MODEL_TURNS` 和 `COMPACT_MAX_OUTPUT_TOKENS`。例如 `AI_MOTOR_INTENT_MODEL` 只覆盖 Motor Intent profile；`AI_COMPACTOR_CONTEXT_WINDOW_TOKENS` 只描述压缩模型的真实上下文上限。配置仍基于协议能力，不绑定服务商或模型名称。
 
-三个推理节点各自持有独立 Model facade 与持久 Session；两个确定性服务只持有实现合约和工具 Schema 身份；压缩器使用独立模型配置和无历史污染的有界 SDK 回合。每个 Run 会写入不含凭证和端点明文的 Harness 身份清单。恢复时会同时核验模型配置、服务实现合约、工具 Schema 和 Agents SDK 版本；不兼容配置会被明确拒绝，不会静默复用旧 Session。
+十三个推理节点各自持有独立 Model facade 与持久 Session；五个非模型节点只持有实现合约和运行身份；压缩器使用独立模型配置和无历史污染的有界 SDK 回合。每个 Run 会写入不含凭证和端点明文的 V2 Harness 身份清单。恢复时会同时核验控制树、反馈合同、模型配置、工具与输出 Schema、服务实现合约和 Agents SDK 版本；不兼容配置会被明确拒绝，不会静默复用旧 Session。
 
 ## 启动
 

@@ -160,20 +160,38 @@ function humanoidActionToolCallAuthority(
  * The latest committed action event is the append-only anchor for the mutable
  * Skill DAG/binding/recovery cache stored in the checkpoint.
  */
-export function verifyDurableHumanoidActionRuntimeState(input: {
+export function recoverDurableHumanoidActionRuntimeState(input: {
   receipts: Readonly<Record<string, HumanoidActionReceipt>>;
   proofs: ReadonlyMap<string, DurableActionCommitProof>;
   checkpointState: JsonValue | null;
-}): void {
-  const parsedState = input.checkpointState === null
+  neuralHierarchyEpochId: string;
+}): {
+  state: JsonValue | null;
+  checkpointRecovered: boolean;
+} {
+  const checkpointState = input.checkpointState === null
     ? null
     : HumanoidActionRuntimeStateSchema.parse(input.checkpointState);
+  if (checkpointState?.neural_hierarchy_epoch_id !== undefined
+    && checkpointState.neural_hierarchy_epoch_id !== input.neuralHierarchyEpochId) {
+    throw new Error(
+      "Checkpoint action runtime state belongs to another neural hierarchy epoch"
+    );
+  }
   const latestEntry = humanoidActionReceiptEntriesInCommitOrder(input.receipts).at(-1);
   if (!latestEntry) {
-    if (parsedState !== null && !actionRuntimeStateIsEmpty(parsedState)) {
+    if (checkpointState !== null && !actionRuntimeStateIsEmpty(checkpointState)) {
       throw new Error("Humanoid action runtime state has no durable action authority");
     }
-    return;
+    return {
+      state: checkpointState === null
+        ? null
+        : json(actionRuntimeStateForEpoch(
+          checkpointState,
+          input.neuralHierarchyEpochId
+        )),
+      checkpointRecovered: false
+    };
   }
   const proof = input.proofs.get(latestEntry[0]);
   if (!proof) {
@@ -183,20 +201,54 @@ export function verifyDurableHumanoidActionRuntimeState(input: {
   const data = jsonObject(event?.data ?? null);
   const durableState = data?.action_runtime_state;
   if (durableState === undefined) {
-    if (parsedState !== null && !actionRuntimeStateIsEmpty(parsedState)) {
+    if (checkpointState !== null && !actionRuntimeStateIsEmpty(checkpointState)) {
       throw new Error(
         `Humanoid action runtime state has no durable event authority: ${latestEntry[0]}`
       );
     }
-    return;
+    return {
+      state: checkpointState === null
+        ? null
+        : json(actionRuntimeStateForEpoch(
+          checkpointState,
+          input.neuralHierarchyEpochId
+        )),
+      checkpointRecovered: false
+    };
   }
-  if (parsedState === null
-    || actionCommitPayloadSha256(durableState)
-      !== actionCommitPayloadSha256(json(parsedState))) {
+  const verifiedDurableState = HumanoidActionRuntimeStateSchema.parse(durableState);
+  if (verifiedDurableState.neural_hierarchy_epoch_id
+      !== input.neuralHierarchyEpochId
+    && checkpointState?.neural_hierarchy_epoch_id
+      === input.neuralHierarchyEpochId) {
+    if (!actionRuntimeCognitiveStateIsEmpty(checkpointState)) {
+      throw new Error(
+        "Fresh neural hierarchy epoch contains inherited action cognitive state"
+      );
+    }
+    return {
+      state: json(checkpointState),
+      checkpointRecovered: false
+    };
+  }
+  if (verifiedDurableState.neural_hierarchy_epoch_id !== undefined
+    && verifiedDurableState.neural_hierarchy_epoch_id
+      !== input.neuralHierarchyEpochId) {
     throw new Error(
-      `Humanoid action runtime state conflicts with durable event: ${latestEntry[0]}`
+      "Latest durable action runtime state belongs to another neural hierarchy epoch"
     );
   }
+  const canonicalDurableState = json(actionRuntimeStateForEpoch(
+    verifiedDurableState,
+    input.neuralHierarchyEpochId
+  ));
+  const checkpointRecovered = checkpointState === null
+    || actionCommitPayloadSha256(canonicalDurableState)
+      !== actionCommitPayloadSha256(json(checkpointState));
+  return {
+    state: canonicalDurableState,
+    checkpointRecovered
+  };
 }
 
 function verifyGoalEvidence(
@@ -325,12 +377,29 @@ function actionRuntimeStateIsEmpty(
   state: ReturnType<typeof HumanoidActionRuntimeStateSchema.parse>
 ): boolean {
   return state.latest_physical_execution_revision === 0
+    && actionRuntimeCognitiveStateIsEmpty(state);
+}
+
+function actionRuntimeCognitiveStateIsEmpty(
+  state: ReturnType<typeof HumanoidActionRuntimeStateSchema.parse>
+): boolean {
+  return state.latest_grounding_observation === null
     && state.skill_plans.length === 0
     && Object.keys(state.active_skill_plan_transactions).length === 0
     && state.active_skills.length === 0
     && state.planning_skill_bindings.length === 0
     && state.recovery_policies.length === 0
     && state.navigation_transit_clearance_requirements.length === 0;
+}
+
+function actionRuntimeStateForEpoch(
+  state: ReturnType<typeof HumanoidActionRuntimeStateSchema.parse>,
+  neuralHierarchyEpochId: string
+): ReturnType<typeof HumanoidActionRuntimeStateSchema.parse> {
+  return HumanoidActionRuntimeStateSchema.parse({
+    ...state,
+    neural_hierarchy_epoch_id: neuralHierarchyEpochId
+  });
 }
 
 function json(value: unknown): JsonValue {

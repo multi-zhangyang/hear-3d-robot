@@ -161,12 +161,12 @@ describe("humanoid Cycle causal evidence", () => {
     );
   });
 
-  it("requires a Sentry observation after execution and every causal mutation", () => {
+  it("requires Sensor Fusion evidence after execution and every causal mutation", () => {
     const missing = validInput();
     const { "observe-after": _observation, ...unobserved } = missing.committedActions;
     missing.committedActions = unobserved;
     expect(() => validateHumanoidCycleCausalEvidence(missing)).toThrow(
-      "requires an accepted Sentry observation"
+      "requires accepted Sensor Fusion evidence"
     );
 
     const stale = validInput();
@@ -176,7 +176,7 @@ describe("humanoid Cycle causal evidence", () => {
       "remove-a": stale.committedActions["remove-a"]!
     };
     expect(() => validateHumanoidCycleCausalEvidence(stale)).toThrow(
-      "requires an accepted Sentry observation"
+      "requires accepted Sensor Fusion evidence"
     );
     expect(resolveHumanoidCycleCompletionReadiness({
       committedActions: stale.committedActions,
@@ -194,7 +194,7 @@ describe("humanoid Cycle causal evidence", () => {
       agentId: "humanoid-motion-reference"
     };
     expect(() => validateHumanoidCycleCausalEvidence(motionObservation)).toThrow(
-      "requires an accepted Sentry observation"
+      "requires accepted Sensor Fusion evidence"
     );
     expect(resolveHumanoidCycleCompletionReadiness({
       committedActions: motionObservation.committedActions,

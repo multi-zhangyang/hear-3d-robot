@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { AgentManifest } from "../../domain/agent-manifest.js";
+import type {
+  AgentManifest,
+  HistoricalAgentAuthorityManifest
+} from "../../domain/agent-manifest.js";
 import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
 import { assertGoalModelSource } from "../../domain/goal-epoch.js";
 import {
@@ -334,11 +337,10 @@ describe("HumanoidModelAuthority", () => {
 
   it("keeps a durably verified Goal source authorized across an archived Agent epoch", async () => {
     const records: ModelCallLifecycleRecord[] = [];
-    const archived = {
-      ...manifest(),
-      epoch_id: "44444444-4444-4444-8444-444444444444",
-      identity_sha256: "d".repeat(64)
-    } as AgentManifest;
+    const archived = historicalManifest(
+      "44444444-4444-4444-8444-444444444444",
+      "d".repeat(64)
+    );
     const authority = createAuthority(
       records,
       async (record) => { records.push(structuredClone(record)); },
@@ -392,11 +394,10 @@ describe("HumanoidModelAuthority", () => {
   });
 
   it("revalidates durable action receipts from an archived model epoch", () => {
-    const archived = {
-      ...manifest(),
-      epoch_id: "55555555-5555-4555-8555-555555555555",
-      identity_sha256: "e".repeat(64)
-    } as AgentManifest;
+    const archived = historicalManifest(
+      "55555555-5555-4555-8555-555555555555",
+      "e".repeat(64)
+    );
     const transactionId = "archived-motion-action";
     const actionInput = { target: { x: 1, y: 0, z: 2 } };
     const argumentsSha256 = modelPayloadSha256(actionInput);
@@ -548,7 +549,7 @@ function createAuthority(
   appendRecord: (record: ModelCallLifecycleRecord) => Promise<void> = async (record) => {
     records.push(structuredClone(record));
   },
-  archivedManifests: readonly AgentManifest[] = []
+  archivedManifests: readonly HistoricalAgentAuthorityManifest[] = []
 ): HumanoidModelAuthority {
   return HumanoidModelAuthority.restore({
     manifest: manifest(),
@@ -571,6 +572,26 @@ function manifest(): AgentManifest {
       executor: { agent_id: HUMANOID_AGENT_IDS.executor }
     }
   } as AgentManifest;
+}
+
+function historicalManifest(
+  epochId: string,
+  identitySha256: string
+): HistoricalAgentAuthorityManifest {
+  return {
+    epoch_id: epochId,
+    identity_sha256: identitySha256,
+    agent_ids: [
+      HUMANOID_AGENT_IDS.goalManager,
+      HUMANOID_AGENT_IDS.coordinator,
+      HUMANOID_AGENT_IDS.sentry,
+      HUMANOID_AGENT_IDS.motion,
+      HUMANOID_AGENT_IDS.executor
+    ],
+    goal_manager_agent_id: HUMANOID_AGENT_IDS.goalManager,
+    grounding_manager_agent_id: HUMANOID_AGENT_IDS.coordinator,
+    execution_manager_agent_id: HUMANOID_AGENT_IDS.coordinator
+  };
 }
 
 function hierarchyNodes(): Record<string, TaskNode> {

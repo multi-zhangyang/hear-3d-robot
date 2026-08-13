@@ -11,6 +11,7 @@ import type { FileSession } from "../persistence/file-session.js";
 import type {
   AgentSessionStateBaseline
 } from "../persistence/run-store.js";
+import type { NeuralHierarchyState } from "../domain/neural-hierarchy.js";
 
 export interface HumanoidAgentStateCheckpoint {
   goal_dag: { state_sha256: string };
@@ -21,6 +22,7 @@ export interface HumanoidAgentStateCheckpoint {
   context_memory: ContextMemoryState;
   cycle_index: number;
   active_cycle: { cycle_id: string } | null;
+  neural_hierarchy_state: NeuralHierarchyState;
 }
 
 export type HumanoidSessionBaseline = ReadonlyMap<
@@ -50,7 +52,8 @@ export function humanoidAgentStateFingerprint(
       checkpoint.context_memory
     ),
     cycleIndex: checkpoint.cycle_index,
-    activeCycleId: checkpoint.active_cycle?.cycle_id ?? null
+    activeCycleId: checkpoint.active_cycle?.cycle_id ?? null,
+    neuralHierarchy: checkpoint.neural_hierarchy_state
   })).digest("hex");
 }
 

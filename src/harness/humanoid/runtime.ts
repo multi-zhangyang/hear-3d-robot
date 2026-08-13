@@ -13,6 +13,8 @@ import {
 import type { HumanoidGroundingReceipt } from
   "../../domain/humanoid-grounding.js";
 import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
+import type { NeuralRolloutExecutionAdmission } from
+  "../../domain/action-execution-ledger.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
 import { HUMANOID_SKILL_CONTRACTS } from "../../domain/humanoid-skill.js";
 import { yawFromQuaternion } from "../../world/geometry.js";
@@ -33,6 +35,7 @@ import {
   type HumanoidActionName
 } from "./actions.js";
 import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 import { normalizeHumanoidMotionCandidateBatchInput } from "./motion-candidate-input.js";
 import { BlockRemovalAuthorityError } from "./block-removal-authority.js";
 import {
@@ -102,6 +105,8 @@ type HumanoidPhysicalActionName = "execute_humanoid_skill"
   | "execute_whole_body_motion"
   | "execute_humanoid_navigation";
 
+const LEGACY_HUMANOID_MOTION_AGENT_ID = "humanoid-motion-reference";
+
 interface ManipulationBasePlacementRequirement {
   observedWorldRevision: number;
   objects: Array<{
@@ -121,6 +126,13 @@ interface RepeatedPlanningFailure {
 
 export const HumanoidActionRuntimeStateSchema = z.object({
   version: z.literal(1),
+  /**
+   * Cognitive authority boundary for mutable Skill plans, bindings, recovery
+   * policy and grounding. Physical receipts remain durable across epochs, but
+   * this hot cache may only be restored by the hierarchy epoch that produced
+   * it. Missing values are accepted only for legacy checkpoint migration.
+   */
+  neural_hierarchy_epoch_id: z.string().uuid().optional(),
   latest_physical_execution_revision: z.number().int().nonnegative(),
   skill_plans: z.array(RegisteredHumanoidSkillPlanSchema),
   active_skill_plan_transactions: z.record(
@@ -209,6 +221,7 @@ export interface HumanoidPhysicalExecutionIntent {
   planId: string;
   decision?: ModelDecisionRef;
   toolAuthority?: HumanoidActionToolCallAuthority;
+  neuralRolloutCertificate?: NeuralRolloutExecutionAdmission;
 }
 
 export interface HumanoidActionToolCallAuthority {
@@ -228,6 +241,8 @@ export interface HumanoidActionInvocationOptions {
   toolAuthority?: HumanoidActionToolCallAuthority;
   /** Internal crash recovery only: replay the decision persisted at admission. */
   recoveryDecision?: ModelDecisionRef;
+  /** Harness-issued rollout authority consumed atomically with physical admission. */
+  neuralRolloutCertificate?: NeuralRolloutExecutionAdmission;
 }
 
 export interface HumanoidActionInvoker {
@@ -288,6 +303,7 @@ export interface HumanoidActionRuntimeOptions {
   }) => ScenarioBlockRemovalTransaction | Promise<ScenarioBlockRemovalTransaction>;
   receipts?: Readonly<Record<string, HumanoidActionReceipt>>;
   state?: JsonValue | null;
+  neuralHierarchyEpochId?: string;
   realtimeExecution?: boolean;
   retainPhysicalTerminals?: boolean;
   requireSkillBinding?: boolean;
@@ -320,6 +336,7 @@ export class HumanoidActionRuntime {
   readonly #retainPhysicalTerminals: boolean;
   readonly #requireSkillBinding: boolean;
   readonly #activeGoal: HumanoidActionRuntimeOptions["activeGoal"];
+  readonly #neuralHierarchyEpochId: string | undefined;
   readonly #signal: AbortSignal | undefined;
   readonly #receipts = new Map<string, HumanoidActionReceipt>();
   readonly #transactions = new Map<string, {
@@ -327,6 +344,7 @@ export class HumanoidActionRuntime {
     decisionSha256: string | undefined;
     toolAuthoritySha256: string | undefined;
     toolAuthority: HumanoidActionToolCallAuthority | undefined;
+    neuralRolloutCertificateSha256: string | undefined;
     promise: Promise<HumanoidActionReceipt>;
   }>();
   readonly #receiptCommits = new Map<string, Promise<void>>();
@@ -391,6 +409,7 @@ export class HumanoidActionRuntime {
     this.#retainPhysicalTerminals = options.retainPhysicalTerminals ?? false;
     this.#requireSkillBinding = options.requireSkillBinding ?? false;
     this.#activeGoal = options.activeGoal;
+    this.#neuralHierarchyEpochId = options.neuralHierarchyEpochId;
     this.#signal = options.signal;
     if (options.state !== undefined && options.state !== null) {
       this.#restoreState(options.state);
@@ -410,7 +429,7 @@ export class HumanoidActionRuntime {
       }
       this.#receipts.set(transactionId, receipt);
       if (receipt.accepted && receipt.action === "observe_humanoid") {
-        if (receipt.agentId !== "humanoid-motion-reference") {
+        if (!isRecognizedPlanningReceiptActor(receipt.agentId)) {
           this.#observationRevisionByAgent.set(
             receipt.agentId,
             Math.max(
@@ -440,6 +459,7 @@ export class HumanoidActionRuntime {
           : undefined,
         toolAuthoritySha256: undefined,
         toolAuthority: undefined,
+        neuralRolloutCertificateSha256: undefined,
         promise: Promise.resolve(receipt)
       });
       if (receipt.accepted
@@ -462,6 +482,9 @@ export class HumanoidActionRuntime {
   persistenceState(): JsonValue {
     return jsonValue(HumanoidActionRuntimeStateSchema.parse({
       version: 1,
+      ...(this.#neuralHierarchyEpochId === undefined
+        ? {}
+        : { neural_hierarchy_epoch_id: this.#neuralHierarchyEpochId }),
       latest_physical_execution_revision: this.#latestPhysicalExecutionRevision,
       skill_plans: [...this.#skillPlansByTransactionId.values()]
         .map((plan) => structuredClone(plan)),
@@ -490,6 +513,30 @@ export class HumanoidActionRuntime {
     }));
   }
 
+  /**
+   * Replaces the mutable action cache with state recovered from a verified
+   * append-only action event. Receipts remain independently reconstructed
+   * from their durable commit proofs.
+   */
+  recoverPersistenceState(rawState: JsonValue): void {
+    this.#skillPlansByTransactionId.clear();
+    this.#activeSkillPlanTransactionByAgent.clear();
+    this.#activeSkillByAgent.clear();
+    this.#skillByPlanningTransactionId.clear();
+    this.#recoveryPolicyByAgent.clear();
+    this.#navigationTransitClearanceRequirementByAgent.clear();
+    this.#latestGroundingObservation = null;
+    for (const agentId of humanoidGroundingAuthorityIds()) {
+      this.#observationRevisionByAgent.delete(agentId);
+      this.#observationByAgent.delete(agentId);
+    }
+    this.#latestPhysicalExecutionRevision = 0;
+    this.#restoreState(rawState);
+    for (const agentId of this.#navigationTransitClearanceRequirementByAgent.keys()) {
+      this.#rebindNavigationTransitClearanceSkill(agentId);
+    }
+  }
+
   restoreSkillEventJournal(
     events: readonly HumanoidEmbodiedSkillEvent[]
   ): void {
@@ -516,6 +563,13 @@ export class HumanoidActionRuntime {
 
   #restoreState(rawState: JsonValue): void {
     const state = HumanoidActionRuntimeStateSchema.parse(rawState);
+    if (state.neural_hierarchy_epoch_id !== undefined
+      && this.#neuralHierarchyEpochId !== undefined
+      && state.neural_hierarchy_epoch_id !== this.#neuralHierarchyEpochId) {
+      throw new Error(
+        "Humanoid action runtime cognitive state belongs to another neural hierarchy epoch"
+      );
+    }
     const currentWorldRevision = this.#world.snapshot().worldRevision;
     if (state.latest_physical_execution_revision > currentWorldRevision) {
       throw new Error(
@@ -530,7 +584,7 @@ export class HumanoidActionRuntime {
     );
     if (grounding) {
       this.#latestGroundingObservation = grounding;
-      for (const agentId of ["humanoid-sentry", "humanoid-motion-reference"]) {
+      for (const agentId of humanoidGroundingAuthorityIds()) {
         this.#observationRevisionByAgent.set(agentId, grounding.worldRevision);
         this.#observationByAgent.set(agentId, structuredClone(grounding));
       }
@@ -591,7 +645,7 @@ export class HumanoidActionRuntime {
 
   isActionAvailable(name: HumanoidActionName, agentId: string): boolean {
     const normalizedAgentId = agentId.trim();
-    if (normalizedAgentId !== "humanoid-motion-reference") return true;
+    if (!isCurrentHumanoidPlanningActor(normalizedAgentId)) return true;
     const transitClearance = this.#navigationTransitClearanceRequirementByAgent.has(
       normalizedAgentId
     );
@@ -755,11 +809,16 @@ export class HumanoidActionRuntime {
     const toolAuthoritySha256 = options.toolAuthority
       ? modelPayloadSha256(options.toolAuthority)
       : undefined;
+    const neuralRolloutCertificateSha256 = options.neuralRolloutCertificate
+      ? modelPayloadSha256(options.neuralRolloutCertificate)
+      : undefined;
     const existing = this.#transactions.get(normalizedTransactionId);
     if (existing) {
       if (existing.fingerprint !== fingerprint
         || existing.decisionSha256 !== decisionSha256
-        || existing.toolAuthoritySha256 !== toolAuthoritySha256) {
+        || existing.toolAuthoritySha256 !== toolAuthoritySha256
+        || existing.neuralRolloutCertificateSha256
+          !== neuralRolloutCertificateSha256) {
         throw new Error(
           `Humanoid action transaction conflict: ${normalizedTransactionId}`
         );
@@ -791,6 +850,7 @@ export class HumanoidActionRuntime {
       toolAuthority: options.toolAuthority
         ? structuredClone(options.toolAuthority)
         : undefined,
+      neuralRolloutCertificateSha256,
       promise
     });
     try {
@@ -859,6 +919,9 @@ export class HumanoidActionRuntime {
       fingerprint,
       ...(decision ? { decision } : {}),
       ...(options.toolAuthority ? { toolAuthority: options.toolAuthority } : {}),
+      ...(options.neuralRolloutCertificate
+        ? { neuralRolloutCertificate: options.neuralRolloutCertificate }
+        : {}),
       ...(options.signal ? { signal: options.signal } : {})
     });
     const after = this.#world.snapshot();
@@ -976,7 +1039,7 @@ export class HumanoidActionRuntime {
   }
 
   #recordPlanningOutcome(receipt: HumanoidActionReceipt): void {
-    if (receipt.agentId !== "humanoid-motion-reference"
+    if (!isRecognizedPlanningReceiptActor(receipt.agentId)
       || !isPlanningAction(receipt.action)) {
       return;
     }
@@ -1008,15 +1071,15 @@ export class HumanoidActionRuntime {
   }
 
   #recordNavigationTransitClearance(receipt: HumanoidActionReceipt): void {
-    const motionAgentId = "humanoid-motion-reference";
     if (receipt.accepted
       && (receipt.action === "execute_humanoid_skill"
         || receipt.action === "execute_whole_body_motion"
         || receipt.action === "execute_humanoid_navigation")) {
-      this.#navigationTransitClearanceRequirementByAgent.delete(motionAgentId);
+      this.#navigationTransitClearanceRequirementByAgent.clear();
       return;
     }
-    if (receipt.agentId !== motionAgentId || receipt.accepted) return;
+    if (!isRecognizedPlanningReceiptActor(receipt.agentId) || receipt.accepted) return;
+    const motionAgentId = receipt.agentId;
     const detail = jsonObject(receipt.detail);
     const failures = receipt.action === "plan_humanoid_navigation"
       ? [{
@@ -1209,6 +1272,7 @@ export class HumanoidActionRuntime {
       fingerprint: string;
       decision?: ModelDecisionRef;
       toolAuthority?: HumanoidActionToolCallAuthority;
+      neuralRolloutCertificate?: NeuralRolloutExecutionAdmission;
       signal?: AbortSignal;
     }
   ): Promise<{
@@ -1220,7 +1284,21 @@ export class HumanoidActionRuntime {
     causalWorldAfterRevision?: number;
   }> {
     if (isPlanningAction(name)
-      && invocation.agentId === "humanoid-motion-reference") {
+      && invocation.agentId === LEGACY_HUMANOID_MOTION_AGENT_ID) {
+      return {
+        accepted: false,
+        code: "legacy_agent_authority_retired",
+        channels: [],
+        detail: {
+          automatic_actuation: false,
+          legacy_agent_id: invocation.agentId,
+          current_planning_agent_id: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+          recovery: "Start a fresh neural hierarchy epoch and invoke Motor Intent through its Premotor parent. Legacy Motion receipts are read-only history."
+        }
+      };
+    }
+    if (isPlanningAction(name)
+      && isCurrentHumanoidPlanningActor(invocation.agentId)) {
       const observedRevision = this.#observationRevisionByAgent.get(
         invocation.agentId
       );
@@ -1313,12 +1391,11 @@ export class HumanoidActionRuntime {
     }
     if (name === "observe_humanoid") {
       HumanoidActionInputs.observe_humanoid.parse(rawInput);
-      const observation = invocation.agentId === "humanoid-sentry"
-        || invocation.agentId === "humanoid-motion-reference"
+      const observation = invocation.agentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion
         ? await this.#world.observeManipulationReachability()
         : await this.#world.captureObservation();
-      const authorityOwners = invocation.agentId === "humanoid-sentry"
-        ? [invocation.agentId, "humanoid-motion-reference"]
+      const authorityOwners = invocation.agentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+        ? [invocation.agentId, HUMANOID_NEURAL_AGENT_IDS.motorIntent]
         : [invocation.agentId];
       for (const ownerId of authorityOwners) {
         const previousObservation = this.#observationByAgent.get(ownerId);
@@ -1347,7 +1424,7 @@ export class HumanoidActionRuntime {
         if (recovery && recovery.world_revision !== observation.worldRevision) {
           this.#recoveryPolicyByAgent.delete(ownerId);
         }
-        if (ownerId === "humanoid-motion-reference") {
+        if (ownerId === HUMANOID_NEURAL_AGENT_IDS.motorIntent) {
           const requirement = manipulationBasePlacementRequirement(observation);
           if (requirement) {
             this.#manipulationBasePlacementRequirementByAgent.set(ownerId, requirement);
@@ -1356,7 +1433,7 @@ export class HumanoidActionRuntime {
           }
         }
       }
-      if (invocation.agentId === "humanoid-sentry") {
+      if (invocation.agentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion) {
         this.#latestGroundingObservation = structuredClone(observation);
       }
       return {
@@ -1677,7 +1754,10 @@ export class HumanoidActionRuntime {
         planningTransactionId: input.planning_transaction_id,
         planId: reference.planId,
         ...(invocation.decision ? { decision: invocation.decision } : {}),
-        ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {})
+        ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {}),
+        ...(invocation.neuralRolloutCertificate
+          ? { neuralRolloutCertificate: invocation.neuralRolloutCertificate }
+          : {})
       });
       if (grounding && !grounding.accepted) {
         return groundingRejection({
@@ -2009,7 +2089,10 @@ export class HumanoidActionRuntime {
         planningTransactionId: input.planning_transaction_id,
         planId: reference.planId,
         ...(invocation.decision ? { decision: invocation.decision } : {}),
-        ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {})
+        ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {}),
+        ...(invocation.neuralRolloutCertificate
+          ? { neuralRolloutCertificate: invocation.neuralRolloutCertificate }
+          : {})
       });
       if (grounding && !grounding.accepted) {
         return groundingRejection({
@@ -2198,7 +2281,10 @@ export class HumanoidActionRuntime {
       planningTransactionId: input.planning_transaction_id,
       planId: reference.planId,
       ...(invocation.decision ? { decision: invocation.decision } : {}),
-      ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {})
+      ...(invocation.toolAuthority ? { toolAuthority: invocation.toolAuthority } : {}),
+      ...(invocation.neuralRolloutCertificate
+        ? { neuralRolloutCertificate: invocation.neuralRolloutCertificate }
+        : {})
     });
     if (grounding && !grounding.accepted) {
       return groundingRejection({
@@ -2400,6 +2486,30 @@ function isPlanningAction(action: HumanoidActionName): action is HumanoidPlannin
     || action === "plan_whole_body_motion"
     || action === "plan_whole_body_motion_candidates"
     || action === "plan_humanoid_navigation";
+}
+
+/**
+ * Motor Intent is the only live planning authority in neural hierarchy V3.
+ */
+function isCurrentHumanoidPlanningActor(agentId: string): boolean {
+  return agentId === HUMANOID_NEURAL_AGENT_IDS.motorIntent;
+}
+
+/**
+ * Persisted pre-V3 receipts may still rebuild bounded failure/cooldown state.
+ * This historical predicate must never be used to authorize a new invocation.
+ */
+function isRecognizedPlanningReceiptActor(agentId: string): boolean {
+  return isCurrentHumanoidPlanningActor(agentId)
+    || agentId === LEGACY_HUMANOID_MOTION_AGENT_ID;
+}
+
+function humanoidGroundingAuthorityIds(): readonly string[] {
+  return [
+    HUMANOID_NEURAL_AGENT_IDS.sensorFusion,
+    HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+    LEGACY_HUMANOID_MOTION_AGENT_ID
+  ];
 }
 
 function transitClearanceSkillReference(
@@ -2780,7 +2890,7 @@ function motionPlanningObservation(
     transition: null
   };
   const relevant = groundingGoalEntities(activeGoal);
-  for (const binding of snapshot.interaction.carrying.bindings) {
+  for (const binding of snapshot.interaction.carrying?.bindings ?? []) {
     relevant.objectIds.add(binding.object_id);
   }
   const tokenById = new Map(snapshot.objectTokens.map((token) => [token.id, token]));
@@ -3121,7 +3231,7 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
         ? []
         : [assessment.object_id]
     )),
-    ...snapshot.interaction.carrying.bindings.map(({ object_id: objectId }) => (
+    ...(snapshot.interaction.carrying?.bindings ?? []).map(({ object_id: objectId }) => (
       objectId
     ))
   ]);
@@ -3445,7 +3555,13 @@ function manipulationBasePlacementRequirement(
   observation: HumanoidWorldObservation
 ): ManipulationBasePlacementRequirement | null {
   const worldModelObjects = observation.interaction.object_world_model?.objects;
-  if (!worldModelObjects) return legacyManipulationBasePlacementRequirement(observation);
+  // Transitional/lightweight observers can publish the v2 interaction envelope
+  // before they have materialized any object-world-model entries.  In that
+  // state the visible object tokens are still the current sensor evidence; an
+  // empty envelope must not erase their IK/base-placement diagnosis.
+  if (!worldModelObjects || worldModelObjects.length === 0) {
+    return legacyManipulationBasePlacementRequirement(observation);
+  }
   const objects = worldModelObjects.flatMap((object) => {
     if (object.status !== "visible"
       || object.role !== "manipulable" && object.articulation === null) return [];

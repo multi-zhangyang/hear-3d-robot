@@ -216,13 +216,21 @@ async function* claimAndStream(
     }
   } catch (error) {
     if (modelCallId && !terminalRecorded) {
+      terminalRecorded = true;
       await runtime.recordModelCallFailed?.(modelCallId, agentId);
     }
     throw preserveModelInterruption(error, agentId);
   } finally {
     if (!streamDone) {
       streamAbort.abort(new Error("Model stream consumer completed"));
-      void iterator.return?.();
+      try {
+        await iterator.return?.();
+      } finally {
+        if (modelCallId && !terminalRecorded) {
+          terminalRecorded = true;
+          await runtime.recordModelCallFailed?.(modelCallId, agentId);
+        }
+      }
     }
   }
 }
@@ -461,13 +469,15 @@ interface ModelProgressGuardLimits {
  */
 export class AuthoritativeModelProgressGuard {
   readonly #limits: ModelProgressGuardLimits;
-  readonly #receiptPatterns = new Map<string, number>();
   #cycleIndex: number;
   #checkerSuccess: boolean;
   #goalStateSha256: string;
+  #authorityStateSha256: string;
   #previousReceiptIds: Set<string>;
   #decisionsSincePhysicalProgress = 0;
   #decisionsWithoutNewReceipt = 0;
+  #lastNoProgressReceiptPattern: string | null = null;
+  #consecutiveNoProgressReceiptCount = 0;
 
   constructor(
     snapshot: ModelProgressSnapshot,
@@ -489,6 +499,7 @@ export class AuthoritativeModelProgressGuard {
     this.#cycleIndex = snapshot.cycleIndex;
     this.#checkerSuccess = snapshot.checkerSuccess;
     this.#goalStateSha256 = snapshot.goalStateSha256;
+    this.#authorityStateSha256 = snapshot.authorityStateSha256;
     this.#previousReceiptIds = new Set(snapshot.receipts.map((receipt) => receipt.transactionId));
   }
 
@@ -502,10 +513,12 @@ export class AuthoritativeModelProgressGuard {
     const authoritativeProgress = snapshot.cycleIndex !== this.#cycleIndex
       || (!this.#checkerSuccess && snapshot.checkerSuccess)
       || snapshot.goalStateSha256 !== this.#goalStateSha256
+      || snapshot.authorityStateSha256 !== this.#authorityStateSha256
       || newReceipts.some(receiptHasPhysicalProgress);
     this.#cycleIndex = snapshot.cycleIndex;
     this.#checkerSuccess = snapshot.checkerSuccess;
     this.#goalStateSha256 = snapshot.goalStateSha256;
+    this.#authorityStateSha256 = snapshot.authorityStateSha256;
     if (authoritativeProgress) {
       this.#resetProgressWindow();
       return;
@@ -521,11 +534,15 @@ export class AuthoritativeModelProgressGuard {
     let repeatedCount = 0;
     for (const receipt of newReceipts) {
       const pattern = receiptPattern(receipt);
-      const count = (this.#receiptPatterns.get(pattern) ?? 0) + 1;
-      this.#receiptPatterns.set(pattern, count);
-      if (count > repeatedCount) {
+      if (pattern === this.#lastNoProgressReceiptPattern) {
+        this.#consecutiveNoProgressReceiptCount += 1;
+      } else {
+        this.#lastNoProgressReceiptPattern = pattern;
+        this.#consecutiveNoProgressReceiptCount = 1;
+      }
+      if (this.#consecutiveNoProgressReceiptCount > repeatedCount) {
         repeatedPattern = pattern;
-        repeatedCount = count;
+        repeatedCount = this.#consecutiveNoProgressReceiptCount;
       }
     }
 
@@ -564,6 +581,7 @@ export class AuthoritativeModelProgressGuard {
     this.#cycleIndex = snapshot.cycleIndex;
     this.#checkerSuccess = snapshot.checkerSuccess;
     this.#goalStateSha256 = snapshot.goalStateSha256;
+    this.#authorityStateSha256 = snapshot.authorityStateSha256;
     this.#previousReceiptIds = new Set(
       snapshot.receipts.map((receipt) => receipt.transactionId)
     );
@@ -571,9 +589,10 @@ export class AuthoritativeModelProgressGuard {
   }
 
   #resetProgressWindow(): void {
-    this.#receiptPatterns.clear();
     this.#decisionsSincePhysicalProgress = 0;
     this.#decisionsWithoutNewReceipt = 0;
+    this.#lastNoProgressReceiptPattern = null;
+    this.#consecutiveNoProgressReceiptCount = 0;
   }
 }
 

@@ -720,8 +720,15 @@ function validatedObstacle(obstacle: NavigationObstacle): NavigationObstacle {
   };
 }
 
+export function navigationObstaclePlanarExpansion(agentRadius: number): number {
+  if (!Number.isFinite(agentRadius) || agentRadius < 0) {
+    throw new Error("Navigation agent radius must be finite and non-negative");
+  }
+  return agentRadius + NAVIGATION_OBSTACLE_SKIN;
+}
+
 function expandedObstacleHalfExtents(halfExtents: Vec3, agentRadius: number): Vec3 {
-  const planarExpansion = agentRadius + NAVIGATION_OBSTACLE_SKIN;
+  const planarExpansion = navigationObstaclePlanarExpansion(agentRadius);
   return {
     x: halfExtents.x + planarExpansion,
     y: halfExtents.y,

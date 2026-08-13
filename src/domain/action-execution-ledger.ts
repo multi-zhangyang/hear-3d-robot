@@ -23,6 +23,7 @@ import {
   HumanoidGroundingReceiptSchema,
   type HumanoidGroundingReceipt
 } from "./humanoid-grounding.js";
+import { NeuralPlanningActionSchema } from "./neural-hierarchy.js";
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
@@ -34,7 +35,10 @@ const PhysicalHumanoidActionSchema = z.enum([
 
 export const ExecutionGateToolCallAuthoritySchema = z.object({
   tool_call_id: z.string().trim().min(1),
-  tool_name: z.literal("delegate_physics_executor"),
+  tool_name: z.enum([
+    "delegate_physics_executor",
+    "execute_certified_motor_intent"
+  ]),
   arguments_sha256: z.string().regex(SHA256_PATTERN),
   normalized_arguments_sha256: z.string().regex(SHA256_PATTERN).optional(),
   deterministic_delegation: z.object({
@@ -48,6 +52,23 @@ export type ExecutionGateToolCallAuthority = z.infer<
   typeof ExecutionGateToolCallAuthoritySchema
 >;
 
+export const NeuralRolloutExecutionAdmissionSchema = z.object({
+  certificate_id: z.string().uuid(),
+  commitment_id: z.string().uuid(),
+  goal_epoch_id: z.string().trim().min(1),
+  planning_transaction_id: z.string().trim().min(1),
+  planning_action: NeuralPlanningActionSchema,
+  rollout_signal_id: z.string().uuid(),
+  predictive_signal_id: z.string().uuid(),
+  rollout_invocation_id: z.string().uuid(),
+  predictive_invocation_id: z.string().uuid(),
+  rollout_payload_sha256: z.string().regex(SHA256_PATTERN)
+}).strict();
+
+export type NeuralRolloutExecutionAdmission = z.infer<
+  typeof NeuralRolloutExecutionAdmissionSchema
+>;
+
 const ActionExecutionAdmissionSchema = z.object({
   planning_transaction_id: z.string().trim().min(1),
   plan_id: z.string().trim().min(1),
@@ -57,7 +78,8 @@ const ActionExecutionAdmissionSchema = z.object({
   physical_checkpoint_sha256: z.string().regex(SHA256_PATTERN),
   decision: ModelDecisionRefSchema.optional(),
   tool_call_authority: ExecutionGateToolCallAuthoritySchema.optional(),
-  grounding_receipt: HumanoidGroundingReceiptSchema.optional()
+  grounding_receipt: HumanoidGroundingReceiptSchema.optional(),
+  neural_rollout_certificate: NeuralRolloutExecutionAdmissionSchema.optional()
 }).strict().superRefine((admission, context) => {
   if ((admission.decision === undefined)
     !== (admission.tool_call_authority === undefined)) {
@@ -81,6 +103,23 @@ const ActionExecutionAdmissionSchema = z.object({
       code: "custom",
       path: ["tool_call_authority"],
       message: "Physical admission authority is not bound to its model decision"
+    });
+  }
+  const neural = admission.neural_rollout_certificate;
+  const certifiedNeuralExecution = authority?.tool_name
+    === "execute_certified_motor_intent";
+  if (certifiedNeuralExecution !== (neural !== undefined)) {
+    context.addIssue({
+      code: "custom",
+      path: ["neural_rollout_certificate"],
+      message: "Certified neural execution and rollout admission must be present together"
+    });
+  } else if (neural
+    && neural.planning_transaction_id !== admission.planning_transaction_id) {
+    context.addIssue({
+      code: "custom",
+      path: ["neural_rollout_certificate", "planning_transaction_id"],
+      message: "Neural rollout admission is not bound to the admitted physical plan"
     });
   }
 });
@@ -286,6 +325,7 @@ export function stageActionExecutionIntent(
     toolCallAuthority: ExecutionGateToolCallAuthority;
     physicalTrajectory?: PhysicalTrajectorySummary;
     groundingReceipt?: HumanoidGroundingReceipt;
+    neuralRolloutCertificate?: NeuralRolloutExecutionAdmission;
     admittedAt?: string;
   }
 ): ActionExecutionLedger {
@@ -314,6 +354,14 @@ export function stageActionExecutionIntent(
             grounding_receipt: HumanoidGroundingReceiptSchema.parse(
               input.groundingReceipt
             )
+          }
+        : {}),
+      ...(input.neuralRolloutCertificate
+        ? {
+            neural_rollout_certificate:
+              NeuralRolloutExecutionAdmissionSchema.parse(
+                input.neuralRolloutCertificate
+              )
           }
         : {})
     }

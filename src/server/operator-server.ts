@@ -6,14 +6,15 @@ import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
 import { z, ZodError } from "zod";
 import {
-  providerConfigForRole,
+  providerConfigForProfile,
   type ProviderConfig,
   type RuntimeCatalog,
   type ServerConfig
 } from "../config/load.js";
 import { GoalSchema } from "../domain/schema.js";
 import { HumanoidRunModeSchema } from "../domain/run-mode.js";
-import { HUMANOID_CAPABILITIES } from "../harness/humanoid/agents.js";
+import { HUMANOID_NEURAL_RUNTIME_CAPABILITIES } from
+  "../harness/humanoid/neural-hierarchy-contract.js";
 import type { RuntimeEvent } from "../runtime/events.js";
 import { providerIdentity } from "../model/factory.js";
 import type { MutationFence } from "../persistence/mutation-fence.js";
@@ -141,11 +142,11 @@ export async function createOperatorServer(input: {
     provider: input.provider
       ? {
           configured: true,
-          ...providerIdentity(providerConfigForRole(input.provider, "coordinator"))
+          ...providerIdentity(providerConfigForProfile(input.provider, "executive"))
         }
       : { configured: false, error: input.providerError ?? "Provider is not configured" },
     authentication_required: Boolean(input.server.password),
-    capability_catalog: [...HUMANOID_CAPABILITIES],
+    capability_catalog: [...HUMANOID_NEURAL_RUNTIME_CAPABILITIES],
     scenarios: scenarioSummaries
   }));
 

@@ -23,6 +23,21 @@ const bundledConfigDirectory = fileURLToPath(new URL("../../config/", import.met
 export const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 300_000;
 export const DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS = 300_000;
 
+export const AGENT_MODEL_PROFILES = [
+  "executive",
+  "associative",
+  "sensorimotor",
+  "motor_intent",
+  "compactor"
+] as const;
+
+export type AgentModelProfile = typeof AGENT_MODEL_PROFILES[number];
+
+/**
+ * Transitional names understood only by the v1 runtime while its callers are
+ * migrated.  They resolve to reusable profiles and are never structural node
+ * identities in the v2 neural manifest.
+ */
 export const AGENT_MODEL_ROLES = [
   "goal_manager",
   "coordinator",
@@ -34,6 +49,16 @@ export const AGENT_MODEL_ROLES = [
 ] as const;
 
 export type AgentModelRole = typeof AGENT_MODEL_ROLES[number];
+
+const LEGACY_ROLE_PROFILE: Readonly<Record<AgentModelRole, AgentModelProfile>> = {
+  goal_manager: "executive",
+  coordinator: "executive",
+  sentry: "associative",
+  motion_planner: "sensorimotor",
+  motion: "motor_intent",
+  executor: "motor_intent",
+  compactor: "compactor"
+};
 
 const ReasoningEffortSchema = z.enum([
   "none",
@@ -72,15 +97,10 @@ const ModelProviderConfigSchema = z.object(ProviderConfigShape).strict().superRe
 
 const ProviderConfigSchema = z.object({
   ...ProviderConfigShape,
-  agentModels: z.object({
-    goal_manager: ModelProviderConfigSchema,
-    coordinator: ModelProviderConfigSchema,
-    sentry: ModelProviderConfigSchema,
-    motion_planner: ModelProviderConfigSchema,
-    motion: ModelProviderConfigSchema,
-    executor: ModelProviderConfigSchema,
-    compactor: ModelProviderConfigSchema
-  }).strict().optional()
+  agentModels: z.record(
+    z.enum(AGENT_MODEL_PROFILES),
+    ModelProviderConfigSchema
+  ).optional()
 }).strict().superRefine(validateProviderBudget);
 
 function validateProviderBudget(
@@ -174,28 +194,28 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
     compactRecentModelTurns: numberFromEnv(env.AI_COMPACT_RECENT_MODEL_TURNS, 4),
     compactMaxOutputTokens
   });
-  const motionProvider = loadAgentModelConfig(env, "motion", inherited);
-  const agentModels = Object.fromEntries(AGENT_MODEL_ROLES.map((role) => [
-    role,
-    role === "motion"
-      ? motionProvider
-      : loadAgentModelConfig(
-          env,
-          role,
-          role === "motion_planner" ? motionProvider : inherited
-        )
-  ])) as Record<AgentModelRole, ModelProviderConfig>;
+  const agentModels = Object.fromEntries(AGENT_MODEL_PROFILES.map((profile) => [
+    profile,
+    loadAgentModelConfig(env, profile, inherited)
+  ])) as Record<AgentModelProfile, ModelProviderConfig>;
   return ProviderConfigSchema.parse({ ...inherited, agentModels });
+}
+
+export function providerConfigForProfile(
+  config: ProviderConfig,
+  profile: AgentModelProfile
+): ModelProviderConfig {
+  const selected = config.agentModels?.[profile];
+  if (selected) return ModelProviderConfigSchema.parse(selected);
+  const { agentModels: _agentModels, ...inherited } = config;
+  return ModelProviderConfigSchema.parse(inherited);
 }
 
 export function providerConfigForRole(
   config: ProviderConfig,
   role: AgentModelRole
 ): ModelProviderConfig {
-  const selected = config.agentModels?.[role];
-  if (selected) return ModelProviderConfigSchema.parse(selected);
-  const { agentModels: _agentModels, ...inherited } = config;
-  return ModelProviderConfigSchema.parse(inherited);
+  return providerConfigForProfile(config, LEGACY_ROLE_PROFILE[role]);
 }
 
 export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -270,10 +290,10 @@ function optionalNumberFromEnv(
 
 function loadAgentModelConfig(
   env: NodeJS.ProcessEnv,
-  role: AgentModelRole,
+  profile: AgentModelProfile,
   inherited: ModelProviderConfig
 ): ModelProviderConfig {
-  const prefix = `AI_${role.toUpperCase()}_`;
+  const prefix = `AI_${profile.toUpperCase()}_`;
   const contextWindowTokens = numberFromEnv(
     env[`${prefix}CONTEXT_WINDOW_TOKENS`],
     inherited.contextWindowTokens

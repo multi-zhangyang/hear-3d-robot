@@ -6,6 +6,7 @@ import { ScenarioBlockRemovalTransactionSchema } from "../../domain/scenario-blo
 import type { JsonValue } from "../../domain/schema.js";
 import { humanoidActionReceiptsInCommitOrder } from "../../domain/humanoid-run.js";
 import type { HumanoidActionReceipt } from "./runtime.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 import {
   completedPhysicalExecution,
   object,
@@ -80,7 +81,7 @@ export function resolveHumanoidCycleCompletionReadiness(
   const observedAfterExecution = receipts.slice(observationBarrierIndex + 1).some((receipt) => (
     receipt.accepted
       && receipt.action === "observe_humanoid"
-      && receipt.agentId === "humanoid-sentry"
+      && isSensorFusionActor(receipt.agentId)
       && sameAutonomousCycle(receipt.cycle, activeCycle)
       && receipt.worldAfterRevision >= (
         mutations.at(-1)?.receipt.worldAfterRevision ?? execution.worldAfterRevision
@@ -238,14 +239,14 @@ function validateHumanoidCycleCausalEvidenceCore(
     const observation = receipts.slice(observationBarrierIndex + 1).find((receipt) => (
       receipt.accepted
         && receipt.action === "observe_humanoid"
-        && receipt.agentId === "humanoid-sentry"
+        && isSensorFusionActor(receipt.agentId)
         && sameAutonomousCycle(receipt.cycle, activeCycle)
         && receipt.worldAfterRevision >= observationBarrierRevision
         && receipt.worldAfterRevision <= currentRevision
     ));
     if (!observation) {
       throw new Error(
-        "Autonomous cycle completion requires an accepted Sentry observation after the latest physical execution and world mutation"
+        "Autonomous cycle completion requires accepted Sensor Fusion evidence after the latest physical execution and world mutation"
       );
     }
   }
@@ -264,4 +265,12 @@ function notReady(reason: string): HumanoidCycleCompletionReadiness {
     observed_after_execution: false,
     reason
   };
+}
+
+function isSensorFusionActor(agentId: string): boolean {
+  // The V2 Sentry is accepted only as provenance on already committed
+  // historical receipts. Current action authority is enforced separately and
+  // admits only the V3 Sensor Fusion service.
+  return agentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+    || agentId === "humanoid-sentry";
 }

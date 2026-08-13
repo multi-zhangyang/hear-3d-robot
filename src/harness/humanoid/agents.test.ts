@@ -183,6 +183,27 @@ describe("humanoid agent hierarchy", () => {
           code: "repeated_planning_failure"
         }
       },
+      recent_receipts: [{
+        transaction_id: "actor-plan-6",
+        agent_id: "humanoid-motion-reference",
+        action: "plan_humanoid_skill",
+        accepted: false,
+        code: "autonomous_skill_route_rejected",
+        detail: {
+          failure_class: "path_or_physical_preview_infeasible",
+          attempts: [{
+            target: { x: 4, y: 0.76, z: 4.56 },
+            accepted: false,
+            reason: "computed path intersects obstacle pickup-stand"
+          }]
+        }
+      }, {
+        transaction_id: "sentry-observation-7",
+        agent_id: "humanoid-sentry",
+        action: "observe_humanoid",
+        accepted: true,
+        code: "humanoid_observed"
+      }],
       robot: { root_position: { x: 9, y: 8, z: 7 } }
     });
 
@@ -192,6 +213,11 @@ describe("humanoid agent hierarchy", () => {
     expect(rendered).toContain(
       '"planning_tool_state":{"planning_actions":[{"action":"plan_humanoid_navigation","available":false}]'
     );
+    expect(rendered).toContain(
+      '"collaboration_results":[{"transaction_id":"actor-plan-6","agent_id":"humanoid-motion-reference"'
+    );
+    expect(rendered).toContain("computed path intersects obstacle pickup-stand");
+    expect(rendered).not.toContain("sentry-observation-7");
     expect(rendered).not.toContain('"root_position"');
   });
 
@@ -1058,7 +1084,9 @@ describe("humanoid agent hierarchy", () => {
       "humanoid-coordinator": "coordinator"
     });
     expect(hierarchy.coordinator.modelSettings.temperature).toBe(0.1);
+    expect(hierarchy.coordinator.modelSettings.toolChoice).toBe("required");
     expect(hierarchy.goalManager.modelSettings.temperature).toBe(0.15);
+    expect(hierarchy.goalManager.modelSettings.toolChoice).toBe("auto");
     expect(hierarchy.goalManager.modelSettings).not.toHaveProperty("maxTokens");
     expect(hierarchy.motionPlanner.modelSettings.temperature).toBe(0.25);
     expect(hierarchy.motion.modelSettings.temperature).toBe(0.3);
@@ -1073,13 +1101,7 @@ describe("humanoid agent hierarchy", () => {
     });
     expect(hierarchy.sentry.kind).toBe("deterministic_service");
     expect(hierarchy.executor.kind).toBe("deterministic_service");
-    for (const agent of [
-      hierarchy.goalManager,
-      hierarchy.coordinator,
-      hierarchy.motionPlanner
-    ]) {
-      expect(agent.modelSettings.toolChoice).toBe("auto");
-    }
+    expect(hierarchy.motionPlanner.modelSettings.toolChoice).toBe("auto");
   });
 });
 

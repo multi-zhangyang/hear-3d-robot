@@ -17,9 +17,12 @@ import {
 } from "../config/load.js";
 import {
   AgentManifestSchema,
+  LegacyAgentManifestSchema,
   type AgentManifest,
   type AgentDeterministicServiceIdentity,
-  type AgentModelIdentity
+  type AgentModelIdentity,
+  type LegacyAgentManifest,
+  type NeuralAgentManifest
 } from "../domain/agent-manifest.js";
 import { configuredOutputTokenLimit } from "../runtime/context-budget.js";
 import { contextCompactorIdentitySource } from "./context-summary-agent.js";
@@ -77,7 +80,7 @@ const VERIFIED_STATUS_TERMINAL_TOOLS = {
 } as const;
 
 type ToolUseBehaviorIdentity = AgentModelIdentity["tool_use_behavior"];
-type AgentToolContract = AgentManifest["agent_tool_contracts"][number];
+type AgentToolContract = LegacyAgentManifest["agent_tool_contracts"][number];
 
 interface AgentIdentitySource {
   agentName: string;
@@ -101,7 +104,7 @@ export function createHumanoidAgentManifest(input: {
   epochId: string;
   createdAt?: string;
   runtimeSdkIdentity?: Record<string, string>;
-}): AgentManifest {
+}): LegacyAgentManifest {
   const goalManagerSource = sourceFromAgent(
     input.hierarchy.goalManager,
     "goal_manager"
@@ -197,7 +200,7 @@ export function createHumanoidAgentManifest(input: {
     agents,
     agent_tool_contracts: agentToolContracts
   };
-  return AgentManifestSchema.parse({
+  return LegacyAgentManifestSchema.parse({
     ...identity,
     epoch_id: input.epochId,
     created_at: input.createdAt ?? new Date().toISOString(),
@@ -212,6 +215,17 @@ export function assertAgentManifestCompatible(
   const persisted = assertManifestIntegrity(persistedInput, "persisted");
   const current = assertManifestIntegrity(currentInput, "current");
   if (persisted.identity_sha256 === current.identity_sha256) return;
+
+  if (persisted.version !== current.version) {
+    throw new AgentManifestIncompatibleError(["version"]);
+  }
+  if (persisted.version === 3 && current.version === 3) {
+    assertNeuralAgentManifestCompatible(persisted, current);
+    return;
+  }
+  if (persisted.version !== 1 || current.version !== 1) {
+    throw new AgentManifestIncompatibleError(["version"]);
+  }
 
   const changes: string[] = [];
   if (persisted.harness_contract_version !== current.harness_contract_version) {
@@ -253,6 +267,27 @@ export function assertAgentManifestCompatible(
   }
   if (changes.length === 0) return;
   throw new AgentManifestIncompatibleError(changes);
+}
+
+function assertNeuralAgentManifestCompatible(
+  persisted: NeuralAgentManifest,
+  current: NeuralAgentManifest
+): void {
+  const changes: string[] = [];
+  for (const field of [
+    "harness_contract_version",
+    "neural_contract_version",
+    "runtime_sdk_identity",
+    "root_agent_id",
+    "agents",
+    "control_edges",
+    "signal_contracts"
+  ] as const) {
+    if (canonicalJson(persisted[field]) !== canonicalJson(current[field])) {
+      changes.push(field);
+    }
+  }
+  if (changes.length > 0) throw new AgentManifestIncompatibleError(changes);
 }
 
 export class AgentManifestIncompatibleError extends Error {
@@ -602,12 +637,26 @@ function assertManifestIntegrity(
 ): AgentManifest {
   const manifest = AgentManifestSchema.parse(input);
   const identity = {
-    version: manifest.version,
-    runtime: manifest.runtime,
-    harness_contract_version: manifest.harness_contract_version,
-    runtime_sdk_identity: manifest.runtime_sdk_identity,
-    agents: manifest.agents,
-    agent_tool_contracts: manifest.agent_tool_contracts
+    ...(manifest.version === 1
+      ? {
+          version: manifest.version,
+          runtime: manifest.runtime,
+          harness_contract_version: manifest.harness_contract_version,
+          runtime_sdk_identity: manifest.runtime_sdk_identity,
+          agents: manifest.agents,
+          agent_tool_contracts: manifest.agent_tool_contracts
+        }
+      : {
+          version: manifest.version,
+          runtime: manifest.runtime,
+          harness_contract_version: manifest.harness_contract_version,
+          neural_contract_version: manifest.neural_contract_version,
+          runtime_sdk_identity: manifest.runtime_sdk_identity,
+          root_agent_id: manifest.root_agent_id,
+          agents: manifest.agents,
+          control_edges: manifest.control_edges,
+          signal_contracts: manifest.signal_contracts
+        })
   };
   const expected = sha256(canonicalJson(identity));
   if (manifest.identity_sha256 !== expected) {

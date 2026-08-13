@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import type { AgentManifest } from "../../domain/agent-manifest.js";
+import type {
+  AgentManifest,
+  HistoricalAgentAuthorityManifest
+} from "../../domain/agent-manifest.js";
 import type { HumanoidActionName } from "../../domain/humanoid-action.js";
 import {
   authorityForToolCall,
@@ -26,6 +29,7 @@ import {
   goalPredicateIsObservable,
   type GoalEvidenceArtifact
 } from "./goal-evidence.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 
 export interface HumanoidModelToolCallAuthority {
   tool_call_id: string;
@@ -60,9 +64,13 @@ type FailedModelCall = Extract<
 
 export class HumanoidModelAuthority {
   readonly #goalManager: ManifestAuthority;
-  readonly #coordinator: ManifestAuthority;
+  readonly #groundingManager: ManifestAuthority;
+  readonly #executionManager: ManifestAuthority;
+  readonly #authorizedGroundingManagers: readonly ManifestAuthority[];
+  readonly #authorizedExecutionManagers: readonly ManifestAuthority[];
   readonly #authorizedGoalManagers: readonly ManifestAuthority[];
   readonly #actionAgents: ReadonlyMap<string, readonly ManifestAuthority[]>;
+  readonly #legacyV2RuntimeAuthorityEnabled: boolean;
   readonly #appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
   readonly #started = new Map<string, StartedModelCall>();
   readonly #terminalIds = new Set<string>();
@@ -70,16 +78,24 @@ export class HumanoidModelAuthority {
 
   private constructor(input: {
     goalManager: ManifestAuthority;
-    coordinator: ManifestAuthority;
+    groundingManager: ManifestAuthority;
+    executionManager: ManifestAuthority;
+    authorizedGroundingManagers: readonly ManifestAuthority[];
+    authorizedExecutionManagers: readonly ManifestAuthority[];
     authorizedGoalManagers: readonly ManifestAuthority[];
     actionAgents: ReadonlyMap<string, readonly ManifestAuthority[]>;
+    legacyV2RuntimeAuthorityEnabled: boolean;
     records: readonly ModelCallLifecycleRecord[];
     appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
   }) {
     this.#goalManager = input.goalManager;
-    this.#coordinator = input.coordinator;
+    this.#groundingManager = input.groundingManager;
+    this.#executionManager = input.executionManager;
+    this.#authorizedGroundingManagers = input.authorizedGroundingManagers;
+    this.#authorizedExecutionManagers = input.authorizedExecutionManagers;
     this.#authorizedGoalManagers = input.authorizedGoalManagers;
     this.#actionAgents = input.actionAgents;
+    this.#legacyV2RuntimeAuthorityEnabled = input.legacyV2RuntimeAuthorityEnabled;
     this.#appendRecord = input.appendRecord;
     this.#authorities = rebuildModelCallAuthorities(input.records);
     for (const record of input.records) {
@@ -94,20 +110,21 @@ export class HumanoidModelAuthority {
 
   static restore(input: {
     manifest: AgentManifest;
-    archivedManifests?: readonly AgentManifest[];
+    archivedManifests?: readonly HistoricalAgentAuthorityManifest[];
     nodes: Readonly<Record<string, TaskNode>>;
     records: readonly unknown[];
     appendRecord: (record: ModelCallLifecycleRecord) => Promise<void>;
   }): HumanoidModelAuthority {
-    const goalManager = input.manifest.agents.goal_manager;
+    const goalManager = goalManagerIdentity(input.manifest);
     assertManifestNode(input.nodes, goalManager.agent_id, "Goal Manager");
     const goalAuthority = manifestAuthority(input.manifest, goalManager.agent_id);
     const authorizedGoalManagers = [
       goalAuthority,
       ...(input.archivedManifests ?? []).map((archived) => {
-        const archivedGoalManager = archived.agents.goal_manager;
-        assertManifestNode(input.nodes, archivedGoalManager.agent_id, "Archived Goal Manager");
-        return manifestAuthority(archived, archivedGoalManager.agent_id);
+        return historicalManifestAuthority(
+          archived,
+          archived.goal_manager_agent_id
+        );
       })
     ];
     const goalAuthorityKeys = new Set<string>();
@@ -135,54 +152,50 @@ export class HumanoidModelAuthority {
         actionAgents.set(agentId, existing);
       }
     };
-    const coordinator = input.manifest.agents.coordinator;
-    const coordinatorAuthority = manifestAuthority(
+    for (const agent of manifestAgentIdentities(input.manifest)) {
+      if (agent.agent_id === goalManager.agent_id) continue;
+      addActionAgent(input.manifest, agent.agent_id, "Current hierarchy node");
+    }
+    const groundingManager = manifestAuthority(
       input.manifest,
-      coordinator.agent_id
+      groundingManagerIdentity(input.manifest).agent_id
     );
-    addActionAgent(input.manifest, coordinator.agent_id, "Coordinator");
-    const motionPlanner = input.manifest.agents.motion_planner;
-    if (motionPlanner.agent_id === goalManager.agent_id
-      || actionAgents.has(motionPlanner.agent_id)) {
-      throw new Error(
-        `Agent manifest reuses an authority identity: ${motionPlanner.agent_id}`
-      );
-    }
-    addActionAgent(input.manifest, motionPlanner.agent_id, "Motion Planner");
-    for (const role of ["sentry", "motion", "executor"] as const) {
-      const agent = input.manifest.agents[role];
-      if (agent.agent_id === goalManager.agent_id || actionAgents.has(agent.agent_id)) {
-        throw new Error(`Agent manifest reuses an authority identity: ${agent.agent_id}`);
-      }
-      addActionAgent(input.manifest, agent.agent_id, role);
-    }
+    const executionManager = manifestAuthority(
+      input.manifest,
+      executionManagerIdentity(input.manifest).agent_id
+    );
+    const authorizedGroundingManagers = [groundingManager];
+    const authorizedExecutionManagers = [executionManager];
     for (const archived of input.archivedManifests ?? []) {
-      addActionAgent(
-        archived,
-        archived.agents.coordinator.agent_id,
-        "Archived Coordinator"
-      );
-      addActionAgent(
-        archived,
-        archived.agents.motion_planner.agent_id,
-        "Archived Motion Planner"
-      );
-      for (const role of ["sentry", "motion", "executor"] as const) {
-        addActionAgent(
-          archived,
-          archived.agents[role].agent_id,
-          `Archived ${role}`
-        );
+      for (const agentId of archived.agent_ids) {
+        const authority = historicalManifestAuthority(archived, agentId);
+        const existing = actionAgents.get(agentId) ?? [];
+        if (!existing.some((candidate) => sameManifestAuthority(candidate, authority))) {
+          existing.push(authority);
+          actionAgents.set(agentId, existing);
+        }
       }
+      pushUniqueAuthority(
+        authorizedGroundingManagers,
+        historicalManifestAuthority(archived, archived.grounding_manager_agent_id)
+      );
+      pushUniqueAuthority(
+        authorizedExecutionManagers,
+        historicalManifestAuthority(archived, archived.execution_manager_agent_id)
+      );
     }
     const records = input.records.map((record) => (
       ModelCallLifecycleRecordSchema.parse(record)
     ));
     return new HumanoidModelAuthority({
       goalManager: goalAuthority,
-      coordinator: coordinatorAuthority,
+      groundingManager,
+      executionManager,
+      authorizedGroundingManagers,
+      authorizedExecutionManagers,
       authorizedGoalManagers,
       actionAgents,
+      legacyV2RuntimeAuthorityEnabled: input.manifest.version !== 3,
       records,
       appendRecord: input.appendRecord
     });
@@ -397,11 +410,12 @@ export class HumanoidModelAuthority {
     const delegation = input.toolAuthority.deterministic_delegation;
     const requiredDelegation = requiredDeterministicDelegation(
       input.expectedToolName,
-      actorAgentId
+      actorAgentId,
+      this.#legacyV2RuntimeAuthorityEnabled
     );
     if (requiredDelegation && delegation?.contract_id !== requiredDelegation) {
       throw new Error(
-        `Humanoid action requires Coordinator deterministic delegation: ${transactionId}`
+        `Humanoid action requires hierarchical Manager delegation: ${transactionId}`
       );
     }
     const sourceAgentId = delegation
@@ -515,21 +529,24 @@ export class HumanoidModelAuthority {
     const sourceToolName = toolCalls?.length === 1 ? toolCalls[0]!.tool_name : undefined;
     const requiredDelegation = requiredDeterministicDelegation(
       input.expectedToolName,
-      input.agentId
+      input.agentId,
+      this.#legacyV2RuntimeAuthorityEnabled
     );
     const sourceAuthorized = requiredDelegation
       ? sourceToolName !== undefined && this.#deterministicDecisionSource({
           sourceToolName,
           action: input.expectedToolName,
           actorAgentId: input.agentId,
-          contractId: requiredDelegation
+          contractId: requiredDelegation,
+          sourceAgentId: decision.agent_id
         }) === decision.agent_id
       : sourceToolName === input.expectedToolName
         ? decision.agent_id === input.agentId
         : sourceToolName !== undefined && this.#deterministicDecisionSource({
             sourceToolName,
             action: input.expectedToolName,
-            actorAgentId: input.agentId
+            actorAgentId: input.agentId,
+            sourceAgentId: decision.agent_id
           }) === decision.agent_id;
     const normalizedArgumentsSha256 = modelPayloadSha256(input.actionInput);
     if (requiredDelegation) {
@@ -579,16 +596,26 @@ export class HumanoidModelAuthority {
     action: HumanoidActionName;
     actorAgentId: string;
     contractId?: "grounding_monitor_v1" | "execution_gate_v1";
+    sourceAgentId?: string;
   }): string {
-    if (input.sourceToolName === "delegate_humanoid_sentry"
+    if ((this.#legacyV2RuntimeAuthorityEnabled
+      && input.sourceToolName === "delegate_humanoid_sentry"
       && input.actorAgentId === "humanoid-sentry"
+      || input.sourceToolName === "capture_sensor_fusion"
+      && input.actorAgentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion)
       && input.action === "observe_humanoid"
       && (input.contractId === undefined
         || input.contractId === "grounding_monitor_v1")) {
-      return this.#coordinator.agentId;
+      return selectAuthorizedManager(
+        this.#authorizedGroundingManagers,
+        this.#groundingManager,
+        input.sourceAgentId
+      );
     }
-    if (input.sourceToolName === "delegate_physics_executor"
-      && input.actorAgentId === "humanoid-executor"
+    if ((this.#legacyV2RuntimeAuthorityEnabled
+      ? input.sourceToolName === "delegate_physics_executor"
+      : input.sourceToolName === "execute_certified_motor_intent")
+      && input.actorAgentId === HUMANOID_NEURAL_AGENT_IDS.executor
       && [
         "execute_humanoid_skill",
         "execute_whole_body_motion",
@@ -596,7 +623,11 @@ export class HumanoidModelAuthority {
         "remove_world_block"
       ].includes(input.action)
       && (input.contractId === undefined || input.contractId === "execution_gate_v1")) {
-      return this.#coordinator.agentId;
+      return selectAuthorizedManager(
+        this.#authorizedExecutionManagers,
+        this.#executionManager,
+        input.sourceAgentId
+      );
     }
     throw new Error(
       `Humanoid deterministic delegation is not authoritative: ${input.sourceToolName}`
@@ -612,8 +643,12 @@ export class HumanoidModelAuthority {
     actorAgentId: string;
   }): void {
     if (input.contractId === "grounding_monitor_v1") {
-      if (input.sourceToolName !== "delegate_humanoid_sentry"
-        || input.actorAgentId !== "humanoid-sentry"
+      const validGroundingEdge = this.#legacyV2RuntimeAuthorityEnabled
+        && input.sourceToolName === "delegate_humanoid_sentry"
+        && input.actorAgentId === "humanoid-sentry"
+        || input.sourceToolName === "capture_sensor_fusion"
+        && input.actorAgentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion;
+      if (!validGroundingEdge
         || input.action !== "observe_humanoid"
         || modelPayloadSha256(input.sourceInput) !== modelPayloadSha256({})
         || modelPayloadSha256(input.actionInput) !== modelPayloadSha256({})) {
@@ -623,8 +658,11 @@ export class HumanoidModelAuthority {
     }
     const source = objectRecord(input.sourceInput);
     const execution = objectRecord(source?.execution);
-    if (input.sourceToolName !== "delegate_physics_executor"
-      || input.actorAgentId !== "humanoid-executor"
+    const expectedExecutionTool = this.#legacyV2RuntimeAuthorityEnabled
+      ? "delegate_physics_executor"
+      : "execute_certified_motor_intent";
+    if (input.sourceToolName !== expectedExecutionTool
+      || input.actorAgentId !== HUMANOID_NEURAL_AGENT_IDS.executor
       || !execution) {
       throw new Error("Execution Gate delegation has no validated source input");
     }
@@ -711,14 +749,106 @@ function manifestAuthority(
   };
 }
 
+function historicalManifestAuthority(
+  manifest: HistoricalAgentAuthorityManifest,
+  agentId: string
+): ManifestAuthority {
+  if (!manifest.agent_ids.includes(agentId)) {
+    throw new Error(`Historical manifest has no Agent authority: ${agentId}`);
+  }
+  return {
+    agentId,
+    epochId: manifest.epoch_id,
+    identitySha256: manifest.identity_sha256
+  };
+}
+
+function manifestAgentIdentities(
+  manifest: AgentManifest
+): Array<{ agent_id: string }> {
+  return Object.values(manifest.agents);
+}
+
+function goalManagerIdentity(
+  manifest: AgentManifest
+): { agent_id: string } {
+  const identity = manifest.version === 3
+    ? manifest.agents[HUMANOID_NEURAL_AGENT_IDS.goalManager]
+    : manifest.agents.goal_manager;
+  if (!identity || (manifest.version === 3 && identity.execution_kind !== "model_agent")) {
+    throw new Error("Agent manifest has no structural Goal Valuation authority");
+  }
+  return identity;
+}
+
+function groundingManagerIdentity(
+  manifest: AgentManifest
+): { agent_id: string } {
+  const identity = manifest.version === 3
+    ? manifest.agents[HUMANOID_NEURAL_AGENT_IDS.perceptionManager]
+    : manifest.agents.coordinator;
+  if (!identity || (manifest.version === 3 && identity.execution_kind !== "model_agent")) {
+    throw new Error("Agent manifest has no structural Perception Manager authority");
+  }
+  return identity;
+}
+
+function executionManagerIdentity(
+  manifest: AgentManifest
+): { agent_id: string } {
+  const identity = manifest.version === 3
+    ? manifest.agents[HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager]
+    : manifest.agents.coordinator;
+  if (!identity || (manifest.version === 3 && identity.execution_kind !== "model_agent")) {
+    throw new Error("Agent manifest has no structural Sensorimotor Manager authority");
+  }
+  return identity;
+}
+
+function sameManifestAuthority(
+  left: ManifestAuthority,
+  right: ManifestAuthority
+): boolean {
+  return left.agentId === right.agentId
+    && left.epochId === right.epochId
+    && left.identitySha256 === right.identitySha256;
+}
+
+function pushUniqueAuthority(
+  authorities: ManifestAuthority[],
+  candidate: ManifestAuthority
+): void {
+  if (!authorities.some((authority) => sameManifestAuthority(authority, candidate))) {
+    authorities.push(candidate);
+  }
+}
+
+function selectAuthorizedManager(
+  authorities: readonly ManifestAuthority[],
+  current: ManifestAuthority,
+  requestedAgentId?: string
+): string {
+  if (requestedAgentId === undefined) return current.agentId;
+  const candidates = authorities.filter((authority) => (
+    authority.agentId === requestedAgentId
+  ));
+  if (candidates.length === 0) {
+    throw new Error(`Deterministic delegation has no Manager authority: ${requestedAgentId}`);
+  }
+  return requestedAgentId;
+}
+
 function requiredDeterministicDelegation(
   action: HumanoidActionName,
-  actorAgentId: string
+  actorAgentId: string,
+  legacyV2RuntimeAuthorityEnabled: boolean
 ): "grounding_monitor_v1" | "execution_gate_v1" | undefined {
-  if (actorAgentId === "humanoid-sentry" && action === "observe_humanoid") {
+  if ((legacyV2RuntimeAuthorityEnabled && actorAgentId === "humanoid-sentry"
+    || actorAgentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion)
+    && action === "observe_humanoid") {
     return "grounding_monitor_v1";
   }
-  if (actorAgentId === "humanoid-executor" && [
+  if (actorAgentId === HUMANOID_NEURAL_AGENT_IDS.executor && [
     "execute_humanoid_skill",
     "execute_whole_body_motion",
     "execute_humanoid_navigation",

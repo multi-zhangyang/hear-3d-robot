@@ -674,6 +674,12 @@ export class HumanoidNavigationExecution {
       this.#final.rootPosition,
       yawFromQuaternion(this.#final.rootRotation)
     );
+    // Once the physical heading satisfies the declared arrival contract, stop
+    // commanding rotation. Continuing to servo a sub-tolerance error makes the
+    // stop gate require a near-zero yaw command while the controller is still
+    // deliberately producing one, so an otherwise valid arrival can never
+    // accumulate settled frames.
+    if (Math.abs(error) <= this.#arrivalHeading.tolerance_radians) return 0;
     return clamp(error * 1.8, -1, 1);
   }
 

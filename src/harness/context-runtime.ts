@@ -63,5 +63,6 @@ export interface ModelProgressSnapshot {
   cycleIndex: number;
   checkerSuccess: boolean;
   goalStateSha256: string;
+  authorityStateSha256: string;
   receipts: ModelProgressReceipt[];
 }

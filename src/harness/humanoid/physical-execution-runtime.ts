@@ -4,8 +4,11 @@ import {
   recordActionExecutionProgress,
   stageActionExecutionIntent,
   ExecutionGateToolCallAuthoritySchema,
+  NeuralRolloutExecutionAdmissionSchema,
   type ActionExecutionLedgerEntry
 } from "../../domain/action-execution-ledger.js";
+import { consumeNeuralRolloutCertificate } from
+  "../../domain/neural-hierarchy.js";
 import type { PendingActionCommit } from "../../domain/action-commit-outbox.js";
 import {
   sameAutonomousCycle,
@@ -143,6 +146,13 @@ export class HumanoidPhysicalExecutionRuntime {
     );
     const checkpoint = this.#checkpoint();
     const cycle = this.#requiredActiveCycle();
+    const neuralTool = toolCallAuthority.tool_name
+      === "execute_certified_motor_intent";
+    if (neuralTool !== (intent.neuralRolloutCertificate !== undefined)) {
+      throw new Error(
+        "Certified neural execution requires exactly one rollout certificate admission"
+      );
+    }
     const planningReceipt = checkpoint.committed_actions[intent.planningTransactionId];
     if (!planningReceipt || !sameAutonomousCycle(planningReceipt.cycle, cycle)) {
       throw new Error(
@@ -179,7 +189,10 @@ export class HumanoidPhysicalExecutionRuntime {
     if (!grounding.accepted) return grounding;
     const trajectory = createPhysicalTrajectory(cut.world);
     this.#physicalTrajectories.set(intent.transactionId, trajectory);
-    checkpoint.action_execution_ledger = stageActionExecutionIntent(
+    const neuralRolloutCertificate = intent.neuralRolloutCertificate
+      ? NeuralRolloutExecutionAdmissionSchema.parse(intent.neuralRolloutCertificate)
+      : undefined;
+    const nextExecutionLedger = stageActionExecutionIntent(
       checkpoint.action_execution_ledger,
       {
         runId: this.#runId,
@@ -197,9 +210,24 @@ export class HumanoidPhysicalExecutionRuntime {
         decision: intent.decision,
         toolCallAuthority,
         physicalTrajectory: trajectory,
-        groundingReceipt: grounding
+        groundingReceipt: grounding,
+        ...(neuralRolloutCertificate ? { neuralRolloutCertificate } : {})
       }
     );
+    const nextNeuralState = neuralRolloutCertificate
+      ? consumeNeuralRolloutCertificate(checkpoint.neural_hierarchy_state, {
+          certificateId: neuralRolloutCertificate.certificate_id,
+          commitmentId: neuralRolloutCertificate.commitment_id,
+          planningTransactionId: neuralRolloutCertificate.planning_transaction_id,
+          planningAction: neuralRolloutCertificate.planning_action,
+          executionTransactionId: intent.transactionId,
+          worldRevision: cut.world.worldRevision
+        }).state
+      : checkpoint.neural_hierarchy_state;
+    // One checkpoint cut is the physical admission boundary: the ledger and
+    // one-shot neural certificate can never be durably advanced separately.
+    checkpoint.action_execution_ledger = nextExecutionLedger;
+    checkpoint.neural_hierarchy_state = nextNeuralState;
     await this.#persist();
     return grounding;
   }
@@ -460,7 +488,9 @@ export class HumanoidPhysicalExecutionRuntime {
       || !intent.toolAuthority
       || JSON.stringify(entry.admission.decision) !== JSON.stringify(intent.decision)
       || JSON.stringify(entry.admission.tool_call_authority)
-        !== JSON.stringify(intent.toolAuthority)) {
+        !== JSON.stringify(intent.toolAuthority)
+      || JSON.stringify(entry.admission.neural_rollout_certificate)
+        !== JSON.stringify(intent.neuralRolloutCertificate)) {
       throw new Error(
         `Physical execution retry conflicts with durable intent: ${intent.transactionId}`
       );

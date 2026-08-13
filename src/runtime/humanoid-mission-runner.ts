@@ -10,11 +10,13 @@ import {
 } from "@openai/agents";
 import {
   DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS,
+  providerConfigForProfile,
   providerConfigForRole,
   type ProviderConfig,
   type RuntimeCatalog
 } from "../config/load.js";
 import type { Goal } from "../domain/schema.js";
+import { modelPayloadSha256 } from "../domain/model-call-authority.js";
 import { humanoidActionReceiptsInCommitOrder } from "../domain/humanoid-run.js";
 import {
   humanoidRunShouldFinish,
@@ -33,15 +35,23 @@ import {
 } from "../harness/context-summary-agent.js";
 import {
   AgentManifestIncompatibleError,
-  assertAgentManifestCompatible,
-  createHumanoidAgentManifest
+  assertAgentManifestCompatible
 } from "../harness/agent-manifest.js";
+import { withAgentInvocation } from "../harness/agent-scope.js";
 import {
-  coordinatorInvocationInput,
-  createHumanoidAgentHierarchy,
-  humanoidAgentRole,
-  HUMANOID_AGENT_IDS
-} from "../harness/humanoid/agents.js";
+  createHumanoidNeuralAgentHierarchy,
+  humanoidNeuralContextProjection,
+  humanoidNeuralAgentProfile
+} from "../harness/humanoid/neural-agents.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from
+  "../harness/humanoid/neural-hierarchy-contract.js";
+import {
+  NeuralHierarchyScheduler,
+  type NeuralSchedulerDispatch,
+  type NeuralSchedulerEvent
+} from "../harness/humanoid/neural-hierarchy-scheduler.js";
+import { createHumanoidNeuralAgentManifest } from
+  "../harness/neural-agent-manifest.js";
 import { createHumanoidRunCheckpoint } from "../harness/humanoid/run-checkpoint.js";
 import { HumanoidRunRuntime } from "../harness/humanoid/run-runtime.js";
 import { DensePolicyRolloutWriter } from
@@ -221,7 +231,10 @@ export async function resumeHumanoidMission(input: {
 }): Promise<HumanoidMissionRunResult> {
   const store = await RunStore.open(
     input.runDir,
-    input.mutationFence ? { mutationFence: input.mutationFence } : {}
+    {
+      ...(input.mutationFence ? { mutationFence: input.mutationFence } : {}),
+      ...(input.freshAgentEpoch ? { freshNeuralHierarchyEpoch: true } : {})
+    }
   );
   if (store.definition.runtime !== "humanoid_g1") {
     throw new Error("This run was not created by the humanoid runtime");
@@ -232,9 +245,6 @@ export async function resumeHumanoidMission(input: {
   );
   const checkpoint = await store.readHumanoidCheckpoint();
   if (checkpoint.status === "succeeded") throw new Error("A succeeded run cannot be resumed");
-  if (input.freshAgentEpoch) {
-    await store.archiveCurrentAgentEpoch();
-  }
   const scenarioChunks = await store.readScenarioChunkDeltaState();
   assertHumanoidPhysicalWorldDeltaRecovery({
     scenario: store.definition.scenario,
@@ -294,12 +304,13 @@ async function executeHumanoidMission(input: {
   );
   let modelProgressRecoveryEpoch = 0;
   let initialized = false;
+  let neuralScheduler: NeuralHierarchyScheduler | undefined;
   try {
     const persistedManifest = await persistedManifestForMission(input);
     const manifestEpochId = persistedManifest?.epoch_id ?? randomUUID();
     const promptCacheKeyFor = (
       agentId: string,
-      provider: ReturnType<typeof providerConfigForRole>
+      provider: ReturnType<typeof providerConfigForProfile>
     ): string => promptCacheAffinityKey({
       namespace: HUMANOID_PROMPT_CACHE_NAMESPACE,
       agentId,
@@ -336,7 +347,7 @@ async function executeHumanoidMission(input: {
         recovery_window_reset: true
       }, agentId);
     };
-    const coordinatorProvider = providerConfigForRole(input.provider, "coordinator");
+    const executiveProvider = providerConfigForProfile(input.provider, "executive");
     const compactorProvider = providerConfigForRole(input.provider, "compactor");
     const compactorOutputLimit = configuredOutputTokenLimit(
       compactorProvider.compactMaxOutputTokens,
@@ -344,10 +355,12 @@ async function executeHumanoidMission(input: {
     );
     const contextManager = new LongRunContextManager({
       runtime: input.runtime,
-      provider: coordinatorProvider,
-      configForAgent: (agentId) => providerConfigForRole(
+      provider: executiveProvider,
+      configForAgent: (agentId) => providerConfigForProfile(
         input.provider,
-        humanoidAgentRole(agentId)
+        agentId.startsWith("humanoid-context-compactor:")
+          ? "compactor"
+          : humanoidNeuralAgentProfile(agentId)
       ),
       compactorProvider,
       createGenerator: (agentId) => new AgentsSdkContextSummaryGenerator({
@@ -390,7 +403,8 @@ async function executeHumanoidMission(input: {
       && !(await hasPersistedAgentRuntimeState(input.runtime.store))
       && Object.keys(contextManager.snapshot.scopes).length > 0;
     if (resumedWithFreshAgentEpoch) {
-      for (const agentId of Object.values(HUMANOID_AGENT_IDS)) {
+      for (const agentId of Object.values(HUMANOID_NEURAL_AGENT_IDS)) {
+        if (!sessions.has(agentId)) continue;
         contextManager.acceptSdkSessionRollback(agentId);
       }
     }
@@ -426,7 +440,7 @@ async function executeHumanoidMission(input: {
         modelRequestSessionBaseline = await captureHumanoidSessionBaseline(sessions);
       }
     };
-    const hierarchy = createHumanoidAgentHierarchy({
+    const hierarchy = createHumanoidNeuralAgentHierarchy({
       createModel: (agentId, provider) => withModelTelemetry(
         createConfiguredModel(provider, {
           promptCacheKey: promptCacheKeyFor(agentId, provider),
@@ -455,7 +469,7 @@ async function executeHumanoidMission(input: {
       runtime: input.runtime,
       onAgentStream: persistAgentEvent
     });
-    const currentManifest = createHumanoidAgentManifest({
+    const currentManifest = createHumanoidNeuralAgentManifest({
       hierarchy,
       provider: input.provider,
       epochId: manifestEpochId,
@@ -477,7 +491,20 @@ async function executeHumanoidMission(input: {
       reasoningItemIdPolicy: "omit",
       workflowName: "HEAR humanoid autonomy"
     });
-    const coordinatorSession = hierarchy.coordinatorSession as FileSession;
+    let scheduledWake: NeuralSchedulerDispatch | undefined;
+    neuralScheduler = new NeuralHierarchyScheduler({
+      resolveAuthority: ({ requestedTargetNodeId }) => (
+        input.runtime.resolveNeuralWakeAuthority(requestedTargetNodeId)
+      ),
+      dispatch: async (wake) => {
+        // The scheduler delivers an interrupt plan to the one Executive root.
+        // It never starts the requested child as a new root episode.
+        scheduledWake = wake;
+      }
+    });
+    const executiveSession = hierarchy.session(
+      HUMANOID_NEURAL_AGENT_IDS.executive
+    ) as FileSession;
 
     if (persistedManifest) {
       assertAgentManifestCompatible(persistedManifest, currentManifest);
@@ -510,21 +537,22 @@ async function executeHumanoidMission(input: {
     const controller = input.runtime.snapshot().robot.controller;
     await input.runtime.recordProvider({
       status: "configured",
-      ...providerIdentity(coordinatorProvider),
-      hierarchy: "coordinator_goal_manager_and_motion_planner_actor_agents_plus_deterministic_grounding_and_execution_services",
+      ...providerIdentity(executiveProvider),
+      hierarchy: "strict_single_parent_invocation_scoped_neural_hierarchy_v3",
       prompt_cache_affinity: "stable_per_credential_agent_protocol_native",
       agent_manifest_epoch: currentManifest.epoch_id,
       agent_profiles: Object.fromEntries(Object.entries(currentManifest.agents).map(
-        ([role, profile]) => [role, profile.execution_kind === "deterministic_service"
+        ([role, profile]) => [role, profile.execution_kind !== "model_agent"
           ? {
               agent_id: profile.agent_id,
               execution_kind: profile.execution_kind,
               implementation_contract: profile.implementation_contract,
-              decision_authority_role: profile.decision_authority_role
+              parent_agent_id: profile.parent_agent_id,
+              physical_write_authority: profile.physical_write_authority
             }
           : {
               agent_id: profile.agent_id,
-              execution_kind: "model",
+              execution_kind: "model_agent",
               protocol: profile.protocol,
               model: profile.model,
               context_window_tokens: profile.settings.context_window_tokens,
@@ -568,14 +596,15 @@ async function executeHumanoidMission(input: {
     ): Promise<HumanoidMissionRunResult | undefined> => {
       const completion = assertCoordinatorStepOutput(output);
       if (completion.status === "step_completed") return undefined;
+      const transitionOutput = completion.payloadOutput;
       await contextManager.commitPendingSessionRewrites(sessionForAgent);
       if (completion.status === "cycle_completed") {
-        const activeGoalCompleted = await input.runtime.completeCycle(output);
+        const activeGoalCompleted = await input.runtime.completeCycle(transitionOutput);
         if (input.runtime.checkpoint.status === "succeeded") {
           return {
             runId: input.runtime.runId,
             runDir: input.runtime.store.runDir,
-            output: input.runtime.checkpoint.final_output ?? output
+            output: input.runtime.checkpoint.final_output ?? transitionOutput
           };
         }
         if (humanoidRunShouldFinish({
@@ -583,20 +612,22 @@ async function executeHumanoidMission(input: {
           activeGoalCompleted,
           missionGoalCompleted: input.runtime.missionGoalCompleted()
         })) {
-          await input.runtime.succeed(output);
+          await input.runtime.succeed(transitionOutput);
           return {
             runId: input.runtime.runId,
             runDir: input.runtime.store.runDir,
-            output
+            output: transitionOutput
           };
         }
       } else if (completion.status === "satisfied_goal_completed") {
-        const activeGoalCompleted = await input.runtime.completeSatisfiedGoal(output);
+        const activeGoalCompleted = await input.runtime.completeSatisfiedGoal(
+          transitionOutput
+        );
         if (input.runtime.checkpoint.status === "succeeded") {
           return {
             runId: input.runtime.runId,
             runDir: input.runtime.store.runDir,
-            output: input.runtime.checkpoint.final_output ?? output
+            output: input.runtime.checkpoint.final_output ?? transitionOutput
           };
         }
         if (humanoidRunShouldFinish({
@@ -604,11 +635,11 @@ async function executeHumanoidMission(input: {
           activeGoalCompleted,
           missionGoalCompleted: input.runtime.missionGoalCompleted()
         })) {
-          await input.runtime.succeed(output);
+          await input.runtime.succeed(transitionOutput);
           return {
             runId: input.runtime.runId,
             runDir: input.runtime.store.runDir,
-            output
+            output: transitionOutput
           };
         }
       }
@@ -622,20 +653,26 @@ async function executeHumanoidMission(input: {
     for (;;) {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
+      await input.runtime.reconcileNeuralHarnessPhase();
+      neuralScheduler.publish(neuralSchedulerEventForRuntime(input.runtime));
+      await neuralScheduler.waitForIdle();
+      const wake = scheduledWake;
+      scheduledWake = undefined;
+      if (!wake) throw new Error("Neural scheduler produced no Executive wake plan");
       const sessionBaseline = await captureHumanoidSessionBaseline(sessions);
       modelRequestSessionBaseline = sessionBaseline;
       try {
-        let runInput: string | RunState<unknown, typeof hierarchy.coordinator>;
+        let runInput: string | RunState<unknown, typeof hierarchy.root>;
         if (serializedState) {
           try {
             runInput = await RunState.fromString(
-              hierarchy.coordinator,
+              hierarchy.root,
               serializedState
             );
           } catch (error) {
             const unavailableTool = recoverableDynamicToolRunStateError(
               error,
-              hierarchy.coordinator.tools.map((tool) => tool.name)
+              hierarchy.root.tools.map((tool) => tool.name)
             );
             if (!unavailableTool) throw error;
             await input.runtime.store.clearAgentState();
@@ -650,19 +687,25 @@ async function executeHumanoidMission(input: {
             }, input.runtime.rootAgentId);
             continue;
           }
-        } else runInput = autonomousCycleInput(input.runtime);
+        } else runInput = neuralCycleInput(input.runtime, wake);
+        const resumedSdkState = serializedState !== undefined;
         serializedState = undefined;
-        const stream = await runner.run(hierarchy.coordinator, runInput, {
+        const stream = await withAgentInvocation(
+          HUMANOID_NEURAL_AGENT_IDS.executive,
+          () => runner.run(hierarchy.root, runInput, {
           stream: true,
-          session: coordinatorSession,
+          session: executiveSession,
           maxTurns: null,
           reasoningItemIdPolicy: "omit",
           toolExecution: { maxFunctionToolConcurrency: 1 },
           toolNotFoundBehavior: "return_error_to_model",
           ...(input.signal ? { signal: input.signal } : {})
-        });
+          }),
+          resumedSdkState,
+          executiveEpisodeId(input.runtime)
+        );
         for await (const event of stream) {
-          await persistAgentEvent(HUMANOID_AGENT_IDS.coordinator, event);
+          await persistAgentEvent(HUMANOID_NEURAL_AGENT_IDS.executive, event);
           if (!shouldPersistHumanoidAgentState(event)) continue;
           const persistedSessionBaseline = await captureHumanoidSessionStateIdentity(
             sessions
@@ -851,6 +894,8 @@ async function executeHumanoidMission(input: {
       await input.runtime.fail(message);
     }
     throw error;
+  } finally {
+    await neuralScheduler?.shutdown("mission_runner_closed");
   }
 }
 
@@ -990,6 +1035,9 @@ export function humanoidModelProgressSnapshot(
     cycleIndex: checkpoint.cycle_index,
     checkerSuccess: checkpoint.checker?.success ?? false,
     goalStateSha256: checkpoint.goal_dag.state_sha256,
+    authorityStateSha256: checkpoint.neural_hierarchy_state
+      ? modelPayloadSha256(checkpoint.neural_hierarchy_state)
+      : "legacy-authority-state-unavailable",
     receipts: receipts.map((receipt) => ({
       transactionId: receipt.transactionId,
       agentId: receipt.agentId,
@@ -1039,13 +1087,18 @@ async function resumableAgentState(
   return { state: record.state, restored: sessionRestore.restored };
 }
 
-function autonomousCycleInput(runtime: HumanoidRunRuntime): string {
+function neuralCycleInput(
+  runtime: HumanoidRunRuntime,
+  wake: NeuralSchedulerDispatch
+): string {
   const checkpoint = runtime.checkpoint;
+  const neural = runtime.neuralHierarchyState();
   const goalDirection = checkpoint.goal_dag.status === "awaiting_model_selection"
-    ? "当前没有 active Goal；先委派目标管理智能体提交 2–3 个真实模型候选并由其另一次响应显式选择，然后再规划物理行动。"
+    ? "当前没有 active Goal；Executive 只能向自己的 Goal Valuation 子节点委派候选生成与选择。"
     : "只围绕 goal_dag 当前 epoch 的 active Goal 规划物理行动。";
   return [
-    "推进人形自主闭环的下一个层级步骤。每次只选择当前 coordinator_phase 对应的一项正式委派或完成动作；工具返回后由 Harness 重新观察阶段，再决定下一步。",
+    "推进神经启发式层级 Agent Harness 的下一个事件驱动控制步骤。你是唯一 Executive 根节点；所有工作必须沿严格单父控制树向下委派，禁止绕过父级或把兄弟当成平级协作者。",
+    "每个 SDK episode 只推进当前 Harness phase 所需的最小责任路径。不要轮询全部 Agent；持续高频身体控制属于 learned controller/reflex，不属于模型循环。",
     "必须根据当前传感、目标、历史回执和物理反馈自主决定动作；不得使用固定动作表、预设路径或假执行。",
     goalDirection,
     runtime.store.definition.run_mode === "mission"
@@ -1056,20 +1109,104 @@ function autonomousCycleInput(runtime: HumanoidRunRuntime): string {
     ...(checkpoint.active_cycle
       ? [`循环身份：${checkpoint.active_cycle.cycle_id}`]
       : []),
-    "完成一次真实物理执行后，必须先委派感知哨兵重新观察；只有 cycle_completion.observed_after_execution=true 且 coordinator_phase=complete_cycle 时，才用 Harness 给出的 accepted 因果证据调用 complete_autonomous_cycle。若 coordinator_phase=complete_satisfied_goal，必须直接提交物理 checker 验证，禁止为了制造本周期执行回执而重复移动。",
-    coordinatorInvocationInput(runtime.contextAnchor(runtime.rootAgentId))
+    `Harness phase：${neural.harness_phase.phase}`,
+    `Scheduler requested responsibility：${wake.requestedTargetNodeId}`,
+    `Nearest lease-authorized responsibility：${wake.authorizedTargetNodeId}`,
+    `Authorized structural parent：${wake.parentNodeId ?? "none; Executive root"}`,
+    `Authority lease：${wake.authorityLeaseId ?? "none; Executive root authority"}`,
+    `Executive-owned control path：${wake.authorityPath.length === 0
+      ? HUMANOID_NEURAL_AGENT_IDS.executive
+      : [
+          HUMANOID_NEURAL_AGENT_IDS.executive,
+          ...wake.authorityPath.map((hop) => hop.childNodeId)
+        ].join(" -> ")}`,
+    `Hierarchy epoch：${neural.epoch_id}`,
+    `Active commitment：${JSON.stringify(neural.active_skill_commitment)}`,
+    `Cycle completion：${JSON.stringify(runtime.cycleCompletionReadiness())}`,
+    "Sensorimotor 先提出 skill_proposal；Action Selection 独占建立 commitment；只有真实 rollout_result 被批准后才能转 executing 并进入 Serial Executor。",
+    "物理执行后必须经 Action Selection→Perception Manager→Sensor Fusion 重新观察；只有 Harness 的 cycle completion 已 ready 且 observed_after_execution=true 时，Executive 才能提交完整的 causal evidence ids。",
+    "下面是当前 Executive 自己的有界上下文锚点；它不是共享记忆，也不得原样转发给子 Agent。",
+    JSON.stringify(humanoidNeuralContextProjection(
+      runtime.contextAnchor(runtime.rootAgentId),
+      runtime.rootAgentId,
+      runtime.pendingNeuralSignals({ targetNodeId: runtime.rootAgentId })
+    ))
   ].join("\n");
+}
+
+function executiveEpisodeId(runtime: HumanoidRunRuntime): `${string}-${string}-${string}-${string}-${string}` {
+  const checkpoint = runtime.checkpoint;
+  const source = checkpoint.active_cycle?.cycle_id
+    ?? `neural-epoch:${checkpoint.neural_hierarchy_state.epoch_id}`;
+  const match = /([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i
+    .exec(source);
+  if (!match?.[1]) {
+    throw new Error("Executive episode has no stable hierarchy or cycle UUID");
+  }
+  return match[1].toLowerCase() as `${string}-${string}-${string}-${string}-${string}`;
+}
+
+function neuralSchedulerEventForRuntime(
+  runtime: HumanoidRunRuntime
+): NeuralSchedulerEvent {
+  const checkpoint = runtime.checkpoint;
+  const state = runtime.neuralHierarchyState();
+  const base = {
+    event_id: randomUUID(),
+    at: new Date().toISOString(),
+    world_revision: runtime.currentWorldRevision(),
+    causal_signal_ids: runtime.pendingNeuralSignals().slice(0, 64).map(
+      (signal) => signal.signal_id
+    )
+  };
+  if (checkpoint.goal_dag.status !== "active") {
+    return { ...base, kind: "no_active_goal" };
+  }
+  switch (state.harness_phase.phase) {
+    case "bootstrapping":
+    case "goal_valuation":
+      return { ...base, kind: "run_started" };
+    case "perception":
+      return { ...base, kind: "world_revision_changed" };
+    case "feedback":
+      return state.active_skill_commitment?.state === "executing"
+        ? { ...base, kind: "skill_completed" }
+        : { ...base, kind: "world_revision_changed" };
+    case "skill_proposal":
+    case "commitment_authorization":
+      return { ...base, kind: "commitment_absent" };
+    case "motor_assessment":
+    case "motor_planning":
+      return { ...base, kind: "goal_selected" };
+    case "rollout_review":
+      return { ...base, kind: "rollout_completed" };
+    case "execution":
+      return { ...base, kind: "goal_selected" };
+    case "recovery":
+      return {
+        ...base,
+        kind: "prediction_error",
+        correction_scope: "pathway"
+      };
+    case "cycle_completion":
+      return { ...base, kind: "cycle_ready" };
+    case "terminal":
+      return { ...base, kind: "run_started" };
+  }
 }
 
 class CompletedResponseDecisionStallError extends ModelDecisionStallError {}
 
 function assertCoordinatorStepOutput(output: string | undefined): {
-  status: "cycle_completed" | "satisfied_goal_completed" | "step_completed";
+  status: "step_completed";
+} | {
+  status: "cycle_completed" | "satisfied_goal_completed";
+  payloadOutput: string;
 } {
   if (!output?.trim()) {
     throw new CompletedResponseDecisionStallError(
-      HUMANOID_AGENT_IDS.coordinator,
-      "Humanoid coordinator returned no cycle output"
+      HUMANOID_NEURAL_AGENT_IDS.executive,
+      "Humanoid Executive returned no hierarchical step output"
     );
   }
   let parsed: unknown;
@@ -1077,32 +1214,59 @@ function assertCoordinatorStepOutput(output: string | undefined): {
     parsed = JSON.parse(output);
   } catch {
     throw new CompletedResponseDecisionStallError(
-      HUMANOID_AGENT_IDS.coordinator,
-      "Humanoid coordinator did not return a formal tool result"
+      HUMANOID_NEURAL_AGENT_IDS.executive,
+      "Humanoid Executive did not return a formal hierarchical result"
     );
   }
   const record = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
     ? parsed as Record<string, unknown>
     : undefined;
-  const status = record?.status;
-  if (status === "goal_candidate_selected"
-    || status === "goal_epoch_retired"
-    || status === "goal_epoch_continued") {
-    return { status: "step_completed" };
-  }
-  if (typeof record?.transactionId === "string"
-    && typeof record.action === "string"
-    && typeof record.accepted === "boolean") {
-    return { status: "step_completed" };
-  }
-  if (status !== "cycle_completed"
-    && status !== "satisfied_goal_completed") {
+  if (!record
+    || typeof record.signal_kind !== "string"
+    || typeof record.summary !== "string"
+    || typeof record.payload_json !== "string"
+    || !Array.isArray(record.source_signal_ids)
+    || !record.source_signal_ids.every((id) => typeof id === "string")
+    || typeof record.confidence !== "number") {
     throw new CompletedResponseDecisionStallError(
-      HUMANOID_AGENT_IDS.coordinator,
-      "Humanoid coordinator did not complete a verified runtime transition"
+      HUMANOID_NEURAL_AGENT_IDS.executive,
+      "Humanoid Executive did not return the V3 neural output envelope"
     );
   }
-  return { status };
+  let payload: unknown;
+  try {
+    payload = JSON.parse(record.payload_json);
+  } catch {
+    throw new CompletedResponseDecisionStallError(
+      HUMANOID_NEURAL_AGENT_IDS.executive,
+      "Humanoid Executive returned invalid payload_json"
+    );
+  }
+  const payloadRecord = payload !== null
+    && typeof payload === "object"
+    && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : undefined;
+  const status = payloadRecord?.status;
+  if (status === "cycle_completed") {
+    if (record.signal_kind !== "skill_completed") {
+      throw new CompletedResponseDecisionStallError(
+        HUMANOID_NEURAL_AGENT_IDS.executive,
+        "Humanoid Executive cycle completion used the wrong neural signal kind"
+      );
+    }
+    return { status, payloadOutput: record.payload_json };
+  }
+  if (status === "satisfied_goal_completed") {
+    if (record.signal_kind !== "skill_completed") {
+      throw new CompletedResponseDecisionStallError(
+        HUMANOID_NEURAL_AGENT_IDS.executive,
+        "Humanoid Executive satisfied Goal completion used the wrong neural signal kind"
+      );
+    }
+    return { status, payloadOutput: record.payload_json };
+  }
+  return { status: "step_completed" };
 }
 
 function formatFrequency(stepSeconds: number): string {

@@ -17,6 +17,7 @@ import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-bloc
 import { applyScenarioChunkDeltaMutation } from "../../domain/scenario-chunk-delta.js";
 import { createScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
 import { BlockRemovalAuthorityError } from "./block-removal-authority.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 
 const scenario = ScenarioSchema.parse({
   title: "Humanoid action field",
@@ -59,7 +60,7 @@ describe("HumanoidActionRuntime", () => {
       "observe_humanoid",
       {},
       "skill-observation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     expect(observation.detail).toMatchObject({
       control_authority: {
@@ -80,15 +81,15 @@ describe("HumanoidActionRuntime", () => {
     });
     expect(runtime.isActionAvailable(
       "begin_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
     expect(runtime.isActionAvailable(
       "submit_humanoid_skill_plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(true);
     expect(runtime.isActionAvailable(
       "plan_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
     const candidate = {
       skill_transaction_id: null,
@@ -117,7 +118,7 @@ describe("HumanoidActionRuntime", () => {
       "plan_whole_body_motion_candidates",
       candidate,
       "unbound-skill-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({ accepted: false, code: "active_skill_required" });
 
     const skillPlan = await runtime.invoke(
@@ -139,7 +140,7 @@ describe("HumanoidActionRuntime", () => {
         selected_strategy_id: "support-recovery"
       },
       "stabilize-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     expect(skillPlan).toMatchObject({
       accepted: true,
@@ -147,15 +148,15 @@ describe("HumanoidActionRuntime", () => {
     });
     expect(runtime.isActionAvailable(
       "submit_humanoid_skill_plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
     expect(runtime.isActionAvailable(
       "begin_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(true);
     expect(runtime.isActionAvailable(
       "plan_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
     const skill = await runtime.invoke(
       "begin_humanoid_skill",
@@ -169,22 +170,22 @@ describe("HumanoidActionRuntime", () => {
         phase: "recover_support"
       },
       "stabilize-skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     expect(skill).toMatchObject({ accepted: true, code: "humanoid_skill_bound" });
     expect(runtime.isActionAvailable(
       "submit_humanoid_skill_plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
     expect(runtime.isActionAvailable(
       "begin_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
     expect(runtime.isActionAvailable(
       "plan_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(true);
-    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+    expect(runtime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent)).toMatchObject({
       active_skill: {
         transaction_id: "stabilize-skill",
         skill_plan_transaction_id: "stabilize-plan",
@@ -198,7 +199,7 @@ describe("HumanoidActionRuntime", () => {
       "plan_humanoid_skill",
       { skill_transaction_id: "stabilize-skill" },
       "bound-skill-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       code: "autonomous_skill_motion_rejected",
       detail: {
@@ -211,11 +212,11 @@ describe("HumanoidActionRuntime", () => {
     expect(lightweight.candidatePlanningCalls()).toBe(1);
     expect(runtime.isActionAvailable(
       "submit_humanoid_skill_plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(true);
     expect(runtime.isActionAvailable(
       "begin_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
 
     await expect(runtime.invoke(
@@ -237,20 +238,20 @@ describe("HumanoidActionRuntime", () => {
         selected_strategy_id: "replacement-support-recovery"
       },
       "replacement-stabilize-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: true,
       code: "humanoid_skill_plan_registered"
     });
     expect(runtime.isActionAvailable(
       "submit_humanoid_skill_plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
     expect(runtime.isActionAvailable(
       "begin_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(true);
-    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+    expect(runtime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent)).toMatchObject({
       active_skill: null,
       skill_plan: {
         transaction_id: "replacement-stabilize-plan",
@@ -272,7 +273,7 @@ describe("HumanoidActionRuntime", () => {
       "observe_humanoid",
       {},
       "routed-observation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     expect(observation.detail).toMatchObject({
       control_authority: {
@@ -335,20 +336,20 @@ describe("HumanoidActionRuntime", () => {
         active_skills: [],
         planning_skill_bindings: [],
         recovery_policies: [{
-          agent_id: "humanoid-motion-reference",
+          agent_id: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
           policy: recoveryPolicy
         }]
       }
     });
 
-    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+    expect(runtime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent)).toMatchObject({
       recovery_policy: recoveryPolicy
     });
     await runtime.invoke(
       "observe_humanoid",
       {},
       "recovery-observation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     const proposal = {
       objective: "select the next recovery Skill",
@@ -367,7 +368,7 @@ describe("HumanoidActionRuntime", () => {
       "submit_humanoid_skill_plan",
       proposal,
       "recovery-skill-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     await expect(runtime.invoke(
       "begin_humanoid_skill",
@@ -378,7 +379,7 @@ describe("HumanoidActionRuntime", () => {
         phase: "recover_support"
       },
       "unsupported-recovery-binding",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "recovery_skill_selection_required",
@@ -414,7 +415,7 @@ describe("HumanoidActionRuntime", () => {
         active_skills: [],
         planning_skill_bindings: [],
         recovery_policies: [{
-          agent_id: "humanoid-motion-reference",
+          agent_id: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
           policy: {
             protocol: "humanoid-recovery-policy-v1",
             source_execution_transaction_id: "old-execution",
@@ -433,15 +434,15 @@ describe("HumanoidActionRuntime", () => {
       }
     });
 
-    expect(runtime.planningToolState("humanoid-motion-reference"))
+    expect(runtime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent))
       .toMatchObject({ recovery_policy: { world_revision: 0 } });
     await runtime.invoke(
       "observe_humanoid",
       {},
       "changed-world-recovery-observation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
-    expect(runtime.planningToolState("humanoid-motion-reference"))
+    expect(runtime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent))
       .toMatchObject({ recovery_policy: null });
   });
 
@@ -455,7 +456,7 @@ describe("HumanoidActionRuntime", () => {
         "observe_humanoid",
         {},
         "lease-observation",
-        "humanoid-motion-reference"
+        HUMANOID_NEURAL_AGENT_IDS.motorIntent
       );
       const invocation = {
         skill: "stabilize" as const,
@@ -478,7 +479,7 @@ describe("HumanoidActionRuntime", () => {
         "submit_humanoid_skill_plan",
         proposal,
         "lease-skill-plan",
-        "humanoid-motion-reference"
+        HUMANOID_NEURAL_AGENT_IDS.motorIntent
       );
       const binding = await runtime.invoke(
         "begin_humanoid_skill",
@@ -489,7 +490,7 @@ describe("HumanoidActionRuntime", () => {
           phase: "recover_support"
         },
         "lease-skill-binding",
-        "humanoid-motion-reference"
+        HUMANOID_NEURAL_AGENT_IDS.motorIntent
       );
       expect(binding.accepted).toBe(true);
 
@@ -499,7 +500,7 @@ describe("HumanoidActionRuntime", () => {
         "plan_humanoid_skill",
         { skill_transaction_id: binding.transactionId },
         "stationary-lease-plan",
-        "humanoid-motion-reference"
+        HUMANOID_NEURAL_AGENT_IDS.motorIntent
       );
       expect(renewed.code).not.toBe("skill_observation_changed");
       expect(renewed.detail).toMatchObject({
@@ -531,7 +532,7 @@ describe("HumanoidActionRuntime", () => {
         "plan_humanoid_skill",
         { skill_transaction_id: binding.transactionId },
         "changed-world-plan",
-        "humanoid-motion-reference"
+        HUMANOID_NEURAL_AGENT_IDS.motorIntent
       )).resolves.toMatchObject({
         accepted: false,
         code: "skill_observation_changed",
@@ -542,9 +543,11 @@ describe("HumanoidActionRuntime", () => {
     }
   }, 30_000);
 
-  it("requires the Motion Agent to own a fresh observation before planning", async () => {
+  it("lets Sensor Fusion ground Motor Intent without sharing an Agent Session", async () => {
     const lightweight = lightweightObservationWorld();
     const runtime = new HumanoidActionRuntime(lightweight.world);
+    const motorIntentId = HUMANOID_NEURAL_AGENT_IDS.motorIntent;
+    const sensorFusionId = HUMANOID_NEURAL_AGENT_IDS.sensorFusion;
     const input = {
       target: { x: 0.15, y: 0, z: 0.3 },
       arrival_heading: null
@@ -552,18 +555,18 @@ describe("HumanoidActionRuntime", () => {
 
     expect(runtime.isActionAvailable(
       "plan_humanoid_navigation",
-      "humanoid-motion-reference"
+      motorIntentId
     )).toBe(false);
     expect(runtime.isActionAvailable(
       "observe_humanoid",
-      "humanoid-motion-reference"
+      motorIntentId
     )).toBe(true);
 
     await expect(runtime.invoke(
       "plan_humanoid_navigation",
       input,
       "stale-motion-plan",
-      "humanoid-motion-reference"
+      motorIntentId
     )).resolves.toMatchObject({
       accepted: false,
       code: "fresh_motion_observation_required",
@@ -576,26 +579,27 @@ describe("HumanoidActionRuntime", () => {
     await expect(runtime.invoke(
       "observe_humanoid",
       {},
-      "motion-observation",
-      "humanoid-motion-reference"
+      "sensor-fusion-observation",
+      sensorFusionId
     )).resolves.toMatchObject({ accepted: true, code: "humanoid_observed" });
     expect(runtime.isActionAvailable(
       "plan_humanoid_navigation",
-      "humanoid-motion-reference"
+      motorIntentId
     )).toBe(true);
     expect(runtime.isActionAvailable(
       "observe_humanoid",
-      "humanoid-motion-reference"
+      motorIntentId
     )).toBe(false);
+    expect(runtime.planningGroundingState(motorIntentId)).not.toBeNull();
     await expect(runtime.invoke(
       "plan_humanoid_navigation",
       input,
       "fresh-motion-plan",
-      "humanoid-motion-reference"
+      motorIntentId
     )).resolves.not.toMatchObject({ code: "fresh_motion_observation_required" });
     expect(runtime.isActionAvailable(
       "observe_humanoid",
-      "humanoid-motion-reference"
+      motorIntentId
     )).toBe(true);
   });
 
@@ -606,7 +610,7 @@ describe("HumanoidActionRuntime", () => {
       "observe_humanoid",
       {},
       "pre-restart-motion-observation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     const restored = new HumanoidActionRuntime(lightweight.world, {
       receipts: { [observation.transactionId]: observation }
@@ -614,13 +618,13 @@ describe("HumanoidActionRuntime", () => {
 
     expect(restored.isActionAvailable(
       "plan_humanoid_navigation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(false);
     await expect(restored.invoke(
       "plan_humanoid_navigation",
       { target: { x: 0.15, y: 0, z: 0.3 }, arrival_heading: null },
       "post-restart-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "fresh_motion_observation_required"
@@ -630,6 +634,7 @@ describe("HumanoidActionRuntime", () => {
   it("blocks a repeated physical input without hiding new planning strategies", async () => {
     const lightweight = lightweightObservationWorld();
     const runtime = new HumanoidActionRuntime(lightweight.world);
+    const motorIntentId = HUMANOID_NEURAL_AGENT_IDS.motorIntent;
     const input = {
       target: { x: 0.15, y: 0, z: 0.3 },
       arrival_heading: null
@@ -639,13 +644,13 @@ describe("HumanoidActionRuntime", () => {
       "observe_humanoid",
       {},
       "loop-observation",
-      "humanoid-motion-reference"
+      motorIntentId
     );
     const first = await runtime.invoke(
       "plan_humanoid_navigation",
       input,
       "loop-plan-1",
-      "humanoid-motion-reference"
+      motorIntentId
     );
     const second = await runtime.invoke(
       "plan_humanoid_navigation",
@@ -654,18 +659,18 @@ describe("HumanoidActionRuntime", () => {
         target: { x: 0.1504, y: 0.004, z: 0.2996 }
       },
       "loop-plan-2",
-      "humanoid-motion-reference"
+      motorIntentId
     );
 
     expect(first).toMatchObject({ accepted: false, code: "humanoid_route_rejected" });
     expect(second).toMatchObject({ accepted: false, code: "humanoid_route_rejected" });
     expect(runtime.isActionAvailable(
       "plan_humanoid_navigation",
-      "humanoid-motion-reference"
+      motorIntentId
     )).toBe(true);
     expect(runtime.isActionAvailable(
       "plan_whole_body_motion_candidates",
-      "humanoid-motion-reference"
+      motorIntentId
     )).toBe(true);
     await expect(runtime.invoke(
       "plan_humanoid_navigation",
@@ -674,7 +679,7 @@ describe("HumanoidActionRuntime", () => {
         target: { x: 0.18, y: 0, z: 0.3 }
       },
       "loop-physically-distinct-navigation",
-      "humanoid-motion-reference"
+      motorIntentId
     )).resolves.toMatchObject({
       accepted: false,
       code: "humanoid_route_rejected"
@@ -683,7 +688,7 @@ describe("HumanoidActionRuntime", () => {
       "plan_humanoid_navigation",
       input,
       "loop-plan-3",
-      "humanoid-motion-reference"
+      motorIntentId
     )).resolves.toMatchObject({
       accepted: false,
       code: "repeated_planning_failure",
@@ -696,9 +701,9 @@ describe("HumanoidActionRuntime", () => {
     });
     expect(runtime.isActionAvailable(
       "plan_humanoid_navigation",
-      "humanoid-motion-reference"
+      motorIntentId
     )).toBe(false);
-    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+    expect(runtime.planningToolState(motorIntentId)).toMatchObject({
       planning_actions: expect.arrayContaining([{
         action: "plan_humanoid_navigation",
         available: false
@@ -738,13 +743,13 @@ describe("HumanoidActionRuntime", () => {
       "plan_whole_body_motion_candidates",
       alternativeInput,
       "loop-alternative-plan-1",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     await runtime.invoke(
       "plan_whole_body_motion_candidates",
       alternativeInput,
       "loop-alternative-plan-2",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     await expect(runtime.invoke(
       "plan_whole_body_motion_candidates",
@@ -762,7 +767,7 @@ describe("HumanoidActionRuntime", () => {
         }))
       },
       "loop-alternative-plan-3",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "repeated_planning_failure",
@@ -776,7 +781,7 @@ describe("HumanoidActionRuntime", () => {
     expect(lightweight.candidatePlanningCalls()).toBe(2);
     expect(runtime.isActionAvailable(
       "plan_humanoid_navigation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(true);
 
     await expect(runtime.invoke(
@@ -792,7 +797,7 @@ describe("HumanoidActionRuntime", () => {
         }
       },
       "loop-physically-distinct-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "whole_body_candidates_rejected"
@@ -828,7 +833,7 @@ describe("HumanoidActionRuntime", () => {
       "observe_humanoid",
       {},
       "reachability-observation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     await expect(runtime.invoke(
       "plan_whole_body_motion_candidates",
@@ -871,7 +876,7 @@ describe("HumanoidActionRuntime", () => {
         }]
       },
       "unreachable-endpoint-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "manipulation_base_placement_required",
@@ -927,7 +932,7 @@ describe("HumanoidActionRuntime", () => {
         }]
       },
       "mobile-contact-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "whole_body_candidates_rejected"
@@ -977,7 +982,7 @@ describe("HumanoidActionRuntime", () => {
         }]
       },
       "unrelated-mobile-contact-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "manipulation_base_placement_required",
@@ -997,7 +1002,7 @@ describe("HumanoidActionRuntime", () => {
         }
       },
       "stale-object-approach",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "manipulation_base_placement_required",
@@ -1025,7 +1030,7 @@ describe("HumanoidActionRuntime", () => {
         }
       },
       "sampled-object-approach",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.not.toMatchObject({
       code: "manipulation_base_placement_required"
     });
@@ -1079,12 +1084,12 @@ describe("HumanoidActionRuntime", () => {
     const input = { skill_transaction_id: "explore-skill" };
     const receipt: HumanoidActionReceipt = {
       transactionId,
-      agentId: "humanoid-motion-reference",
+      agentId: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
       action: "plan_humanoid_skill",
       input,
       fingerprint: humanoidActionFingerprint(
         "plan_humanoid_skill",
-        "humanoid-motion-reference",
+        HUMANOID_NEURAL_AGENT_IDS.motorIntent,
         input
       ),
       accepted: false,
@@ -1139,7 +1144,7 @@ describe("HumanoidActionRuntime", () => {
       receipts: { [transactionId]: receipt }
     });
 
-    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+    expect(runtime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent)).toMatchObject({
       transit_clearance: {
         status: "required",
         blocked_action: "plan_humanoid_skill",
@@ -1238,7 +1243,7 @@ describe("HumanoidActionRuntime", () => {
       "observe_humanoid",
       {},
       "clearance-observation",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     const invocation = {
       skill: "explore" as const,
@@ -1262,7 +1267,7 @@ describe("HumanoidActionRuntime", () => {
         selected_strategy_id: "frontier-route"
       },
       "clearance-skill-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     await runtime.invoke(
       "begin_humanoid_skill",
@@ -1273,13 +1278,13 @@ describe("HumanoidActionRuntime", () => {
         phase: "route_to_frontier"
       },
       "clearance-skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     );
     await expect(runtime.invoke(
       "plan_humanoid_skill",
       { skill_transaction_id: "clearance-skill" },
       "clearance-route-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "autonomous_skill_route_rejected",
@@ -1290,13 +1295,13 @@ describe("HumanoidActionRuntime", () => {
 
     expect(runtime.isActionAvailable(
       "plan_humanoid_skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(true);
     expect(runtime.isActionAvailable(
       "plan_whole_body_motion_candidates",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).toBe(true);
-    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+    expect(runtime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent)).toMatchObject({
       planning_actions: expect.arrayContaining([
         { action: "plan_humanoid_skill", available: true },
         { action: "plan_humanoid_navigation", available: true },
@@ -1329,7 +1334,7 @@ describe("HumanoidActionRuntime", () => {
         selected_strategy_id: "rebound-frontier-route"
       },
       "clearance-rebound-skill-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({ accepted: true });
     await expect(runtime.invoke(
       "begin_humanoid_skill",
@@ -1340,9 +1345,9 @@ describe("HumanoidActionRuntime", () => {
         phase: "route_to_frontier"
       },
       "clearance-rebound-skill",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({ accepted: true });
-    expect(runtime.planningToolState("humanoid-motion-reference")).toMatchObject({
+    expect(runtime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent)).toMatchObject({
       transit_clearance: {
         skill_transaction_id: "clearance-rebound-skill"
       }
@@ -1358,7 +1363,7 @@ describe("HumanoidActionRuntime", () => {
       requireSkillBinding: true,
       state: persistedState
     });
-    expect(restoredRuntime.planningToolState("humanoid-motion-reference"))
+    expect(restoredRuntime.planningToolState(HUMANOID_NEURAL_AGENT_IDS.motorIntent))
       .toMatchObject({
         transit_clearance: {
           skill_transaction_id: "clearance-rebound-skill"
@@ -1373,7 +1378,7 @@ describe("HumanoidActionRuntime", () => {
         arrival_heading: null
       },
       "clearance-alternate-route",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "humanoid_route_rejected",
@@ -1447,7 +1452,7 @@ describe("HumanoidActionRuntime", () => {
         }]
       },
       "clearance-posture-plan",
-      "humanoid-motion-reference"
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
     )).resolves.toMatchObject({
       accepted: false,
       code: "whole_body_candidates_rejected",
@@ -2013,6 +2018,10 @@ function lightweightObservationWorld(
     },
     observe: () => {
       observationCalls += 1;
+      const override = structuredClone(observationOverride) as Record<string, unknown>;
+      const interactionOverride = recordOrEmpty(override.interaction);
+      const navigationOverride = recordOrEmpty(override.navigation);
+      const spatialBeliefOverride = recordOrEmpty(override.spatialBelief);
       return {
         frame: 0,
         worldRevision,
@@ -2119,18 +2128,95 @@ function lightweightObservationWorld(
           contractSha256: "fc1e2d113bb5e5f5f8a75f0faa3efc8bd97ecc18eb41463da09d26bb52cfc193",
           assessments: []
         },
-        interaction: {},
-        navigation: {},
+        spatialBelief: {
+          protocol: "humanoid-spatial-belief-v2",
+          visibility_model: "occlusion_aware_head_camera",
+          frontier_model: "reachable_geodesic_diversity",
+          resolution_m: 0.5,
+          observed_cell_count: 0,
+          free_cell_count: 0,
+          occupied_cell_count: 0,
+          visited_cell_count: 0,
+          reachable_free_cell_count: 0,
+          total_cell_count: 1,
+          coverage_ratio: 0,
+          frontiers: [],
+          ...spatialBeliefOverride
+        },
+        interaction: {
+          frame: 0,
+          world_revision: worldRevision,
+          object_world_model: { frame: 0, world_revision: worldRevision, objects: [] },
+          skill_catalog: {
+            protocol: "humanoid-skill-catalog-v1",
+            contract_sha256: "a".repeat(64),
+            world_frame: 0,
+            world_revision: worldRevision,
+            entries: []
+          },
+          carrying: { bindings: [] },
+          zones: [],
+          manipulable_objects: [],
+          ...interactionOverride
+        },
+        navigation: {
+          planId: null,
+          status: "idle",
+          target: null,
+          waypoints: [],
+          waypointIndex: null,
+          ...navigationOverride
+        },
         motionGenerator: {
           protocol: "humanoid-motion-generator-v1",
           implementation: "test_task_space_generator"
         },
-        ...structuredClone(observationOverride)
+        ...override,
+        interaction: {
+          frame: 0,
+          world_revision: worldRevision,
+          object_world_model: { frame: 0, world_revision: worldRevision, objects: [] },
+          skill_catalog: {
+            protocol: "humanoid-skill-catalog-v1",
+            contract_sha256: "a".repeat(64),
+            world_frame: 0,
+            world_revision: worldRevision,
+            entries: []
+          },
+          carrying: { bindings: [] },
+          zones: [],
+          manipulable_objects: [],
+          ...interactionOverride
+        },
+        navigation: {
+          planId: null,
+          status: "idle",
+          target: null,
+          waypoints: [],
+          waypointIndex: null,
+          ...navigationOverride
+        },
+        spatialBelief: {
+          protocol: "humanoid-spatial-belief-v2",
+          visibility_model: "occlusion_aware_head_camera",
+          frontier_model: "reachable_geodesic_diversity",
+          resolution_m: 0.5,
+          observed_cell_count: 0,
+          free_cell_count: 0,
+          occupied_cell_count: 0,
+          visited_cell_count: 0,
+          reachable_free_cell_count: 0,
+          total_cell_count: 1,
+          coverage_ratio: 0,
+          frontiers: [],
+          ...spatialBeliefOverride
+        }
       };
     }
   };
   const world = {
     ...worldShape,
+    captureObservation: async () => worldShape.observe(),
     observeManipulationReachability: async () => worldShape.observe()
   } as unknown as HumanoidWorld;
   return {
@@ -2138,6 +2224,12 @@ function lightweightObservationWorld(
     observationCalls: () => observationCalls,
     candidatePlanningCalls: () => candidatePlanningCalls
   };
+}
+
+function recordOrEmpty(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
 }
 
 function visibleWorkpieceToken(position: { x: number; y: number; z: number }) {

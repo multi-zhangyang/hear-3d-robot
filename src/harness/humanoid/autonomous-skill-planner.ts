@@ -29,6 +29,8 @@ import {
 import type { HumanoidNavigationArrivalHeading } from "../../world/humanoid/navigation-arrival.js";
 import { solveG1PregraspPose } from "../../world/humanoid/pregrasp-pose.js";
 import { minimumHumanoidManipulationRootStandoff } from "../../world/humanoid/manipulation-reachability.js";
+import { HUMANOID_NAVIGATION_PROFILE } from "../../world/humanoid/environment.js";
+import { navigationObstaclePlanarExpansion } from "../../world/navigation.js";
 import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
 
 type HumanoidMotionOptionPredicate = HumanoidMotionOptionContract["predicates"][number];
@@ -36,6 +38,7 @@ type HumanoidMotionOptionPredicate = HumanoidMotionOptionContract["predicates"][
 const MINIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS = 0.18;
 const MAXIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS = 0.5;
 const MAXIMUM_GOAL_SETTLING_RESERVE_METERS = 0.05;
+const APPROACH_SUPPORT_CLEARANCE_MARGIN_METERS = 0.01;
 
 export type AutonomousHumanoidSkillPlan =
   | {
@@ -215,11 +218,15 @@ function navigationSkillPlan(
   const directions = approachDirections(point?.approach_direction_world);
   const current = observation.robot.rootPosition;
   const lateralOffsets = approachLateralOffsets(invocation.hand ?? null);
-  const standoff = Math.max(
+  const requestedStandoff = Math.max(
     invocation.standoff_m,
     minimumHumanoidManipulationRootStandoff({
       ...(point ? { clearanceMeters: point.clearance_m } : {})
     })
+  );
+  const contactedSolids = objectContactedSolids(
+    observation,
+    invocation.object_id
   );
   const reachabilityTargets = observation.manipulationBasePlacements
     .filter((placement) => placement.objectId === invocation.object_id
@@ -228,7 +235,8 @@ function navigationSkillPlan(
         || placement.interactionPointId === invocation.interaction_point_id)
       && (!invocation.hand
         || placement.handSurface.startsWith(`${invocation.hand}_`))
-      && planarDistance(current, placement.rootWorldTarget) > 0.025)
+      && planarDistance(current, placement.rootWorldTarget) > 0.025
+      && rootClearsNavigationSolids(placement.rootWorldTarget, contactedSolids))
     .map((placement) => ({
       target: { ...placement.rootWorldTarget },
       arrivalHeading: {
@@ -244,6 +252,10 @@ function navigationSkillPlan(
     targets: [...reachabilityTargets, ...directions.flatMap((direction, directionIndex) => (
       lateralOffsets.map((lateralOffset, lateralIndex) => {
       const lateral = { x: direction.z, y: 0, z: -direction.x };
+      const standoff = Math.max(
+        requestedStandoff,
+        minimumContactedSolidStandoff(around, direction, contactedSolids)
+      );
       const target = {
         x: around.x - direction.x * standoff
           + lateral.x * lateralOffset,
@@ -297,6 +309,59 @@ function approachLateralOffsets(hand: "left" | "right" | null): number[] {
   if (hand === "right") return [0.2, 0.14, 0.26, 0, -0.18];
   if (hand === "left") return [-0.2, -0.14, -0.26, 0, 0.18];
   return [0, 0.18, -0.18];
+}
+
+function objectContactedSolids(
+  observation: HumanoidWorldObservation,
+  objectId: string
+): HumanoidWorldObservation["solidTokens"] {
+  return observation.solidTokens.filter((solid) => (
+    solid.currentContacts.some((contact) => (
+      contact.firstObject === objectId && contact.secondSolid === solid.id
+    ) || (
+      contact.secondObject === objectId && contact.firstSolid === solid.id
+    ))
+  ));
+}
+
+function rootClearsNavigationSolids(
+  root: Vec3,
+  solids: HumanoidWorldObservation["solidTokens"]
+): boolean {
+  const expansion = navigationObstaclePlanarExpansion(
+    HUMANOID_NAVIGATION_PROFILE.radius
+  ) + APPROACH_SUPPORT_CLEARANCE_MARGIN_METERS;
+  return solids.every((solid) => (
+    Math.abs(root.x - solid.center.x) > solid.size.x / 2 + expansion
+      || Math.abs(root.z - solid.center.z) > solid.size.z / 2 + expansion
+  ));
+}
+
+function minimumContactedSolidStandoff(
+  interactionPoint: Vec3,
+  direction: Vec3,
+  solids: HumanoidWorldObservation["solidTokens"]
+): number {
+  const planarLength = Math.hypot(direction.x, direction.z);
+  if (planarLength <= 1e-9 || solids.length === 0) return 0;
+  const unit = {
+    x: direction.x / planarLength,
+    z: direction.z / planarLength
+  };
+  const navigationExpansion = navigationObstaclePlanarExpansion(
+    HUMANOID_NAVIGATION_PROFILE.radius
+  ) + APPROACH_SUPPORT_CLEARANCE_MARGIN_METERS;
+  return Math.max(0, ...solids.map((solid) => {
+    const pointFromCenter = {
+      x: interactionPoint.x - solid.center.x,
+      z: interactionPoint.z - solid.center.z
+    };
+    const pointProjection = pointFromCenter.x * unit.x
+      + pointFromCenter.z * unit.z;
+    const solidProjectedHalfExtent = Math.abs(unit.x) * solid.size.x / 2
+      + Math.abs(unit.z) * solid.size.z / 2;
+    return pointProjection + solidProjectedHalfExtent + navigationExpansion;
+  }));
 }
 
 function motionSkillPlan(
@@ -1535,9 +1600,17 @@ function skillContactConstraints(
     ? binding.invocation.object_id
     : null;
   if (!objectId) return [];
-  const hands = new Set(predicates.flatMap((predicate) => (
-    predicate.type === "grasp_verified" ? [predicate.hand] : []
-  )));
+  const hands = new Set(predicates.flatMap((predicate) => {
+    if (predicate.type === "grasp_verified"
+      || predicate.type === "hand_contact_object_any"
+      || predicate.type === "hand_contact_object_region") {
+      return [predicate.hand];
+    }
+    if (predicate.type === "hand_contact_object") {
+      return [predicate.hand_surface.startsWith("left_") ? "left" as const : "right" as const];
+    }
+    return [];
+  }));
   if (hands.size === 0 && "hand" in binding.invocation
     && binding.invocation.hand
     && ["push", "pull", "press", "open", "close", "turn"].includes(
@@ -2192,8 +2265,12 @@ function axisAngleQuaternion(axis: Vec3, radians: number): Quaternion {
 
 function approachDirections(preferred?: Vec3): Vec3[] {
   const directions: Vec3[] = preferred
-    && Math.hypot(preferred.x, preferred.y, preferred.z) > 1e-9
-    ? [normalize(preferred)] : [];
+    && Math.hypot(preferred.x, preferred.z) > 1e-9
+    ? [{
+        x: preferred.x / Math.hypot(preferred.x, preferred.z),
+        y: 0,
+        z: preferred.z / Math.hypot(preferred.x, preferred.z)
+      }] : [];
   for (let index = 0; index < 16; index += 1) {
     const angle = index / 16 * Math.PI * 2;
     directions.push({ x: Math.cos(angle), y: 0, z: Math.sin(angle) });

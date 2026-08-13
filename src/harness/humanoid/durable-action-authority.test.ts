@@ -11,11 +11,13 @@ import type { JournalName, RunStore } from "../../persistence/run-store.js";
 import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
 import { humanoidActionFingerprint, type HumanoidActionReceipt } from "./runtime.js";
 import {
-  verifyDurableHumanoidActionRuntimeState,
+  recoverDurableHumanoidActionRuntimeState,
   verifyDurableHumanoidActionWindow
 } from "./durable-action-authority.js";
 
 describe("durable humanoid action authority", () => {
+  const hierarchyEpochId = "11111111-1111-4111-8111-111111111111";
+
   it("rebuilds a hot receipt only from its identity, action row and runtime event", async () => {
     const proof = fixture();
     const assertions: string[] = [];
@@ -93,25 +95,68 @@ describe("durable humanoid action authority", () => {
       identities: new Map([[proof.identity.transaction_id, proof.identity]]),
       assertDecisionAuthority: () => undefined
     });
-    expect(() => verifyDurableHumanoidActionRuntimeState({
+    expect(recoverDurableHumanoidActionRuntimeState({
       receipts: { [proof.receipt.transactionId]: proof.receipt },
       proofs: verified,
-      checkpointState: proof.actionRuntimeState
-    })).not.toThrow();
-    expect(() => verifyDurableHumanoidActionRuntimeState({
+      checkpointState: proof.actionRuntimeState,
+      neuralHierarchyEpochId: hierarchyEpochId
+    })).toMatchObject({
+      state: proof.actionRuntimeState,
+      checkpointRecovered: false
+    });
+    expect(recoverDurableHumanoidActionRuntimeState({
       receipts: { [proof.receipt.transactionId]: proof.receipt },
       proofs: verified,
       checkpointState: {
         ...proof.actionRuntimeState,
         latest_physical_execution_revision: 1
-      }
-    })).toThrow("conflicts with durable event");
+      },
+      neuralHierarchyEpochId: hierarchyEpochId
+    })).toMatchObject({
+      state: proof.actionRuntimeState,
+      checkpointRecovered: true
+    });
+  });
+
+  it("does not restore a previous epoch's cognitive hot cache", async () => {
+    const proof = fixture();
+    const verified = await verifyDurableHumanoidActionWindow({
+      store: journalStore(proof.journals),
+      runId: "run-1",
+      receipts: { [proof.receipt.transactionId]: proof.receipt },
+      identities: new Map([[proof.identity.transaction_id, proof.identity]]),
+      assertDecisionAuthority: () => undefined
+    });
+    const freshEpochId = "55555555-5555-4555-8555-555555555555";
+    const freshState = {
+      version: 1 as const,
+      neural_hierarchy_epoch_id: freshEpochId,
+      latest_physical_execution_revision: 7,
+      skill_plans: [],
+      active_skill_plan_transactions: {},
+      active_skills: [],
+      planning_skill_bindings: [],
+      recovery_policies: [],
+      navigation_transit_clearance_requirements: [],
+      latest_grounding_observation: null
+    };
+
+    expect(recoverDurableHumanoidActionRuntimeState({
+      receipts: { [proof.receipt.transactionId]: proof.receipt },
+      proofs: verified,
+      checkpointState: freshState,
+      neuralHierarchyEpochId: freshEpochId
+    })).toEqual({
+      state: freshState,
+      checkpointRecovered: false
+    });
   });
 });
 
 function fixture() {
   const actionRuntimeState = {
     version: 1 as const,
+    neural_hierarchy_epoch_id: "11111111-1111-4111-8111-111111111111",
     latest_physical_execution_revision: 0,
     skill_plans: [],
     active_skill_plan_transactions: {},

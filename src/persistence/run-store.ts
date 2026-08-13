@@ -42,8 +42,11 @@ import {
 } from "../domain/run-mode.js";
 import {
   AgentManifestSchema,
+  HistoricalAgentAuthorityManifestSchema,
+  type HistoricalAgentAuthorityManifest,
   type AgentManifest
 } from "../domain/agent-manifest.js";
+import { NEURAL_HIERARCHY_CONTRACT_VERSION } from "../domain/neural-hierarchy.js";
 import { z } from "zod";
 import {
   appendIndexedRecordsBuilt,
@@ -58,6 +61,7 @@ import {
   type MutationFence
 } from "./mutation-fence.js";
 import {
+  assertFreshNeuralHierarchyEpochSafe,
   humanoidRunCheckpointNeedsPhysicalMigration,
   normalizeHumanoidRunCheckpoint
 } from "./humanoid-checkpoint-migration.js";
@@ -134,6 +138,7 @@ export interface RunDetailsSnapshot {
 
 export interface RunStoreOptions {
   mutationFence?: MutationFence;
+  freshNeuralHierarchyEpoch?: boolean;
 }
 
 export interface AgentStateRecord {
@@ -209,7 +214,16 @@ export class RunStore {
     );
     if (basename(resolved) !== definition.run_id) throw new Error("Run directory identity mismatch");
     const store = new RunStore(resolved, definition, options.mutationFence);
-    await store.#normalizeCheckpointIfPresent();
+    if (options.freshNeuralHierarchyEpoch === true) {
+      // Archive the old model epoch before changing the checkpoint. If archival
+      // fails, the old hierarchy, Sessions, and checkpoint remain a coherent
+      // resumable unit rather than a half-switched epoch.
+      await store.#assertFreshNeuralHierarchyEpochSafeIfPresent();
+      await store.archiveAgentEpochForFreshHierarchy();
+    }
+    await store.#normalizeCheckpointIfPresent(
+      options.freshNeuralHierarchyEpoch === true
+    );
     return store;
   }
 
@@ -495,7 +509,7 @@ export class RunStore {
     }
   }
 
-  async readArchivedAgentManifests(): Promise<AgentManifest[]> {
+  async readArchivedAgentManifests(): Promise<HistoricalAgentAuthorityManifest[]> {
     return this.#runMutation(async () => {
       const directory = resolve(this.runDir, "agent-epochs");
       let entries;
@@ -505,14 +519,14 @@ export class RunStore {
         if (isMissing(error)) return [];
         throw error;
       }
-      const manifests: AgentManifest[] = [];
+      const manifests: HistoricalAgentAuthorityManifest[] = [];
       for (const entry of entries
         .filter((candidate) => candidate.isDirectory())
         .sort((left, right) => left.name.localeCompare(right.name))) {
-        const manifest = parsePersistedAgentManifest(await readFile(
+        const manifest = historicalAgentAuthorityManifest(JSON.parse(await readFile(
           resolve(directory, entry.name, "agent-manifest.json"),
           "utf8"
-        ), `archived epoch ${entry.name}`);
+        )) as unknown, `archived epoch ${entry.name}`);
         if (manifest.epoch_id !== entry.name) {
           throw new Error(`Archived Agent manifest epoch mismatch: ${entry.name}`);
         }
@@ -585,6 +599,84 @@ export class RunStore {
     });
   }
 
+  /**
+   * Archive an incompatible pre-contract manifest without parsing it as the
+   * current manifest schema. This path is reachable only through the explicit
+   * fresh hierarchy epoch operation; normal resume remains strict.
+   */
+  async archiveIncompatibleAgentEpoch(): Promise<string> {
+    return this.#runMutation(async () => {
+      const manifestPath = resolve(this.runDir, "agent-manifest.json");
+      const raw = JSON.parse(await readFile(manifestPath, "utf8")) as unknown;
+      if (!isRecord(raw) || typeof raw.epoch_id !== "string"
+        || !z.string().uuid().safeParse(raw.epoch_id).success
+        || raw.runtime !== "humanoid_g1") {
+        throw new Error("Incompatible Agent manifest has no safe archive identity");
+      }
+      const epochId = raw.epoch_id;
+      const archiveRoot = resolve(this.runDir, "agent-epochs");
+      const destination = resolve(archiveRoot, epochId);
+      const staging = resolve(archiveRoot, `.${epochId}.${randomUUID()}.tmp`);
+      await mkdir(archiveRoot, { recursive: true });
+      try {
+        await access(destination);
+      } catch {
+        await mkdir(staging, { recursive: false });
+        try {
+          for (const name of [
+            "agent-manifest.json",
+            "agent-state.json",
+            "session.json",
+            "sessions"
+          ] as const) {
+            const source = resolve(this.runDir, name);
+            try {
+              await access(source);
+            } catch {
+              continue;
+            }
+            await cp(source, resolve(staging, name), {
+              recursive: name === "sessions",
+              errorOnExist: true
+            });
+          }
+          await rename(staging, destination);
+        } catch (error) {
+          await rm(staging, { recursive: true, force: true });
+          throw error;
+        }
+      }
+      for (const name of [
+        "agent-manifest.json",
+        "agent-state.json",
+        "session.json",
+        "sessions"
+      ] as const) {
+        await rm(resolve(this.runDir, name), { recursive: true, force: true });
+      }
+      return epochId;
+    });
+  }
+
+  async archiveAgentEpochForFreshHierarchy(): Promise<string | undefined> {
+    try {
+      await access(resolve(this.runDir, "agent-manifest.json"));
+    } catch (error) {
+      if (isMissing(error)) return undefined;
+      throw error;
+    }
+    try {
+      return await this.archiveCurrentAgentEpoch();
+    } catch (error) {
+      if (!(error instanceof Error)
+        || (!error.message.includes("neural contract")
+          && !error.message.includes("pre-invocation neural manifest"))) {
+        throw error;
+      }
+      return this.archiveIncompatibleAgentEpoch();
+    }
+  }
+
   sessionPath(): string {
     return resolve(this.runDir, "session.json");
   }
@@ -643,7 +735,7 @@ export class RunStore {
     return checkpoint;
   }
 
-  async #normalizeCheckpointIfPresent(): Promise<void> {
+  async #normalizeCheckpointIfPresent(freshNeuralHierarchyEpoch = false): Promise<void> {
     let raw: unknown;
     try {
       raw = JSON.parse(
@@ -653,10 +745,38 @@ export class RunStore {
       if (isMissing(error)) return;
       throw error;
     }
-    if (!humanoidRunCheckpointNeedsPhysicalMigration(raw)) return;
+    if (!freshNeuralHierarchyEpoch
+      && !humanoidRunCheckpointNeedsPhysicalMigration(raw)) {
+      // Opening a run is the compatibility boundary. Validate the neural
+      // contract now so callers never receive a store that fails later with a
+      // raw schema error on its first checkpoint read.
+      await normalizeHumanoidRunCheckpoint(raw, this.definition.scenario);
+      return;
+    }
     await this.#runMutation(async () => {
-      await this.#readCheckpoint();
+      const normalized = await normalizeHumanoidRunCheckpoint(
+        raw,
+        this.definition.scenario,
+        { freshNeuralHierarchyEpoch }
+      );
+      const checkpoint = AnyRunCheckpointSchema.parse(normalized.checkpoint);
+      this.#assertCheckpointRuntime(checkpoint);
+      if (normalized.migrated) {
+        await atomicJson(resolve(this.runDir, "checkpoint.json"), checkpoint);
+      }
     });
+  }
+
+  async #assertFreshNeuralHierarchyEpochSafeIfPresent(): Promise<void> {
+    try {
+      const raw: unknown = JSON.parse(
+        await readFile(resolve(this.runDir, "checkpoint.json"), "utf8")
+      );
+      assertFreshNeuralHierarchyEpochSafe(raw);
+    } catch (error) {
+      if (isMissing(error)) return;
+      throw error;
+    }
   }
 
   async #readScenarioChunkDeltaState(): Promise<ScenarioChunkDeltaState> {
@@ -743,6 +863,84 @@ export class RunStore {
   }
 }
 
+function historicalAgentAuthorityManifest(
+  raw: unknown,
+  label: string
+): HistoricalAgentAuthorityManifest {
+  if (!isRecord(raw) || raw.runtime !== "humanoid_g1"
+    || typeof raw.epoch_id !== "string"
+    || typeof raw.identity_sha256 !== "string"
+    || !isRecord(raw.agents)) {
+    throw new Error(`The ${label} manifest has no historical authority identity`);
+  }
+  const agents = Object.values(raw.agents).filter(isRecord);
+  const agentIds = agents.flatMap((agent) => (
+    typeof agent.agent_id === "string" && agent.agent_id.trim().length > 0
+      ? [agent.agent_id]
+      : []
+  ));
+  if (agentIds.length !== agents.length || agentIds.length === 0) {
+    throw new Error(`The ${label} manifest has incomplete Agent identities`);
+  }
+  const legacyAgents = raw.agents;
+  const neural = raw.version !== 1;
+  const goalManagerAgentId = neural
+    ? historicalStructuralAgentId(raw, "executive", "goal_valuation", label)
+    : historicalLegacyAgentId(legacyAgents, "goal_manager", label);
+  const groundingManagerAgentId = neural
+    ? historicalStructuralAgentId(
+        raw,
+        "perceptual_association",
+        "perceptual_association",
+        label
+      )
+    : historicalLegacyAgentId(legacyAgents, "coordinator", label);
+  const executionManagerAgentId = neural
+    ? historicalStructuralAgentId(raw, "sensorimotor", "sensorimotor_selection", label)
+    : historicalLegacyAgentId(legacyAgents, "coordinator", label);
+  return HistoricalAgentAuthorityManifestSchema.parse({
+    epoch_id: raw.epoch_id,
+    identity_sha256: raw.identity_sha256,
+    agent_ids: agentIds,
+    goal_manager_agent_id: goalManagerAgentId,
+    grounding_manager_agent_id: groundingManagerAgentId,
+    execution_manager_agent_id: executionManagerAgentId
+  });
+}
+
+function historicalStructuralAgentId(
+  manifest: Record<string, unknown>,
+  layer: string,
+  pathway: string,
+  label: string
+): string {
+  const agents = isRecord(manifest.agents) ? Object.values(manifest.agents) : [];
+  const candidates = agents.filter(isRecord).filter((agent) => (
+    agent.execution_kind === "model_agent"
+      && agent.layer === layer
+      && agent.pathway === pathway
+  ));
+  const candidate = candidates[0];
+  if (candidates.length !== 1 || !candidate
+    || typeof candidate.agent_id !== "string") {
+    throw new Error(`The ${label} manifest has ambiguous ${pathway} authority`);
+  }
+  return candidate.agent_id;
+}
+
+function historicalLegacyAgentId(
+  agents: Record<string, unknown>,
+  key: "goal_manager" | "coordinator",
+  label: string
+): string {
+  const agent = agents[key];
+  if (!isRecord(agent) || typeof agent.agent_id !== "string"
+    || agent.agent_id.trim().length === 0) {
+    throw new Error(`The ${label} manifest has no ${key} authority`);
+  }
+  return agent.agent_id;
+}
+
 function parsePersistedAgentManifest(
   source: string,
   label: string
@@ -750,6 +948,21 @@ function parsePersistedAgentManifest(
   const raw: unknown = JSON.parse(source);
   const parsed = AgentManifestSchema.safeParse(raw);
   if (parsed.success) return parsed.data;
+  if (isRecord(raw)
+    && raw.runtime === "humanoid_g1"
+    && (raw.version === 2
+      || (typeof raw.neural_contract_version === "number"
+        && raw.neural_contract_version !== NEURAL_HIERARCHY_CONTRACT_VERSION))) {
+    throw new Error(
+      `The ${label} Agent manifest uses ${raw.version === 2
+        ? "the pre-invocation neural manifest v2"
+        : `neural contract v${raw.neural_contract_version}`}; `
+      + `the current invocation-scoped hierarchy contract is v${NEURAL_HIERARCHY_CONTRACT_VERSION}. `
+      + "Existing Sessions and "
+      + "physical state remain unchanged; create an explicit fresh Agent/hierarchy epoch "
+      + "instead of mixing contexts across contracts."
+    );
+  }
   if (isRecord(raw)
     && raw.runtime === "humanoid_g1"
     && typeof raw.harness_contract_version === "number"

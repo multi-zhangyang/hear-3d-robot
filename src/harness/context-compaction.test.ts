@@ -688,8 +688,8 @@ describe("LongRunContextManager hierarchy identity", () => {
     expect(recovered.snapshot.scopes[node.id]).toMatchObject({
       compaction_count: 1,
       summary_origin: "model",
-      raw_item_count: 2,
-      retained_item_count: 2
+      raw_item_count: 1,
+      retained_item_count: 1
     });
   });
 

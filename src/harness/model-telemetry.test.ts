@@ -136,6 +136,31 @@ describe("authoritative model progress guard", () => {
     expect(() => guard.observe("humanoid-motion-reference", snapshot)).not.toThrow();
   });
 
+  it("does not merge observations from different recovery transitions into one repetition", () => {
+    const snapshot = progressSnapshot();
+    const guard = new AuthoritativeModelProgressGuard(snapshot, {
+      repeatedNoProgressReceipts: 3,
+      decisionsWithoutAuthorityChange: 20,
+      decisionsWithoutPhysicalProgress: 20
+    });
+
+    for (let index = 1; index <= 4; index += 1) {
+      snapshot.receipts.push(receipt(`observe-${index}`, {
+        agentId: "humanoid-sentry",
+        action: "observe_humanoid",
+        code: "humanoid_observed"
+      }));
+      expect(() => guard.observe("humanoid-coordinator", snapshot)).not.toThrow();
+      snapshot.receipts.push(receipt(`transition-${index}`, {
+        agentId: "humanoid-motion-reference",
+        action: "plan_humanoid_skill",
+        accepted: false,
+        code: `recovery_transition_${index}`
+      }));
+      expect(() => guard.observe("humanoid-coordinator", snapshot)).not.toThrow();
+    }
+  });
+
   it("bounds valid read-only decisions that never change authority", () => {
     const snapshot = progressSnapshot();
     const guard = new AuthoritativeModelProgressGuard(snapshot, {
@@ -167,6 +192,20 @@ describe("authoritative model progress guard", () => {
     snapshot.goalStateSha256 = "goal-state-1";
     expect(() => guard.observe("humanoid-goal-manager", snapshot)).not.toThrow();
     expect(() => guard.observe("humanoid-goal-manager", snapshot)).not.toThrow();
+  });
+
+  it("treats a neural Harness authority transition as authoritative progress", () => {
+    const snapshot = progressSnapshot();
+    const guard = new AuthoritativeModelProgressGuard(snapshot, {
+      decisionsWithoutAuthorityChange: 2,
+      repeatedNoProgressReceipts: 20,
+      decisionsWithoutPhysicalProgress: 20
+    });
+
+    guard.observe("humanoid-sensorimotor-manager", snapshot);
+    snapshot.authorityStateSha256 = "authority-state-1";
+    expect(() => guard.observe("humanoid-sensorimotor-manager", snapshot)).not.toThrow();
+    expect(() => guard.observe("humanoid-sensorimotor-manager", snapshot)).not.toThrow();
   });
 
   it("does not mistake idle physics clock revisions for Agent progress", () => {
@@ -614,6 +653,7 @@ function progressSnapshot(): ModelProgressSnapshot {
     cycleIndex: 0,
     checkerSuccess: false,
     goalStateSha256: "goal-state-0",
+    authorityStateSha256: "authority-state-0",
     receipts: []
   };
 }

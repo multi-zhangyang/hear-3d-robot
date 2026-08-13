@@ -38,9 +38,9 @@ describe("provider context budget", () => {
     expect(config.compactTriggerTokens).toBe(249_037);
     expect(config.maxOutputTokens).toBeUndefined();
     expect(config.compactMaxOutputTokens).toBeUndefined();
-    expect(config.agentModels?.executor.maxOutputTokens).toBeUndefined();
-    expect(config.agentModels?.executor.requestTimeoutMs).toBe(300_000);
-    expect(config.agentModels?.executor.streamEventIdleTimeoutMs).toBe(300_000);
+    expect(config.agentModels?.motor_intent.maxOutputTokens).toBeUndefined();
+    expect(config.agentModels?.motor_intent.requestTimeoutMs).toBe(300_000);
+    expect(config.agentModels?.motor_intent.streamEventIdleTimeoutMs).toBe(300_000);
     expect(config.agentModels?.compactor.compactMaxOutputTokens).toBeUndefined();
   });
 
@@ -48,12 +48,12 @@ describe("provider context budget", () => {
     const config = loadProviderConfig({
       ...required,
       AI_TOOL_CHOICE: "auto",
-      AI_MOTION_TOOL_CHOICE: "required"
+      AI_MOTOR_INTENT_TOOL_CHOICE: "required"
     });
 
     expect(config.toolChoice).toBe("auto");
-    expect(config.agentModels?.sentry.toolChoice).toBe("auto");
-    expect(config.agentModels?.motion.toolChoice).toBe("required");
+    expect(config.agentModels?.associative.toolChoice).toBe("auto");
+    expect(config.agentModels?.motor_intent.toolChoice).toBe("required");
   });
 
   it("applies provider-neutral reasoning effort and one-million-token context to every role", () => {
@@ -94,7 +94,7 @@ describe("provider context budget", () => {
     })).toThrow("cannot run an autonomous Harness");
     expect(() => loadProviderConfig({
       ...required,
-      AI_EXECUTOR_TOOL_CHOICE: "none"
+      AI_MOTOR_INTENT_TOOL_CHOICE: "none"
     })).toThrow("cannot run an autonomous Harness");
   });
 
@@ -121,45 +121,36 @@ describe("provider context budget", () => {
   it("inherits AI defaults while resolving independent provider-neutral agent profiles", () => {
     const config = loadProviderConfig({
       ...required,
-      AI_GOAL_MANAGER_MODEL: "goal-manager-model",
-      AI_COORDINATOR_TEMPERATURE: "0.1",
-      AI_SENTRY_MAX_OUTPUT_TOKENS: "2048",
-      AI_MOTION_PROVIDER: "anthropic_messages",
-      AI_MOTION_BASE_URL: "https://motion.example.test/messages",
-      AI_MOTION_MODEL: "motion-model",
-      AI_MOTION_API_KEY: "motion-key",
-      AI_EXECUTOR_CONTEXT_WINDOW_TOKENS: "131072",
-      AI_EXECUTOR_COMPACT_TRIGGER_TOKENS: "24000",
+      AI_EXECUTIVE_MODEL: "executive-model",
+      AI_EXECUTIVE_TEMPERATURE: "0.1",
+      AI_ASSOCIATIVE_MAX_OUTPUT_TOKENS: "2048",
+      AI_MOTOR_INTENT_PROVIDER: "anthropic_messages",
+      AI_MOTOR_INTENT_BASE_URL: "https://motion.example.test/messages",
+      AI_MOTOR_INTENT_MODEL: "motion-model",
+      AI_MOTOR_INTENT_API_KEY: "motion-key",
+      AI_SENSORIMOTOR_CONTEXT_WINDOW_TOKENS: "131072",
+      AI_SENSORIMOTOR_COMPACT_TRIGGER_TOKENS: "24000",
       AI_COMPACTOR_MODEL: "compactor-model",
       AI_COMPACTOR_COMPACT_MAX_OUTPUT_TOKENS: "2048"
     });
 
-    expect(config.agentModels?.goal_manager).toMatchObject({
-      model: "goal-manager-model"
-    });
-    expect(config.agentModels?.coordinator).toMatchObject({
-      model: "model-name",
+    expect(config.agentModels?.executive).toMatchObject({
+      model: "executive-model",
       temperature: 0.1
     });
-    expect(config.agentModels?.sentry).toMatchObject({
+    expect(config.agentModels?.associative).toMatchObject({
       protocol: "openai_compatible",
       baseUrl: "https://example.test/v1",
       apiKey: "test-key",
       maxOutputTokens: 2048
     });
-    expect(config.agentModels?.motion).toMatchObject({
+    expect(config.agentModels?.motor_intent).toMatchObject({
       protocol: "anthropic_messages",
       baseUrl: "https://motion.example.test/messages",
       model: "motion-model",
       apiKey: "motion-key"
     });
-    expect(config.agentModels?.motion_planner).toMatchObject({
-      protocol: "anthropic_messages",
-      baseUrl: "https://motion.example.test/messages",
-      model: "motion-model",
-      apiKey: "motion-key"
-    });
-    expect(config.agentModels?.executor).toMatchObject({
+    expect(config.agentModels?.sensorimotor).toMatchObject({
       contextWindowTokens: 131072,
       compactTriggerTokens: 24000
     });
@@ -172,10 +163,10 @@ describe("provider context budget", () => {
   it("derives an independent output-reserved trigger when a role overrides its window", () => {
     const config = loadProviderConfig({
       ...required,
-      AI_EXECUTOR_CONTEXT_WINDOW_TOKENS: "131072"
+      AI_SENSORIMOTOR_CONTEXT_WINDOW_TOKENS: "131072"
     });
 
-    expect(config.agentModels?.executor).toMatchObject({
+    expect(config.agentModels?.sensorimotor).toMatchObject({
       contextWindowTokens: 131072,
       compactTriggerTokens: 124_519
     });
@@ -193,10 +184,10 @@ describe("provider context budget", () => {
   it("validates every agent profile before the runtime can create a model", () => {
     expect(() => loadProviderConfig({
       ...required,
-      AI_SENTRY_CONTEXT_WINDOW_TOKENS: "16000",
-      AI_SENTRY_COMPACT_TRIGGER_TOKENS: "11001",
-      AI_SENTRY_MAX_OUTPUT_TOKENS: "5000",
-      AI_SENTRY_COMPACT_MAX_OUTPUT_TOKENS: "2000"
+      AI_ASSOCIATIVE_CONTEXT_WINDOW_TOKENS: "16000",
+      AI_ASSOCIATIVE_COMPACT_TRIGGER_TOKENS: "11001",
+      AI_ASSOCIATIVE_MAX_OUTPUT_TOKENS: "5000",
+      AI_ASSOCIATIVE_COMPACT_MAX_OUTPUT_TOKENS: "2000"
     })).toThrow("explicitly configured AI_MAX_OUTPUT_TOKENS");
   });
 });

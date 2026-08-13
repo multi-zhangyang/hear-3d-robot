@@ -54,6 +54,73 @@ describe("autonomous humanoid navigation Goal constraints", () => {
     if (plan.kind !== "navigation") return;
     expect(plan.targets[0]?.acceptedPositionToleranceMeters).toBeCloseTo(0.02, 12);
   });
+
+  it("keeps approach bases outside a contacted support solid footprint", () => {
+    const binding = {
+      phase_authority: "navigation",
+      invocation: {
+        skill: "approach",
+        object_id: "assembly_rod",
+        interaction_point_id: "geometry-z-negative",
+        hand: "left",
+        standoff_m: 0.2
+      },
+      target_position: { x: 4.2, y: 0.67, z: 4.8 },
+      eligible_interaction_points: [{
+        id: "geometry-z-negative",
+        kind: "grasp",
+        compatible_hands: "either",
+        world_position: { x: 4.2, y: 0.67, z: 4.77 },
+        approach_direction_world: { x: 0, y: 0, z: 1 },
+        clearance_m: 0.025,
+        source: "geometry"
+      }]
+    } as ActiveHumanoidSkillBinding;
+    const rejectedIkTarget = { x: 4, y: 0.7655, z: 4.565 };
+    const plan = planAutonomousHumanoidSkill({
+      binding,
+      observation: {
+        robot: { rootPosition: { x: 3.98, y: 0.7655, z: 4.02 } },
+        manipulationBasePlacements: [{
+          objectId: "assembly_rod",
+          interactionPointId: "geometry-z-negative",
+          handSurface: "left_hand_palm_link",
+          rootWorldTarget: rejectedIkTarget,
+          rootTranslationWorld: { x: 0, y: 0, z: 0 },
+          rootYawRadians: 0,
+          wristWorldTarget: { x: 4.2, y: 0.67, z: 4.77 },
+          ikResidualMeters: 0.01
+        }],
+        solidTokens: [{
+          id: "object-pickup_stand",
+          sourceId: "pickup_stand",
+          kind: "fixed_object",
+          center: { x: 4.2, y: 0.555, z: 4.8 },
+          size: { x: 0.12, y: 0.01, z: 0.12 },
+          currentContacts: [{
+            position: { x: 4.2, y: 0.56, z: 4.8 },
+            normal: { x: 0, y: -1, z: 0 },
+            normalForce: 1,
+            firstBody: null,
+            secondBody: null,
+            firstObject: "assembly_rod",
+            secondObject: null,
+            firstSolid: null,
+            secondSolid: "object-pickup_stand",
+            firstHandLink: null,
+            secondHandLink: null
+          }]
+        }]
+      } as HumanoidWorldObservation
+    });
+
+    expect(plan.kind).toBe("navigation");
+    if (plan.kind !== "navigation") return;
+    expect(plan.targets.some(({ target }) => (
+      target.x === rejectedIkTarget.x && target.z === rejectedIkTarget.z
+    ))).toBe(false);
+    expect(plan.targets[0]?.target.z).toBeLessThan(4.46);
+  });
 });
 
 function explorationBinding(): ActiveHumanoidSkillBinding {

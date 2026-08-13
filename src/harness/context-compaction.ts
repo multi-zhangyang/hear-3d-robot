@@ -1035,18 +1035,12 @@ function chooseCutIndex(input: {
   triggerTokens: number;
   tokenEstimatorCorrectionMilli: number;
 }): number {
-  const starts = modelTurnStarts(input.items)
-    .filter((index) => index > input.alreadyCompacted);
+  const completeTurns = conversationTurnStarts(input.items);
   const preferred = input.recentTurns === 0
-    ? input.items.length
-    : starts.at(-input.recentTurns) ?? input.items.length;
-  const boundaries = [...new Set([
-    ...starts.filter((index) => index >= preferred),
-    input.items.length
-  ])].sort((left, right) => left - right);
+    ? input.alreadyCompacted
+    : completeTurns.at(-input.recentTurns) ?? input.alreadyCompacted;
   const target = Math.floor(input.triggerTokens * 0.82);
-  for (const cut of boundaries) {
-    if (cut <= input.alreadyCompacted) continue;
+  const fits = (cut: number): boolean => {
     const projected = correctedTokenEstimate(estimateModelInputTokens({
       input: input.items.slice(cut),
       ...(input.modelData.instructions === undefined
@@ -1054,7 +1048,20 @@ function chooseCutIndex(input: {
         : { instructions: input.modelData.instructions })
     }) + input.toolTokens, input.tokenEstimatorCorrectionMilli)
       + input.summaryTokenReserve;
-    if (projected <= target) return cut;
+    return projected <= target;
+  };
+  // Prefer whole conversation turns, matching coding-agent compaction: one
+  // delegation request and all of its reasoning/tool traffic stay together.
+  for (const cut of completeTurns) {
+    if (cut <= input.alreadyCompacted || cut < preferred) continue;
+    if (fits(cut)) return cut;
+  }
+  // A single oversized turn may itself exceed the hot-tail budget. Split only
+  // then, at a protocol-safe continuation boundary; never between a tool call
+  // and its result.
+  for (const cut of safeCompactionStarts(input.items)) {
+    if (cut <= input.alreadyCompacted || cut < preferred) continue;
+    if (fits(cut)) return cut;
   }
   return input.items.length;
 }
@@ -1064,8 +1071,8 @@ function correctedTokenEstimate(estimate: number, correctionMilli: number): numb
 }
 
 /**
- * A cut is only legal immediately before a model turn, or at the end of the
- * current history. That keeps function calls/results and model output grouped
+ * A cut prefers the start of a full delegation turn. Split-turn fallback uses
+ * only protocol-safe continuation points, keeping function calls with results
  * instead of slicing arbitrary JSON items merely to satisfy a byte budget.
  */
 function compactionBoundaries(
@@ -1073,13 +1080,22 @@ function compactionBoundaries(
   after: number,
   through: number
 ): number[] {
-  return [...new Set([...modelTurnStarts(items), items.length])]
+  return [...new Set([...safeCompactionStarts(items), items.length])]
     .filter((index) => index > after && index <= through)
     .sort((left, right) => left - right);
 }
 
-function modelTurnStarts(items: AgentInputItem[]): number[] {
+function conversationTurnStarts(items: AgentInputItem[]): number[] {
   const starts: number[] = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const current = items[index];
+    if (current && "role" in current && current.role === "user") starts.push(index);
+  }
+  return starts;
+}
+
+function safeCompactionStarts(items: AgentInputItem[]): number[] {
+  const starts = conversationTurnStarts(items);
   for (let index = 0; index < items.length; index += 1) {
     const current = items[index];
     const previous = items[index - 1];

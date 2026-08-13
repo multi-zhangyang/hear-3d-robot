@@ -4,7 +4,11 @@ import {
   HumanoidNavigationExecution,
   HumanoidNavigationExecutionProgressSchema
 } from "./navigation-execution.js";
-import { neutralHumanoidReference, type HumanoidReference } from "./reference.js";
+import {
+  neutralHumanoidReference,
+  targetReference,
+  type HumanoidReference
+} from "./reference.js";
 import type {
   HumanoidContactSnapshot,
   HumanoidSimulation,
@@ -459,6 +463,50 @@ describe("humanoid navigation execution progress", () => {
     expect(execution.result()).toMatchObject({ completed: true });
     expect(0.4 - execution.result().final.rootPosition.z).toBeCloseTo(0.067, 6);
     expect(execution.result().travelledDistance).toBeGreaterThanOrEqual(0.3);
+  });
+
+  it("stops yaw actuation once the requested heading is inside tolerance", async () => {
+    const approachRoute: NavigationPlan = {
+      waypoints: [
+        { x: 0, y: 0.8, z: 0 },
+        { x: 0, y: 0.8, z: 0.4 }
+      ],
+      distance: 0.4,
+      resolvedTarget: { x: 0, y: 0.8, z: 0.4 },
+      projectionDistance: 0
+    };
+    const simulation = new NavigationSimulation(
+      { x: 0, y: 0.8, z: 0.35 },
+      [],
+      0.4,
+      0
+    );
+    simulation.yaw = 0.052;
+    const execution = new HumanoidNavigationExecution({
+      plan: approachRoute,
+      reference: targetReference(neutralHumanoidReference(), {
+        rootYawVelocity: 0.094
+      }),
+      simulation: simulation.asHumanoidSimulation(),
+      progress: {
+        version: 1,
+        start_root_position: { x: 0, y: 0.8, z: 0 },
+        waypoint_index: approachRoute.waypoints.length,
+        committed_frame_count: 10,
+        stopping_frame_count: 1,
+        stopping_settled_frame_count: 0,
+        arrival_position_latched: true
+      },
+      arrivalHeading: {
+        type: "yaw",
+        yaw_radians: 0,
+        tolerance_radians: 0.12
+      }
+    });
+
+    await execution.step(simulation.asHumanoidSimulation());
+
+    expect(Math.abs(execution.reference.rootYawVelocity)).toBeLessThan(0.094);
   });
 
   it("physically aligns the requested arrival heading before completing", async () => {

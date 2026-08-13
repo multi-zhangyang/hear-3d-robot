@@ -36,12 +36,10 @@ const provider: ProviderConfig = {
   compactRecentModelTurns: 4,
   compactMaxOutputTokens: 1024,
   agentModels: {
-    goal_manager: profile("goal-manager-model", 0.15),
-    coordinator: profile("coordinator-model", 0.1),
-    sentry: profile("sentry-model", 0.2),
-    motion_planner: profile("motion-planner-model", 0.25),
-    motion: profile("motion-model", 0.3),
-    executor: profile("executor-model", 0.4),
+    executive: profile("executive-model", 0.1),
+    associative: profile("associative-model", 0.2),
+    sensorimotor: profile("sensorimotor-model", 0.25),
+    motor_intent: profile("motion-model", 0.3),
     compactor: profile("compactor-model", 0.5)
   }
 };
@@ -99,7 +97,7 @@ describe("agent manifest", () => {
       agent_id: "humanoid-motion-planner",
       agent_name: "全身运动规划智能体",
       role: "motion_planner",
-      model: "motion-planner-model",
+      model: "sensorimotor-model",
       tool_use_behavior: { kind: "sdk_flag", value: "run_llm_again" }
     });
     expect(manifest.agents.sentry).toMatchObject({
@@ -192,15 +190,10 @@ describe("agent manifest", () => {
       ...provider,
       baseUrl: sensitiveEndpoint,
       agentModels: {
-        goal_manager: { ...provider.agentModels!.goal_manager, baseUrl: sensitiveEndpoint },
-        coordinator: { ...provider.agentModels!.coordinator, baseUrl: sensitiveEndpoint },
-        sentry: { ...provider.agentModels!.sentry, baseUrl: sensitiveEndpoint },
-        motion_planner: {
-          ...provider.agentModels!.motion_planner,
-          baseUrl: sensitiveEndpoint
-        },
-        motion: { ...provider.agentModels!.motion, baseUrl: sensitiveEndpoint },
-        executor: { ...provider.agentModels!.executor, baseUrl: sensitiveEndpoint },
+        executive: { ...provider.agentModels!.executive, baseUrl: sensitiveEndpoint },
+        associative: { ...provider.agentModels!.associative, baseUrl: sensitiveEndpoint },
+        sensorimotor: { ...provider.agentModels!.sensorimotor, baseUrl: sensitiveEndpoint },
+        motor_intent: { ...provider.agentModels!.motor_intent, baseUrl: sensitiveEndpoint },
         compactor: { ...provider.agentModels!.compactor, baseUrl: sensitiveEndpoint }
       }
     };
@@ -270,7 +263,10 @@ describe("agent manifest", () => {
       ...provider,
       agentModels: {
         ...provider.agentModels!,
-        motion: { ...provider.agentModels!.motion, model: "different-motion-model" }
+        motor_intent: {
+          ...provider.agentModels!.motor_intent,
+          model: "different-motion-model"
+        }
       }
     };
     const changed = createManifest(
@@ -500,7 +496,7 @@ describe("agent manifest", () => {
     });
     expect(first.identity_sha256).toBe(second.identity_sha256);
     expect(first.identity_sha256).toBe(
-      "07cb8a42549cfbb7ff146b34f59d7cef5b6decdafd9832c8b3be3af292393772"
+      "3844dfbd814803f59084304b2f42d36e20ff38c59a2a6a24af3317523fdd0aad"
     );
   });
 

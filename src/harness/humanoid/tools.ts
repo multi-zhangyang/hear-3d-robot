@@ -24,11 +24,14 @@ import type {
   HumanoidActionReceipt,
   HumanoidActionToolCallAuthority,
 } from "./runtime.js";
+import type { NeuralRolloutExecutionAdmission } from
+  "../../domain/action-execution-ledger.js";
 import {
   HUMANOID_EXPERIENCE_OUTCOMES,
   HUMANOID_GOAL_PREDICATE_TYPES
 } from "./embodied-recall.js";
 import { modelToolReceiptDetail } from "./receipt-context.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 
 export type { HumanoidActionInvoker } from "./runtime.js";
 
@@ -130,7 +133,7 @@ export function createHumanoidActionTools(
   if (unique.size !== allowedActions.length) {
     throw new Error(`Duplicate humanoid action grant for ${agentId}`);
   }
-  if (agentId === "humanoid-motion-reference"
+  if (agentId === HUMANOID_NEURAL_AGENT_IDS.motorIntent
     && unique.has("plan_whole_body_motion")) {
     throw new Error(
       "Production Motion Agent cannot receive raw dense-motion authoring authority"
@@ -161,6 +164,7 @@ export async function invokeDeterministicHumanoidAction(input: {
   contractId: NonNullable<
     HumanoidActionToolCallAuthority["deterministic_delegation"]
   >["contract_id"];
+  neuralRolloutCertificate?: NeuralRolloutExecutionAdmission;
   details?: {
     toolCall?: {
       callId?: string;
@@ -169,6 +173,12 @@ export async function invokeDeterministicHumanoidAction(input: {
     };
     signal?: AbortSignal;
   };
+  /**
+   * Runtime-only observer for deterministic hierarchy services that need the
+   * authoritative, unprojected receipt. The model still receives only the
+   * bounded projection returned by humanoidActionReceiptModelOutput().
+   */
+  onReceipt?: (receipt: HumanoidActionReceipt) => void | Promise<void>;
 }): Promise<string> {
   const toolCall = input.details?.toolCall;
   const transactionId = toolCall?.callId;
@@ -193,14 +203,20 @@ export async function invokeDeterministicHumanoidAction(input: {
       action_input_sha256: modelPayloadSha256(input.actionInput)
     }
   };
-  const receipt = input.details?.signal
+  const invocationOptions = {
+    ...(input.details?.signal ? { signal: input.details.signal } : {}),
+    ...(input.neuralRolloutCertificate
+      ? { neuralRolloutCertificate: input.neuralRolloutCertificate }
+      : {})
+  };
+  const receipt = input.details?.signal || input.neuralRolloutCertificate
     ? await input.runtime.invoke(
         input.action,
         input.actionInput,
         transactionId,
         input.actorAgentId,
         authority,
-        { signal: input.details.signal }
+        invocationOptions
       )
     : await input.runtime.invoke(
         input.action,
@@ -209,6 +225,7 @@ export async function invokeDeterministicHumanoidAction(input: {
         input.actorAgentId,
         authority
       );
+  await input.onReceipt?.(structuredClone(receipt));
   return humanoidActionReceiptModelOutput(receipt);
 }
 

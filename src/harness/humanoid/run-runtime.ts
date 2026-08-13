@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { Mutex } from "async-mutex";
-import type {
-  ContextCompactionSummary,
-  ContextMemoryState,
-  Goal,
-  JsonValue,
-  Scenario,
-  TaskNode
+import {
+  EmptyContextMemoryState,
+  type ContextCompactionSummary,
+  type ContextMemoryState,
+  type Goal,
+  type JsonValue,
+  type Scenario,
+  type TaskNode
 } from "../../domain/schema.js";
 import {
   goalConstraintSha256,
@@ -86,6 +87,7 @@ import {
   humanoidExecutionLedgerStateSha256,
   humanoidGoalControlState,
   humanoidGoalControlStateSha256,
+  humanoidPhysicalStateSha256,
   humanoidActionReceiptsInCommitOrder,
   PersistedHumanoidActionReceiptSchema,
   type HumanoidCheckerResult,
@@ -183,7 +185,47 @@ import {
 } from "./cycle-causal-evidence.js";
 import { HumanoidModelAuthority } from "./model-authority.js";
 import {
-  verifyDurableHumanoidActionRuntimeState,
+  currentAgentHarnessInvocation,
+  currentAgentHarnessInvocationChain
+} from "../agent-scope.js";
+import {
+  activeNeuralAuthorityLease,
+  appendNeuralPredictionError,
+  closeNeuralAuthorityLease,
+  consumeNeuralRolloutCertificate,
+  consumeNeuralSignals,
+  establishNeuralSkillCommitment,
+  issueNeuralAuthorityLease,
+  issueNeuralRolloutCertificate,
+  markNeuralPathwayDispatch,
+  neuralPathwayDue,
+  pendingNeuralSignals,
+  publishNeuralSignal,
+  transitionNeuralHarnessPhase,
+  transitionNeuralSkillCommitment,
+  type NeuralAuthorityLease,
+  type NeuralHarnessPhase,
+  type NeuralHierarchyState,
+  type NeuralPathway,
+  type NeuralPlanningAction,
+  type NeuralPredictionError,
+  type NeuralRolloutCertificate,
+  type NeuralSignal,
+  type NeuralSignalKind,
+  type NeuralSkillCommitment
+} from "../../domain/neural-hierarchy.js";
+import {
+  assertHumanoidNeuralSignalRoute,
+  HUMANOID_NEURAL_AGENT_IDS,
+  HUMANOID_NEURAL_NODE_BY_ID,
+  HUMANOID_NEURAL_SIGNAL_CONTRACTS,
+  type HumanoidNeuralAgentId
+} from "./neural-hierarchy-contract.js";
+import type {
+  NeuralWakeAuthority
+} from "./neural-hierarchy-scheduler.js";
+import {
+  recoverDurableHumanoidActionRuntimeState,
   verifyDurableHumanoidActionWindow
 } from "./durable-action-authority.js";
 import { HumanoidPhysicalExecutionRuntime } from "./physical-execution-runtime.js";
@@ -207,6 +249,27 @@ export type HumanoidCoordinatorPhase =
   | "execute_plan"
   | "post_execution"
   | "complete_cycle";
+
+type HumanoidAuthorityDomain =
+  | "physical"
+  | "goal"
+  | "embodied_memory"
+  | "context_memory"
+  | "execution_ledger";
+
+type HumanoidPersistOptions = {
+  refreshWorld?: boolean;
+  authorityDomains?: readonly HumanoidAuthorityDomain[] | "all";
+  neuralOnly?: boolean;
+};
+
+const ALL_HUMANOID_AUTHORITY_DOMAINS: readonly HumanoidAuthorityDomain[] = [
+  "physical",
+  "goal",
+  "embodied_memory",
+  "context_memory",
+  "execution_ledger"
+];
 
 function compactReplanAttemptInProgress(
   budget: HumanoidReplanBudget,
@@ -238,9 +301,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   readonly #physicsClock: HumanoidPhysicsClock;
   readonly #actionMutex = new Mutex();
   readonly #goalStateMutex = new Mutex();
+  readonly #neuralStateMutex = new Mutex();
+  readonly #persistMutex = new Mutex();
   #checkpoint: HumanoidRunCheckpoint;
+  #durableCheckpoint: HumanoidRunCheckpoint;
   #scenario: Scenario;
-  #checkpointWriteTail: Promise<void> = Promise.resolve();
   #physicalStateAnchorTail: Promise<void> = Promise.resolve();
   #goalStateAnchorTail: Promise<void> = Promise.resolve();
   #embodiedMemoryStateAnchorTail: Promise<void> = Promise.resolve();
@@ -262,6 +327,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   #actionTransactionIdentities = new Map<string, ActionTransactionIdentity>();
   #actionTransactionIdentitiesLoaded = false;
   #durableActionReceiptCache = new Map<string, HumanoidActionReceipt>();
+  readonly #activeModelCallsByAgent = new Map<string, number>();
 
   constructor(input: {
     store: RunStore;
@@ -276,6 +342,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#missionGoal = structuredClone(input.goal);
     this.#world = input.world;
     this.#checkpoint = reconcileHumanoidHierarchyCapabilities(input.checkpoint);
+    this.#durableCheckpoint = structuredClone(this.#checkpoint);
     this.#scenario = structuredClone(input.store.definition.scenario);
     if (goalSha256(this.#missionGoal) !== goalSha256(this.#checkpoint.mission_goal)) {
       throw new Error("Humanoid mission Goal does not match the persisted run constraint");
@@ -307,6 +374,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#actions = new HumanoidActionRuntime(this.#world, {
       receipts: this.#checkpoint.committed_actions,
       state: this.#checkpoint.action_runtime_state,
+      neuralHierarchyEpochId: this.#checkpoint.neural_hierarchy_state.epoch_id,
       frameSink: (frame) => this.#physicalExecution.recordFrame(frame, "execution"),
       ...(input.policyFrameSink
         ? { policyFrameSink: input.policyFrameSink }
@@ -366,6 +434,697 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   get checkpoint(): HumanoidRunCheckpoint {
     return structuredClone(this.#checkpoint);
+  }
+
+  neuralHierarchyState(): NeuralHierarchyState {
+    return structuredClone(this.#checkpoint.neural_hierarchy_state);
+  }
+
+  neuralHarnessPhase(): NeuralHierarchyState["harness_phase"] {
+    return structuredClone(this.#checkpoint.neural_hierarchy_state.harness_phase);
+  }
+
+  activeNeuralAuthorityLease(input: {
+    targetChildNodeId: string;
+    signalKind?: NeuralSignalKind;
+  }): NeuralAuthorityLease | undefined {
+    const phase = this.#checkpoint.neural_hierarchy_state.harness_phase;
+    return activeNeuralAuthorityLease({
+      state: this.#checkpoint.neural_hierarchy_state,
+      targetChildNodeId: input.targetChildNodeId,
+      worldRevision: this.#world.snapshot().worldRevision,
+      ...(input.signalKind === undefined ? {} : { signalKind: input.signalKind }),
+      goalEpochId: phase.goal_epoch_id,
+      commitmentId: phase.commitment_id,
+      liveInvocationIds: this.#liveNeuralInvocationIds()
+    });
+  }
+
+  neuralNodeEnabled(input: {
+    nodeId: string;
+    phases: readonly NeuralHarnessPhase[];
+    signalKinds?: readonly NeuralSignalKind[];
+    requireCommitment?: boolean;
+  }): boolean {
+    const state = this.#checkpoint.neural_hierarchy_state;
+    const phase = state.harness_phase;
+    if (!input.phases.includes(phase.phase)) return false;
+    if (input.requireCommitment && phase.commitment_id === null) return false;
+    const descriptor = HUMANOID_NEURAL_NODE_BY_ID.get(input.nodeId);
+    if (!descriptor) return false;
+    if (descriptor.parentKey === null) return input.nodeId === this.rootAgentId;
+    const authorityPath = this.#activeNeuralAuthorityPath(descriptor.id);
+    const lease = authorityPath?.at(-1)?.lease;
+    if (!lease) return false;
+    return input.signalKinds === undefined
+      || input.signalKinds.some((kind) => lease.allowed_signal_kinds.includes(kind));
+  }
+
+  resolveNeuralWakeAuthority(
+    requestedTargetNodeId: string
+  ): NeuralWakeAuthority {
+    let descriptor = HUMANOID_NEURAL_NODE_BY_ID.get(requestedTargetNodeId);
+    if (!descriptor) throw new Error(`Unknown neural wake target: ${requestedTargetNodeId}`);
+    while (descriptor.parentKey !== null) {
+      if (descriptor.executionKind === "model_agent") {
+        const authorityPath = this.#activeNeuralAuthorityPath(descriptor.id);
+        const direct = authorityPath?.at(-1);
+        if (authorityPath && direct) {
+          return {
+            targetNodeId: descriptor.id,
+            parentNodeId: direct.parentNodeId,
+            authorityLeaseId: direct.lease.lease_id,
+            authorityPath: authorityPath.map(({ parentNodeId, childNodeId, lease }) => ({
+              parentNodeId,
+              childNodeId,
+              authorityLeaseId: lease.lease_id
+            }))
+          };
+        }
+      }
+      descriptor = HUMANOID_NEURAL_NODE_BY_ID.get(
+        HUMANOID_NEURAL_AGENT_IDS[descriptor.parentKey]
+      );
+      if (!descriptor) throw new Error("Neural control tree has a missing ancestor");
+    }
+    return {
+      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+      parentNodeId: null,
+      authorityLeaseId: null,
+      authorityPath: []
+    };
+  }
+
+  /**
+   * Resolve a live, invocation-linked chain from Executive to one descendant.
+   * A direct child lease is insufficient: every intermediate Manager must
+   * still be running under the lease issued by its own structural parent.
+   */
+  #activeNeuralAuthorityPath(targetNodeId: HumanoidNeuralAgentId): Array<{
+    parentNodeId: HumanoidNeuralAgentId;
+    childNodeId: HumanoidNeuralAgentId;
+    lease: NeuralAuthorityLease;
+  }> | undefined {
+    const reversed: Array<{
+      parentNodeId: HumanoidNeuralAgentId;
+      childNodeId: HumanoidNeuralAgentId;
+      lease: NeuralAuthorityLease;
+    }> = [];
+    let child = HUMANOID_NEURAL_NODE_BY_ID.get(targetNodeId);
+    while (child?.parentKey !== null && child?.parentKey !== undefined) {
+      const parentNodeId = HUMANOID_NEURAL_AGENT_IDS[child.parentKey];
+      const lease = this.activeNeuralAuthorityLease({ targetChildNodeId: child.id });
+      if (!lease || lease.issuing_parent_node_id !== parentNodeId) return undefined;
+      reversed.push({ parentNodeId, childNodeId: child.id, lease });
+      child = HUMANOID_NEURAL_NODE_BY_ID.get(parentNodeId);
+    }
+    if (!child || child.id !== HUMANOID_NEURAL_AGENT_IDS.executive) return undefined;
+    const path = reversed.reverse();
+    for (let index = 1; index < path.length; index += 1) {
+      const parentLease = path[index - 1]!.lease;
+      const childLease = path[index]!.lease;
+      if (childLease.parent_invocation_id !== parentLease.invocation_id
+        || childLease.parent_episode_id !== parentLease.invocation_id) {
+        return undefined;
+      }
+    }
+    return path;
+  }
+
+  async reconcileNeuralHarnessPhase(): Promise<NeuralHierarchyState["harness_phase"]> {
+    const checkpoint = this.#checkpoint;
+    const state = checkpoint.neural_hierarchy_state;
+    const current = state.harness_phase;
+    let phase: NeuralHarnessPhase;
+    let reason: string;
+    if (checkpoint.status === "succeeded" || checkpoint.status === "failed") {
+      phase = "terminal";
+      reason = "run_terminal";
+    } else if (checkpoint.goal_dag.status !== "active") {
+      phase = "goal_valuation";
+      reason = "no_active_goal_epoch";
+    } else {
+      const coordinator = this.coordinatorPhase();
+      if (coordinator === "complete_satisfied_goal" || coordinator === "complete_cycle") {
+        phase = "cycle_completion";
+        reason = "runtime_completion_barrier_ready";
+      } else if (coordinator === "post_execution") {
+        phase = "feedback";
+        reason = "post_execution_observation_required";
+      } else if (coordinator === "post_failure_observation"
+        || coordinator === "replan_or_retire") {
+        phase = "recovery";
+        reason = "runtime_failure_feedback_required";
+      } else if (coordinator === "execute_plan") {
+        const activeCommitment = state.active_skill_commitment;
+        const activeCertificates = Object.values(state.rollout_certificates).filter(
+          (certificate) => certificate.status === "active"
+            && certificate.commitment_id === activeCommitment?.commitment_id
+        );
+        if (activeCommitment?.state === "executing"
+          && activeCertificates.length === 1) {
+          phase = "execution";
+          reason = "certified_commitment_requires_serial_execution";
+        } else {
+          phase = "rollout_review";
+          reason = "accepted_plan_requires_action_selection_authorization";
+        }
+      } else if (current.phase === "bootstrapping"
+        || current.phase === "goal_valuation"
+        || current.phase === "cycle_completion") {
+        phase = "perception";
+        reason = "active_goal_requires_current_perception";
+      } else {
+        return structuredClone(current);
+      }
+    }
+    if (phase === current.phase) return structuredClone(current);
+    return this.transitionNeuralHarnessPhase({
+      phase,
+      enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+      reason
+    });
+  }
+
+  neuralPathwayDue(pathway: NeuralPathway, now = Date.now()): boolean {
+    return neuralPathwayDue(
+      this.#checkpoint.neural_hierarchy_state,
+      pathway,
+      now
+    );
+  }
+
+  pendingNeuralSignals(input: {
+    targetNodeId?: string;
+    kinds?: readonly NeuralSignalKind[];
+    invocationId?: string;
+  } = {}): NeuralSignal[] {
+    return pendingNeuralSignals({
+      state: this.#checkpoint.neural_hierarchy_state,
+      ...(input.targetNodeId === undefined
+        ? {}
+        : { targetNodeId: input.targetNodeId }),
+      ...(input.kinds === undefined ? {} : { kinds: input.kinds }),
+      worldRevision: this.#world.snapshot().worldRevision,
+      liveInvocationIds: this.#liveNeuralInvocationIds()
+    }).filter((signal) => (
+      (input.invocationId === undefined || signal.invocation_id === input.invocationId)
+    ));
+  }
+
+  currentWorldRevision(): number {
+    return this.#world.snapshot().worldRevision;
+  }
+
+  neuralExecutionAvailable(): boolean {
+    return this.executorDelegationAvailable();
+  }
+
+  async publishNeuralSignal(input: {
+    kind: NeuralSignalKind;
+    pathway: NeuralPathway;
+    direction: "descending" | "ascending" | "reentrant";
+    sourceNodeId: string;
+    targetNodeId: string;
+    ttlRevisions: number;
+    priority: number;
+    causalParentIds?: readonly string[];
+    authorityLeaseId?: string | null;
+    sourceAuthorityLeaseId?: string | null;
+    invocationId?: string;
+    parentInvocationId?: string | null;
+    parentEpisodeId?: string;
+    payload: JsonValue;
+  }): Promise<NeuralSignal> {
+    return this.#neuralStateMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
+      const route = assertHumanoidNeuralSignalRoute({
+        ...input,
+        kind: input.kind
+      });
+      const world = this.#world.snapshot();
+      let authorityLeaseId = input.authorityLeaseId ?? null;
+      const sourceAuthorityLeaseId = input.sourceAuthorityLeaseId ?? null;
+      let provenanceLease: NeuralAuthorityLease | undefined;
+      if (input.direction === "descending") {
+        if (sourceAuthorityLeaseId !== null) {
+          throw new Error("Descending neural signal cannot claim source-lease provenance");
+        }
+        const candidate = authorityLeaseId
+          ? this.#checkpoint.neural_hierarchy_state.authority_leases[authorityLeaseId]
+          : this.activeNeuralAuthorityLease({
+              targetChildNodeId: route.target.id,
+              signalKind: input.kind
+            });
+        const liveInvocationIds = this.#liveNeuralInvocationIds();
+        const invocationIsLive = candidate
+          ? liveInvocationIds.includes(candidate.invocation_id)
+          : false;
+        const lease = candidate
+          && candidate.status === "active"
+          && world.worldRevision >= candidate.issued_world_revision
+          && (invocationIsLive
+            || (world.worldRevision <= candidate.expires_world_revision
+              && Date.now() <= Date.parse(candidate.expires_at)))
+          ? candidate
+          : undefined;
+        if (!lease || lease.status !== "active"
+          || lease.issuing_parent_node_id !== route.source.id
+          || lease.target_child_node_id !== route.target.id
+          || !lease.allowed_signal_kinds.includes(input.kind)) {
+          throw new Error(
+            `Descending neural signal lacks active single-parent authority: ${route.source.id} -> ${route.target.id}`
+          );
+        }
+        authorityLeaseId = lease.lease_id;
+        provenanceLease = lease;
+      } else {
+        if (authorityLeaseId !== null) {
+          throw new Error("Feedback cannot carry current child authority");
+        }
+        if (sourceAuthorityLeaseId === null) {
+          throw new Error("Feedback must retain source-lease provenance");
+        }
+        const lease = this.#checkpoint.neural_hierarchy_state
+          .authority_leases[sourceAuthorityLeaseId];
+        const endpointOwnsLease = lease
+          && (lease.issuing_parent_node_id === route.source.id
+            || lease.target_child_node_id === route.source.id);
+        if (!lease || !endpointOwnsLease
+          || (lease.status !== "active" && lease.status !== "suspended")) {
+          throw new Error("Ascending or reentrant signal references invalid authority lease");
+        }
+        provenanceLease = lease;
+      }
+      if (!provenanceLease) {
+        throw new Error("Neural signal has no invocation-scoped authority lease");
+      }
+      const invocationId = input.invocationId ?? provenanceLease.invocation_id;
+      if (invocationId !== provenanceLease.invocation_id) {
+        throw new Error("Neural signal invocation does not match its authority lease");
+      }
+      const parentInvocationId = input.parentInvocationId
+        ?? provenanceLease.parent_invocation_id;
+      if (parentInvocationId !== provenanceLease.parent_invocation_id) {
+        throw new Error(
+          "Neural signal parent invocation does not match its authority lease"
+        );
+      }
+      const parentEpisodeId = input.parentEpisodeId
+        ?? provenanceLease.parent_episode_id;
+      if (parentEpisodeId !== provenanceLease.parent_episode_id) {
+        throw new Error("Neural signal parent episode does not match its authority lease");
+      }
+      const causalParents = (input.causalParentIds ?? []).map(
+        (signalId) => this.#checkpoint.neural_hierarchy_state.signals[signalId]
+      );
+      if (causalParents.some((signal) => signal === undefined)) {
+        throw new Error("Neural signal references an unknown causal parent");
+      }
+      const published = publishNeuralSignal(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          kind: input.kind,
+          pathway: input.pathway,
+          direction: input.direction,
+          sourceNodeId: route.source.id,
+          sourceLayer: route.source.layer,
+          targetNodeId: route.target.id,
+          targetLayer: route.target.layer,
+          worldFrame: world.frame,
+          worldRevision: world.worldRevision,
+          ttlRevisions: input.ttlRevisions,
+          priority: input.priority,
+          invocationId,
+          parentInvocationId,
+          parentEpisodeId,
+          ...(input.causalParentIds === undefined
+            ? {}
+            : { causalParentIds: input.causalParentIds }),
+          authorityLeaseId,
+          sourceAuthorityLeaseId,
+          payload: input.payload,
+          liveInvocationIds: this.#liveNeuralInvocationIds()
+        }
+      );
+      this.#checkpoint.neural_hierarchy_state = published.state;
+      await this.#persistNeuralState();
+      await this.emit("neural_signal_published", json({
+        signal: published.signal,
+        automatic_actuation: false
+      }));
+      return published.signal;
+    });
+  }
+
+  async consumeNeuralSignals(
+    consumerNodeId: string,
+    signalIds: readonly string[]
+  ): Promise<void> {
+    await this.#neuralStateMutex.runExclusive(async () => {
+      const uniqueSignalIds = [...new Set(signalIds)];
+      const pendingById = new Map(this.pendingNeuralSignals({
+        targetNodeId: consumerNodeId
+      }).map((signal) => [signal.signal_id, signal] as const));
+      for (const signalId of uniqueSignalIds) {
+        if (!pendingById.has(signalId)) {
+          throw new Error(
+            `Neural signal is absent, stale, consumed, or owned by another node: ${signalId}`
+          );
+        }
+      }
+      this.#checkpoint.neural_hierarchy_state = consumeNeuralSignals(
+        this.#checkpoint.neural_hierarchy_state,
+        uniqueSignalIds
+      );
+      await this.#persistNeuralState();
+      await this.emit("neural_signals_consumed", json({
+        consumer_node_id: consumerNodeId,
+        signal_ids: uniqueSignalIds,
+        automatic_actuation: false
+      }));
+    });
+  }
+
+  async markNeuralPathway(
+    pathway: NeuralPathway,
+    phase: "started" | "completed"
+  ): Promise<void> {
+    await this.#neuralStateMutex.runExclusive(async () => {
+      this.#checkpoint.neural_hierarchy_state = markNeuralPathwayDispatch(
+        this.#checkpoint.neural_hierarchy_state,
+        pathway,
+        phase
+      );
+      await this.#persistNeuralState();
+    });
+  }
+
+  async transitionNeuralHarnessPhase(input: {
+    phase: NeuralHarnessPhase;
+    enteredByNodeId: string;
+    reason: string;
+    goalEpochId?: string | null;
+    commitmentId?: string | null;
+  }): Promise<NeuralHierarchyState["harness_phase"]> {
+    return this.#neuralStateMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
+      const state = this.#checkpoint.neural_hierarchy_state;
+      const goalEpochId = input.goalEpochId === undefined
+        ? this.#checkpoint.goal_dag.current_epoch_id
+        : input.goalEpochId;
+      const activeCommitment = state.active_skill_commitment;
+      const commitmentId = input.commitmentId === undefined
+        ? activeCommitment
+          && !["completed", "failed", "released"].includes(activeCommitment.state)
+            ? activeCommitment.commitment_id
+            : null
+        : input.commitmentId;
+      this.#checkpoint.neural_hierarchy_state = transitionNeuralHarnessPhase(
+        state,
+        {
+          ...input,
+          goalEpochId,
+          commitmentId,
+          worldRevision: this.#world.snapshot().worldRevision,
+          liveInvocationIds: this.#liveNeuralInvocationIds()
+        }
+      );
+      await this.#persistNeuralState();
+      await this.emit("neural_harness_phase_transitioned", json({
+        phase: this.#checkpoint.neural_hierarchy_state.harness_phase,
+        automatic_actuation: false
+      }));
+      return structuredClone(this.#checkpoint.neural_hierarchy_state.harness_phase);
+    });
+  }
+
+  async issueNeuralAuthorityLease(input: {
+    issuingParentNodeId: string;
+    targetChildNodeId: string;
+    allowedSignalKinds: readonly NeuralSignalKind[];
+    correctionScope?: NeuralAuthorityLease["correction_scope"];
+    ttlRevisions?: number;
+    ttlMs?: number;
+    exclusive?: boolean;
+    suspendLeaseIds?: readonly string[];
+    invocationId?: string;
+    parentInvocationId?: string | null;
+    parentEpisodeId: string;
+  }): Promise<NeuralAuthorityLease> {
+    const child = HUMANOID_NEURAL_NODE_BY_ID.get(input.targetChildNodeId);
+    if (!child || child.parentKey === null
+      || HUMANOID_NEURAL_AGENT_IDS[child.parentKey] !== input.issuingParentNodeId) {
+      throw new Error("Authority lease issuer is not the child's structural parent");
+    }
+    const invocation = currentAgentHarnessInvocation();
+    if (!invocation
+      || invocation.agentId !== child.id
+      || invocation.parentAgentId !== input.issuingParentNodeId
+      || invocation.invocationId !== input.invocationId
+      || invocation.parentInvocationId === null
+      || invocation.parentInvocationId !== input.parentInvocationId
+      || invocation.parentInvocationId !== input.parentEpisodeId) {
+      throw new Error(
+        `Authority lease must be opened inside the direct child SDK episode: ${input.issuingParentNodeId} -> ${child.id}`
+      );
+    }
+    if (input.issuingParentNodeId !== HUMANOID_NEURAL_AGENT_IDS.executive) {
+      const parentAuthority = this.#activeNeuralAuthorityPath(
+        input.issuingParentNodeId as HumanoidNeuralAgentId
+      );
+      const parentLease = parentAuthority?.at(-1)?.lease;
+      if (!parentLease
+        || parentLease.invocation_id !== invocation.parentInvocationId) {
+        throw new Error(
+          `Authority lease issuer has no live Executive-owned invocation chain: ${input.issuingParentNodeId}`
+        );
+      }
+    }
+    const route = HUMANOID_NEURAL_SIGNAL_CONTRACTS.find((contract) => (
+      contract.sourceAgentId === input.issuingParentNodeId
+        && contract.targetAgentId === input.targetChildNodeId
+        && contract.direction === "descending"
+    ));
+    if (!route || input.allowedSignalKinds.some(
+      (kind) => !route.signalKinds.includes(kind)
+    )) {
+      throw new Error("Authority lease signal scope exceeds the parent-child contract");
+    }
+    const correctionScopeRank: Readonly<Record<
+      NeuralAuthorityLease["correction_scope"] | "none",
+      number
+    >> = {
+      none: 0,
+      ordinary: 0,
+      local: 1,
+      pathway: 2,
+      supervisory: 3
+    };
+    const requestedScope = input.correctionScope ?? "ordinary";
+    if (requestedScope !== "ordinary"
+      && correctionScopeRank[requestedScope]
+        > correctionScopeRank[child.maximumCorrectionScope]) {
+      throw new Error(
+        `Authority lease correction scope exceeds the child contract: ${child.id}`
+      );
+    }
+    if ((child.orchestrationKind === "exclusive_lease_episode")
+      !== (input.exclusive === true)) {
+      throw new Error(
+        `Exclusive lease mode does not match the child orchestration contract: ${child.id}`
+      );
+    }
+    return this.#neuralStateMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
+      const worldRevision = this.#world.snapshot().worldRevision;
+      const phase = this.#checkpoint.neural_hierarchy_state.harness_phase;
+      const issued = issueNeuralAuthorityLease(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          ...input,
+          goalEpochId: phase.goal_epoch_id,
+          commitmentId: phase.commitment_id,
+          worldRevision,
+          liveInvocationIds: this.#liveNeuralInvocationIds(),
+          expiresWorldRevision: worldRevision + (
+            input.ttlRevisions ?? this.#neuralLeaseRevisionHorizon(input.ttlMs ?? 120_000)
+          ),
+          expiresAt: new Date(Date.now() + (input.ttlMs ?? 120_000)).toISOString()
+        }
+      );
+      this.#checkpoint.neural_hierarchy_state = issued.state;
+      await this.#persistNeuralState();
+      await this.emit("neural_authority_lease_issued", json({
+        lease: issued.lease,
+        automatic_actuation: false
+      }));
+      return issued.lease;
+    });
+  }
+
+  async closeNeuralAuthorityLease(input: {
+    leaseId: string;
+    closedByNodeId: string;
+    reason: string;
+    status?: "closed" | "revoked" | "expired";
+    resumeSuspended?: boolean;
+  }): Promise<void> {
+    await this.#neuralStateMutex.runExclusive(async () => {
+      this.#checkpoint.neural_hierarchy_state = closeNeuralAuthorityLease(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          ...input,
+          worldRevision: this.#world.snapshot().worldRevision,
+          liveInvocationIds: this.#liveNeuralInvocationIds()
+        }
+      );
+      await this.#persistNeuralState();
+      await this.emit("neural_authority_lease_closed", json({
+        lease_id: input.leaseId,
+        closed_by_node_id: input.closedByNodeId,
+        reason: input.reason,
+        automatic_actuation: false
+      }));
+    });
+  }
+
+  #neuralLeaseRevisionHorizon(ttlMs: number): number {
+    const controlStepSeconds = this.#world.snapshot().robot.controller.controlStepSeconds;
+    const revisions = Math.ceil(ttlMs / (controlStepSeconds * 1_000));
+    return Math.max(1, Math.min(revisions + 4, 1_000_000));
+  }
+
+  #liveNeuralInvocationIds(): string[] {
+    return currentAgentHarnessInvocationChain().map(
+      (invocation) => invocation.invocationId
+    );
+  }
+
+  async establishNeuralSkillCommitment(input: {
+    ownerNodeId: string;
+    goalEpochId: string;
+    skill: string;
+    terminationContract: JsonValue;
+    sourceSignalIds: readonly string[];
+  }): Promise<NeuralSkillCommitment> {
+    if (input.ownerNodeId !== HUMANOID_NEURAL_AGENT_IDS.actionSelection) {
+      throw new Error("Only Action Selection may establish a neural skill commitment");
+    }
+    return this.#neuralStateMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
+      const worldRevision = this.#world.snapshot().worldRevision;
+      const established = establishNeuralSkillCommitment(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          ...input,
+          worldRevision
+        }
+      );
+      this.#checkpoint.neural_hierarchy_state = established.state;
+      await this.#persistNeuralState();
+      await this.emit("neural_skill_commitment_established", json({
+        commitment: established.commitment,
+        automatic_actuation: false
+      }));
+      return established.commitment;
+    });
+  }
+
+  async transitionNeuralSkillCommitment(input: {
+    ownerNodeId: string;
+    commitmentId: string;
+    state: NeuralSkillCommitment["state"];
+    sourceSignalIds?: readonly string[];
+  }): Promise<NeuralSkillCommitment> {
+    if (input.ownerNodeId !== HUMANOID_NEURAL_AGENT_IDS.actionSelection) {
+      throw new Error("Only Action Selection may transition a neural skill commitment");
+    }
+    return this.#neuralStateMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
+      const transitioned = transitionNeuralSkillCommitment(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          ...input,
+          worldRevision: this.#world.snapshot().worldRevision
+        }
+      );
+      this.#checkpoint.neural_hierarchy_state = transitioned.state;
+      await this.#persistNeuralState();
+      await this.emit("neural_skill_commitment_transitioned", json({
+        commitment: transitioned.commitment,
+        automatic_actuation: false
+      }));
+      return transitioned.commitment;
+    });
+  }
+
+  async recordNeuralPredictionError(input: {
+    observerNodeId: string;
+    sourceSignalId: string;
+    magnitude: number;
+    tolerance: number;
+    correctionScope: NeuralPredictionError["correction_scope"];
+    detail: JsonValue;
+  }): Promise<NeuralPredictionError> {
+    if (input.observerNodeId !== HUMANOID_NEURAL_AGENT_IDS.predictive
+      && input.observerNodeId !== HUMANOID_NEURAL_AGENT_IDS.reflex) {
+      throw new Error(
+        "Only Predictive Critic or the Reflex loop may record prediction error"
+      );
+    }
+    return this.#neuralStateMutex.runExclusive(async () => {
+      const recorded = appendNeuralPredictionError(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          ...input,
+          worldRevision: this.#world.snapshot().worldRevision
+        }
+      );
+      this.#checkpoint.neural_hierarchy_state = recorded.state;
+      await this.#persistNeuralState();
+      await this.emit("neural_prediction_error_recorded", json({
+        prediction_error: recorded.error,
+        automatic_actuation: false
+      }));
+      return recorded.error;
+    });
+  }
+
+  async issueNeuralRolloutCertificate(input: {
+    issuedByNodeId: string;
+    commitmentId: string;
+    goalEpochId: string;
+    planningTransactionId: string;
+    planningAction: NeuralPlanningAction;
+    rolloutSignalId: string;
+    predictiveSignalId: string;
+    rolloutPayloadSha256: string;
+    rolloutInvocationId: string;
+    predictiveInvocationId: string;
+    ttlRevisions?: number;
+  }): Promise<NeuralRolloutCertificate> {
+    if (input.issuedByNodeId !== HUMANOID_NEURAL_AGENT_IDS.predictive) {
+      throw new Error("Only Predictive Critic may issue a rollout certificate");
+    }
+    return this.#neuralStateMutex.runExclusive(async () => {
+      const worldRevision = this.#world.snapshot().worldRevision;
+      const issued = issueNeuralRolloutCertificate(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          ...input,
+          worldRevision,
+          expiresWorldRevision: worldRevision + (input.ttlRevisions ?? 10_000)
+        }
+      );
+      this.#checkpoint.neural_hierarchy_state = issued.state;
+      await this.#persistNeuralState();
+      await this.emit("neural_rollout_certificate_issued", json({
+        rollout_certificate: issued.certificate,
+        automatic_actuation: false
+      }));
+      return issued.certificate;
+    });
   }
 
   async initializeGoalAutonomy(manifest: AgentManifest): Promise<void> {
@@ -455,11 +1214,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         );
       }
     });
-    verifyDurableHumanoidActionRuntimeState({
+    const actionRuntimeRecovery = recoverDurableHumanoidActionRuntimeState({
       receipts: this.#checkpoint.committed_actions,
       proofs: durableActions,
-      checkpointState: this.#checkpoint.action_runtime_state
+      checkpointState: this.#checkpoint.action_runtime_state,
+      neuralHierarchyEpochId: this.#checkpoint.neural_hierarchy_state.epoch_id
     });
+    if (actionRuntimeRecovery.state !== null) {
+      this.#checkpoint.action_runtime_state = actionRuntimeRecovery.state;
+      this.#actions.recoverPersistenceState(actionRuntimeRecovery.state);
+    }
     this.#durableActionReceiptCache = new Map(
       [...durableActions].map(([transactionId, proof]) => (
         [transactionId, structuredClone(proof.receipt)] as const
@@ -491,7 +1255,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         }
       }
     }
-    if (replanBudgetReconciliation.changed
+    if (actionRuntimeRecovery.checkpointRecovered
+      || replanBudgetReconciliation.changed
       || interruptedModelCalls.length > 0) {
       await this.#persist();
     }
@@ -1031,7 +1796,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         if (latestRejectedRemovalIndex >= 0) {
           const failureObserved = cycleReceipts.slice(
             latestRejectedRemovalIndex + 1
-          ).some((receipt) => receipt.agentId === "humanoid-sentry"
+          ).some((receipt) => isHumanoidSensorFusionActor(receipt.agentId)
             && receipt.accepted
             && receipt.action === "observe_humanoid");
           return failureObserved ? "replan_or_retire" : "post_failure_observation";
@@ -1080,7 +1845,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     );
     if (failureBarrier >= 0) {
       const failureObserved = cycleReceipts.slice(failureBarrier + 1).some(
-        (receipt) => receipt.agentId === "humanoid-sentry"
+        (receipt) => isHumanoidSensorFusionActor(receipt.agentId)
           && receipt.accepted
           && receipt.action === "observe_humanoid"
       );
@@ -1186,7 +1951,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     );
     if (feedbackBarrier < 0) return false;
     return !cycleReceipts.slice(feedbackBarrier + 1).some((receipt) => (
-      receipt.agentId === "humanoid-sentry"
+      isHumanoidSensorFusionActor(receipt.agentId)
         && receipt.accepted
         && receipt.action === "observe_humanoid"
     ));
@@ -1270,12 +2035,74 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#rememberGoalEvidence(result.worldEvidence);
     this.#contextGoalEvidenceRefs.set(agentId, result.worldEvidence.evidence.ref);
     this.#pruneGoalEvidence();
-    if (agentId !== "humanoid-motion-reference"
-      && agentId !== "humanoid-motion-planner") return result.anchor;
+    const neuralNode = HUMANOID_NEURAL_NODE_BY_ID.get(agentId);
+    const directedSignals = this.pendingNeuralSignals({ targetNodeId: agentId });
+    const visiblePathways = new Set<NeuralPathway>();
+    if (neuralNode) {
+      visiblePathways.add(neuralNode.pathway);
+      if (neuralNode.parentKey !== null) {
+        visiblePathways.add(
+          HUMANOID_NEURAL_NODE_BY_ID.get(
+            HUMANOID_NEURAL_AGENT_IDS[neuralNode.parentKey]
+          )!.pathway
+        );
+      }
+      for (const childKey of neuralNode.childKeys) {
+        visiblePathways.add(
+          HUMANOID_NEURAL_NODE_BY_ID.get(
+            HUMANOID_NEURAL_AGENT_IDS[childKey]
+          )!.pathway
+        );
+      }
+    }
+    for (const signal of directedSignals) visiblePathways.add(signal.pathway);
+    const activeCommitment =
+      this.#checkpoint.neural_hierarchy_state.active_skill_commitment;
+    const activeAuthorityLeases = Object.values(
+      this.#checkpoint.neural_hierarchy_state.authority_leases
+    ).filter((lease) => (
+      lease.status === "active"
+        && (lease.issuing_parent_node_id === agentId
+          || lease.target_child_node_id === agentId)
+    ));
+    const neuralProjection = {
+      epoch_id: this.#checkpoint.neural_hierarchy_state.epoch_id,
+      harness_phase: this.#checkpoint.neural_hierarchy_state.harness_phase,
+      directed_signals: directedSignals,
+      endpoint_authority_leases: activeAuthorityLeases,
+      owned_skill_commitment: activeCommitment?.owner_node_id === agentId
+        ? activeCommitment
+        : null,
+      active_rollout_certificates: Object.values(
+        this.#checkpoint.neural_hierarchy_state.rollout_certificates
+      ).filter((certificate) => (
+        certificate.status === "active"
+          && certificate.commitment_id === activeCommitment?.commitment_id
+          && (agentId === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+            || agentId === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+            || agentId === HUMANOID_NEURAL_AGENT_IDS.predictive)
+      )),
+      unresolved_prediction_errors:
+        this.#checkpoint.neural_hierarchy_state.prediction_errors
+          .filter((error) => !error.corrected && error.observer_node_id === agentId)
+          .slice(-16),
+      pathway_cadence: Object.values(
+        this.#checkpoint.neural_hierarchy_state.pathway_cadences
+      ).filter((cadence) => visiblePathways.has(cadence.pathway))
+    };
+    if (agentId !== HUMANOID_NEURAL_AGENT_IDS.motorIntent) return json({
+        ...(object(result.anchor) ?? {}),
+        neural_hierarchy: neuralProjection
+      });
     return json({
       ...(object(result.anchor) ?? {}),
-      planning_tool_state: this.#actions.planningToolState("humanoid-motion-reference"),
-      grounding_snapshot: this.#actions.planningGroundingState("humanoid-motion-reference")
+      neural_hierarchy: neuralProjection,
+      planning_tool_state: this.#actions.planningToolState(
+        HUMANOID_NEURAL_AGENT_IDS.motorIntent
+      ),
+      grounding_snapshot: this.#actions.planningGroundingState(
+        HUMANOID_NEURAL_AGENT_IDS.motorIntent
+      )
     });
   }
 
@@ -1334,10 +2161,36 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     await this.emit("context_memory_updated", { context_memory: json(state) });
   }
 
+  async resetAgentContextEpoch(): Promise<void> {
+    const previous = this.#checkpoint.context_memory;
+    this.#checkpoint.context_memory = {
+      ...structuredClone(EmptyContextMemoryState),
+      context_window_tokens: previous.context_window_tokens,
+      compact_trigger_tokens: previous.compact_trigger_tokens,
+      compact_recent_model_turns: previous.compact_recent_model_turns,
+      compact_max_output_tokens: previous.compact_max_output_tokens
+    };
+    this.#checkpoint.context_memory_state_anchor = null;
+    await this.#persist();
+    await this.emit("agent_context_epoch_reset", {
+      previous_scope_ids: Object.keys(previous.scopes).sort(),
+      preserved_goal_dag: true,
+      preserved_embodied_memory: true,
+      preserved_physical_state: true,
+      automatic_actuation: false
+    });
+  }
+
   async recordModelCallStarted(agentId: string): Promise<string> {
     return this.#goalStateMutex.runExclusive(async () => {
       this.#signal?.throwIfAborted();
       this.#assertRunAcceptsDecisions();
+      const descriptor = HUMANOID_NEURAL_NODE_BY_ID.get(agentId);
+      if (!descriptor || descriptor.executionKind !== "model_agent") {
+        throw new Error(
+          `Model telemetry cannot originate from a non-model hierarchy node: ${agentId}`
+        );
+      }
       const cycle = this.#activeCycleRef();
       const modelCallId = randomUUID();
       const at = new Date().toISOString();
@@ -1388,6 +2241,10 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           this.#checkpoint.active_cycle
         )
       });
+      // The provider call begins only after this method returns. Registering
+      // activity last prevents a failed lifecycle/checkpoint write from
+      // leaving a ghost Agent in the parallel active set.
+      this.#beginAgentActivity(agentId);
       return record.model_call_id;
     });
   }
@@ -1404,48 +2261,56 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }>;
   }): Promise<void> {
     await this.#goalStateMutex.runExclusive(async () => {
-      const record = await this.#requiredModelAuthority().recordCompleted(input);
-      const budgetUpdate = this.#finishReplanModelCall(
-        input.modelCallId,
-        "completed",
-        record.at
-      );
-      await this.#persist();
-      await this.emit("model_request_completed", {
-        agent_id: input.agentId,
-        model_call_id: input.modelCallId,
-        response_id: input.responseId,
-        ...(record.cycle ? { cycle: record.cycle } : {}),
-        tool_call_count: input.toolCalls.length,
-        ...replanModelCallEvent(
-          budgetUpdate,
-          this.#checkpoint.active_cycle
-        )
-      });
+      try {
+        const record = await this.#requiredModelAuthority().recordCompleted(input);
+        const budgetUpdate = this.#finishReplanModelCall(
+          input.modelCallId,
+          "completed",
+          record.at
+        );
+        await this.#persist();
+        await this.emit("model_request_completed", {
+          agent_id: input.agentId,
+          model_call_id: input.modelCallId,
+          response_id: input.responseId,
+          ...(record.cycle ? { cycle: record.cycle } : {}),
+          tool_call_count: input.toolCalls.length,
+          ...replanModelCallEvent(
+            budgetUpdate,
+            this.#checkpoint.active_cycle
+          )
+        });
+      } finally {
+        this.#endAgentActivity(input.agentId);
+      }
     });
   }
 
   async recordModelCallFailed(modelCallId: string, agentId: string): Promise<void> {
     await this.#goalStateMutex.runExclusive(async () => {
-      const record = await this.#requiredModelAuthority().recordFailed(
-        modelCallId,
-        agentId
-      );
-      const budgetUpdate = this.#finishReplanModelCall(
-        modelCallId,
-        "failed",
-        record.at
-      );
-      await this.#persist();
-      await this.emit("model_request_failed", {
-        agent_id: agentId,
-        model_call_id: modelCallId,
-        ...(record.cycle ? { cycle: record.cycle } : {}),
-        ...replanModelCallEvent(
-          budgetUpdate,
-          this.#checkpoint.active_cycle
-        )
-      });
+      try {
+        const record = await this.#requiredModelAuthority().recordFailed(
+          modelCallId,
+          agentId
+        );
+        const budgetUpdate = this.#finishReplanModelCall(
+          modelCallId,
+          "failed",
+          record.at
+        );
+        await this.#persist();
+        await this.emit("model_request_failed", {
+          agent_id: agentId,
+          model_call_id: modelCallId,
+          ...(record.cycle ? { cycle: record.cycle } : {}),
+          ...replanModelCallEvent(
+            budgetUpdate,
+            this.#checkpoint.active_cycle
+          )
+        });
+      } finally {
+        this.#endAgentActivity(agentId);
+      }
     });
   }
 
@@ -1540,18 +2405,50 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   async setActiveAgent(agentId: string): Promise<void> {
-    if (this.#checkpoint.active_agent_id === agentId) return;
+    this.#node(agentId);
+    if (this.#checkpoint.active_agent_id === agentId
+      && this.#checkpoint.active_agent_ids.includes(agentId)) return;
     const at = new Date().toISOString();
+    const active = new Set([...this.#activeModelCallsByAgent.entries()]
+      .filter(([, count]) => count > 0)
+      .map(([activeAgentId]) => activeAgentId));
+    active.add(agentId);
+    this.#applyActiveAgentSet(active, agentId, at);
+    await this.emit("hierarchy_focus_changed", {
+      active_agent_id: agentId,
+      active_agent_ids: [...active],
+      nodes: json(this.#checkpoint.nodes)
+    });
+  }
+
+  async setActiveAgents(agentIds: readonly string[]): Promise<void> {
+    const unique = [...new Set(agentIds)];
+    if (unique.length === 0) throw new Error("Hierarchy focus requires an active Agent");
+    for (const agentId of unique) this.#node(agentId);
+    const at = new Date().toISOString();
+    this.#applyActiveAgentSet(new Set(unique), unique[0]!, at);
+    await this.emit("hierarchy_focus_changed", {
+      active_agent_id: unique[0]!,
+      active_agent_ids: unique,
+      nodes: json(this.#checkpoint.nodes)
+    });
+  }
+
+  #applyActiveAgentSet(
+    active: ReadonlySet<string>,
+    focus: string,
+    at: string
+  ): void {
     for (const node of Object.values(this.#checkpoint.nodes)) {
-      if (node.id === this.rootAgentId) {
-        node.status = agentId === node.id ? "active" : "waiting";
-      } else {
-        node.status = agentId === node.id ? "active" : "ready";
+      if (active.has(node.id)) node.status = "active";
+      else if (node.id === this.rootAgentId) node.status = "waiting";
+      else if (node.status !== "completed" && node.status !== "failed") {
+        node.status = "ready";
       }
       node.updated_at = at;
     }
-    this.#checkpoint.active_agent_id = agentId;
-    this.#checkpoint.active_agent_ids = [agentId];
+    this.#checkpoint.active_agent_id = focus;
+    this.#checkpoint.active_agent_ids = [...active];
     // Hierarchy focus is execution telemetry, not physical or Goal authority.
     // Persisting it used to take a fresh MuJoCo/Goal cut for every SDK stream
     // event. In a standard nested Agent loop those events can arrive while a
@@ -1559,10 +2456,31 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     // allowing the telemetry write to pair an older anchor with newer state.
     // The durable focus event below is sufficient; the next authoritative
     // state transition checkpoints the latest focus together with its own cut.
-    await this.emit("hierarchy_focus_changed", {
-      active_agent_id: agentId,
-      nodes: json(this.#checkpoint.nodes)
-    });
+  }
+
+  #beginAgentActivity(agentId: string): void {
+    this.#activeModelCallsByAgent.set(
+      agentId,
+      (this.#activeModelCallsByAgent.get(agentId) ?? 0) + 1
+    );
+    this.#applyActiveAgentSet(
+      new Set([...this.#activeModelCallsByAgent.entries()]
+        .filter(([, count]) => count > 0)
+        .map(([activeAgentId]) => activeAgentId)),
+      agentId,
+      new Date().toISOString()
+    );
+  }
+
+  #endAgentActivity(agentId: string): void {
+    const remaining = Math.max(0, (this.#activeModelCallsByAgent.get(agentId) ?? 0) - 1);
+    if (remaining === 0) this.#activeModelCallsByAgent.delete(agentId);
+    else this.#activeModelCallsByAgent.set(agentId, remaining);
+    const active = new Set([...this.#activeModelCallsByAgent.entries()]
+      .filter(([, count]) => count > 0)
+      .map(([activeAgentId]) => activeAgentId));
+    if (active.size === 0) active.add(this.rootAgentId);
+    this.#applyActiveAgentSet(active, active.values().next().value!, new Date().toISOString());
   }
 
   async start(resumed: boolean): Promise<void> {
@@ -1672,7 +2590,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       execution.transaction_id,
       execution.agent_id,
       authority,
-      { recoveryDecision: execution.admission.decision }
+      {
+        recoveryDecision: execution.admission.decision,
+        ...(execution.admission.neural_rollout_certificate
+          ? {
+              neuralRolloutCertificate:
+                execution.admission.neural_rollout_certificate
+            }
+          : {})
+      }
     );
     await this.emit("physical_execution_recovered", json({
       transaction_id: receipt.transactionId,
@@ -2638,6 +3564,22 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     reason?: string
   ): void {
     const at = new Date().toISOString();
+    if ((status === "succeeded" || status === "failed")
+      && this.#checkpoint.neural_hierarchy_state.harness_phase.phase !== "terminal") {
+      this.#checkpoint.neural_hierarchy_state = transitionNeuralHarnessPhase(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          phase: "terminal",
+          goalEpochId: null,
+          commitmentId: null,
+          worldRevision: this.#world.snapshot().worldRevision,
+          enteredByNodeId: this.rootAgentId,
+          reason: eventType,
+          liveInvocationIds: this.#liveNeuralInvocationIds(),
+          at
+        }
+      );
+    }
     this.#checkpoint.status = status;
     this.#checkpoint.final_output = output;
     this.#checkpoint.error = error;
@@ -3072,28 +4014,107 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#checkpoint.world_checkpoint = captured.worldCheckpoint;
   }
 
-  async #persist(refreshWorld = true): Promise<void> {
-    if (refreshWorld) {
-      const captured = await this.#world.capturePersistenceState();
-      // Apply and clone in the same continuation. The continuous authority
-      // publisher may advance the display snapshot on the next task, but it
-      // cannot split this persisted world/world-checkpoint cut.
-      this.#applyWorldPersistenceState(captured);
+  async #persistNeuralState(): Promise<void> {
+    await this.#persist({
+      refreshWorld: false,
+      authorityDomains: [],
+      neuralOnly: true
+    });
+  }
+
+  async #persist(
+    input: boolean | HumanoidPersistOptions = {}
+  ): Promise<void> {
+    const options: HumanoidPersistOptions = typeof input === "boolean"
+      ? { refreshWorld: input }
+      : input;
+    const refreshWorld = options.refreshWorld ?? true;
+    const authorityDomains = new Set(
+      options.authorityDomains === "all" || options.authorityDomains === undefined
+        ? ALL_HUMANOID_AUTHORITY_DOMAINS
+        : options.authorityDomains
+    );
+    await this.#persistMutex.runExclusive(async () => {
+      if (options.neuralOnly) {
+        const snapshot = structuredClone(this.#durableCheckpoint);
+        snapshot.neural_hierarchy_state = structuredClone(
+          this.#checkpoint.neural_hierarchy_state
+        );
+        snapshot.updated_at = new Date().toISOString();
+        await this.#store.writeCheckpoint(snapshot);
+        this.#durableCheckpoint = snapshot;
+        return;
+      }
+      if (refreshWorld) {
+        const captured = await this.#world.capturePersistenceState();
+        this.#applyWorldPersistenceState(captured);
+      }
+      this.#checkpoint.action_runtime_state = this.#actions.persistenceState();
+      this.#assertActiveGoalProgress();
+      this.#checkpoint.updated_at = new Date().toISOString();
+
+      // Anchor and validate an immutable authority cut. Parallel hierarchy
+      // branches can keep changing the live state while durable events are
+      // appended, but those later mutations must not leak into this write.
+      const snapshot = structuredClone(this.#checkpoint);
+      if (authorityDomains.has("physical")) {
+        await this.#anchorCurrentPhysicalState(snapshot);
+      }
+      if (authorityDomains.has("goal")) {
+        await this.#anchorCurrentGoalState(snapshot);
+      }
+      if (authorityDomains.has("embodied_memory")) {
+        await this.#anchorCurrentEmbodiedMemoryState(snapshot);
+      }
+      if (authorityDomains.has("context_memory")) {
+        await this.#anchorCurrentContextMemoryState(snapshot);
+      }
+      if (authorityDomains.has("execution_ledger")) {
+        await this.#anchorCurrentExecutionLedgerState(snapshot);
+      }
+      await this.#store.writeCheckpoint(snapshot);
+      this.#durableCheckpoint = structuredClone(snapshot);
+      this.#adoptAuthorityAnchors(snapshot, authorityDomains);
+    });
+  }
+
+  #adoptAuthorityAnchors(
+    snapshot: HumanoidRunCheckpoint,
+    domains: ReadonlySet<HumanoidAuthorityDomain>
+  ): void {
+    if (domains.has("physical")
+      && snapshot.world.frame === this.#checkpoint.world.frame
+      && snapshot.world.worldRevision === this.#checkpoint.world.worldRevision
+      && humanoidPhysicalStateSha256(snapshot.world_checkpoint)
+        === humanoidPhysicalStateSha256(this.#checkpoint.world_checkpoint)) {
+      this.#checkpoint.physical_state_anchor = snapshot.physical_state_anchor;
     }
-    await this.#anchorCurrentPhysicalState();
-    await this.#anchorCurrentGoalState();
-    await this.#anchorCurrentEmbodiedMemoryState();
-    await this.#anchorCurrentContextMemoryState();
-    await this.#anchorCurrentExecutionLedgerState();
-    this.#checkpoint.action_runtime_state = this.#actions.persistenceState();
-    this.#assertActiveGoalProgress();
-    this.#checkpoint.updated_at = new Date().toISOString();
-    const snapshot = structuredClone(this.#checkpoint);
-    const write = this.#checkpointWriteTail
-      .catch(() => undefined)
-      .then(() => this.#store.writeCheckpoint(snapshot));
-    this.#checkpointWriteTail = write;
-    await write;
+    if (domains.has("goal")
+      && snapshot.goal_dag.state_sha256 === this.#checkpoint.goal_dag.state_sha256
+      && humanoidGoalControlStateSha256(snapshot)
+        === humanoidGoalControlStateSha256(this.#checkpoint)) {
+      this.#checkpoint.goal_state_anchor = snapshot.goal_state_anchor;
+    }
+    if (domains.has("embodied_memory")
+      && humanoidEmbodiedMemoryStateSha256(snapshot.embodied_memory)
+        === humanoidEmbodiedMemoryStateSha256(this.#checkpoint.embodied_memory)) {
+      this.#checkpoint.embodied_memory_state_anchor =
+        snapshot.embodied_memory_state_anchor;
+    }
+    if (domains.has("context_memory")
+      && humanoidContextMemoryStateSha256(snapshot.context_memory)
+        === humanoidContextMemoryStateSha256(this.#checkpoint.context_memory)) {
+      this.#checkpoint.context_memory_state_anchor =
+        snapshot.context_memory_state_anchor;
+    }
+    if (domains.has("execution_ledger")
+      && humanoidExecutionLedgerStateSha256(snapshot.action_execution_ledger)
+        === humanoidExecutionLedgerStateSha256(
+          this.#checkpoint.action_execution_ledger
+        )) {
+      this.#checkpoint.execution_ledger_state_anchor =
+        snapshot.execution_ledger_state_anchor;
+    }
   }
 
   async #verifyExistingPhysicalStateAnchor(): Promise<void> {
@@ -3131,6 +4152,47 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         this.#physicalAnchorOrphanRecoveryPending = false;
         return;
       }
+      const physicalStateSha256 = humanoidPhysicalStateSha256(
+        this.#checkpoint.world_checkpoint
+      );
+      const physicalIdentity = {
+        version: 2 as const,
+        run_id: this.runId,
+        world_frame: this.#checkpoint.world.frame,
+        world_revision: this.#checkpoint.world.worldRevision,
+        physical_state_sha256: physicalStateSha256
+      };
+      const physicalEventId = `humanoid-physical-state:${
+        actionCommitPayloadSha256(json(physicalIdentity))
+      }`;
+      const physicalOrphan = await findDurableRuntimeEventById(
+        this.#store,
+        physicalEventId
+      );
+      if (physicalOrphan) {
+        await assertDurableAnchorIsLatest(
+          this.#store,
+          "humanoid_physical_state_anchored",
+          physicalEventId,
+          "Physical state anchor"
+        );
+        const recovered = HumanoidPhysicalStateAnchorSchema.parse({
+          version: 2,
+          event_id: physicalEventId,
+          world_frame: physicalIdentity.world_frame,
+          world_revision: physicalIdentity.world_revision,
+          physical_state_sha256: physicalStateSha256,
+          anchored_at: physicalOrphan.at
+        });
+        assertHumanoidPhysicalStateAnchorEvent(
+          physicalOrphan,
+          this.runId,
+          recovered
+        );
+        this.#checkpoint.physical_state_anchor = recovered;
+        this.#physicalAnchorOrphanRecoveryPending = false;
+        return;
+      }
       await assertNoDurableAnchorDowngrade(
         this.#store,
         "humanoid_physical_state_anchored",
@@ -3139,13 +4201,19 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       return;
     }
     const cut = await this.#world.capturePersistenceState();
-    const checkpointSha256 = actionCommitPayloadSha256(
-      json(this.#checkpoint.world_checkpoint)
+    const persistedPhysicalStateSha256 = humanoidPhysicalStateSha256(
+      this.#checkpoint.world_checkpoint
+    );
+    const restoredPhysicalStateSha256 = humanoidPhysicalStateSha256(
+      cut.worldCheckpoint
     );
     if (cut.world.frame !== anchor.world_frame
       || cut.world.worldRevision !== anchor.world_revision
-      || actionCommitPayloadSha256(json(cut.worldCheckpoint)) !== checkpointSha256
-      || checkpointSha256 !== anchor.world_checkpoint_sha256) {
+      || restoredPhysicalStateSha256 !== persistedPhysicalStateSha256
+      || (anchor.version === 1
+        ? actionCommitPayloadSha256(json(this.#checkpoint.world_checkpoint))
+          !== anchor.world_checkpoint_sha256
+        : persistedPhysicalStateSha256 !== anchor.physical_state_sha256)) {
       throw new Error("Physical state anchor conflicts with the restored MuJoCo checkpoint");
     }
     const event = await findDurableRuntimeEventById(this.#store, anchor.event_id);
@@ -3381,11 +4449,71 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     // Recover it only when it consumes exactly the checkpoint's terminal
     // outbox entries and the durable action journals prove those commits.
     const recovered = await this.#recoverAcknowledgedExecutionLedgerHead(latest);
-    if (!recovered) {
+    if (recovered) {
+      this.#checkpoint.action_execution_ledger = recovered;
+      this.#checkpoint.execution_ledger_state_anchor = latest.anchor;
+      return;
+    }
+    const recoveredAdmission = this.#recoverCertifiedExecutionAdmissionHead(latest);
+    if (!recoveredAdmission) {
       throw new Error("Execution ledger state anchor is not the latest durable state");
     }
-    this.#checkpoint.action_execution_ledger = recovered;
+    this.#checkpoint.action_execution_ledger = recoveredAdmission.ledger;
+    this.#checkpoint.neural_hierarchy_state = recoveredAdmission.neuralState;
     this.#checkpoint.execution_ledger_state_anchor = latest.anchor;
+  }
+
+  #recoverCertifiedExecutionAdmissionHead(
+    event: RuntimeEvent
+  ): {
+    ledger: HumanoidRunCheckpoint["action_execution_ledger"];
+    neuralState: NeuralHierarchyState;
+  } | undefined {
+    const data = object(event.data);
+    if (data.action_execution_ledger === undefined) return undefined;
+    try {
+      const ledger = restoreActionExecutionLedger(data.action_execution_ledger);
+      const ledgerSha256 = humanoidExecutionLedgerStateSha256(ledger);
+      const anchor = HumanoidExecutionLedgerStateAnchorSchema.parse({
+        version: 1,
+        event_id: event.event_id,
+        execution_ledger_sha256: ledgerSha256,
+        anchored_at: event.at
+      });
+      assertHumanoidExecutionLedgerStateAnchorEvent(event, this.runId, anchor);
+      const previous = this.#checkpoint.action_execution_ledger;
+      for (const [transactionId, entry] of Object.entries(previous.active)) {
+        if (JSON.stringify(ledger.active[transactionId]) !== JSON.stringify(entry)) {
+          return undefined;
+        }
+      }
+      const added = Object.values(ledger.active).filter(
+        (entry) => previous.active[entry.transaction_id] === undefined
+      );
+      if (added.length !== 1 || Object.keys(ledger.active).length
+        !== Object.keys(previous.active).length + 1) return undefined;
+      const [admission] = added;
+      const neural = admission?.admission.neural_rollout_certificate;
+      if (!admission || admission.status !== "admitted" || !neural
+        || this.#checkpoint.committed_actions[admission.transaction_id]) {
+        return undefined;
+      }
+      const consumed = consumeNeuralRolloutCertificate(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          certificateId: neural.certificate_id,
+          commitmentId: neural.commitment_id,
+          planningTransactionId: neural.planning_transaction_id,
+          planningAction: neural.planning_action,
+          executionTransactionId: admission.transaction_id,
+          worldRevision: admission.admission.world_revision,
+          at: admission.admitted_at
+        }
+      );
+      return { ledger, neuralState: consumed.state };
+    } catch {
+      return undefined;
+    }
   }
 
   async #recoverAcknowledgedExecutionLedgerHead(
@@ -3428,31 +4556,35 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
   }
 
-  async #anchorCurrentPhysicalState(): Promise<void> {
+  async #anchorCurrentPhysicalState(checkpoint: HumanoidRunCheckpoint): Promise<void> {
     const anchoring = this.#physicalStateAnchorTail
       .catch(() => undefined)
-      .then(() => this.#anchorCurrentPhysicalStateOnce());
+      .then(() => this.#anchorCurrentPhysicalStateOnce(checkpoint));
     this.#physicalStateAnchorTail = anchoring;
     await anchoring;
   }
 
-  async #anchorCurrentPhysicalStateOnce(): Promise<void> {
-    const worldCheckpointSha256 = actionCommitPayloadSha256(
-      json(this.#checkpoint.world_checkpoint)
+  async #anchorCurrentPhysicalStateOnce(checkpoint: HumanoidRunCheckpoint): Promise<void> {
+    const physicalStateSha256 = humanoidPhysicalStateSha256(
+      checkpoint.world_checkpoint
     );
-    const current = this.#checkpoint.physical_state_anchor;
+    const current = checkpoint.physical_state_anchor;
     if (current
-      && current.world_frame === this.#checkpoint.world.frame
-      && current.world_revision === this.#checkpoint.world.worldRevision
-      && current.world_checkpoint_sha256 === worldCheckpointSha256) {
+      && current.world_frame === checkpoint.world.frame
+      && current.world_revision === checkpoint.world.worldRevision
+      && (current.version === 1
+        ? current.world_checkpoint_sha256 === actionCommitPayloadSha256(
+            json(checkpoint.world_checkpoint)
+          )
+        : current.physical_state_sha256 === physicalStateSha256)) {
       return;
     }
     const identity = {
-      version: 1 as const,
+      version: 2 as const,
       run_id: this.runId,
-      world_frame: this.#checkpoint.world.frame,
-      world_revision: this.#checkpoint.world.worldRevision,
-      world_checkpoint_sha256: worldCheckpointSha256
+      world_frame: checkpoint.world.frame,
+      world_revision: checkpoint.world.worldRevision,
+      physical_state_sha256: physicalStateSha256
     };
     const eventId = `humanoid-physical-state:${actionCommitPayloadSha256(json(identity))}`;
     const existing = this.#physicalAnchorOrphanRecoveryPending
@@ -3461,12 +4593,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#physicalAnchorOrphanRecoveryPending = false;
     const committed = existing ?? await findDurableRuntimeEventById(this.#store, eventId);
     const anchoredAt = committed?.at ?? new Date().toISOString();
-    const anchor = HumanoidPhysicalStateAnchorSchema.parse({
-      version: 1,
+    const anchor = HumanoidPhysicalStateAnchorSchema.options[1].parse({
+      version: 2,
       event_id: eventId,
       world_frame: identity.world_frame,
       world_revision: identity.world_revision,
-      world_checkpoint_sha256: worldCheckpointSha256,
+      physical_state_sha256: physicalStateSha256,
       anchored_at: anchoredAt
     });
     const runtimeEvent: RuntimeEvent = {
@@ -3478,7 +4610,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         version: anchor.version,
         world_frame: anchor.world_frame,
         world_revision: anchor.world_revision,
-        world_checkpoint_sha256: anchor.world_checkpoint_sha256
+        physical_state_sha256: anchor.physical_state_sha256
       })
     };
     let persisted: RuntimeEvent | undefined;
@@ -3492,7 +4624,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       persisted = committed;
     }
     assertHumanoidPhysicalStateAnchorEvent(persisted!, this.runId, anchor);
-    this.#checkpoint.physical_state_anchor = anchor;
+    checkpoint.physical_state_anchor = anchor;
     try {
       await this.#eventSink(persisted!);
     } catch {
@@ -3500,19 +4632,19 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
   }
 
-  async #anchorCurrentGoalState(): Promise<void> {
+  async #anchorCurrentGoalState(checkpoint: HumanoidRunCheckpoint): Promise<void> {
     const anchoring = this.#goalStateAnchorTail
       .catch(() => undefined)
-      .then(() => this.#anchorCurrentGoalStateOnce());
+      .then(() => this.#anchorCurrentGoalStateOnce(checkpoint));
     this.#goalStateAnchorTail = anchoring;
     await anchoring;
   }
 
-  async #anchorCurrentGoalStateOnce(): Promise<void> {
-    const goalDAG = structuredClone(this.#checkpoint.goal_dag);
-    const goalControlState = structuredClone(humanoidGoalControlState(this.#checkpoint));
+  async #anchorCurrentGoalStateOnce(checkpoint: HumanoidRunCheckpoint): Promise<void> {
+    const goalDAG = structuredClone(checkpoint.goal_dag);
+    const goalControlState = structuredClone(humanoidGoalControlState(checkpoint));
     const controlStateSha256 = actionCommitPayloadSha256(goalControlState);
-    const current = this.#checkpoint.goal_state_anchor;
+    const current = checkpoint.goal_state_anchor;
     if (current?.goal_dag_state_sha256 === goalDAG.state_sha256
       && current.control_state_sha256 === controlStateSha256) return;
     const identity = {
@@ -3559,7 +4691,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       persisted = committed;
     }
     assertHumanoidGoalStateAnchorEvent(persisted!, this.runId, anchor);
-    this.#checkpoint.goal_state_anchor = anchor;
+    checkpoint.goal_state_anchor = anchor;
     try {
       await this.#eventSink(persisted!);
     } catch {
@@ -3567,18 +4699,22 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
   }
 
-  async #anchorCurrentEmbodiedMemoryState(): Promise<void> {
+  async #anchorCurrentEmbodiedMemoryState(
+    checkpoint: HumanoidRunCheckpoint
+  ): Promise<void> {
     const anchoring = this.#embodiedMemoryStateAnchorTail
       .catch(() => undefined)
-      .then(() => this.#anchorCurrentEmbodiedMemoryStateOnce());
+      .then(() => this.#anchorCurrentEmbodiedMemoryStateOnce(checkpoint));
     this.#embodiedMemoryStateAnchorTail = anchoring;
     await anchoring;
   }
 
-  async #anchorCurrentEmbodiedMemoryStateOnce(): Promise<void> {
-    const memory = this.#checkpoint.embodied_memory;
+  async #anchorCurrentEmbodiedMemoryStateOnce(
+    checkpoint: HumanoidRunCheckpoint
+  ): Promise<void> {
+    const memory = checkpoint.embodied_memory;
     const memorySha256 = humanoidEmbodiedMemoryStateSha256(memory);
-    const current = this.#checkpoint.embodied_memory_state_anchor;
+    const current = checkpoint.embodied_memory_state_anchor;
     if (current?.embodied_memory_sha256 === memorySha256) return;
     const identity = {
       version: 1 as const,
@@ -3620,7 +4756,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       persisted = committed;
     }
     assertHumanoidEmbodiedMemoryStateAnchorEvent(persisted!, this.runId, anchor);
-    this.#checkpoint.embodied_memory_state_anchor = anchor;
+    checkpoint.embodied_memory_state_anchor = anchor;
     try {
       await this.#eventSink(persisted!);
     } catch {
@@ -3628,18 +4764,22 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
   }
 
-  async #anchorCurrentContextMemoryState(): Promise<void> {
+  async #anchorCurrentContextMemoryState(
+    checkpoint: HumanoidRunCheckpoint
+  ): Promise<void> {
     const anchoring = this.#contextMemoryStateAnchorTail
       .catch(() => undefined)
-      .then(() => this.#anchorCurrentContextMemoryStateOnce());
+      .then(() => this.#anchorCurrentContextMemoryStateOnce(checkpoint));
     this.#contextMemoryStateAnchorTail = anchoring;
     await anchoring;
   }
 
-  async #anchorCurrentContextMemoryStateOnce(): Promise<void> {
-    const memory = this.#checkpoint.context_memory;
+  async #anchorCurrentContextMemoryStateOnce(
+    checkpoint: HumanoidRunCheckpoint
+  ): Promise<void> {
+    const memory = checkpoint.context_memory;
     const memorySha256 = humanoidContextMemoryStateSha256(memory);
-    const current = this.#checkpoint.context_memory_state_anchor;
+    const current = checkpoint.context_memory_state_anchor;
     if (current?.context_memory_sha256 === memorySha256) return;
     const identity = {
       version: 1 as const,
@@ -3681,7 +4821,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       persisted = committed;
     }
     assertHumanoidContextMemoryStateAnchorEvent(persisted!, this.runId, anchor);
-    this.#checkpoint.context_memory_state_anchor = anchor;
+    checkpoint.context_memory_state_anchor = anchor;
     try {
       await this.#eventSink(persisted!);
     } catch {
@@ -3689,25 +4829,29 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
   }
 
-  async #anchorCurrentExecutionLedgerState(): Promise<void> {
+  async #anchorCurrentExecutionLedgerState(
+    checkpoint: HumanoidRunCheckpoint
+  ): Promise<void> {
     const anchoring = this.#executionLedgerStateAnchorTail
       .catch(() => undefined)
       .then(async () => {
         do {
-          await this.#anchorCurrentExecutionLedgerStateOnce();
-        } while (this.#checkpoint.execution_ledger_state_anchor
+          await this.#anchorCurrentExecutionLedgerStateOnce(checkpoint);
+        } while (checkpoint.execution_ledger_state_anchor
           ?.execution_ledger_sha256 !== humanoidExecutionLedgerStateSha256(
-            this.#checkpoint.action_execution_ledger
+            checkpoint.action_execution_ledger
           ));
       });
     this.#executionLedgerStateAnchorTail = anchoring;
     await anchoring;
   }
 
-  async #anchorCurrentExecutionLedgerStateOnce(): Promise<void> {
-    const ledger = structuredClone(this.#checkpoint.action_execution_ledger);
+  async #anchorCurrentExecutionLedgerStateOnce(
+    checkpoint: HumanoidRunCheckpoint
+  ): Promise<void> {
+    const ledger = structuredClone(checkpoint.action_execution_ledger);
     const ledgerSha256 = humanoidExecutionLedgerStateSha256(ledger);
-    const current = this.#checkpoint.execution_ledger_state_anchor;
+    const current = checkpoint.execution_ledger_state_anchor;
     if (current?.execution_ledger_sha256 === ledgerSha256) {
       const latest = await latestDurableExecutionLedgerAnchorEvent(this.#store);
       if (latest?.event_id === current.event_id) return;
@@ -3765,10 +4909,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       persisted = committed;
     }
     assertHumanoidExecutionLedgerStateAnchorEvent(persisted!, this.runId, anchor);
-    if (humanoidExecutionLedgerStateSha256(this.#checkpoint.action_execution_ledger)
-      === ledgerSha256) {
-      this.#checkpoint.execution_ledger_state_anchor = anchor;
-    }
+    checkpoint.execution_ledger_state_anchor = anchor;
     try {
       await this.#eventSink(persisted!);
     } catch {
@@ -3817,7 +4958,9 @@ function assertHumanoidPhysicalStateAnchorEvent(
     || data.version !== anchor.version
     || data.world_frame !== anchor.world_frame
     || data.world_revision !== anchor.world_revision
-    || data.world_checkpoint_sha256 !== anchor.world_checkpoint_sha256) {
+    || (anchor.version === 1
+      ? data.world_checkpoint_sha256 !== anchor.world_checkpoint_sha256
+      : data.physical_state_sha256 !== anchor.physical_state_sha256)) {
     throw new Error(`Physical state anchor event conflicts with ${anchor.event_id}`);
   }
 }
@@ -4319,10 +5462,12 @@ function usageTotalsDominate(
 function replanBudgetRole(
   agentId: string
 ): "coordinator" | "motion" | "goal_manager" | undefined {
-  if (agentId === "humanoid-coordinator") return "coordinator";
-  if (agentId === "humanoid-motion-planner") return "motion";
-  if (agentId === "humanoid-motion-reference") return "motion";
-  if (agentId === "humanoid-goal-manager") return "goal_manager";
+  if (agentId === HUMANOID_NEURAL_AGENT_IDS.executive
+    || agentId === HUMANOID_NEURAL_AGENT_IDS.actionSelection) return "coordinator";
+  if (agentId === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+    || agentId === HUMANOID_NEURAL_AGENT_IDS.premotor
+    || agentId === HUMANOID_NEURAL_AGENT_IDS.motorIntent) return "motion";
+  if (agentId === HUMANOID_NEURAL_AGENT_IDS.goalManager) return "goal_manager";
   return undefined;
 }
 
@@ -4372,14 +5517,21 @@ function planningTransactionIdFromReceipt(
 
 function humanoidActionRoleAuthority(action: HumanoidActionReceipt["action"]): Set<string> {
   if (action === "observe_humanoid") {
-    return new Set(["humanoid-sentry", "humanoid-motion-reference"]);
+    return new Set([HUMANOID_NEURAL_AGENT_IDS.sensorFusion]);
   }
   if (action === "submit_humanoid_skill_plan"
     || action === "begin_humanoid_skill"
     || isHumanoidPlanningActionName(action)) {
-    return new Set(["humanoid-motion-reference"]);
+    return new Set([HUMANOID_NEURAL_AGENT_IDS.motorIntent]);
   }
-  return new Set(["humanoid-executor"]);
+  return new Set([HUMANOID_NEURAL_AGENT_IDS.executor]);
+}
+
+function isHumanoidSensorFusionActor(agentId: string): boolean {
+  // Read-side checkpoint compatibility only. humanoidActionRoleAuthority()
+  // above does not grant the retired V2 Sentry any new observation call.
+  return agentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+    || agentId === "humanoid-sentry";
 }
 
 function isHumanoidPlanningActionName(

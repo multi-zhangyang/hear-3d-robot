@@ -1,4 +1,4 @@
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -226,6 +226,156 @@ describe("RunStore legacy humanoid recovery", () => {
 
       await expect(RunStore.open(runDir)).rejects.toThrow(
         "display evidence without its authoritative registry"
+      );
+    } finally {
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("rebuilds only the cognitive hierarchy for an explicit fresh epoch", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-g1-fresh-hierarchy-"));
+    const runDir = join(runsDir, basename(FIXTURE));
+    await cp(FIXTURE, runDir, { recursive: true });
+    try {
+      const first = await RunStore.open(runDir);
+      const current = await first.readHumanoidCheckpoint();
+      const contextBudget = {
+        context_window_tokens: current.context_memory.context_window_tokens,
+        compact_trigger_tokens: current.context_memory.compact_trigger_tokens,
+        compact_recent_model_turns: current.context_memory.compact_recent_model_turns,
+        compact_max_output_tokens: current.context_memory.compact_max_output_tokens
+      };
+      expect(Object.keys(current.context_memory.scopes).length).toBeGreaterThan(0);
+      const incompatible = structuredClone(current) as unknown as Record<string, unknown>;
+      (incompatible.neural_hierarchy_state as Record<string, unknown>).version = 2;
+      incompatible.status = "interrupted";
+      incompatible.action_runtime_state = {
+        version: 1,
+        neural_hierarchy_epoch_id: current.neural_hierarchy_state.epoch_id,
+        latest_physical_execution_revision: 17,
+        skill_plans: [],
+        active_skill_plan_transactions: {},
+        active_skills: [],
+        planning_skill_bindings: [],
+        recovery_policies: [],
+        navigation_transit_clearance_requirements: [],
+        latest_grounding_observation: { stale_epoch_grounding: true }
+      };
+      await writeFile(
+        join(runDir, "checkpoint.json"),
+        `${JSON.stringify(incompatible, null, 2)}\n`,
+        "utf8"
+      );
+
+      await expect(RunStore.open(runDir)).rejects.toThrow(
+        "requires v3 with invocation-scoped parent fork/join identity"
+      );
+      const reopened = await RunStore.open(runDir, {
+        freshNeuralHierarchyEpoch: true
+      });
+      const migrated = await reopened.readHumanoidCheckpoint();
+      expect(migrated.neural_hierarchy_state.version).toBe(3);
+      expect(migrated.neural_hierarchy_state.epoch_id)
+        .not.toBe(current.neural_hierarchy_state.epoch_id);
+      expect(migrated.world_checkpoint).toEqual(current.world_checkpoint);
+      expect(migrated.goal_dag).toEqual(current.goal_dag);
+      expect(migrated.embodied_memory).toEqual(current.embodied_memory);
+      expect(migrated.committed_actions).toEqual(current.committed_actions);
+      expect(migrated.action_commit_outbox).toEqual(current.action_commit_outbox);
+      expect(migrated.action_execution_ledger).toEqual(
+        current.action_execution_ledger
+      );
+      expect(migrated.context_memory).toMatchObject(contextBudget);
+      expect(migrated.context_memory).toMatchObject({
+        active_scope_id: null,
+        active_estimated_tokens: 0,
+        total_compactions: 0,
+        last_compacted_at: null,
+        scopes: {}
+      });
+      expect(migrated.context_memory_state_anchor).toBeNull();
+      expect(migrated.active_agent_id).toBe(migrated.root_id);
+      expect(migrated.active_agent_ids).toEqual([migrated.root_id]);
+      expect(migrated.neural_hierarchy_state.authority_leases).toEqual({});
+      expect(migrated.neural_hierarchy_state.signals).toEqual({});
+      const latestDurablePhysicalRevision = Math.max(
+        17,
+        ...Object.values(current.committed_actions).flatMap((receipt) => (
+          receipt.accepted
+            && (receipt.action === "execute_humanoid_skill"
+              || receipt.action === "execute_whole_body_motion"
+              || receipt.action === "execute_humanoid_navigation")
+            ? [receipt.worldAfterRevision]
+            : []
+        ))
+      );
+      expect(migrated.action_runtime_state).toEqual({
+        version: 1,
+        neural_hierarchy_epoch_id: migrated.neural_hierarchy_state.epoch_id,
+        latest_physical_execution_revision: latestDurablePhysicalRevision,
+        skill_plans: [],
+        active_skill_plan_transactions: {},
+        active_skills: [],
+        planning_skill_bindings: [],
+        recovery_policies: [],
+        navigation_transit_clearance_requirements: [],
+        latest_grounding_observation: null
+      });
+    } finally {
+      await rm(runsDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("reads a pre-invocation V2 epoch only as historical authority", async () => {
+    const runsDir = await mkdtemp(join(tmpdir(), "hear-g1-v2-authority-"));
+    const runDir = join(runsDir, basename(FIXTURE));
+    await cp(FIXTURE, runDir, { recursive: true });
+    const epochId = "22222222-2222-4222-8222-222222222222";
+    const archiveDir = join(runDir, "agent-epochs", epochId);
+    await mkdir(archiveDir, { recursive: true });
+    await writeFile(join(archiveDir, "agent-manifest.json"), `${JSON.stringify({
+      version: 2,
+      runtime: "humanoid_g1",
+      epoch_id: epochId,
+      identity_sha256: "a".repeat(64),
+      agents: {
+        goal: {
+          agent_id: "v2-goal-valuation",
+          execution_kind: "model_agent",
+          layer: "executive",
+          pathway: "goal_valuation"
+        },
+        perception: {
+          agent_id: "v2-perception-manager",
+          execution_kind: "model_agent",
+          layer: "perceptual_association",
+          pathway: "perceptual_association"
+        },
+        sensorimotor: {
+          agent_id: "v2-sensorimotor-manager",
+          execution_kind: "model_agent",
+          layer: "sensorimotor",
+          pathway: "sensorimotor_selection"
+        }
+      }
+    }, null, 2)}\n`, "utf8");
+
+    try {
+      const store = await RunStore.open(runDir);
+      await expect(store.readArchivedAgentManifests()).resolves.toEqual([{
+        epoch_id: epochId,
+        identity_sha256: "a".repeat(64),
+        agent_ids: [
+          "v2-goal-valuation",
+          "v2-perception-manager",
+          "v2-sensorimotor-manager"
+        ],
+        goal_manager_agent_id: "v2-goal-valuation",
+        grounding_manager_agent_id: "v2-perception-manager",
+        execution_manager_agent_id: "v2-sensorimotor-manager"
+      }]);
+      await expect(store.readAgentManifest()).rejects.toThrow(
+        "Agent manifest is missing"
       );
     } finally {
       await rm(runsDir, { recursive: true, force: true });

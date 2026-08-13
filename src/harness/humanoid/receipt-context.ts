@@ -1,5 +1,6 @@
 import type { JsonValue } from "../../domain/schema.js";
 import type { HumanoidActionReceipt } from "./runtime.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 
 const MODEL_RECEIPT_DETAIL_KEYS = [
   "frame",
@@ -158,7 +159,7 @@ export function modelToolReceiptDetail(
   receipt: HumanoidActionReceipt
 ): Record<string, unknown> {
   if (receipt.action !== "observe_humanoid"
-    || receipt.agentId !== "humanoid-motion-reference") {
+    || receipt.agentId !== HUMANOID_NEURAL_AGENT_IDS.sensorFusion) {
     return modelReceiptDetail(receipt.detail);
   }
   const source = record(receipt.detail);

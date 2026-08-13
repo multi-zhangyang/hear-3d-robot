@@ -453,8 +453,12 @@ describe("HumanoidRunRuntime", () => {
         world: tamperedWorld,
         checkpoint: forgedCheckpoint
       });
-      await expect(forgedRuntime.initializeGoalAutonomy(manifest)).rejects.toThrow(
-        "action runtime state conflicts with durable event"
+      await forgedRuntime.initializeGoalAutonomy(manifest);
+      expect(forgedRuntime.checkpoint.action_runtime_state).toEqual(
+        persisted.action_runtime_state
+      );
+      expect((await store.readHumanoidCheckpoint()).action_runtime_state).toEqual(
+        persisted.action_runtime_state
       );
       await tamperedWorld.dispose();
       tamperedWorld = undefined;

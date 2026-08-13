@@ -1,4 +1,5 @@
 import type { Scenario } from "../domain/schema.js";
+import { EmptyContextMemoryState } from "../domain/schema.js";
 import {
   HumanoidRunCheckpointSchema,
   LegacyHumanoidRunCheckpointSchema,
@@ -17,6 +18,10 @@ import {
 import { humanoidMotionArtifactSha256 } from "../world/humanoid/motion-artifact.js";
 import { humanoidMotionIntentSha256 } from "../world/humanoid/plan-lifecycle.js";
 import { humanoidMotionContactEvidenceSha256 } from "../world/humanoid/motion-contact-evidence.js";
+import {
+  NEURAL_HIERARCHY_CONTRACT_VERSION,
+  createNeuralHierarchyState
+} from "../domain/neural-hierarchy.js";
 
 export interface NormalizedHumanoidRunCheckpoint {
   checkpoint: HumanoidRunCheckpoint;
@@ -25,20 +30,25 @@ export interface NormalizedHumanoidRunCheckpoint {
 
 export async function normalizeHumanoidRunCheckpoint(
   raw: unknown,
-  scenario: Scenario
+  scenario: Scenario,
+  options: { freshNeuralHierarchyEpoch?: boolean } = {}
 ): Promise<NormalizedHumanoidRunCheckpoint> {
-  if (!humanoidRunCheckpointNeedsPhysicalMigration(raw)) {
+  const source = options.freshNeuralHierarchyEpoch
+    ? checkpointWithFreshNeuralHierarchy(raw)
+    : raw;
+  assertCompatibleNeuralHierarchyCheckpoint(source);
+  if (!humanoidRunCheckpointNeedsPhysicalMigration(source)) {
     return {
-      checkpoint: HumanoidRunCheckpointSchema.parse(raw),
-      migrated: false
+      checkpoint: HumanoidRunCheckpointSchema.parse(source),
+      migrated: options.freshNeuralHierarchyEpoch === true
     };
   }
 
-  if (preGraspV6NeedsPhysicalMigration(raw)) {
-    return migratePreGraspV6(raw, scenario);
+  if (preGraspV6NeedsPhysicalMigration(source)) {
+    return migratePreGraspV6(source, scenario);
   }
 
-  const legacy = LegacyHumanoidRunCheckpointSchema.parse(raw);
+  const legacy = LegacyHumanoidRunCheckpointSchema.parse(source);
   const simulation = await HumanoidSimulation.create(humanoidEnvironment(scenario));
   try {
     const source = legacy.world_checkpoint.simulation;
@@ -131,6 +141,116 @@ export async function normalizeHumanoidRunCheckpoint(
   } finally {
     await simulation.dispose();
   }
+}
+
+function checkpointWithFreshNeuralHierarchy(raw: unknown): unknown {
+  assertFreshNeuralHierarchyEpochSafe(raw);
+  const source = structuredClone(raw as Record<string, unknown>);
+  const hierarchy = createNeuralHierarchyState();
+  source.neural_hierarchy_state = hierarchy;
+  source.action_runtime_state = emptyActionRuntimeStateForFreshEpoch(
+    source,
+    hierarchy.epoch_id
+  );
+  const previousContext = recordProperty(source, "context_memory");
+  source.context_memory = {
+    ...structuredClone(EmptyContextMemoryState),
+    ...(typeof previousContext.context_window_tokens === "number"
+      ? { context_window_tokens: previousContext.context_window_tokens }
+      : {}),
+    ...(typeof previousContext.compact_trigger_tokens === "number"
+      ? { compact_trigger_tokens: previousContext.compact_trigger_tokens }
+      : {}),
+    ...(typeof previousContext.compact_recent_model_turns === "number"
+      ? { compact_recent_model_turns: previousContext.compact_recent_model_turns }
+      : {}),
+    ...(typeof previousContext.compact_max_output_tokens === "number"
+      ? { compact_max_output_tokens: previousContext.compact_max_output_tokens }
+      : {})
+  };
+  source.context_memory_state_anchor = null;
+  source.active_agent_id = source.root_id;
+  source.active_agent_ids = [source.root_id];
+  return source;
+}
+
+function emptyActionRuntimeStateForFreshEpoch(
+  source: Record<string, unknown>,
+  neuralHierarchyEpochId: string
+): Record<string, unknown> {
+  const previousState = recordProperty(source, "action_runtime_state");
+  const persistedRevision = nonnegativeInteger(
+    previousState.latest_physical_execution_revision
+  ) ?? 0;
+  const receipts = recordProperty(source, "committed_actions");
+  const durablePhysicalRevision = Object.values(receipts).reduce<number>((latest, value) => {
+    if (!isRecord(value)
+      || value.accepted !== true
+      || !isPhysicalExecutionAction(value.action)) return latest;
+    return Math.max(latest, nonnegativeInteger(value.worldAfterRevision) ?? 0);
+  }, 0);
+  return {
+    version: 1,
+    neural_hierarchy_epoch_id: neuralHierarchyEpochId,
+    latest_physical_execution_revision: Math.max(
+      persistedRevision,
+      durablePhysicalRevision
+    ),
+    skill_plans: [],
+    active_skill_plan_transactions: {},
+    active_skills: [],
+    planning_skill_bindings: [],
+    recovery_policies: [],
+    navigation_transit_clearance_requirements: [],
+    latest_grounding_observation: null
+  };
+}
+
+function isPhysicalExecutionAction(value: unknown): boolean {
+  return value === "execute_humanoid_skill"
+    || value === "execute_whole_body_motion"
+    || value === "execute_humanoid_navigation";
+}
+
+function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number"
+    && Number.isInteger(value)
+    && value >= 0
+    ? value
+    : undefined;
+}
+
+export function assertFreshNeuralHierarchyEpochSafe(raw: unknown): void {
+  if (!isRecord(raw)) throw new Error("Humanoid checkpoint must be an object");
+  if (raw.status === "succeeded") {
+    throw new Error("A succeeded run cannot start a fresh Agent/hierarchy epoch");
+  }
+  const ledger = recordProperty(raw, "action_execution_ledger");
+  const activeExecutions = recordProperty(ledger, "active");
+  const outbox = recordProperty(raw, "action_commit_outbox");
+  const pendingCommits = recordProperty(outbox, "pending");
+  if (Object.keys(activeExecutions).length > 0
+    || Object.keys(pendingCommits).length > 0) {
+    throw new Error(
+      "A fresh Agent/hierarchy epoch cannot start while a physical execution or "
+        + "action commit is unfinished; recover that transaction first"
+    );
+  }
+}
+
+function assertCompatibleNeuralHierarchyCheckpoint(raw: unknown): void {
+  if (!isRecord(raw)) return;
+  const hierarchy = raw.neural_hierarchy_state;
+  if (!isRecord(hierarchy) || typeof hierarchy.version !== "number") return;
+  if (hierarchy.version === NEURAL_HIERARCHY_CONTRACT_VERSION) return;
+  throw new Error(
+    `The persisted neural hierarchy uses contract v${hierarchy.version}, but this `
+      + `runtime requires v${NEURAL_HIERARCHY_CONTRACT_VERSION} with invocation-scoped `
+      + "parent fork/join identity. It cannot reuse the old Agent epoch because doing so "
+      + "could attach rollout feedback to the wrong hierarchy episode. Physical state, "
+      + "Goal state, and embodied memory remain unchanged; resume through an explicit fresh "
+      + "Agent/hierarchy epoch."
+  );
 }
 
 export function humanoidRunCheckpointNeedsPhysicalMigration(
