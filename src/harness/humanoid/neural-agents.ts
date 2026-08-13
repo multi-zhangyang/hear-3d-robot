@@ -275,7 +275,7 @@ const MotorIntentOutputSchema = NeuralAgentOutputSchema.extend({
 }).strict();
 
 const RecoveryOutputSchema = NeuralAgentOutputSchema.extend({
-  signal_kind: z.enum(["skill_proposal", "risk_assessment", "escalation"])
+  signal_kind: z.enum(["skill_proposal", "escalation"])
 }).strict();
 
 export interface HumanoidNeuralAgentRuntime extends HumanoidActionInvoker,
@@ -1412,7 +1412,14 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         childKey: "sensorimotorManager",
         child: sensorimotorManager,
         description: "Select, rollout, and admit one bounded sensorimotor skill.",
-        phases: ["skill_proposal", "motor_assessment", "motor_planning", "rollout_review", "execution"],
+        phases: [
+          "skill_proposal",
+          "motor_assessment",
+          "motor_planning",
+          "rollout_review",
+          "execution",
+          "recovery"
+        ],
         requireCommitment: false
       })
     ],
@@ -1423,6 +1430,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "Sensorimotor may return only a skill_proposal before authorization.",
         "You alone establish one durable skill commitment. Copy the outer delegate_sensorimotor_manager.source_signal_ids into establish_skill_commitment.source_signal_ids; nested Affordance/Risk ids do not authorize commitment. Then invoke Sensorimotor again with the resulting skill_commitment signal.",
         "Authorize execution only after the committed branch returns a real accepted rollout_result. Call authorize_skill_execution with the active commitment id and your reason; the Harness binds the unique direct certified rollout, so do not copy a rollout or Predictive signal id into that call.",
+        "In recovery, forward the direct failure signal to Sensorimotor. If Recovery returns a replacement skill_proposal, you alone replace the failed commitment; if it escalates, return that typed escalation unchanged to Executive.",
         "In feedback, complete or fail the active commitment before delegating post-execution Perception. After Perception returns, forward perceptual_belief to Executive with the exact child source_signal_ids.",
         "Children may not replace the active Goal or establish their own commitment."
       ]
@@ -1455,6 +1463,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           "rollout_review",
           "execution",
           "feedback",
+          "recovery",
           "cycle_completion"
         ]
       })
@@ -1465,6 +1474,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "You are the only root. Goal Valuation and Action Selection are children, never peers.",
         "Do not wake lower layers unless an event requires work; never poll all Agents.",
         "A typed direct child return ends this Executive episode; the Harness scheduler starts the next phase in a fresh event. Never relabel or resubmit a child result.",
+        "In recovery, preserve the active Goal and delegate the direct failure signal through Action Selection; Recovery remains reachable only through Action Selection and Sensorimotor.",
         "After execution, delegate Action Selection once to resolve its commitment, then again for post-execution Perception when the Harness requests it.",
         "After post-execution Sensor Fusion, cite the direct perceptual_belief and decide whether to complete; the Harness resolves exact physical transaction ids. Never self-certify success."
       ]
@@ -2451,11 +2461,18 @@ function recoveryAuthorityTool(
             reason: "sensorimotor_granted_recovery_decision_domain"
           });
         }
-        const relevant = runtime.pendingNeuralSignals({
+        const recoveryDemands = runtime.pendingNeuralSignals({
           targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
           kinds: ["prediction_error", "skill_failed", "escalation"]
-        })[0];
-        if (!relevant) throw new Error("Recovery requires current failure or risk feedback");
+        });
+        const relevant = recoveryDemands.find((signal) => signal.direction === "descending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+          && signal.invocation_id === recoveryInvocation.parentInvocationId);
+        if (!relevant) {
+          throw new Error(
+            "Recovery requires failure feedback routed through the current Action Selection -> Sensorimotor episode"
+          );
+        }
         const state = runtime.neuralHierarchyState();
         const suspendLeaseIds = Object.values(state.authority_leases)
           .filter((lease) => (
@@ -2544,7 +2561,10 @@ function recoveryAuthorityTool(
             targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
             ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
             priority: 100,
-            causalParentIds: [descending.signal_id, ...parsed.source_signal_ids],
+            causalParentIds: [...new Set([
+              descending.signal_id,
+              ...parsed.source_signal_ids
+            ])],
             sourceAuthorityLeaseId: lease.lease_id,
             invocationId: recoveryInvocation.invocationId,
             parentInvocationId: recoveryInvocation.parentInvocationId,
@@ -2552,12 +2572,12 @@ function recoveryAuthorityTool(
           });
           await runtime.consumeNeuralSignals(
             HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            [relevant.signal_id]
+            recoveryDemands.map((signal) => signal.signal_id)
           );
           await runtime.transitionNeuralHarnessPhase({
             phase: parsed.signal_kind === "escalation"
               ? "goal_valuation"
-              : "motor_assessment",
+              : "skill_proposal",
             enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
             reason: parsed.signal_kind === "escalation"
               ? "recovery_escalated_to_supervisory_control"
@@ -3399,6 +3419,12 @@ async function prepareHarnessPhaseForChild(
     return;
   }
   if (childKey === "sensorimotorManager") {
+    if (phase.phase === "recovery") {
+      // Recovery is a strict Executive -> Action Selection -> Sensorimotor
+      // control episode. Preserve its decision domain until Sensorimotor has
+      // opened and closed the exclusive Recovery child lease.
+      return;
+    }
     const commitment = runtime.neuralHierarchyState().active_skill_commitment;
     await transition(
       commitment?.state === "executing"
@@ -3738,6 +3764,22 @@ function requireManagerJoinEvidence(
   invocationId: string,
   sourceSignalIds: readonly string[]
 ): NeuralSignal[] {
+  if (managerKey === "sensorimotorManager" && outputKind === "skill_proposal") {
+    const recoveryProposal = runtime.pendingNeuralSignals({
+      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+      kinds: ["skill_proposal"]
+    }).find((signal) => signal.direction === "ascending"
+      && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.recovery
+      && signal.parent_episode_id === invocationId
+      && sourceSignalIds.includes(signal.signal_id)
+      && isCurrentNeuralSignal(runtime, signal));
+    if (recoveryProposal) {
+      // Recovery owns a separate, exclusive failure-domain lease. Its proposal
+      // is already the formal child result and must not be forced through the
+      // ordinary Affordance/Risk assessment fork.
+      return [];
+    }
+  }
   const requirements: readonly NeuralSignalKind[] = managerKey === "perceptionManager"
     && outputKind === "perceptual_belief"
     ? ["sensory_evidence", "scene_interpretation", "memory_retrieval"]
@@ -4174,18 +4216,12 @@ function directChildNeuralOutcomeToolUseBehavior(
       }
       const childOutput = outputObject(result.output);
       if (!childOutput) continue;
-      const output = outputType.safeParse({
-        signal_kind: childOutput.signal_kind,
-        summary: childOutput.summary,
-        payload_json: JSON.stringify(childOutput.payload),
-        source_signal_ids: childOutput.source_signal_ids,
-        confidence: childOutput.confidence
-      });
-      if (!output.success) continue;
+      const output = directChildNeuralOutput(outputType, childOutput);
+      if (!output) continue;
       return {
         isFinalOutput: true,
         isInterrupted: undefined,
-        finalOutput: JSON.stringify(output.data)
+        finalOutput: JSON.stringify(output)
       };
     }
     return { isFinalOutput: false, isInterrupted: undefined };
@@ -4294,11 +4330,28 @@ function actionSelectionToolUseBehavior(
     "skill_released"
   ]);
   const perceptionToolName = humanoidNeuralAgentToolName("perceptionManager");
+  const sensorimotorToolName = humanoidNeuralAgentToolName("sensorimotorManager");
   return (_context, results) => {
     for (const result of results) {
       if (result.type !== "function_output") continue;
       const parsed = outputObject(result.output);
       if (!parsed) continue;
+      if (result.tool.name === sensorimotorToolName
+        && parsed.signal_kind === "escalation") {
+        const finalOutput = directChildNeuralOutput(
+          ActionSelectionOutputSchema,
+          parsed
+        );
+        if (!finalOutput || finalOutput.signal_kind !== "escalation") continue;
+        // Recovery escalation already crossed the direct Sensorimotor edge.
+        // Preserve that typed result so it can cross the final direct edge to
+        // Executive without another model-authored restatement.
+        return {
+          isFinalOutput: true,
+          isInterrupted: undefined,
+          finalOutput: JSON.stringify(finalOutput)
+        };
+      }
       if (result.tool.name === perceptionToolName
         && runtime.neuralHarnessPhase().phase === "cycle_completion") {
         const finalOutput = ActionSelectionOutputSchema.safeParse({
@@ -4351,11 +4404,30 @@ function sensorimotorToolUseBehavior(
 ): ToolUseBehavior {
   const predictiveToolName = humanoidNeuralAgentToolName("predictive");
   const executorToolName = humanoidNeuralAgentToolName("executor");
+  const recoveryToolName = humanoidNeuralAgentToolName("recovery");
   return (_context, results) => {
     for (const result of results) {
       if (result.type !== "function_output") continue;
       const parsed = outputObject(result.output);
       if (!parsed) continue;
+      if (result.tool.name === recoveryToolName
+        && (parsed.signal_kind === "skill_proposal"
+          || parsed.signal_kind === "escalation")) {
+        const finalOutput = directChildNeuralOutput(
+          SensorimotorOutputSchema,
+          parsed
+        );
+        if (!finalOutput) continue;
+        // A Recovery proposal is authorized by its exclusive failure lease,
+        // not by the ordinary Affordance/Risk fork. End the Sensorimotor
+        // episode on the already-routed child result so Action Selection can
+        // either bind the replacement Skill or forward the escalation.
+        return {
+          isFinalOutput: true,
+          isInterrupted: undefined,
+          finalOutput: JSON.stringify(finalOutput)
+        };
+      }
       if (result.tool.name === predictiveToolName
         && parsed.signal_kind === "forward_prediction") {
         const state = runtime.neuralHierarchyState();
@@ -4469,6 +4541,22 @@ function sensorimotorToolUseBehavior(
   };
 }
 
+function directChildNeuralOutput<TSchema extends z.ZodObject>(
+  schema: TSchema,
+  parsed: Record<string, unknown>
+): z.infer<TSchema> | undefined {
+  const output = schema.safeParse({
+    signal_kind: parsed.signal_kind,
+    summary: parsed.summary,
+    payload_json: typeof parsed.payload_json === "string"
+      ? parsed.payload_json
+      : JSON.stringify(parsed.payload ?? {}),
+    source_signal_ids: parsed.source_signal_ids,
+    confidence: parsed.confidence
+  });
+  return output.success ? output.data : undefined;
+}
+
 function executiveToolUseBehavior(): ToolUseBehavior {
   const statuses = new Set(["cycle_completed", "satisfied_goal_completed"]);
   const goalToolName = humanoidNeuralAgentToolName("goalManager");
@@ -4478,24 +4566,32 @@ function executiveToolUseBehavior(): ToolUseBehavior {
       if (result.type !== "function_output") continue;
       const parsed = outputObject(result.output);
       if (!parsed) continue;
-      if (result.tool.name === goalToolName
-        || result.tool.name === actionSelectionToolName) {
+      if (result.tool.name === actionSelectionToolName) {
+        const executiveOutput = directChildNeuralOutput(
+          ExecutiveOutputSchema,
+          parsed
+        );
+        if (!executiveOutput) continue;
+        // A direct manager-as-tool return is already a typed, Harness-routed
+        // result. End this event-bounded Executive episode immediately instead
+        // of asking the model to relabel and resubmit the same child signal.
+        return {
+          isFinalOutput: true,
+          isInterrupted: undefined,
+          finalOutput: JSON.stringify(executiveOutput)
+        };
+      }
+      if (result.tool.name === goalToolName) {
         const childOutput = NeuralAgentOutputSchema.passthrough().safeParse(parsed);
         if (!childOutput.success) continue;
-        const outputSignalKind = result.tool.name === goalToolName
-          ? "goal_context"
-          : childOutput.data.signal_kind;
         const executiveOutput = ExecutiveOutputSchema.safeParse({
-          signal_kind: outputSignalKind,
+          signal_kind: "goal_context",
           summary: childOutput.data.summary,
           payload_json: JSON.stringify(childOutput.data.payload),
           source_signal_ids: childOutput.data.source_signal_ids,
           confidence: childOutput.data.confidence
         });
         if (!executiveOutput.success) continue;
-        // A direct manager-as-tool return is already a typed, Harness-routed
-        // result. End this event-bounded Executive episode immediately instead
-        // of asking the model to relabel and resubmit the same child signal.
         return {
           isFinalOutput: true,
           isInterrupted: undefined,

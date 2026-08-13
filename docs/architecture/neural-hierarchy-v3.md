@@ -135,6 +135,20 @@ lease. Recovery cannot call Premotor or Executor behind that parent. It returns
 one recovery proposal or escalation, closes the lease, and only then may the
 ordinary Sensorimotor branch resume.
 
+Recovery is reachable only through the complete production control path:
+
+```text
+Executive -> Action Selection -> Sensorimotor Manager -> Recovery
+```
+
+The triggering `prediction_error`, `skill_failed`, or `escalation` is rebound
+at each direct descending edge. A recovery `skill_proposal` returns through the
+same parents and only Action Selection may bind it as the replacement
+commitment. A recovery `escalation` also returns through Sensorimotor and Action
+Selection before Executive can revalue the Goal. Recovery has no
+`risk_assessment` holding state: its bounded decision must either propose a
+replacement Skill or escalate.
+
 This is the **ownership graph**, not the data-flow graph. The rollout result,
 body sensation, and reflex error shown later are typed feedback routes; none
 creates another parent. The executable contract rejects multiple parents,
@@ -306,12 +320,12 @@ stateDiagram-v2
     Predictive --> Recovery: error outside local scope
     Execute --> ResolveCommitment: execution_receipt + skill_completed / failed
     ResolveCommitment --> PostExecutionSense: Action Selection closes commitment
-    Recovery --> AssessmentFork: lease closed with proposal
+    Recovery --> CommitmentAuthorization: lease closed with replacement proposal
     Recovery --> Escalate: local recovery unavailable
     PostExecutionSense --> CycleBarrier: current perceptual_belief joined
     CycleBarrier --> CompleteSkill: Executive validates physical completion
     PostExecutionSense --> AssessmentFork: Goal preserved; replan Skill
-    Escalate --> ActionSelection: replace commitment
+    Escalate --> GoalValuation: Sensorimotor -> Action Selection -> Executive
     CompleteSkill --> ActionSelection: resolve commitment from real feedback
 ```
 

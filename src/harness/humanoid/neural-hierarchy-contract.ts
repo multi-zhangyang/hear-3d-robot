@@ -517,11 +517,11 @@ export const HUMANOID_NEURAL_RUNTIME_CAPABILITIES = [
 export const HUMANOID_NEURAL_SIGNAL_CONTRACTS = [
   signalContract("executive", "goalManager", "descending", "goal_context"),
   signalContract("goalManager", "executive", "ascending", "goal_selected", "escalation"),
-  signalContract("executive", "actionSelection", "descending", "goal_context", "goal_selected", "skill_commitment", "execution_receipt", "skill_completed", "skill_failed"),
+  signalContract("executive", "actionSelection", "descending", "goal_context", "goal_selected", "skill_commitment", "execution_receipt", "skill_completed", "skill_failed", "prediction_error", "escalation"),
   signalContract("actionSelection", "executive", "ascending", "perceptual_belief", "skill_commitment", "skill_completed", "skill_failed", "escalation"),
   signalContract("actionSelection", "perceptionManager", "descending", "goal_context", "goal_selected", "skill_commitment", "execution_receipt", "skill_completed", "skill_failed"),
   signalContract("perceptionManager", "actionSelection", "ascending", "perceptual_belief", "escalation"),
-  signalContract("actionSelection", "sensorimotorManager", "descending", "goal_context", "goal_selected", "perceptual_belief", "skill_commitment"),
+  signalContract("actionSelection", "sensorimotorManager", "descending", "goal_context", "goal_selected", "perceptual_belief", "skill_commitment", "prediction_error", "skill_failed", "escalation"),
   signalContract("sensorimotorManager", "actionSelection", "ascending", "skill_proposal", "skill_commitment", "rollout_result", "prediction_error", "execution_receipt", "skill_completed", "skill_failed", "escalation"),
   signalContract("perceptionManager", "sensorFusion", "descending", "goal_context"),
   signalContract("sensorFusion", "perceptionManager", "ascending", "sensory_evidence"),
@@ -548,7 +548,7 @@ export const HUMANOID_NEURAL_SIGNAL_CONTRACTS = [
   signalContract("reflex", "body", "descending", "motor_intent"),
   signalContract("body", "reflex", "ascending", "sensory_evidence", "prediction_error"),
   signalContract("sensorimotorManager", "recovery", "descending", "risk_assessment", "prediction_error", "skill_failed", "escalation"),
-  signalContract("recovery", "sensorimotorManager", "ascending", "skill_proposal", "risk_assessment", "escalation"),
+  signalContract("recovery", "sensorimotorManager", "ascending", "skill_proposal", "escalation"),
   signalContract("rolloutGate", "predictive", "reentrant", "rollout_result"),
   signalContract("reflex", "sensorimotorManager", "reentrant", "prediction_error", "execution_receipt", "skill_completed", "skill_failed", "escalation"),
   signalContract("body", "perceptionManager", "reentrant", "sensory_evidence")

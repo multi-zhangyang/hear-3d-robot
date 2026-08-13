@@ -573,8 +573,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         reason = "post_execution_observation_required";
       } else if (coordinator === "post_failure_observation"
         || coordinator === "replan_or_retire") {
-        phase = "recovery";
-        reason = "runtime_failure_feedback_required";
+        if (activeRecoveryReplacementCommitment(state)) {
+          phase = "motor_assessment";
+          reason = "recovery_replacement_commitment_requires_assessment";
+        } else if (recoveryEscalationAwaitsGoalValuation(state)) {
+          phase = "goal_valuation";
+          reason = "recovery_escalation_requires_goal_valuation";
+        } else {
+          phase = "recovery";
+          reason = "runtime_failure_feedback_required";
+        }
       } else if (coordinator === "execute_plan") {
         const activeCommitment = state.active_skill_commitment;
         const activeCertificates = Object.values(state.rollout_certificates).filter(
@@ -4917,6 +4925,72 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
   }
 
+}
+
+function activeRecoveryReplacementCommitment(
+  state: NeuralHierarchyState
+): NeuralSkillCommitment | undefined {
+  const commitment = state.active_skill_commitment;
+  if (!commitment || commitment.state !== "committed") return undefined;
+  const recoveryId = HUMANOID_NEURAL_AGENT_IDS.recovery;
+  const sensorimotorId = HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager;
+  const actionSelectionId = HUMANOID_NEURAL_AGENT_IDS.actionSelection;
+  const sourceSignals = commitment.source_signal_ids.map(
+    (signalId) => state.signals[signalId]
+  ).filter((signal): signal is NeuralSignal => signal !== undefined);
+  return sourceSignals.some((proposal) => proposal.kind === "skill_proposal"
+    && proposal.source_node_id === sensorimotorId
+    && proposal.target_node_id === actionSelectionId
+    && neuralSignalDescendsFromRecoveryProposal(state, proposal, recoveryId))
+    ? commitment
+    : undefined;
+}
+
+function recoveryEscalationAwaitsGoalValuation(
+  state: NeuralHierarchyState
+): boolean {
+  return Object.values(state.signals).some((signal) => signal.status === "pending"
+    && signal.kind === "escalation"
+    && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+    && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.executive
+    && neuralSignalDescendsFromRecoveryKind(state, signal, "escalation"));
+}
+
+function neuralSignalDescendsFromRecoveryProposal(
+  state: NeuralHierarchyState,
+  signal: NeuralSignal,
+  recoveryNodeId: typeof HUMANOID_NEURAL_AGENT_IDS.recovery
+): boolean {
+  return neuralSignalDescendsFromRecoveryKind(
+    state,
+    signal,
+    "skill_proposal",
+    recoveryNodeId
+  );
+}
+
+function neuralSignalDescendsFromRecoveryKind(
+  state: NeuralHierarchyState,
+  signal: NeuralSignal,
+  kind: "skill_proposal" | "escalation",
+  recoveryNodeId = HUMANOID_NEURAL_AGENT_IDS.recovery
+): boolean {
+  const visited = new Set<string>();
+  const pending = [...signal.causal_parent_ids];
+  while (pending.length > 0) {
+    const signalId = pending.pop()!;
+    if (visited.has(signalId)) continue;
+    visited.add(signalId);
+    const parent = state.signals[signalId];
+    if (!parent) continue;
+    if (parent.kind === kind
+      && parent.source_node_id === recoveryNodeId
+      && parent.target_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager) {
+      return true;
+    }
+    pending.push(...parent.causal_parent_ids);
+  }
+  return false;
 }
 
 function verifiedMissionCompletionOutput(input: {

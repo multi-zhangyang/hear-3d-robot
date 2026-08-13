@@ -772,6 +772,208 @@ describe("humanoid neural Agent hierarchy", () => {
     expect(riskHistory).not.toContain("target affords bounded walking");
   });
 
+  it("replaces a failed Skill only through Executive -> Action Selection -> Sensorimotor -> exclusive Recovery", async () => {
+    const calls: string[] = [];
+    const actions: string[] = [];
+    const sessions = new Map<string, MemorySession>();
+    const runtime = inMemoryNeuralRuntime({ onAction: (action) => actions.push(action) });
+    const goalEpochId = "goal-epoch-recovery-smoke";
+    await advanceToPerception(runtime, goalEpochId);
+    const initialBelief = await publishPriorPerceptualBelief(runtime, {
+      world_revision: 0,
+      blocked_path_visible: false
+    });
+    await runtime.transitionNeuralHarnessPhase({
+      phase: "skill_proposal",
+      enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      reason: "recovery_smoke_initial_proposal"
+    });
+    await runtime.transitionNeuralHarnessPhase({
+      phase: "commitment_authorization",
+      enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      reason: "recovery_smoke_initial_authorization"
+    });
+    const failed = await runtime.establishNeuralSkillCommitment({
+      ownerNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      goalEpochId,
+      skill: "walk_straight_into_blocked_path",
+      terminationContract: { type: "robot_at", tolerance: 0.35 },
+      sourceSignalIds: [initialBelief.signal_id]
+    });
+    await runtime.transitionNeuralHarnessPhase({
+      phase: "motor_assessment",
+      enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      reason: "recovery_smoke_initial_commitment"
+    });
+    await runtime.transitionNeuralSkillCommitment({
+      commitmentId: failed.commitment_id,
+      ownerNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      state: "failed",
+      sourceSignalIds: []
+    });
+    await runtime.transitionNeuralHarnessPhase({
+      phase: "recovery",
+      enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+      reason: "recovery_smoke_failure_feedback"
+    });
+    const failedActionSelectionInvocationId = randomUUID();
+    const failedActionSelectionLease = await runtime.issueNeuralAuthorityLease({
+      issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+      targetChildNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      allowedSignalKinds: ["skill_failed"],
+      correctionScope: "pathway",
+      invocationId: failedActionSelectionInvocationId,
+      parentInvocationId: null,
+      parentEpisodeId: randomUUID(),
+      ttlRevisions: 64
+    });
+    const failureToExecutive = await runtime.publishNeuralSignal({
+      kind: "skill_failed",
+      pathway: "sensorimotor_selection",
+      direction: "ascending",
+      sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+      ttlRevisions: 64,
+      priority: 100,
+      sourceAuthorityLeaseId: failedActionSelectionLease.lease_id,
+      invocationId: failedActionSelectionInvocationId,
+      parentInvocationId: null,
+      parentEpisodeId: failedActionSelectionLease.parent_episode_id,
+      payload: {
+        reason: "blocked_path_destabilized_controller",
+        failed_commitment_id: failed.commitment_id
+      }
+    });
+    await runtime.closeNeuralAuthorityLease({
+      leaseId: failedActionSelectionLease.lease_id,
+      closedByNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+      reason: "failed_action_selection_episode_returned"
+    });
+    const lowerFailureInvocationId = randomUUID();
+    const lowerFailureLease = await runtime.issueNeuralAuthorityLease({
+      issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
+      targetChildNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
+      allowedSignalKinds: ["skill_failed"],
+      correctionScope: "pathway",
+      invocationId: lowerFailureInvocationId,
+      parentInvocationId: randomUUID(),
+      parentEpisodeId: randomUUID(),
+      ttlRevisions: 64
+    });
+    const lowerFailure = await runtime.publishNeuralSignal({
+      kind: "skill_failed",
+      pathway: "ascending_feedback",
+      direction: "reentrant",
+      sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
+      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+      ttlRevisions: 64,
+      priority: 100,
+      sourceAuthorityLeaseId: lowerFailureLease.lease_id,
+      invocationId: lowerFailureInvocationId,
+      parentInvocationId: lowerFailureLease.parent_invocation_id,
+      parentEpisodeId: lowerFailureLease.parent_episode_id,
+      payload: { reason: "same_bounded_failure_domain" }
+    });
+    await runtime.closeNeuralAuthorityLease({
+      leaseId: lowerFailureLease.lease_id,
+      closedByNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
+      reason: "lower_failure_feedback_returned"
+    });
+
+    const hierarchy = createHumanoidNeuralAgentHierarchy({
+      provider,
+      runtime,
+      createModel: (agentId) => recoveryHierarchyModel(
+        agentId,
+        calls,
+        runtime,
+        goalEpochId,
+        failureToExecutive.signal_id
+      ),
+      createSession: (agentId) => {
+        const session = new MemorySession({ sessionId: agentId });
+        sessions.set(agentId, session);
+        return session;
+      },
+      callModelInputFilter: ({ modelData }) => modelData
+    });
+    const runner = new Runner({
+      tracingDisabled: true,
+      modelSettings: { parallelToolCalls: false },
+      toolExecution: { maxFunctionToolConcurrency: 1 }
+    });
+
+    const result = await withAgentInvocation(
+      HUMANOID_NEURAL_AGENT_IDS.executive,
+      () => runner.run(hierarchy.root, "recover the failed Skill through the owned hierarchy", {
+        session: hierarchy.session(HUMANOID_NEURAL_AGENT_IDS.executive),
+        maxTurns: 12,
+        reasoningItemIdPolicy: "omit",
+        toolExecution: { maxFunctionToolConcurrency: 1 }
+      }),
+      false,
+      randomUUID()
+    );
+
+    expect(result.finalOutput).toMatchObject({
+      signal_kind: "skill_commitment",
+      summary: "skill_committed",
+      confidence: 1
+    });
+    expect(actions).toEqual([]);
+    expect(calls).toEqual(expect.arrayContaining([
+      HUMANOID_NEURAL_AGENT_IDS.executive,
+      HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+      HUMANOID_NEURAL_AGENT_IDS.recovery
+    ]));
+    const state = runtime.neuralHierarchyState();
+    const edges = Object.values(state.signals).map((signal) => (
+      `${signal.source_node_id}->${signal.target_node_id}:${signal.kind}`
+    ));
+    expect(edges).toEqual(expect.arrayContaining([
+      `${HUMANOID_NEURAL_AGENT_IDS.executive}->${HUMANOID_NEURAL_AGENT_IDS.actionSelection}:skill_failed`,
+      `${HUMANOID_NEURAL_AGENT_IDS.actionSelection}->${HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager}:skill_failed`,
+      `${HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager}->${HUMANOID_NEURAL_AGENT_IDS.recovery}:skill_failed`,
+      `${HUMANOID_NEURAL_AGENT_IDS.recovery}->${HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager}:skill_proposal`,
+      `${HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager}->${HUMANOID_NEURAL_AGENT_IDS.actionSelection}:skill_proposal`,
+      `${HUMANOID_NEURAL_AGENT_IDS.actionSelection}->${HUMANOID_NEURAL_AGENT_IDS.executive}:skill_commitment`
+    ]));
+    const recoveryLease = Object.values(state.authority_leases).find((lease) => (
+      lease.issuing_parent_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+        && lease.target_child_node_id === HUMANOID_NEURAL_AGENT_IDS.recovery
+    ));
+    expect(recoveryLease).toMatchObject({
+      exclusive: true,
+      status: "closed",
+      correction_scope: "pathway"
+    });
+    const routedRecoveryInput = Object.values(state.signals).find((signal) => (
+      signal.kind === "skill_failed"
+        && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+        && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+    ));
+    expect(routedRecoveryInput?.status).toBe("consumed");
+    expect(signalHasAncestor(
+      state,
+      routedRecoveryInput!,
+      failureToExecutive.signal_id
+    )).toBe(true);
+    expect(state.signals[lowerFailure.signal_id]?.status).toBe("consumed");
+    expect(state.active_skill_commitment).toMatchObject({
+      goal_epoch_id: goalEpochId,
+      owner_node_id: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      skill: "sidestep_then_resume_goal",
+      state: "committed"
+    });
+    expect(state.active_skill_commitment?.commitment_id).not.toBe(failed.commitment_id);
+    expect(state.harness_phase.phase).toBe("motor_assessment");
+    expect(Object.values(state.authority_leases).every(
+      (lease) => lease.status === "closed"
+    )).toBe(true);
+    expect(new Set(sessions.values()).size).toBe(sessions.size);
+  });
+
   it("certifies one committed Skill through Premotor, Motor Intent, MuJoCo rollout, Predictive, and the sole Serial Executor", async () => {
     const calls: string[] = [];
     const actions: string[] = [];
@@ -1763,6 +1965,107 @@ function certifiedMotionHierarchyModel(
     },
     getStreamedResponse: () => {
       throw new Error("Streaming is outside this certified motion smoke test");
+    }
+  } as Model;
+}
+
+function recoveryHierarchyModel(
+  agentId: string,
+  calls: string[],
+  runtime: HumanoidNeuralAgentRuntime,
+  goalEpochId: string,
+  failureSignalId: string
+): Model {
+  return {
+    getResponse: async (request) => {
+      calls.push(agentId);
+      const results = functionResultRecords(request);
+      if (agentId === HUMANOID_NEURAL_AGENT_IDS.executive) {
+        return functionCallResponse(
+          "executive-delegates-failure-recovery",
+          "delegate_action_selection",
+          {
+            signal_kind: "skill_failed",
+            intent: "Recover the failed Skill while preserving the active Goal",
+            source_signal_ids: [failureSignalId],
+            ttl_revisions: 64,
+            priority: 100
+          }
+        );
+      }
+      if (agentId === HUMANOID_NEURAL_AGENT_IDS.actionSelection) {
+        const proposal = results.find((record) => record.signal_kind === "skill_proposal");
+        if (proposal) {
+          return functionCallResponse(
+            "action-selection-binds-recovery-proposal",
+            "establish_skill_commitment",
+            {
+              goal_epoch_id: goalEpochId,
+              skill: "sidestep_then_resume_goal",
+              termination_contract_json: JSON.stringify({
+                type: "rejoin_original_goal_path",
+                preserve_goal_epoch: true
+              }),
+              source_signal_ids: stringSignalIds(proposal.source_signal_ids)
+            }
+          );
+        }
+        const failure = runtime.pendingNeuralSignals({
+          targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+          kinds: ["skill_failed"]
+        }).find((signal) => signal.direction === "descending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.executive);
+        if (!failure) {
+          throw new Error("Action Selection received no direct failure signal");
+        }
+        return functionCallResponse(
+          "action-selection-delegates-recovery",
+          "delegate_sensorimotor_manager",
+          {
+            signal_kind: "skill_failed",
+            intent: "Open the bounded Sensorimotor recovery decision domain",
+            source_signal_ids: [failure.signal_id],
+            ttl_revisions: 64,
+            priority: 100
+          }
+        );
+      }
+      if (agentId === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager) {
+        return functionCallResponse(
+          "sensorimotor-opens-exclusive-recovery",
+          "run_recovery_lease_episode",
+          {}
+        );
+      }
+      if (agentId === HUMANOID_NEURAL_AGENT_IDS.recovery) {
+        const failure = runtime.pendingNeuralSignals({
+          targetNodeId: HUMANOID_NEURAL_AGENT_IDS.recovery,
+          kinds: ["skill_failed"]
+        }).find((signal) => signal.direction === "descending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager);
+        if (!failure) {
+          throw new Error("Recovery received no direct failure signal");
+        }
+        return functionCallResponse(
+          "recovery-submits-replacement-skill",
+          "submit_neural_output",
+          {
+            signal_kind: "skill_proposal",
+            summary: "Exclusive Recovery proposed a bounded sidestep",
+            payload: {
+              skill: "sidestep_then_resume_goal",
+              preserves_goal_epoch: true,
+              physical_write_authority: false
+            },
+            source_signal_ids: [failure.signal_id],
+            confidence: 0.93
+          }
+        );
+      }
+      throw new Error(`Unexpected model activation in recovery path: ${agentId}`);
+    },
+    getStreamedResponse: () => {
+      throw new Error("Streaming is outside this recovery hierarchy smoke test");
     }
   } as Model;
 }
