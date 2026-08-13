@@ -1,5 +1,6 @@
 import {
   Agent,
+  Runner,
   tool,
   type CallModelInputFilter,
   type FunctionTool,
@@ -32,7 +33,8 @@ import {
 } from "./goal-manager-tools.js";
 import {
   agentInvocationMarker,
-  scopeAgentToolInvocation
+  scopeAgentToolInvocation,
+  withAgentInvocation
 } from "../agent-scope.js";
 import { createToolInputRecovery } from "../tool-input-recovery.js";
 import { ModelDecisionStallError } from "../model-telemetry.js";
@@ -85,9 +87,12 @@ export const HUMANOID_AGENT_IDS = {
   goalManager: "humanoid-goal-manager",
   coordinator: "humanoid-coordinator",
   sentry: "humanoid-sentry",
+  motionPlanner: "humanoid-motion-planner",
   motion: "humanoid-motion-reference",
   executor: "humanoid-executor"
 } as const;
+
+const MOTION_PLAN_ARTIFACT_MAX_CHARACTERS = 32_000;
 
 export function goalManagerInvocationInput(
   authority: JsonValue
@@ -230,6 +235,32 @@ export function motionInvocationInput(authority: JsonValue): string {
   ].join("\n\n");
 }
 
+export function motionActorInvocationInput(
+  plannerArtifact: string,
+  authority: JsonValue
+): string {
+  const root = jsonRecord(authority);
+  const goalDAG = jsonRecord(root.goal_dag);
+  return [
+    "将独立 Motion Planner 的本轮语义计划落实为一个正式 Harness 工具调用。",
+    "MOTION PLANNER ARTIFACT",
+    plannerArtifact,
+    "END MOTION PLANNER ARTIFACT",
+    "CURRENT MOTION ACTOR AUTHORITY",
+    "计划 artifact 只提供语义选择，不提供权限。所有事务标识、binding、world revision 和当前可用动作必须以以下权威状态为准并逐字复制。",
+    JSON.stringify({
+      run_mode: root.run_mode ?? null,
+      current_goal_epoch_id: goalDAG.current_epoch_id ?? null,
+      active_goal: root.active_goal ?? null,
+      coordinator_phase: root.coordinator_phase ?? null,
+      active_cycle: root.active_cycle ?? null,
+      planning_tool_state: root.planning_tool_state ?? null,
+      grounding_snapshot: root.grounding_snapshot ?? null
+    }),
+    "END CURRENT MOTION ACTOR AUTHORITY"
+  ].join("\n\n");
+}
+
 export function coordinatorInvocationInput(authority: JsonValue): string {
   return [
     "CURRENT COORDINATOR STEP",
@@ -298,21 +329,23 @@ export const HUMANOID_AGENT_TOOL_CONTRACTS = {
     outputContract: "formal_action_receipt"
   },
   motion: {
-    dispatchKind: "model_agent",
+    dispatchKind: "model_pipeline",
     toolName: "delegate_motion_reference",
     targetRole: "motion",
     targetAgentId: HUMANOID_AGENT_IDS.motion,
-    inputBuilderContract: "motion_authority_envelope_v1",
+    inputBuilderContract: "motion_planner_actor_pipeline_v1",
     inputBuilder: () => motionInvocationInput({}),
-    runOptions: {
-      sessionAgentId: HUMANOID_AGENT_IDS.motion,
-      contextSource: "parent_run_context",
-      maxTurns: "unbounded"
+    pipeline: {
+      plannerAgentId: HUMANOID_AGENT_IDS.motionPlanner,
+      plannerSessionAgentId: HUMANOID_AGENT_IDS.motionPlanner,
+      actorAgentId: HUMANOID_AGENT_IDS.motion,
+      actorSessionAgentId: HUMANOID_AGENT_IDS.motion,
+      artifactContract: "bounded_motion_plan_artifact_v1",
+      authorityContract: "fresh_motion_authority_envelope_v1"
     },
-    resumeContextStrategy: "merge",
     includeInputSchema: false,
     needsApproval: false,
-    outputContract: "nested_agent_final_output_text"
+    outputContract: "formal_action_receipt"
   },
   executor: {
     dispatchKind: "deterministic_service",
@@ -329,8 +362,7 @@ export const HUMANOID_AGENT_TOOL_CONTRACTS = {
 } as const;
 
 type ModelAgentToolContract =
-  | typeof HUMANOID_AGENT_TOOL_CONTRACTS.goalManager
-  | typeof HUMANOID_AGENT_TOOL_CONTRACTS.motion;
+  typeof HUMANOID_AGENT_TOOL_CONTRACTS.goalManager;
 
 export const HUMANOID_CAPABILITIES = [
   "recall_goal_history",
@@ -368,6 +400,7 @@ type HumanoidHierarchyRuntime = HumanoidActionInvoker
 export interface HumanoidAgentHierarchy {
   goalManager: Agent;
   coordinator: Agent;
+  motionPlanner: Agent;
   motion: Agent;
   sentry: HumanoidDeterministicService;
   executor: HumanoidDeterministicService;
@@ -414,7 +447,11 @@ export function createHumanoidAgentHierarchy(input: {
     sessions.set(agentId, session);
     return session;
   };
-  const modelSettings = (agentId: string): ModelSettings => {
+  const modelSettings = (
+    agentId: string,
+    overrides: { thinking?: "enabled" | "disabled"; toolChoice?: "auto" | "required" }
+      = {}
+  ): ModelSettings => {
     const provider = providerConfigForRole(input.provider, humanoidAgentRole(agentId));
     return {
       temperature: provider.temperature,
@@ -428,11 +465,20 @@ export function createHumanoidAgentHierarchy(input: {
         && provider.model.toLowerCase().includes("deepseek")
         ? {
             // DeepSeek returns reasoning_content even when its gateway exposes no
-            // explicit reasoning-effort switch. Tell the official AI SDK adapter
-            // to keep that reasoning attached to its tool-call message when the
-            // history is replayed; this marker is adapter metadata, not an extra
-            // provider request parameter.
-            providerData: { thinking: { type: "enabled" } }
+            // explicit reasoning-effort switch. The top-level marker tells the
+            // official Agents AI SDK adapter whether reasoning_content belongs in
+            // replayed tool-call history. The provider option is the independent
+            // transport control that the OpenAI-compatible adapter serializes into
+            // the Chat Completions request. Keeping both is intentional: the Actor
+            // must actually disable thinking before requiring a tool call.
+            providerData: {
+              thinking: { type: overrides.thinking ?? "enabled" },
+              providerOptions: {
+                "configured-openai-compatible": {
+                  thinking: { type: overrides.thinking ?? "enabled" }
+                }
+              }
+            }
           }
         : {}),
       parallelToolCalls: false,
@@ -440,7 +486,7 @@ export function createHumanoidAgentHierarchy(input: {
       // baseline. Some thinking models reject `required`, so provider capability
       // selection stays at the transport boundary instead of leaking a
       // Responses-only assumption into Agent orchestration.
-      toolChoice: provider.toolChoice ?? "auto"
+      toolChoice: overrides.toolChoice ?? provider.toolChoice ?? "auto"
     };
   };
 
@@ -460,13 +506,27 @@ export function createHumanoidAgentHierarchy(input: {
       continue_goal_epoch: "goal_epoch_continued"
     })
   });
+  const motionPlanner = new Agent({
+    name: "全身运动规划智能体",
+    instructions: scopedInstructions(
+      HUMANOID_AGENT_IDS.motionPlanner,
+      motionPlannerInstructions()
+    ),
+    model: ownModel(HUMANOID_AGENT_IDS.motionPlanner),
+    modelSettings: modelSettings(HUMANOID_AGENT_IDS.motionPlanner),
+    tools: [createHumanoidEmbodiedRecallTool(input.runtime)],
+    resetToolChoice: false,
+    toolUseBehavior: "run_llm_again"
+  });
   const motion = new Agent({
-    name: "全身运动参考智能体",
-    instructions: scopedInstructions(HUMANOID_AGENT_IDS.motion, motionInstructions()),
+    name: "全身运动动作智能体",
+    instructions: scopedInstructions(HUMANOID_AGENT_IDS.motion, motionActorInstructions()),
     model: ownModel(HUMANOID_AGENT_IDS.motion),
-    modelSettings: modelSettings(HUMANOID_AGENT_IDS.motion),
+    modelSettings: modelSettings(HUMANOID_AGENT_IDS.motion, {
+      thinking: "disabled",
+      toolChoice: "required"
+    }),
     tools: [
-      createHumanoidEmbodiedRecallTool(input.runtime),
       ...createHumanoidActionTools(
         input.runtime,
         HUMANOID_AGENT_IDS.motion,
@@ -504,6 +564,7 @@ export function createHumanoidAgentHierarchy(input: {
       HUMANOID_AGENT_TOOL_CONTRACTS.executor.implementationContract
   };
   const goalManagerSession = ownSession(HUMANOID_AGENT_IDS.goalManager);
+  const motionPlannerSession = ownSession(HUMANOID_AGENT_IDS.motionPlanner);
   ownSession(HUMANOID_AGENT_IDS.motion);
   const coordinatorSession = ownSession(HUMANOID_AGENT_IDS.coordinator);
   const agentToolSession = (contract: ModelAgentToolContract): Session => {
@@ -517,7 +578,6 @@ export function createHumanoidAgentHierarchy(input: {
     return session;
   };
   const goalManagerContract = HUMANOID_AGENT_TOOL_CONTRACTS.goalManager;
-  const motionContract = HUMANOID_AGENT_TOOL_CONTRACTS.motion;
   const coordinator = new Agent({
     name: "人形自主协调智能体",
     instructions: scopedInstructions(HUMANOID_AGENT_IDS.coordinator, coordinatorInstructions()),
@@ -563,44 +623,15 @@ export function createHumanoidAgentHierarchy(input: {
         )
       ), SpecialistDelegationSchema),
       groundingMonitorTool(input.runtime),
-      recoverAgentToolInput(scopeAgentToolInvocation(
-        HUMANOID_AGENT_IDS.motion,
-        requireDelegatedDecision(
-          HUMANOID_AGENT_IDS.motion,
-          motion.asTool({
-        toolName: motionContract.toolName,
-        toolDescription: "让独立运动参考智能体读取当前状态，提出多个按偏好排序且分别经过完整物理预演的连续全身动作候选，或规划双足路线。",
-        customOutputExtractor: ({ finalOutput }) => serializeAgentToolOutput(finalOutput),
-        parameters: SpecialistDelegationSchema,
-        inputBuilder: () => motionInvocationInput(
-          input.runtime.contextAnchor(HUMANOID_AGENT_IDS.motion)
-        ),
-        includeInputSchema: motionContract.includeInputSchema,
-        needsApproval: motionContract.needsApproval,
-        runConfig: { callModelInputFilter: input.callModelInputFilter },
-        runOptions: {
-          session: agentToolSession(motionContract),
-          maxTurns: null,
-          reasoningItemIdPolicy: "omit"
-        },
-        resumeState: { contextStrategy: motionContract.resumeContextStrategy },
-        ...(input.onAgentStream
-          ? { onStream: ({ event }) => input.onAgentStream!(HUMANOID_AGENT_IDS.motion, event) }
-          : {})
-          }),
-          (output) => isFormalActionReceipt(
-            output,
-            HUMANOID_AGENT_IDS.motion,
-            [
-              "submit_humanoid_skill_plan",
-              "begin_humanoid_skill",
-              "plan_humanoid_skill",
-              "plan_whole_body_motion_candidates",
-              "plan_humanoid_navigation"
-            ]
-          )
-        )
-      ), SpecialistDelegationSchema),
+      recoverAgentToolInput(createMotionPipelineTool({
+        runtime: input.runtime,
+        planner: motionPlanner,
+        actor: motion,
+        plannerSession: motionPlannerSession,
+        actorSession: sessions.get(HUMANOID_AGENT_IDS.motion)!,
+        callModelInputFilter: input.callModelInputFilter,
+        ...(input.onAgentStream ? { onAgentStream: input.onAgentStream } : {})
+      }), SpecialistDelegationSchema),
       executionGateTool(input.runtime),
       cycleCompletionTool(input.runtime),
       satisfiedGoalCompletionTool(input.runtime)
@@ -614,6 +645,7 @@ export function createHumanoidAgentHierarchy(input: {
     goalManager,
     coordinator,
     sentry,
+    motionPlanner,
     motion,
     executor,
     goalManagerSession,
@@ -647,6 +679,146 @@ function groundingMonitorTool(
     scopeAgentToolInvocation(HUMANOID_AGENT_IDS.sentry, groundingTool),
     SpecialistDelegationSchema
   );
+}
+
+function createMotionPipelineTool(input: {
+  runtime: HumanoidHierarchyRuntime;
+  planner: Agent;
+  actor: Agent;
+  plannerSession: Session;
+  actorSession: Session;
+  callModelInputFilter: CallModelInputFilter;
+  onAgentStream?: (agentId: string, event: RunStreamEvent) => void | Promise<void>;
+}): FunctionTool<unknown, typeof SpecialistDelegationSchema, string> {
+  const contract = HUMANOID_AGENT_TOOL_CONTRACTS.motion;
+  const runner = new Runner({
+    tracingDisabled: true,
+    traceIncludeSensitiveData: false,
+    callModelInputFilter: input.callModelInputFilter,
+    toolExecution: { maxFunctionToolConcurrency: 1 },
+    toolNotFoundBehavior: "return_error_to_model",
+    reasoningItemIdPolicy: "omit",
+    modelSettings: { parallelToolCalls: false }
+  });
+  const drain = async <TStream extends {
+    completed: Promise<void>;
+    [Symbol.asyncIterator](): AsyncIterator<RunStreamEvent>;
+  }>(
+    agentId: string,
+    stream: TStream
+  ): Promise<void> => {
+    for await (const event of stream) await input.onAgentStream?.(agentId, event);
+    await stream.completed;
+  };
+  const runPlanner = async (
+    authority: JsonValue,
+    signal?: AbortSignal
+  ): Promise<string> => withAgentInvocation(
+    HUMANOID_AGENT_IDS.motionPlanner,
+    async () => {
+      if (!input.onAgentStream) {
+        const result = await runner.run(
+          input.planner,
+          motionInvocationInput(authority),
+          {
+            session: input.plannerSession,
+            maxTurns: null,
+            reasoningItemIdPolicy: "omit",
+            toolExecution: { maxFunctionToolConcurrency: 1 },
+            ...(signal ? { signal } : {})
+          }
+        );
+        return boundedMotionPlannerArtifact(result.finalOutput);
+      }
+      const stream = await runner.run(
+        input.planner,
+        motionInvocationInput(authority),
+        {
+          stream: true,
+          session: input.plannerSession,
+          maxTurns: null,
+          reasoningItemIdPolicy: "omit",
+          toolExecution: { maxFunctionToolConcurrency: 1 },
+          ...(signal ? { signal } : {})
+        }
+      );
+      await drain(HUMANOID_AGENT_IDS.motionPlanner, stream);
+      return boundedMotionPlannerArtifact(stream.finalOutput);
+    }
+  );
+  const runActor = async (
+    plannerArtifact: string,
+    authority: JsonValue,
+    signal?: AbortSignal
+  ): Promise<string> => withAgentInvocation(
+    HUMANOID_AGENT_IDS.motion,
+    async () => {
+      if (!input.onAgentStream) {
+        const result = await runner.run(
+          input.actor,
+          motionActorInvocationInput(plannerArtifact, authority),
+          {
+            session: input.actorSession,
+            maxTurns: null,
+            reasoningItemIdPolicy: "omit",
+            toolExecution: { maxFunctionToolConcurrency: 1 },
+            ...(signal ? { signal } : {})
+          }
+        );
+        return serializeAgentToolOutput(result.finalOutput);
+      }
+      const stream = await runner.run(
+        input.actor,
+        motionActorInvocationInput(plannerArtifact, authority),
+        {
+          stream: true,
+          session: input.actorSession,
+          maxTurns: null,
+          reasoningItemIdPolicy: "omit",
+          toolExecution: { maxFunctionToolConcurrency: 1 },
+          ...(signal ? { signal } : {})
+        }
+      );
+      await drain(HUMANOID_AGENT_IDS.motion, stream);
+      return serializeAgentToolOutput(stream.finalOutput);
+    }
+  );
+  return scopeAgentToolInvocation(HUMANOID_AGENT_IDS.motion, tool({
+    name: contract.toolName,
+    description: "运行独立 Motion Planner → Motion Actor 管线：Planner 保留语义推理，Actor 只把本轮有界计划和最新权威状态落实为一个正式 Harness 动作工具。",
+    parameters: SpecialistDelegationSchema,
+    strict: true,
+    needsApproval: contract.needsApproval,
+    timeoutBehavior: "raise_exception",
+    errorFunction: null,
+    execute: async (_params, _context, details) => {
+      details?.signal?.throwIfAborted();
+      const plannerAuthority = input.runtime.contextAnchor(
+        HUMANOID_AGENT_IDS.motionPlanner
+      );
+      const plannerArtifact = await runPlanner(plannerAuthority, details?.signal);
+      const actorAuthority = input.runtime.contextAnchor(HUMANOID_AGENT_IDS.motion);
+      const output = await runActor(plannerArtifact, actorAuthority, details?.signal);
+      if (isFormalActionReceipt(output, HUMANOID_AGENT_IDS.motion, [
+        "submit_humanoid_skill_plan",
+        "begin_humanoid_skill",
+        "plan_humanoid_skill",
+        "plan_whole_body_motion_candidates",
+        "plan_humanoid_navigation"
+      ])) return output;
+      throw new ModelDecisionStallError(
+        HUMANOID_AGENT_IDS.motion,
+        `${HUMANOID_AGENT_IDS.motion} did not return its required terminal tool result`
+      );
+    }
+  }));
+}
+
+function boundedMotionPlannerArtifact(output: unknown): string {
+  const text = serializeAgentToolOutput(output).trim();
+  if (text.length === 0) return "Planner returned no prose plan; derive the one legal action from current authority without inventing identifiers.";
+  if (text.length <= MOTION_PLAN_ARTIFACT_MAX_CHARACTERS) return text;
+  return text.slice(0, MOTION_PLAN_ARTIFACT_MAX_CHARACTERS);
 }
 
 function executionGateTool(
@@ -879,6 +1051,8 @@ export function humanoidAgentRole(agentId: string): Exclude<AgentModelRole, "com
       return "coordinator";
     case HUMANOID_AGENT_IDS.sentry:
       return "sentry";
+    case HUMANOID_AGENT_IDS.motionPlanner:
+      return "motion_planner";
     case HUMANOID_AGENT_IDS.motion:
       return "motion";
     case HUMANOID_AGENT_IDS.executor:
@@ -1144,24 +1318,34 @@ function goalManagerInstructions(): string {
   ].join("\n");
 }
 
-function motionInstructions(): string {
+function motionPlannerInstructions(): string {
   return [
-    "你是全身 Skill 规划智能体，拥有独立模型、独立 Session，并只决定语义目标与策略。每次委派只提交一个正式工具事务，不输出普通聊天。",
+    "你是全身 Motion Planner Agent，拥有独立模型、独立 Session，并只决定本轮语义目标与策略。你不拥有物理动作工具，也不能直接改变 Harness 或世界。",
     "CURRENT MOTION DELEGATION.grounding_snapshot 是 Sentry 在本次 coordinator phase 捕获并由 Harness 绑定给你的唯一当前物理事实。你没有感知工具；快照缺失或 world_revision 不匹配时不得规划。",
     "根据 active Goal、实时空间信念、对象世界模型、Affordance、关节状态、掌指几何、平衡和近期真实失败，自主选择当前局部阶段。不得使用固定巡逻点、预设动作序列、随机电机噪声或猜测坐标。",
     "每个 Skill 必须对 active Goal 具有可验证因果关系：空间目标应推进对应位置或区域谓词，操作 Skill 应匹配 Goal 中的对象、方块或关节，准备阶段应建立同一实体的真实前置条件。与 Goal 无关或令目标距离增加的另一 frontier 会被 Harness 拒绝；真实物理失败授权的安全恢复除外。",
     "观察中的 control_authority 区分 MuJoCo 物理后端、已加载学习策略的真实能力和任务空间生成器。active_control 是当前物理帧实际执行的控制来源：learned_policy 为学习控制，reference_control 为参考控制，hybrid_control 为学习式下肢运动与参考式上肢跟踪的同帧组合；transition 表示尚未结束的连续交接。只有 learned_policy.capabilities 明确列出的能力才能称为已经由策略学习；未列出的接触操作能力不能靠叙述冒充已训练，是否可执行仍以当前控制后端的完整 MuJoCo 预演为准。",
     "观察回执的 interaction.available_skills 中 learned_policy_ready 与 learned_policy_missing_capabilities 表示训练策略是否完整覆盖该 Skill；false 只表示使用 reference_control_fallback，仍须通过完整 MuJoCo 预演。",
-    "观察后若当前没有仍与 world_revision 一致的 Skill 计划，调用 submit_humanoid_skill_plan 提交短程 Skill DAG；已有有效计划时继续其中依赖已满足的节点。你必须自己选择策略、Skill、目标对象或 frontier、交互点、手、操作方向及依赖。",
-    "submit_humanoid_skill_plan 被接受后，本次委派立即结束。下一次委派从 planning_tool_state.ready_skill_bindings 自主选择一项，并将其中 skill_plan_transaction_id、skill_node_id、invocation、phase 原样复制到 begin_humanoid_skill。若有多个 ready binding，选择权属于你而非 Harness。",
+    "观察后若当前没有仍与 world_revision 一致的 Skill 计划，明确提出 submit_humanoid_skill_plan 所需的短程 Skill DAG；已有有效计划时继续其中依赖已满足的节点。你必须自己选择策略、Skill、目标对象或 frontier、交互点、手、操作方向及依赖。",
+    "若 planning_tool_state.ready_skill_bindings 非空，从中自主选择一项，并在计划中明确要求 Motion Actor 将 skill_plan_transaction_id、skill_node_id、invocation、phase 原样复制到 begin_humanoid_skill。若有多个 ready binding，选择权属于你而非 Harness。",
     "长程语义 Skill 可能由多个真实物理 chunk 完成。物理 chunk 成功不等于 Skill phase 完成；若下一次委派的 planning_tool_state 保留 skill_plan 且给出 ready_skill_bindings，从中选择并原样调用 begin_humanoid_skill，继续同一模型提交的 DAG，禁止重复提交整个 DAG。",
-    "begin_humanoid_skill 被接受后，本次委派立即结束。下一次委派只调用 planning_tool_state.active_skill.planning_action，并逐字复制该绑定要求的事务标识。",
+    "planning_tool_state.active_skill 存在时，只计划其 planning_action，并要求 Actor 逐字复制该绑定要求的事务标识。",
     "plan_humanoid_skill 会从实时几何生成站位、任务空间轨迹和终止契约，再通过 Recast、IK 与 MuJoCo 完整预演；不能提交关节角或低层路线绕过它。planning_tool_state.transit_clearance.status=required 时，可调用 plan_humanoid_navigation 或 plan_whole_body_motion_candidates，并逐字传递其中 skill_transaction_id；候选仍必须由你选择且通过新的 MuJoCo 预演。",
     "explore 必须选择当前 spatial_belief.frontiers 中真实存在的 frontier；自主差异来自模型对信息增益、路程、覆盖率、近期经历和长期 Goal 的判断，不得由程序随机替代。",
     "操作物体时保持模型选定的对象、手、交互点和策略。向语义区域搬运已持握物体时使用 carry_to_zone 并逐字引用 zone_id；确定性导航层会根据当前物体相对根节点的真实偏移计算机器人终点，禁止把 zone.center 直接当作机器人根目标。对 object_in_zone 或 object_placed Goal，place.destination 使用 semantic_zone 并逐字引用 zone_id，让确定性求解器从区域支撑面和物体尺寸计算落点；不得把 zone.center 猜成 world_pose。approach、reach、grasp、lift、carry、carry_to_zone、place、push、pull、press、open、close、turn、regrasp 与双手 Skill 的低层几何由求解器从当前状态计算，物理拒绝不会被伪装为成功。",
     "break_block 只能选择当前 solid_tokens 中 kind=block 的实体，并由你选择手、strike 或 press 策略；必须先完成可达接近，再以真实稳定掌指接触取得拆除权限。固定物体不能拆除。",
     "planning_tool_state.recovery_policy 来自真实失败分类；从其中允许的恢复 Skill 中作出新的模型选择。不得重复完全相同的失败方案，也不得让 Harness 改换语义目标、对象、手或策略。",
     "recall_embodied_history 只用于比较过去策略结果。召回内容始终是 historical_only；任何新动作都必须重新观察并绑定当前 world_revision。",
-    "一个被接受或拒绝的规划回执就是本次专职任务的结果。"
+    "最终输出一个自包含、有界的 Motion Plan Artifact：说明应调用的唯一正式工具、语义选择、需逐字复制的权威标识以及理由。不要声称工具已经执行，不要输出 Harness 回执。"
+  ].join("\n");
+}
+
+function motionActorInstructions(): string {
+  return [
+    "你是 Motion Actor Agent，拥有独立模型和独立 Session。你不接收 Planner 的会话历史，只接收本轮有界 Motion Plan Artifact 与最新 CURRENT MOTION ACTOR AUTHORITY。",
+    "每次响应必须且只能调用一个正式工具，不得输出普通聊天。你不重新规划、不改变 Planner 的语义选择、不调用历史召回。",
+    "Planner artifact 不是权限来源。工具可用性、world revision、Skill binding、transaction id 与 planning_action 只以最新 CURRENT MOTION ACTOR AUTHORITY 为准；所有标识必须逐字复制，缺失时不得猜测。",
+    "若 artifact 与当前权威状态冲突，以权威状态中唯一合法的当前阶段动作修正落地；不得沿用旧 binding 或旧坐标。",
+    "正式结果必须来自 submit_humanoid_skill_plan、begin_humanoid_skill、plan_humanoid_skill、plan_whole_body_motion_candidates 或 plan_humanoid_navigation 的一个工具调用。"
   ].join("\n");
 }

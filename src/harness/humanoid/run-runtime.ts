@@ -208,17 +208,23 @@ export type HumanoidCoordinatorPhase =
   | "post_execution"
   | "complete_cycle";
 
-function pendingCompactReplanSpecialist(
-  budget: HumanoidReplanBudget
+function compactReplanAttemptInProgress(
+  budget: HumanoidReplanBudget,
+  committedActions: HumanoidRunCheckpoint["committed_actions"],
+  activeCycle: ActiveAutonomousCycle
 ): boolean {
   const latestDecisionIndex = budget.model_calls.findLastIndex(
     (call) => call.role === "replan_decision"
   );
   if (latestDecisionIndex < 0) return false;
-  const latestSpecialistIndex = budget.model_calls.findLastIndex(
-    (call) => call.role === "specialist_replan"
-  );
-  return latestDecisionIndex > latestSpecialistIndex;
+  const decision = budget.model_calls[latestDecisionIndex]!;
+  const nextFailure = humanoidActionReceiptsInCommitOrder(committedActions)
+    .filter((receipt) => sameAutonomousCycle(receipt.cycle, activeCycle))
+    .find((receipt) => receipt.committedAt > decision.started_at
+      && ((!receipt.accepted && isHumanoidPlanningReceipt(receipt))
+        || (physicalExecutionReceipt(receipt)
+          && !completedPhysicalExecution(receipt))));
+  return nextFailure === undefined;
 }
 
 export class HumanoidRunRuntime implements LongRunContextRuntime {
@@ -786,7 +792,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         evidence_ref: evidence.ref,
         world_revision: captured.world.worldRevision
       });
+      // Continuing an active Goal transfers control back to the Coordinator,
+      // so publish the successor Cycle in the same locked checkpoint cut. A
+      // specialist result must never expose `active Goal + no active Cycle` as
+      // if the Goal Manager should select the already-active Goal again.
       this.#checkpoint.active_cycle = null;
+      const nextCycle = this.#createActiveCycle();
       this.#pruneRuntimeAuthority();
       await this.#persist();
       await this.emit("autonomous_cycle_interrupted", json({
@@ -796,11 +807,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         evidence_ref: evidence.ref,
         world_revision: captured.world.worldRevision
       }));
+      await this.#emitCycleStarted(nextCycle);
       return json({
         status: "goal_epoch_continued",
         epoch_id: interruptedCycle.goal_epoch_id,
         completed_cycle_id: interruptedCycle.cycle_id,
-        next_cycle_index: interruptedCycle.cycle_index + 1,
+        next_cycle_id: nextCycle.cycle_id,
+        next_cycle_index: nextCycle.cycle_index,
         reason: input.reason,
         recovery_intent: input.recovery_intent,
         evidence_ref: evidence.ref,
@@ -996,7 +1009,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   coordinatorPhase(): HumanoidCoordinatorPhase {
     if (this.#checkpoint.goal_dag.status !== "active") return "goal_selection";
     const activeCycle = this.#checkpoint.active_cycle;
-    if (!activeCycle) return "goal_selection";
+    if (!activeCycle) {
+      throw new Error(
+        "An active Goal must enter an autonomous Cycle before Coordinator dispatch"
+      );
+    }
     const receipts = humanoidActionReceiptsInCommitOrder(
       this.#checkpoint.committed_actions
     );
@@ -1108,12 +1125,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     if (!activeCycleState) return false;
     const budget = activeCycleState.replan_budget;
     if (budget.goal_reevaluation_started) return true;
-    const compactDecisionPendingSpecialist = pendingCompactReplanSpecialist(budget);
-    const recoveryDeadlineExceeded = budget.recovery_deadline_at !== null
-      && Date.now() > Date.parse(budget.recovery_deadline_at);
-    if (!compactDecisionPendingSpecialist
-      && (budget.compact_replans_started >= budget.compact_replan_limit
-        || recoveryDeadlineExceeded)) {
+    const compactAttemptInProgress = compactReplanAttemptInProgress(
+      budget,
+      this.#checkpoint.committed_actions,
+      activeCycleState
+    );
+    if (!compactAttemptInProgress
+      && budget.compact_replans_started >= budget.compact_replan_limit) {
       return true;
     }
     return false;
@@ -1180,11 +1198,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     if (phase !== "replan_or_retire") return false;
     const budget = this.#checkpoint.active_cycle?.replan_budget;
     if (!budget || budget.goal_reevaluation_started) return false;
-    if (pendingCompactReplanSpecialist(budget)) return true;
-    const recoveryDeadlineExceeded = budget.recovery_deadline_at !== null
-      && Date.now() > Date.parse(budget.recovery_deadline_at);
-    return !recoveryDeadlineExceeded
-      && budget.compact_replans_started < budget.compact_replan_limit;
+    if (compactReplanAttemptInProgress(
+      budget,
+      this.#checkpoint.committed_actions,
+      this.#checkpoint.active_cycle!
+    )) return true;
+    return budget.compact_replans_started < budget.compact_replan_limit;
   }
 
   #validateCycleCausalEvidence(
@@ -1251,11 +1270,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#rememberGoalEvidence(result.worldEvidence);
     this.#contextGoalEvidenceRefs.set(agentId, result.worldEvidence.evidence.ref);
     this.#pruneGoalEvidence();
-    if (agentId !== "humanoid-motion-reference") return result.anchor;
+    if (agentId !== "humanoid-motion-reference"
+      && agentId !== "humanoid-motion-planner") return result.anchor;
     return json({
       ...(object(result.anchor) ?? {}),
-      planning_tool_state: this.#actions.planningToolState(agentId),
-      grounding_snapshot: this.#actions.planningGroundingState(agentId)
+      planning_tool_state: this.#actions.planningToolState("humanoid-motion-reference"),
+      grounding_snapshot: this.#actions.planningGroundingState("humanoid-motion-reference")
     });
   }
 
@@ -1321,9 +1341,19 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       const cycle = this.#activeCycleRef();
       const modelCallId = randomUUID();
       const at = new Date().toISOString();
-      const budgetRole = this.coordinatorPhase() === "replan_or_retire"
+      const rawBudgetRole = this.coordinatorPhase() === "replan_or_retire"
         ? replanBudgetRole(agentId)
         : undefined;
+      const budgetRole = rawBudgetRole === "coordinator"
+        && this.#checkpoint.active_cycle
+        && (this.#checkpoint.active_cycle.replan_budget.goal_reevaluation_started
+          || compactReplanAttemptInProgress(
+            this.#checkpoint.active_cycle.replan_budget,
+            this.#checkpoint.committed_actions,
+            this.#checkpoint.active_cycle
+          ))
+        ? undefined
+        : rawBudgetRole;
       const budgetUpdate = budgetRole && this.#checkpoint.active_cycle
         ? beginHumanoidReplanModelCall(
             this.#checkpoint.active_cycle.replan_budget,
@@ -4290,6 +4320,7 @@ function replanBudgetRole(
   agentId: string
 ): "coordinator" | "motion" | "goal_manager" | undefined {
   if (agentId === "humanoid-coordinator") return "coordinator";
+  if (agentId === "humanoid-motion-planner") return "motion";
   if (agentId === "humanoid-motion-reference") return "motion";
   if (agentId === "humanoid-goal-manager") return "goal_manager";
   return undefined;

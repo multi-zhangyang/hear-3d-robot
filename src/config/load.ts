@@ -27,6 +27,7 @@ export const AGENT_MODEL_ROLES = [
   "goal_manager",
   "coordinator",
   "sentry",
+  "motion_planner",
   "motion",
   "executor",
   "compactor"
@@ -75,6 +76,7 @@ const ProviderConfigSchema = z.object({
     goal_manager: ModelProviderConfigSchema,
     coordinator: ModelProviderConfigSchema,
     sentry: ModelProviderConfigSchema,
+    motion_planner: ModelProviderConfigSchema,
     motion: ModelProviderConfigSchema,
     executor: ModelProviderConfigSchema,
     compactor: ModelProviderConfigSchema
@@ -172,9 +174,16 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
     compactRecentModelTurns: numberFromEnv(env.AI_COMPACT_RECENT_MODEL_TURNS, 4),
     compactMaxOutputTokens
   });
+  const motionProvider = loadAgentModelConfig(env, "motion", inherited);
   const agentModels = Object.fromEntries(AGENT_MODEL_ROLES.map((role) => [
     role,
-    loadAgentModelConfig(env, role, inherited)
+    role === "motion"
+      ? motionProvider
+      : loadAgentModelConfig(
+          env,
+          role,
+          role === "motion_planner" ? motionProvider : inherited
+        )
   ])) as Record<AgentModelRole, ModelProviderConfig>;
   return ProviderConfigSchema.parse({ ...inherited, agentModels });
 }

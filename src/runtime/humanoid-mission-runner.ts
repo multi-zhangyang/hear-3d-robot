@@ -511,7 +511,7 @@ async function executeHumanoidMission(input: {
     await input.runtime.recordProvider({
       status: "configured",
       ...providerIdentity(coordinatorProvider),
-      hierarchy: "three_reasoning_agents_plus_deterministic_grounding_and_execution_services",
+      hierarchy: "coordinator_goal_manager_and_motion_planner_actor_agents_plus_deterministic_grounding_and_execution_services",
       prompt_cache_affinity: "stable_per_credential_agent_protocol_native",
       agent_manifest_epoch: currentManifest.epoch_id,
       agent_profiles: Object.fromEntries(Object.entries(currentManifest.agents).map(

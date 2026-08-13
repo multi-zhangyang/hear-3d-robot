@@ -31,7 +31,7 @@ import {
 
 const COMPACTOR_AGENT_ID = "humanoid-context-compactor";
 const COMPACTOR_AGENT_NAME = "Context Compactor";
-const HUMANOID_HARNESS_CONTRACT_VERSION = 21;
+const HUMANOID_HARNESS_CONTRACT_VERSION = 22;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
@@ -40,6 +40,7 @@ const CORE_SDK_PACKAGES = [
 const MODEL_RUNTIME_ROLES = [
   "goal_manager",
   "coordinator",
+  "motion_planner",
   "motion",
   "compactor"
 ] as const satisfies readonly AgentModelRole[];
@@ -109,6 +110,10 @@ export function createHumanoidAgentManifest(input: {
     input.hierarchy.coordinator,
     "coordinator"
   );
+  const motionPlannerSource = sourceFromAgent(
+    input.hierarchy.motionPlanner,
+    "motion_planner"
+  );
   const motionSource = sourceFromAgent(input.hierarchy.motion, "motion");
   const compactorProvider = providerConfigForRole(input.provider, "compactor");
   const compactorIdentity = contextCompactorIdentitySource();
@@ -158,6 +163,12 @@ export function createHumanoidAgentManifest(input: {
     sentry: deterministicServiceIdentity(
       "sentry",
       input.hierarchy.sentry
+    ),
+    motion_planner: modelIdentity(
+      "motion_planner",
+      HUMANOID_AGENT_IDS.motionPlanner,
+      motionPlannerSource,
+      providerConfigForRole(input.provider, "motion_planner")
     ),
     motion: modelIdentity(
       "motion",
@@ -349,6 +360,12 @@ function toolUseBehaviorIdentity(
   role: Exclude<AgentModelRole, "compactor">
 ): ToolUseBehaviorIdentity {
   const behavior = agent.toolUseBehavior;
+  if (role === "motion_planner") {
+    if (behavior !== "run_llm_again") {
+      throw new Error("Motion Planner must preserve the standard SDK model loop");
+    }
+    return { kind: "sdk_flag", value: "run_llm_again" };
+  }
   if (typeof behavior === "string") {
     return { kind: "sdk_flag", value: behavior };
   }
@@ -492,6 +509,13 @@ function createAgentToolContracts(
           + definition.runOptions.sessionAgentId
         );
       }
+    if (definition.dispatchKind === "model_pipeline"
+      && (!hierarchy.session(definition.pipeline.plannerSessionAgentId)
+        || !hierarchy.session(definition.pipeline.actorSessionAgentId))) {
+      throw new Error(
+        `Agent pipeline ${definition.toolName} requires independent Planner and Actor Sessions`
+      );
+    }
     const toolSchema = functionToolSchemaIdentity(matches[0], definition.toolName);
     return {
       dispatch_kind: definition.dispatchKind,
@@ -520,6 +544,18 @@ function createAgentToolContracts(
               max_turns: definition.runOptions.maxTurns
             },
             resume_context_strategy: definition.resumeContextStrategy
+          }
+        : {}),
+      ...(definition.dispatchKind === "model_pipeline"
+        ? {
+            pipeline: {
+              planner_agent_id: definition.pipeline.plannerAgentId,
+              planner_session_agent_id: definition.pipeline.plannerSessionAgentId,
+              actor_agent_id: definition.pipeline.actorAgentId,
+              actor_session_agent_id: definition.pipeline.actorSessionAgentId,
+              artifact_contract: definition.pipeline.artifactContract,
+              authority_contract: definition.pipeline.authorityContract
+            }
           }
         : {}),
       include_input_schema: definition.includeInputSchema,

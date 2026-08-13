@@ -292,15 +292,17 @@ describe("humanoid agent hierarchy", () => {
 
     expect(modelOwners).toEqual([
       "humanoid-goal-manager",
+      "humanoid-motion-planner",
       "humanoid-motion-reference",
       "humanoid-coordinator"
     ]);
     expect(sessionOwners).toEqual([
       "humanoid-goal-manager",
+      "humanoid-motion-planner",
       "humanoid-motion-reference",
       "humanoid-coordinator"
     ]);
-    expect(new Set(models).size).toBe(3);
+    expect(new Set(models).size).toBe(4);
     expect(hierarchy.goalManager.model).not.toBe(hierarchy.coordinator.model);
     expect(hierarchy.coordinator.model).not.toBe(hierarchy.motion.model);
     expect(hierarchy.sentry).toMatchObject({
@@ -337,7 +339,6 @@ describe("humanoid agent hierarchy", () => {
       "execute_whole_body_motion"
     );
     expect(hierarchy.motion.tools.map((entry) => entry.name)).toEqual([
-      "recall_embodied_history",
       "submit_humanoid_skill_plan",
       "begin_humanoid_skill",
       "plan_humanoid_skill",
@@ -534,7 +535,7 @@ describe("humanoid agent hierarchy", () => {
     );
     expect(String(validExecutorDelegation)).toContain('"accepted":true');
     expect(invokedActions).toContain("execute_humanoid_navigation");
-    expect(modelOwners).toHaveLength(3);
+    expect(modelOwners).toHaveLength(4);
     cycleCompletion = {
       status: "ready",
       evidence_transaction_ids: [execution.transactionId],
@@ -578,23 +579,26 @@ describe("humanoid agent hierarchy", () => {
     coordinatorPhase = "complete_cycle";
     executorDelegationAvailable = false;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "submit_humanoid_skill_plan 提交短程 Skill DAG"
+    expect(hierarchy.motionPlanner.instructions).toEqual(expect.stringContaining(
+      "submit_humanoid_skill_plan 所需的短程 Skill DAG"
     ));
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
-      "只调用 planning_tool_state.active_skill.planning_action"
+    expect(hierarchy.motionPlanner.instructions).toEqual(expect.stringContaining(
+      "只计划其 planning_action"
     ));
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+    expect(hierarchy.motionPlanner.instructions).toEqual(expect.stringContaining(
       "不能提交关节角或低层路线绕过它"
     ));
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+    expect(hierarchy.motionPlanner.instructions).toEqual(expect.stringContaining(
       "break_block 只能选择当前 solid_tokens 中 kind=block 的实体"
     ));
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+    expect(hierarchy.motionPlanner.instructions).toEqual(expect.stringContaining(
       "不得使用固定巡逻点、预设动作序列、随机电机噪声"
     ));
-    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+    expect(hierarchy.motionPlanner.instructions).toEqual(expect.stringContaining(
       "grounding_snapshot 是 Sentry 在本次 coordinator phase 捕获并由 Harness 绑定给你的唯一当前物理事实"
+    ));
+    expect(hierarchy.motion.instructions).toEqual(expect.stringContaining(
+      "不接收 Planner 的会话历史"
     ));
     expect(hierarchy.goalManager.instructions).toEqual(expect.stringContaining(
       "不得改 tolerance、删减谓词或拼接额外条件"
@@ -863,12 +867,11 @@ describe("humanoid agent hierarchy", () => {
     expect(filteredAgents).toEqual([]);
   });
 
-  it("returns a prose-only Motion stall to the outer Harness", async () => {
+  it("passes a prose Motion plan to an independent required-tool Actor", async () => {
     let worldRevision = 11;
     const modelRequests: ModelRequest[] = [];
     const invokedActions: string[] = [];
     const sessions = new Map<string, MemorySession>();
-    let motionResponse = 0;
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
       runtime: delegatedMotionRuntime({
@@ -890,22 +893,30 @@ describe("humanoid agent hierarchy", () => {
           });
         }
       }),
-      createModel: (agentId) => agentId === "humanoid-motion-reference"
+      createModel: (agentId) => agentId === "humanoid-motion-planner"
         ? {
             getResponse: async (request) => {
               modelRequests.push(request);
-              motionResponse += 1;
-              if (motionResponse === 1) return textResponse("现在提交正式规划。");
-              return functionCallResponse(
-                "plan_humanoid_skill",
-                JSON.stringify({ skill_transaction_id: "skill-binding-12" })
-              );
+              return textResponse("调用 plan_humanoid_skill 并逐字复制 skill-binding-12。");
             },
             getStreamedResponse: () => {
               throw new Error("Streaming is outside this test");
             }
           } as Model
-        : modelStub(),
+        : agentId === "humanoid-motion-reference"
+          ? {
+              getResponse: async (request) => {
+                modelRequests.push(request);
+                return functionCallResponse(
+                  "plan_humanoid_skill",
+                  JSON.stringify({ skill_transaction_id: "skill-binding-12" })
+                );
+              },
+              getStreamedResponse: () => {
+                throw new Error("Streaming is outside this test");
+              }
+            } as Model
+          : modelStub(),
       createSession: (agentId) => {
         const session = new MemorySession({ sessionId: agentId });
         sessions.set(agentId, session);
@@ -920,7 +931,7 @@ describe("humanoid agent hierarchy", () => {
       throw new Error("Motion delegation tool is missing");
     }
 
-    await expect(delegate.invoke(
+    const output = await delegate.invoke(
       new RunContext({ runId: "motion-same-session-continuation" }),
       "{}",
       {
@@ -932,13 +943,25 @@ describe("humanoid agent hierarchy", () => {
           status: "completed"
         }
       }
-    )).rejects.toThrow("did not return its required terminal tool result");
+    );
 
-    expect(invokedActions).toEqual([]);
-    expect(modelRequests).toHaveLength(1);
+    expect(JSON.parse(String(output))).toMatchObject({
+      result: {
+        action: "plan_humanoid_skill",
+        accepted: true
+      }
+    });
+    expect(invokedActions).toEqual(["plan_humanoid_skill"]);
+    expect(modelRequests).toHaveLength(2);
+    expect(modelRequests[1]?.input.some((item) => JSON.stringify(item).includes(
+      "调用 plan_humanoid_skill"
+    ))).toBe(true);
+    expect(JSON.stringify(
+      await sessions.get("humanoid-motion-planner")?.getItems()
+    )).toContain("调用 plan_humanoid_skill");
     expect(JSON.stringify(
       await sessions.get("humanoid-motion-reference")?.getItems()
-    )).toContain("现在提交正式规划");
+    )).not.toContain("response-prose");
     expect(hierarchy.session("humanoid-motion-reference")).toBe(
       sessions.get("humanoid-motion-reference")
     );
@@ -955,7 +978,7 @@ describe("humanoid agent hierarchy", () => {
           throw new Error("No action should be synthesized from prose");
         }
       }),
-      createModel: (agentId) => agentId === "humanoid-motion-reference"
+      createModel: (agentId) => agentId === "humanoid-motion-planner"
         ? {
             getResponse: async () => {
               modelCalls += 1;
@@ -988,7 +1011,7 @@ describe("humanoid agent hierarchy", () => {
           status: "completed"
         }
       }
-    )).rejects.toThrow("did not return its required terminal tool result");
+    )).rejects.toThrow();
     expect(modelCalls).toBe(1);
     expect(actionCalls).toBe(0);
   });
@@ -1001,7 +1024,8 @@ describe("humanoid agent hierarchy", () => {
         goal_manager: { ...unboundedProvider, model: "goal-manager", temperature: 0.15 },
         coordinator: { ...provider, model: "coordinator", temperature: 0.1 },
         sentry: { ...provider, model: "sentry", temperature: 0.2 },
-        motion: { ...provider, model: "motion", temperature: 0.3 },
+        motion_planner: { ...provider, model: "motion-planner", temperature: 0.25 },
+        motion: { ...provider, model: "deepseek-v4-flash", temperature: 0.3 },
         executor: {
           ...provider,
           model: "executor",
@@ -1029,19 +1053,30 @@ describe("humanoid agent hierarchy", () => {
 
     expect(Object.fromEntries(owners)).toEqual({
       "humanoid-goal-manager": "goal-manager",
-      "humanoid-motion-reference": "motion",
+      "humanoid-motion-planner": "motion-planner",
+      "humanoid-motion-reference": "deepseek-v4-flash",
       "humanoid-coordinator": "coordinator"
     });
     expect(hierarchy.coordinator.modelSettings.temperature).toBe(0.1);
     expect(hierarchy.goalManager.modelSettings.temperature).toBe(0.15);
     expect(hierarchy.goalManager.modelSettings).not.toHaveProperty("maxTokens");
+    expect(hierarchy.motionPlanner.modelSettings.temperature).toBe(0.25);
     expect(hierarchy.motion.modelSettings.temperature).toBe(0.3);
+    expect(hierarchy.motion.modelSettings.toolChoice).toBe("required");
+    expect(hierarchy.motion.modelSettings.providerData).toMatchObject({
+      thinking: { type: "disabled" },
+      providerOptions: {
+        "configured-openai-compatible": {
+          thinking: { type: "disabled" }
+        }
+      }
+    });
     expect(hierarchy.sentry.kind).toBe("deterministic_service");
     expect(hierarchy.executor.kind).toBe("deterministic_service");
     for (const agent of [
       hierarchy.goalManager,
       hierarchy.coordinator,
-      hierarchy.motion
+      hierarchy.motionPlanner
     ]) {
       expect(agent.modelSettings.toolChoice).toBe("auto");
     }

@@ -141,6 +141,14 @@ export class HumanoidModelAuthority {
       coordinator.agent_id
     );
     addActionAgent(input.manifest, coordinator.agent_id, "Coordinator");
+    const motionPlanner = input.manifest.agents.motion_planner;
+    if (motionPlanner.agent_id === goalManager.agent_id
+      || actionAgents.has(motionPlanner.agent_id)) {
+      throw new Error(
+        `Agent manifest reuses an authority identity: ${motionPlanner.agent_id}`
+      );
+    }
+    addActionAgent(input.manifest, motionPlanner.agent_id, "Motion Planner");
     for (const role of ["sentry", "motion", "executor"] as const) {
       const agent = input.manifest.agents[role];
       if (agent.agent_id === goalManager.agent_id || actionAgents.has(agent.agent_id)) {
@@ -153,6 +161,11 @@ export class HumanoidModelAuthority {
         archived,
         archived.agents.coordinator.agent_id,
         "Archived Coordinator"
+      );
+      addActionAgent(
+        archived,
+        archived.agents.motion_planner.agent_id,
+        "Archived Motion Planner"
       );
       for (const role of ["sentry", "motion", "executor"] as const) {
         addActionAgent(

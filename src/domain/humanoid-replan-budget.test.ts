@@ -62,7 +62,7 @@ describe("humanoid replan budget", () => {
     })).toThrow("exhausted after Goal re-evaluation");
   });
 
-  it("escalates on the recovery deadline without spending a stale compact replan", () => {
+  it("keeps wall-clock latency as telemetry instead of treating it as strategy failure", () => {
     const initial = createHumanoidReplanBudget();
     const first = beginHumanoidReplanModelCall(initial, {
       modelCallId: "00000000-0000-4000-8000-000000000011",
@@ -70,21 +70,21 @@ describe("humanoid replan budget", () => {
       role: "coordinator",
       at: "2026-08-11T00:00:00.000Z"
     });
-    const escalated = beginHumanoidReplanModelCall(first.budget, {
+    const delayed = beginHumanoidReplanModelCall(first.budget, {
       modelCallId: "00000000-0000-4000-8000-000000000012",
       agentId: "humanoid-coordinator",
       role: "coordinator",
       at: "2026-08-11T00:02:00.001Z"
     });
-    expect(escalated.budget.compact_replans_started).toBe(1);
-    expect(escalated.call.recovery_tier).toBe("goal_re_evaluation");
+    expect(delayed.budget.compact_replans_started).toBe(2);
+    expect(delayed.call.recovery_tier).toBe("compact_replan");
     expect(humanoidReplanBudgetAuthority(
-      escalated.budget,
+      delayed.budget,
       "2026-08-11T00:02:00.001Z"
     )).toMatchObject({
-      status: "goal_re_evaluation_in_progress",
+      status: "compact_replan_available",
       recovery_deadline_exceeded: true,
-      compact_replans: { used: 1, remaining: 2, available: false }
+      compact_replans: { used: 2, remaining: 1, available: true }
     });
   });
 

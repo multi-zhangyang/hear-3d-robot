@@ -28,7 +28,11 @@ const AgentToolUseBehaviorIdentitySchema = z.discriminatedUnion("kind", [
 ]);
 
 const AgentToolContractSchema = z.object({
-  dispatch_kind: z.enum(["model_agent", "deterministic_service"]).optional(),
+  dispatch_kind: z.enum([
+    "model_agent",
+    "model_pipeline",
+    "deterministic_service"
+  ]).optional(),
   tool_name: z.string().trim().min(1),
   target_role: z.enum(["goal_manager", "sentry", "motion", "executor"]),
   target_agent_id: z.string().trim().min(1),
@@ -40,6 +44,7 @@ const AgentToolContractSchema = z.object({
     "goal_manager_authority_envelope_v2",
     "live_authority_delegation_v1",
     "motion_authority_envelope_v1",
+    "motion_planner_actor_pipeline_v1",
     "validated_execution_task_json_v1",
     "grounding_monitor_direct_v1",
     "validated_execution_gate_v1"
@@ -52,6 +57,14 @@ const AgentToolContractSchema = z.object({
     max_turns: z.literal("unbounded")
   }).strict().optional(),
   resume_context_strategy: z.enum(["merge", "replace", "preferSerialized"]).optional(),
+  pipeline: z.object({
+    planner_agent_id: z.string().trim().min(1),
+    planner_session_agent_id: z.string().trim().min(1),
+    actor_agent_id: z.string().trim().min(1),
+    actor_session_agent_id: z.string().trim().min(1),
+    artifact_contract: z.literal("bounded_motion_plan_artifact_v1"),
+    authority_contract: z.literal("fresh_motion_authority_envelope_v1")
+  }).strict().optional(),
   include_input_schema: z.literal(false),
   needs_approval: z.literal(false),
   output_contract: z.enum([
@@ -80,6 +93,29 @@ const AgentToolContractSchema = z.object({
         code: "custom",
         path: ["output_contract"],
         message: "A model Agent delegation must return nested final output"
+      });
+    }
+  } else if (dispatch === "model_pipeline") {
+    if (!contract.pipeline) {
+      context.addIssue({
+        code: "custom",
+        path: ["pipeline"],
+        message: "A model pipeline requires planner and actor ownership"
+      });
+    }
+    if (contract.run_options || contract.resume_context_strategy
+      || contract.implementation_contract) {
+      context.addIssue({
+        code: "custom",
+        path: ["dispatch_kind"],
+        message: "A model pipeline owns separate planner and actor Sessions"
+      });
+    }
+    if (contract.output_contract !== "formal_action_receipt") {
+      context.addIssue({
+        code: "custom",
+        path: ["output_contract"],
+        message: "A model pipeline must return the Actor's formal action receipt"
       });
     }
   } else {
@@ -126,6 +162,7 @@ const AgentModelIdentitySchema = z.object({
     "goal_manager",
     "coordinator",
     "sentry",
+    "motion_planner",
     "motion",
     "executor",
     "compactor"
@@ -170,6 +207,7 @@ export const AgentManifestSchema = z.object({
     goal_manager: AgentModelIdentitySchema,
     coordinator: AgentModelIdentitySchema,
     sentry: AgentServiceOrLegacyModelIdentitySchema,
+    motion_planner: AgentModelIdentitySchema,
     motion: AgentModelIdentitySchema,
     executor: AgentServiceOrLegacyModelIdentitySchema,
     compactor: AgentModelIdentitySchema
@@ -181,6 +219,7 @@ export const AgentManifestSchema = z.object({
     "goal_manager",
     "coordinator",
     "sentry",
+    "motion_planner",
     "motion",
     "executor",
     "compactor"
@@ -225,6 +264,23 @@ export const AgentManifestSchema = z.object({
         path: ["agent_tool_contracts", index, "run_options", "session_agent_id"],
         message: "Agent-as-tool Session owner does not match its target role"
       });
+    }
+    if (contract.dispatch_kind === "model_pipeline") {
+      const pipeline = contract.pipeline;
+      const planner = manifest.agents.motion_planner;
+      const actor = manifest.agents.motion;
+      if (!pipeline
+        || pipeline.planner_agent_id !== planner.agent_id
+        || pipeline.planner_session_agent_id !== planner.agent_id
+        || pipeline.actor_agent_id !== actor.agent_id
+        || pipeline.actor_session_agent_id !== actor.agent_id
+        || contract.target_agent_id !== actor.agent_id) {
+        context.addIssue({
+          code: "custom",
+          path: ["agent_tool_contracts", index, "pipeline"],
+          message: "Motion pipeline identities must match independent Planner and Actor nodes"
+        });
+      }
     }
     if (contract.dispatch_kind === "deterministic_service") {
       if (target.execution_kind !== "deterministic_service"

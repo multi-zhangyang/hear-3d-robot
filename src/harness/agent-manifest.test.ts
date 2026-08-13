@@ -39,6 +39,7 @@ const provider: ProviderConfig = {
     goal_manager: profile("goal-manager-model", 0.15),
     coordinator: profile("coordinator-model", 0.1),
     sentry: profile("sentry-model", 0.2),
+    motion_planner: profile("motion-planner-model", 0.25),
     motion: profile("motion-model", 0.3),
     executor: profile("executor-model", 0.4),
     compactor: profile("compactor-model", 0.5)
@@ -53,13 +54,14 @@ describe("agent manifest", () => {
       "goal_manager",
       "coordinator",
       "sentry",
+      "motion_planner",
       "motion",
       "executor",
       "compactor"
     ]);
     expect(manifest.agents.motion).toMatchObject({
       agent_id: "humanoid-motion-reference",
-      agent_name: "全身运动参考智能体",
+      agent_name: "全身运动动作智能体",
       role: "motion",
       protocol: "openai_compatible",
       model: "motion-model",
@@ -68,15 +70,18 @@ describe("agent manifest", () => {
         temperature: 0.3,
         maxTokens: 2048,
         parallelToolCalls: false,
-        toolChoice: "auto"
+        toolChoice: "required"
       },
       reset_tool_choice: false,
       tool_use_behavior: {
         kind: "harness_callback",
         contract_id: "accepted_humanoid_action_receipt_v1",
         terminal_tool_names: [
+          "submit_humanoid_skill_plan",
+          "begin_humanoid_skill",
           "plan_humanoid_skill",
-          "plan_whole_body_motion_candidates"
+          "plan_whole_body_motion_candidates",
+          "plan_humanoid_navigation"
         ]
       },
       settings: {
@@ -89,7 +94,14 @@ describe("agent manifest", () => {
       "@openai/agents": "test-sdk",
       "@openai/agents-extensions": "test-bridge"
     });
-    expect(manifest.harness_contract_version).toBe(21);
+    expect(manifest.harness_contract_version).toBe(22);
+    expect(manifest.agents.motion_planner).toMatchObject({
+      agent_id: "humanoid-motion-planner",
+      agent_name: "全身运动规划智能体",
+      role: "motion_planner",
+      model: "motion-planner-model",
+      tool_use_behavior: { kind: "sdk_flag", value: "run_llm_again" }
+    });
     expect(manifest.agents.sentry).toMatchObject({
       execution_kind: "deterministic_service",
       agent_id: "humanoid-sentry",
@@ -111,14 +123,17 @@ describe("agent manifest", () => {
     expect(manifest.agents.goal_manager.tool_use_behavior).toEqual({
       kind: "harness_callback",
       contract_id: "verified_harness_terminal_status_v1",
-      terminal_tool_names: ["select_goal_candidate", "retire_goal_epoch"]
+      terminal_tool_names: [
+        "select_goal_candidate",
+        "retire_goal_epoch",
+        "continue_goal_epoch"
+      ]
     });
     expect(manifest.agents.coordinator.tool_use_behavior).toEqual({
       kind: "harness_callback",
       contract_id: "verified_harness_terminal_status_v1",
       terminal_tool_names: [
         "complete_autonomous_cycle",
-        "complete_goal_transition",
         "complete_satisfied_goal"
       ]
     });
@@ -139,9 +154,19 @@ describe("agent manifest", () => {
         output_contract: "formal_action_receipt"
       }),
       expect.objectContaining({
+        dispatch_kind: "model_pipeline",
         tool_name: "delegate_motion_reference",
         target_role: "motion",
-        input_builder_contract: "motion_authority_envelope_v1"
+        input_builder_contract: "motion_planner_actor_pipeline_v1",
+        output_contract: "formal_action_receipt",
+        pipeline: {
+          planner_agent_id: "humanoid-motion-planner",
+          planner_session_agent_id: "humanoid-motion-planner",
+          actor_agent_id: "humanoid-motion-reference",
+          actor_session_agent_id: "humanoid-motion-reference",
+          artifact_contract: "bounded_motion_plan_artifact_v1",
+          authority_contract: "fresh_motion_authority_envelope_v1"
+        }
       }),
       expect.objectContaining({
         dispatch_kind: "deterministic_service",
@@ -170,6 +195,10 @@ describe("agent manifest", () => {
         goal_manager: { ...provider.agentModels!.goal_manager, baseUrl: sensitiveEndpoint },
         coordinator: { ...provider.agentModels!.coordinator, baseUrl: sensitiveEndpoint },
         sentry: { ...provider.agentModels!.sentry, baseUrl: sensitiveEndpoint },
+        motion_planner: {
+          ...provider.agentModels!.motion_planner,
+          baseUrl: sensitiveEndpoint
+        },
         motion: { ...provider.agentModels!.motion, baseUrl: sensitiveEndpoint },
         executor: { ...provider.agentModels!.executor, baseUrl: sensitiveEndpoint },
         compactor: { ...provider.agentModels!.compactor, baseUrl: sensitiveEndpoint }
@@ -471,7 +500,7 @@ describe("agent manifest", () => {
     });
     expect(first.identity_sha256).toBe(second.identity_sha256);
     expect(first.identity_sha256).toBe(
-      "b65c7eddcc08c92ba8ffabcc3ff5e818b2541bfc94194cded6589255b9036e84"
+      "07cb8a42549cfbb7ff146b34f59d7cef5b6decdafd9832c8b3be3af292393772"
     );
   });
 

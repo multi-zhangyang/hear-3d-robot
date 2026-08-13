@@ -112,14 +112,40 @@ export function reconcileHumanoidHierarchyCapabilities(
     sentry.capabilities = ["observe_humanoid"];
   }
   const motion = checkpoint.nodes[HUMANOID_AGENT_IDS.motion];
-  if (motion) motion.capabilities = [
-    "observe_humanoid",
-    "recall_embodied_history",
+  if (motion) {
+    motion.name = "全身运动动作智能体";
+    motion.parent_id = HUMANOID_AGENT_IDS.motionPlanner;
+    motion.capabilities = [
     "submit_humanoid_skill_plan",
     "begin_humanoid_skill",
     "plan_whole_body_motion_candidates",
     "plan_humanoid_navigation"
-  ];
+    ];
+  }
+  const motionPlanner = checkpoint.nodes[HUMANOID_AGENT_IDS.motionPlanner]
+    ?? node({
+      id: HUMANOID_AGENT_IDS.motionPlanner,
+      name: "全身运动规划智能体",
+      parentId: HUMANOID_AGENT_IDS.coordinator,
+      childIds: [HUMANOID_AGENT_IDS.motion],
+      objective: "基于实时状态和长期具身经验产生本轮有界语义运动计划。",
+      criteria: ["输出一个不含执行权限的 Motion Plan Artifact。"],
+      capabilities: ["recall_embodied_history"],
+      mayDelegate: true,
+      status: "ready",
+      predicateIndexes: [],
+      at: checkpoint.updated_at
+    });
+  motionPlanner.child_ids = [HUMANOID_AGENT_IDS.motion];
+  motionPlanner.capabilities = ["recall_embodied_history"];
+  checkpoint.nodes[motionPlanner.id] = motionPlanner;
+  if (coordinator) {
+    coordinator.child_ids = coordinator.child_ids
+      .filter((id) => id !== HUMANOID_AGENT_IDS.motion);
+    if (!coordinator.child_ids.includes(motionPlanner.id)) {
+      coordinator.child_ids.push(motionPlanner.id);
+    }
+  }
   const executor = checkpoint.nodes[HUMANOID_AGENT_IDS.executor];
   if (executor) {
     executor.name = "确定性物理 Execution Gate";
@@ -141,7 +167,7 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     childIds: [
       HUMANOID_AGENT_IDS.goalManager,
       HUMANOID_AGENT_IDS.sentry,
-      HUMANOID_AGENT_IDS.motion,
+      HUMANOID_AGENT_IDS.motionPlanner,
       HUMANOID_AGENT_IDS.executor
     ],
     objective: mission,
@@ -184,16 +210,27 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     predicateIndexes: [],
     at
   });
+  const motionPlanner = node({
+    id: HUMANOID_AGENT_IDS.motionPlanner,
+    name: "全身运动规划智能体",
+    parentId: coordinator.id,
+    childIds: [HUMANOID_AGENT_IDS.motion],
+    objective: "基于实时状态和长期具身经验产生本轮有界语义运动计划。",
+    criteria: ["输出一个不含执行权限的 Motion Plan Artifact。"],
+    capabilities: ["recall_embodied_history"],
+    mayDelegate: true,
+    status: "ready",
+    predicateIndexes: [],
+    at
+  });
   const motion = node({
     id: HUMANOID_AGENT_IDS.motion,
-    name: "全身运动参考智能体",
-    parentId: coordinator.id,
+    name: "全身运动动作智能体",
+    parentId: motionPlanner.id,
     childIds: [],
-    objective: "根据实时状态生成连续全身参考或双足路线，并通过完整物理预演。",
+    objective: "把本轮有界语义计划和最新权威状态落实为唯一正式规划工具调用。",
     criteria: ["产生 accepted 规划回执或带物理证据的拒绝回执。"],
     capabilities: [
-      "observe_humanoid",
-      "recall_embodied_history",
       "submit_humanoid_skill_plan",
       "begin_humanoid_skill",
       "plan_whole_body_motion_candidates",
@@ -223,7 +260,7 @@ function hierarchyNodes(mission: string, goal: Goal, at: string): Record<string,
     at
   });
   return Object.fromEntries(
-    [coordinator, goalManager, sentry, motion, executor]
+    [coordinator, goalManager, sentry, motionPlanner, motion, executor]
       .map((entry) => [entry.id, entry])
   );
 }

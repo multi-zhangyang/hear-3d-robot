@@ -3599,6 +3599,7 @@ function humanoidTestManifest(): AgentManifest {
       goal_manager: { agent_id: HUMANOID_AGENT_IDS.goalManager },
       coordinator: { agent_id: HUMANOID_AGENT_IDS.coordinator },
       sentry: { agent_id: HUMANOID_AGENT_IDS.sentry },
+      motion_planner: { agent_id: HUMANOID_AGENT_IDS.motionPlanner },
       motion: { agent_id: HUMANOID_AGENT_IDS.motion },
       executor: { agent_id: HUMANOID_AGENT_IDS.executor }
     }

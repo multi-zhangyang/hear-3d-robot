@@ -481,8 +481,9 @@ export class RunStore {
 
   async readAgentManifest(): Promise<AgentManifest> {
     try {
-      return AgentManifestSchema.parse(
-        JSON.parse(await readFile(resolve(this.runDir, "agent-manifest.json"), "utf8"))
+      return parsePersistedAgentManifest(
+        await readFile(resolve(this.runDir, "agent-manifest.json"), "utf8"),
+        "current"
       );
     } catch (error) {
       if (isMissing(error)) {
@@ -508,10 +509,10 @@ export class RunStore {
       for (const entry of entries
         .filter((candidate) => candidate.isDirectory())
         .sort((left, right) => left.name.localeCompare(right.name))) {
-        const manifest = AgentManifestSchema.parse(JSON.parse(await readFile(
+        const manifest = parsePersistedAgentManifest(await readFile(
           resolve(directory, entry.name, "agent-manifest.json"),
           "utf8"
-        )));
+        ), `archived epoch ${entry.name}`);
         if (manifest.epoch_id !== entry.name) {
           throw new Error(`Archived Agent manifest epoch mismatch: ${entry.name}`);
         }
@@ -740,6 +741,33 @@ export class RunStore {
   async #runMutation<T>(operation: () => Promise<T>): Promise<T> {
     return runFencedMutation(this.#mutationFence, operation);
   }
+}
+
+function parsePersistedAgentManifest(
+  source: string,
+  label: string
+): AgentManifest {
+  const raw: unknown = JSON.parse(source);
+  const parsed = AgentManifestSchema.safeParse(raw);
+  if (parsed.success) return parsed.data;
+  if (isRecord(raw)
+    && raw.runtime === "humanoid_g1"
+    && typeof raw.harness_contract_version === "number"
+    && raw.harness_contract_version < 22
+    && isRecord(raw.agents)
+    && raw.agents.motion_planner === undefined) {
+    throw new Error(
+      `The ${label} Agent manifest uses the legacy single-Motion topology `
+      + `(Harness contract v${raw.harness_contract_version}); it cannot be attached `
+      + "to the independent Motion Planner/Actor topology. The old run and its "
+      + "Sessions remain unchanged; start a new run instead of mixing Agent contexts."
+    );
+  }
+  throw parsed.error;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function parseJournalLine(line: string): JsonValue {

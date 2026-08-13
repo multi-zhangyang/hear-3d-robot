@@ -153,6 +153,12 @@ describe("provider context budget", () => {
       model: "motion-model",
       apiKey: "motion-key"
     });
+    expect(config.agentModels?.motion_planner).toMatchObject({
+      protocol: "anthropic_messages",
+      baseUrl: "https://motion.example.test/messages",
+      model: "motion-model",
+      apiKey: "motion-key"
+    });
     expect(config.agentModels?.executor).toMatchObject({
       contextWindowTokens: 131072,
       compactTriggerTokens: 24000

@@ -182,7 +182,6 @@ export function beginHumanoidReplanModelCall(
       startedMs + budget.recovery_deadline_ms
     ).toISOString();
   }
-  const deadlineExceeded = startedMs > Date.parse(budget.recovery_deadline_at!);
   let recoveryTier: "compact_replan" | "goal_re_evaluation";
   let role: z.infer<typeof HumanoidReplanModelCallRoleSchema>;
 
@@ -190,8 +189,7 @@ export function beginHumanoidReplanModelCall(
     if (budget.goal_reevaluation_started) {
       throw new Error("Replan budget exhausted after Goal re-evaluation escalation");
     }
-    if (!deadlineExceeded
-      && budget.compact_replans_started < budget.compact_replan_limit) {
+    if (budget.compact_replans_started < budget.compact_replan_limit) {
       budget.compact_replans_started += 1;
       recoveryTier = "compact_replan";
       role = "replan_decision";
@@ -336,7 +334,6 @@ export function humanoidReplanBudgetAuthority(
     && budget.recovery_deadline_at !== null
     && now > Date.parse(budget.recovery_deadline_at);
   const compactAvailable = !budget.goal_reevaluation_started
-    && !deadlineExceeded
     && remainingCompact > 0;
   const goalAvailable = !budget.goal_reevaluation_started;
   const startedCalls = budget.model_calls.filter(
