@@ -36,14 +36,16 @@ import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 export type { HumanoidActionInvoker } from "./runtime.js";
 
 const HumanoidEmbodiedRecallInputSchema = z.object({
+  query_mode: z.enum(["chronological_or_exact", "semantic"])
+    .describe("chronological_or_exact 按时间或 source_refs 精确读取；semantic 按结果和 Goal 实体筛选经验。两种模式互斥"),
   source_refs: z.array(
     z.string().max(320).regex(/^(?:episode:[1-9]\d*|action:\S+)$/)
   ).max(64).nullable().optional()
-    .describe("要精确召回的 episode:N 或 action:transactionId 来源标识"),
+    .describe("仅 chronological_or_exact 模式使用；要精确召回的 episode:N 或 action:transactionId 来源标识"),
   before_sequence: z.number().int().positive().nullable().optional()
-    .describe("分页时只返回指定 episode sequence 之前的历史"),
+    .describe("仅 chronological_or_exact 模式使用；分页时只返回指定 episode sequence 之前的历史"),
   before_experience_sequence: z.number().int().positive().nullable().optional()
-    .describe("语义经验分页时只返回指定 experience sequence 之前的历史"),
+    .describe("仅 semantic 模式使用；语义经验分页时只返回指定 experience sequence 之前的历史"),
   outcomes: z.array(z.enum(HUMANOID_EXPERIENCE_OUTCOMES)).max(3)
     .nullable().optional()
     .describe("按真实执行结果筛选经验；同一字段内为任一匹配"),
@@ -100,11 +102,32 @@ const HumanoidEmbodiedRecallInputSchema = z.object({
     || (input.object_ids?.length ?? 0) > 0
     || (input.solid_ids?.length ?? 0) > 0
     || (input.zone_ids?.length ?? 0) > 0;
-  if (semantic && (input.source_refs?.length ?? 0) > 0) {
+  if (input.query_mode === "semantic" && !semantic) {
+    context.addIssue({
+      code: "custom",
+      path: ["query_mode"],
+      message: "Semantic recall requires at least one semantic filter or before_experience_sequence"
+    });
+  }
+  if (input.query_mode === "semantic" && input.before_sequence != null) {
+    context.addIssue({
+      code: "custom",
+      path: ["before_sequence"],
+      message: "Semantic recall must set before_sequence to null"
+    });
+  }
+  if (input.query_mode === "semantic" && (input.source_refs?.length ?? 0) > 0) {
     context.addIssue({
       code: "custom",
       path: ["source_refs"],
-      message: "Exact source recall and semantic experience filters are separate queries"
+      message: "Semantic recall must set source_refs to null; the current failure is already present in the Recovery input"
+    });
+  }
+  if (input.query_mode === "chronological_or_exact" && semantic) {
+    context.addIssue({
+      code: "custom",
+      path: ["query_mode"],
+      message: "Semantic filters require query_mode=semantic; otherwise set every semantic filter to null or []"
     });
   }
 });
@@ -233,9 +256,10 @@ export function createHumanoidEmbodiedRecallTool(
   runtime: HumanoidEmbodiedRecallInvoker
 ): FunctionTool<unknown, typeof HumanoidEmbodiedRecallInputSchema, string> {
   const name = "recall_embodied_history";
-  return tool<typeof HumanoidEmbodiedRecallInputSchema, unknown, string>({
+  const inputRecovery = createToolInputRecovery();
+  const recallTool = tool<typeof HumanoidEmbodiedRecallInputSchema, unknown, string>({
     name,
-    description: "只读召回带来源标识的具身历史。既可按 episode:N 或 action:transactionId 精确读取，也可按真实结果、Goal 谓词、对象、静态方块和区域检索持久经验。所有结果均为 historical_only，不代表当前传感或当前物理状态。",
+    description: "只读召回带来源标识的具身历史。必须明确选择一种互斥 query_mode：chronological_or_exact 按 episode:N、action:transactionId 或时间读取；semantic 按真实结果、Goal 谓词、对象、静态方块和区域检索持久经验。所有结果均为 historical_only，不代表当前传感或当前物理状态。",
     parameters: HumanoidEmbodiedRecallInputSchema,
     strict: true,
     timeoutBehavior: "raise_exception",
@@ -260,6 +284,18 @@ export function createHumanoidEmbodiedRecallTool(
       })
     )
   });
+  const invoke = recallTool.invoke;
+  recallTool.invoke = async (context, input, details) => {
+    const output = await invoke(context, input, details);
+    return recoverInvalidToolInputOutput(
+      output,
+      input,
+      HumanoidEmbodiedRecallInputSchema,
+      name,
+      inputRecovery
+    );
+  };
+  return recallTool;
 }
 
 function humanoidActionTool(

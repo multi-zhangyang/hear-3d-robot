@@ -260,6 +260,109 @@ describe("HumanoidActionRuntime", () => {
     });
   });
 
+  it("rejects a Goal-misaligned Skill DAG before it can deadlock the lifecycle", async () => {
+    const lightweight = lightweightObservationWorld(undefined, {
+      interaction: {
+        object_world_model: { frame: 0, world_revision: 0, objects: [] },
+        skill_catalog: {
+          contract_sha256: "a".repeat(64),
+          frame: 0,
+          world_revision: 0,
+          entries: []
+        },
+        carrying: { bindings: [] },
+        zones: [{
+          zone_id: "assembly_bay",
+          center: { x: 4, y: 0, z: 4 },
+          half_extents: { x: 0.5, y: 0.5, z: 0.5 }
+        }],
+        manipulable_objects: []
+      }
+    });
+    const runtime = new HumanoidActionRuntime(lightweight.world, {
+      requireSkillBinding: true,
+      activeGoal: () => ({
+        summary: "place the assembly rod in the bay",
+        predicates: [{
+          type: "object_placed" as const,
+          object_id: "assembly_rod",
+          zone_id: "assembly_bay",
+          tolerance: 0.2
+        }]
+      })
+    });
+    const agentId = HUMANOID_NEURAL_AGENT_IDS.motorIntent;
+    await runtime.invoke("observe_humanoid", {}, "goal-observation", agentId);
+
+    await expect(runtime.invoke(
+      "submit_humanoid_skill_plan",
+      {
+        objective: "move directly to the destination",
+        strategies: [{
+          strategy_id: "wrong-destination-first",
+          rationale: "walk to the bay without acquiring the rod",
+          nodes: [{
+            node_id: "walk-to-bay",
+            invocation: { skill: "navigate_to_zone", zone_id: "assembly_bay" },
+            depends_on_node_ids: []
+          }]
+        }],
+        selected_strategy_id: "wrong-destination-first"
+      },
+      "misaligned-skill-plan",
+      agentId
+    )).resolves.toMatchObject({
+      accepted: false,
+      code: "skill_plan_no_goal_aligned_entry",
+      detail: {
+        rejected_ready_nodes: [{
+          skill_node_id: "walk-to-bay",
+          invocation: { skill: "navigate_to_zone", zone_id: "assembly_bay" }
+        }]
+      }
+    });
+    expect(runtime.planningToolState(agentId)).toMatchObject({
+      skill_plan: null,
+      ready_skill_bindings: [],
+      required_next_tool: null
+    });
+    expect(runtime.isActionAvailable("submit_humanoid_skill_plan", agentId)).toBe(true);
+    expect(runtime.isActionAvailable("begin_humanoid_skill", agentId)).toBe(false);
+
+    await expect(runtime.invoke(
+      "submit_humanoid_skill_plan",
+      {
+        objective: "establish the rod manipulation prerequisite",
+        strategies: [{
+          strategy_id: "rod-first",
+          rationale: "approach the object before attempting transport",
+          nodes: [{
+            node_id: "approach-rod",
+            invocation: {
+              skill: "approach",
+              object_id: "assembly_rod",
+              interaction_point_id: "assembly_rod:grasp:0",
+              hand: "right",
+              standoff_m: 0.45
+            },
+            depends_on_node_ids: []
+          }]
+        }],
+        selected_strategy_id: "rod-first"
+      },
+      "corrected-skill-plan",
+      agentId
+    )).resolves.toMatchObject({
+      accepted: true,
+      code: "humanoid_skill_plan_registered"
+    });
+    expect(runtime.planningToolState(agentId)).toMatchObject({
+      skill_plan: { transaction_id: "corrected-skill-plan" },
+      ready_skill_bindings: [{ skill_node_id: "approach-rod" }],
+      required_next_tool: "begin_humanoid_skill"
+    });
+  });
+
   it("exposes an independent reference-control route without merging trained capabilities", async () => {
     const lightweight = lightweightObservationWorld(
       undefined,

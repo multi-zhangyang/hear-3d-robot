@@ -22,6 +22,12 @@ const HumanoidReplanModelCallStatusSchema = z.enum([
 export const HumanoidReplanModelCallSchema = z.object({
   model_call_id: z.string().uuid(),
   agent_id: z.string().trim().min(1),
+  // One OpenAI Agents SDK run may contain several model turns while tools are
+  // executed and their results are fed back. Recovery authority is granted to
+  // that bounded Agent episode, not separately to every internal loop turn.
+  // Optional preserves pre-episode checkpoints; their repeated turns are
+  // conservatively grouped by structural Agent during reconciliation.
+  episode_id: z.string().uuid().optional(),
   recovery_tier: z.enum(["compact_replan", "goal_re_evaluation"]),
   role: HumanoidReplanModelCallRoleSchema,
   status: HumanoidReplanModelCallStatusSchema,
@@ -110,10 +116,11 @@ export const HumanoidReplanBudgetSchema = z.object({
       message: "Compact replan usage must equal its recorded decisions"
     });
   }
-  const specialistCalls = budget.model_calls.filter(
-    (call) => call.role === "specialist_replan"
-  ).length;
-  if (specialistCalls
+  const specialistEpisodes = budgetedEpisodeCount(
+    budget.model_calls,
+    "specialist_replan"
+  );
+  if (specialistEpisodes
     > budget.compact_replans_started * budget.specialist_calls_per_replan) {
     context.addIssue({
       code: "custom",
@@ -121,10 +128,11 @@ export const HumanoidReplanBudgetSchema = z.object({
       message: "Specialist replanning exceeded the calls authorized by compact replans"
     });
   }
-  const goalCalls = budget.model_calls.filter(
-    (call) => call.role === "goal_re_evaluation"
-  ).length;
-  if (goalCalls > budget.goal_reevaluation_call_limit) {
+  const goalEpisodes = budgetedEpisodeCount(
+    budget.model_calls,
+    "goal_re_evaluation"
+  );
+  if (goalEpisodes > budget.goal_reevaluation_call_limit) {
     context.addIssue({
       code: "custom",
       path: ["model_calls"],
@@ -167,6 +175,7 @@ export function beginHumanoidReplanModelCall(
     modelCallId: string;
     agentId: string;
     role: "coordinator" | "motion" | "goal_manager";
+    episodeId?: string;
     at?: string;
   }
 ): { budget: HumanoidReplanBudget; call: HumanoidReplanModelCall } {
@@ -199,23 +208,32 @@ export function beginHumanoidReplanModelCall(
       role = "goal_re_evaluation_decision";
     }
   } else if (input.role === "motion") {
-    const specialistCalls = budget.model_calls.filter(
-      (call) => call.role === "specialist_replan"
-    ).length;
+    const specialistEpisodes = budgetedEpisodeCount(
+      budget.model_calls,
+      "specialist_replan"
+    );
     const specialistLimit = budget.compact_replans_started
       * budget.specialist_calls_per_replan;
+    const continuingEpisode = input.episodeId !== undefined
+      && budget.model_calls.some((call) => call.role === "specialist_replan"
+        && call.episode_id === input.episodeId);
     if (budget.goal_reevaluation_started
       || budget.compact_replans_started === 0
-      || specialistCalls >= specialistLimit) {
+      || (!continuingEpisode && specialistEpisodes >= specialistLimit)) {
       throw new Error("Motion specialist has no remaining compact replan authority");
     }
     recoveryTier = "compact_replan";
     role = "specialist_replan";
   } else {
-    const goalCalls = budget.model_calls.filter(
-      (call) => call.role === "goal_re_evaluation"
-    ).length;
-    if (goalCalls >= budget.goal_reevaluation_call_limit) {
+    const goalEpisodes = budgetedEpisodeCount(
+      budget.model_calls,
+      "goal_re_evaluation"
+    );
+    const continuingEpisode = input.episodeId !== undefined
+      && budget.model_calls.some((call) => call.role === "goal_re_evaluation"
+        && call.episode_id === input.episodeId);
+    if (!continuingEpisode
+      && goalEpisodes >= budget.goal_reevaluation_call_limit) {
       throw new Error("Goal re-evaluation model-call budget exhausted");
     }
     budget.goal_reevaluation_started = true;
@@ -226,6 +244,7 @@ export function beginHumanoidReplanModelCall(
   const call = HumanoidReplanModelCallSchema.parse({
     model_call_id: input.modelCallId,
     agent_id: input.agentId,
+    ...(input.episodeId ? { episode_id: input.episodeId } : {}),
     recovery_tier: recoveryTier,
     role,
     status: "started",
@@ -240,6 +259,17 @@ export function beginHumanoidReplanModelCall(
     budget: HumanoidReplanBudgetSchema.parse(budget),
     call: structuredClone(call)
   };
+}
+
+function budgetedEpisodeCount(
+  calls: readonly HumanoidReplanModelCall[],
+  role: "specialist_replan" | "goal_re_evaluation"
+): number {
+  return new Set(calls.filter((call) => call.role === role).map((call) => (
+    call.episode_id
+      ? `episode:${call.episode_id}`
+      : `legacy-agent:${call.agent_id}`
+  ))).size;
 }
 
 export function finishHumanoidReplanModelCall(

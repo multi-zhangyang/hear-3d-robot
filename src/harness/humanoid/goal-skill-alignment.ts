@@ -41,8 +41,28 @@ export function alignHumanoidSkillToGoal(input: {
   }
   return {
     accepted: false,
-    reason: "The selected Skill neither advances nor establishes a prerequisite for any active Goal predicate"
+    reason: misalignedSkillReason(input.goal, input.invocation)
   };
+}
+
+function misalignedSkillReason(
+  goal: Goal,
+  invocation: HumanoidSkillInvocation
+): string {
+  if (invocation.skill === "navigate_to_zone") {
+    const objectGoal = goal.predicates.find((predicate) => (
+      predicate.type === "object_grasped"
+        || predicate.type === "object_at"
+        || predicate.type === "object_in_zone"
+        || predicate.type === "object_placed"
+        || predicate.type === "object_inside"
+        || predicate.type === "object_on"
+    ));
+    if (objectGoal && "object_id" in objectGoal) {
+      return `navigate_to_zone(${invocation.zone_id}) moves only the robot root and does not establish a manipulation prerequisite for ${objectGoal.type}(${objectGoal.object_id}). Use an object-targeted approach/reach/grasp/lift entry before carrying, or carry_to_zone/place only after a verified carried-object binding exists`;
+    }
+  }
+  return "The selected Skill neither advances nor establishes a prerequisite for any active Goal predicate";
 }
 
 function skillPredicateRelation(

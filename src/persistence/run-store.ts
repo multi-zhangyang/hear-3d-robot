@@ -885,18 +885,31 @@ function historicalAgentAuthorityManifest(
   const legacyAgents = raw.agents;
   const neural = raw.version !== 1;
   const goalManagerAgentId = neural
-    ? historicalStructuralAgentId(raw, "executive", "goal_valuation", label)
+    ? historicalStructuralAgentId(
+        raw,
+        "executive",
+        "goal_valuation",
+        "manage_goal_epoch",
+        label
+      )
     : historicalLegacyAgentId(legacyAgents, "goal_manager", label);
   const groundingManagerAgentId = neural
     ? historicalStructuralAgentId(
         raw,
         "perceptual_association",
         "perceptual_association",
+        "orchestrate_perception",
         label
       )
     : historicalLegacyAgentId(legacyAgents, "coordinator", label);
   const executionManagerAgentId = neural
-    ? historicalStructuralAgentId(raw, "sensorimotor", "sensorimotor_selection", label)
+    ? historicalStructuralAgentId(
+        raw,
+        "sensorimotor",
+        "sensorimotor_selection",
+        "orchestrate_sensorimotor",
+        label
+      )
     : historicalLegacyAgentId(legacyAgents, "coordinator", label);
   return HistoricalAgentAuthorityManifestSchema.parse({
     epoch_id: raw.epoch_id,
@@ -912,14 +925,26 @@ function historicalStructuralAgentId(
   manifest: Record<string, unknown>,
   layer: string,
   pathway: string,
+  authorityCapability: string,
   label: string
 ): string {
   const agents = isRecord(manifest.agents) ? Object.values(manifest.agents) : [];
-  const candidates = agents.filter(isRecord).filter((agent) => (
+  const structuralCandidates = agents.filter(isRecord).filter((agent) => (
     agent.execution_kind === "model_agent"
       && agent.layer === layer
       && agent.pathway === pathway
   ));
+  const capabilityCandidates = structuralCandidates.filter((agent) => (
+    Array.isArray(agent.capabilities)
+      && agent.capabilities.includes(authorityCapability)
+  ));
+  // Early neural manifests predate explicit manager capabilities and remain
+  // recoverable when their structural authority was unique. Modern deep
+  // hierarchies intentionally place managers and specialists on one pathway,
+  // so their declared orchestration capability is the authority identity.
+  const candidates = capabilityCandidates.length > 0
+    ? capabilityCandidates
+    : structuralCandidates;
   const candidate = candidates[0];
   if (candidates.length !== 1 || !candidate
     || typeof candidate.agent_id !== "string") {

@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { Mutex } from "async-mutex";
 import {
   EmptyContextMemoryState,
+  GoalPredicateSchema,
+  GoalSchema,
   type ContextCompactionSummary,
   type ContextMemoryState,
   type Goal,
@@ -28,6 +30,11 @@ import {
   type HumanoidReplanBudget,
   type HumanoidReplanModelCall
 } from "../../domain/humanoid-replan-budget.js";
+import {
+  HUMANOID_SKILL_CONTRACTS,
+  HumanoidSkillInvocationSchema,
+  type HumanoidSkillInvocation
+} from "../../domain/humanoid-skill.js";
 import {
   completeGoalEpoch,
   goalCandidateBySequence,
@@ -118,12 +125,16 @@ import {
 } from "../../world/humanoid/embodied-skill-call.js";
 import type { LongRunContextRuntime } from "../context-runtime.js";
 import {
+  HumanoidActionRuntimeStateSchema,
   HumanoidActionRuntime,
   humanoidActionFingerprint,
+  type HumanoidActionRuntimeState,
   type HumanoidActionInvocationOptions,
   type HumanoidActionToolCallAuthority,
   type HumanoidActionReceipt
 } from "./runtime.js";
+import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
+import { bindHumanoidSkill } from "./skill-binding.js";
 import {
   appendEmbodiedEpisode,
   rememberEmbodiedActionExperience,
@@ -334,6 +345,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     goal: Goal;
     world: HumanoidWorld;
     checkpoint: HumanoidRunCheckpoint;
+    freshNeuralHierarchyEpoch?: boolean;
     eventSink?: RuntimeEventSink;
     policyFrameSink?: HumanoidPolicyFrameSink;
     signal?: AbortSignal;
@@ -374,6 +386,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#actions = new HumanoidActionRuntime(this.#world, {
       receipts: this.#checkpoint.committed_actions,
       state: this.#checkpoint.action_runtime_state,
+      replayHistoricalCognitiveState: input.freshNeuralHierarchyEpoch !== true,
       neuralHierarchyEpochId: this.#checkpoint.neural_hierarchy_state.epoch_id,
       frameSink: (frame) => this.#physicalExecution.recordFrame(frame, "execution"),
       ...(input.policyFrameSink
@@ -401,6 +414,9 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       retainPhysicalTerminals: true,
       requireSkillBinding: true,
       activeGoal: () => this.#activeGoal(),
+      activeNeuralSkillCommitment: () => (
+        this.#activeNeuralSkillCommitmentAuthority()
+      ),
       ...(this.#signal ? { signal: this.#signal } : {})
     });
     this.#physicsClock = new HumanoidPhysicsClock({
@@ -565,31 +581,96 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       reason = "no_active_goal_epoch";
     } else {
       const coordinator = this.coordinatorPhase();
-      if (coordinator === "complete_satisfied_goal" || coordinator === "complete_cycle") {
+      if (coordinator === "complete_satisfied_goal") {
         phase = "cycle_completion";
         reason = "runtime_completion_barrier_ready";
+      } else if (coordinator === "complete_cycle") {
+        const completion = this.cycleCompletionReadiness();
+        const execution = this.validateCycleEvidence(
+          completion.evidence_transaction_ids
+        );
+        const hasDirectPostExecutionBelief = this.pendingNeuralSignals({
+          targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+          kinds: ["perceptual_belief"]
+        }).some((signal) => signal.world_revision >= execution.worldAfterRevision);
+        if (hasDirectPostExecutionBelief) {
+          phase = "cycle_completion";
+          reason = "runtime_completion_barrier_ready";
+        } else {
+          // A fresh Agent epoch has the durable physical execution and
+          // observation receipts, but deliberately inherits no neural edge.
+          // Recreate that edge through Perception before Executive closes the
+          // cycle; never invent a skill_completed signal in the new epoch.
+          phase = "perception";
+          reason = "fresh_epoch_completion_perception_required";
+        }
       } else if (coordinator === "post_execution") {
-        phase = "feedback";
-        reason = "post_execution_observation_required";
-      } else if (coordinator === "post_failure_observation"
-        || coordinator === "replan_or_retire") {
+        // A fresh Agent/hierarchy epoch deliberately has no inherited neural
+        // commitment or signal graph. Resume from the durable physical receipt
+        // by obtaining a new observation; normal live epochs still close their
+        // executing commitment through feedback first.
+        if (state.active_skill_commitment === null) {
+          phase = "perception";
+          reason = "fresh_epoch_post_execution_observation_required";
+        } else {
+          phase = "feedback";
+          reason = "post_execution_observation_required";
+        }
+      } else if (coordinator === "post_failure_observation") {
+        phase = "perception";
+        reason = "physical_failure_requires_current_perception";
+      } else if (coordinator === "replan_or_retire") {
         if (activeRecoveryReplacementCommitment(state)) {
           phase = "motor_assessment";
           reason = "recovery_replacement_commitment_requires_assessment";
         } else if (recoveryEscalationAwaitsGoalValuation(state)) {
           phase = "goal_valuation";
           reason = "recovery_escalation_requires_goal_valuation";
+        } else if (!this.pendingNeuralSignals({
+          targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+          kinds: ["perceptual_belief"]
+        }).some((signal) => signal.status === "pending")) {
+          // The durable Coordinator phase proves that a rejected plan or
+          // failed execution was followed by Sensor Fusion.  A fresh neural
+          // epoch still needs its own Perception edge before Recovery can act.
+          phase = "perception";
+          reason = "fresh_epoch_failure_perception_required";
         } else {
           phase = "recovery";
           reason = "runtime_failure_feedback_required";
         }
       } else if (coordinator === "execute_plan") {
-        const activeCommitment = state.active_skill_commitment;
+        const storedCommitment = state.active_skill_commitment;
+        const activeCommitment = storedCommitment
+          && !["completed", "failed", "released"].includes(storedCommitment.state)
+          ? storedCommitment
+          : null;
+        const commitmentPlan = activeCommitment
+          ? humanoidActionReceiptsInCommitOrder(
+              checkpoint.committed_actions
+            ).findLast((receipt) => (
+              receipt.accepted
+                && isHumanoidPlanningReceipt(receipt)
+                && receipt.worldAfterRevision
+                  >= activeCommitment.established_world_revision
+                && sameAutonomousCycle(receipt.cycle, checkpoint.active_cycle)
+            ))
+          : undefined;
         const activeCertificates = Object.values(state.rollout_certificates).filter(
           (certificate) => certificate.status === "active"
             && certificate.commitment_id === activeCommitment?.commitment_id
         );
-        if (activeCommitment?.state === "executing"
+        if (activeCommitment === null) {
+          // The accepted plan receipt belongs to an earlier Agent epoch.  It
+          // remains durable evidence, but the fresh hierarchy has neither its
+          // Skill commitment nor causal rollout signals and therefore cannot
+          // inherit execution authority from it.
+          phase = "perception";
+          reason = "fresh_epoch_accepted_plan_reobservation_required";
+        } else if (!commitmentPlan) {
+          phase = "motor_assessment";
+          reason = "committed_skill_requires_current_motor_assessment";
+        } else if (activeCommitment.state === "executing"
           && activeCertificates.length === 1) {
           phase = "execution";
           reason = "certified_commitment_requires_serial_execution";
@@ -610,7 +691,10 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     return this.transitionNeuralHarnessPhase({
       phase,
       enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
-      reason
+      reason,
+      ...(current.phase === "terminal" && checkpoint.status === "running"
+        ? { resumeFromTerminal: true }
+        : {})
     });
   }
 
@@ -834,6 +918,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     reason: string;
     goalEpochId?: string | null;
     commitmentId?: string | null;
+    resumeFromTerminal?: boolean;
   }): Promise<NeuralHierarchyState["harness_phase"]> {
     return this.#neuralStateMutex.runExclusive(async () => {
       this.#assertRunAcceptsDecisions();
@@ -1039,6 +1124,103 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
   }
 
+  neuralSkillProposalAdmission(signal: NeuralSignal): {
+    accepted: boolean;
+    reason?: string;
+    invocation?: JsonValue;
+    relation?: "direct" | "prerequisite" | "recovery" | "safety";
+    predicate_index?: number | null;
+  } {
+    if (signal.kind !== "skill_proposal") {
+      return {
+        accepted: false,
+        reason: "Action Selection commitment admission requires a skill_proposal signal"
+      };
+    }
+    const payload = object(signal.payload);
+    const proposal = payload?.proposed_skill === undefined
+      ? undefined
+      : object(payload.proposed_skill);
+    const params = proposal?.params === undefined
+      ? undefined
+      : object(proposal.params);
+    const invocation = HumanoidSkillInvocationSchema.safeParse({
+      ...(params ?? {}),
+      skill: proposal?.skill
+    });
+    if (!invocation.success) {
+      return {
+        accepted: false,
+        reason: "The cited Skill proposal has no valid bounded invocation"
+      };
+    }
+    const activeGoal = this.#activeGoal();
+    if (!activeGoal) {
+      return {
+        accepted: false,
+        invocation: json(invocation.data),
+        reason: "No active Goal exists for Skill commitment admission"
+      };
+    }
+    const observation = this.#world.observe();
+    const recoveryAuthorized = this.#neuralSignalHasSourceNode(
+      signal,
+      HUMANOID_NEURAL_AGENT_IDS.recovery
+    );
+    const alignment = alignHumanoidSkillToGoal({
+      goal: activeGoal,
+      invocation: invocation.data,
+      observation,
+      ...(recoveryAuthorized ? { recoveryAuthorized: true } : {})
+    });
+    if (!alignment.accepted) {
+      return {
+        accepted: false,
+        invocation: json(invocation.data),
+        reason: alignment.reason
+      };
+    }
+    const actionablePhase = HUMANOID_SKILL_CONTRACTS[invocation.data.skill]
+      .process.find(({ authority }) => (
+        authority === "navigation"
+          || authority === "whole_body"
+          || authority === "grasp"
+      ));
+    if (!actionablePhase) {
+      return {
+        accepted: false,
+        invocation: json(invocation.data),
+        reason: "The proposed Skill has no physically actionable phase"
+      };
+    }
+    const readiness = bindHumanoidSkill({
+      transactionId: `neural-proposal-preflight:${signal.signal_id}`,
+      agentId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      request: {
+        skill_plan_transaction_id: null,
+        skill_node_id: null,
+        invocation: invocation.data,
+        phase: actionablePhase.phase
+      },
+      observation,
+      activeGoal,
+      ...(recoveryAuthorized ? { recoveryAuthorized: true } : {})
+    });
+    if (!readiness.accepted) {
+      return {
+        accepted: false,
+        invocation: json(invocation.data),
+        reason: `The proposed Skill is not ready for a bounded physical commitment: ${readiness.code}; ${JSON.stringify(readiness.detail)}`
+      };
+    }
+    return {
+      accepted: true,
+      invocation: json(invocation.data),
+      relation: alignment.relation,
+      predicate_index: alignment.predicateIndex
+    };
+  }
+
   async transitionNeuralSkillCommitment(input: {
     ownerNodeId: string;
     commitmentId: string;
@@ -1065,6 +1247,86 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       }));
       return transitioned.commitment;
     });
+  }
+
+  neuralSkillCommitmentOutcome(commitment: NeuralSkillCommitment): {
+    status: "completed" | "failed" | "in_progress";
+    detail: JsonValue;
+  } {
+    const world = this.#world.snapshot();
+    const contract = commitment.termination_contract;
+    if (!contract || Array.isArray(contract) || typeof contract !== "object") {
+      return {
+        status: "completed",
+        detail: json({ authority: "legacy_unstructured_termination_contract" })
+      };
+    }
+    const record = contract as Record<string, JsonValue>;
+    const failureConditions = Array.isArray(record.failure_conditions)
+      ? record.failure_conditions
+      : [];
+    for (const condition of failureConditions) {
+      if (!condition || Array.isArray(condition) || typeof condition !== "object") {
+        continue;
+      }
+      const failure = condition as Record<string, JsonValue>;
+      if (failure.type === "robot_fallen" && world.robot.fallen) {
+        return {
+          status: "failed",
+          detail: json({ authority: "physical_world", condition: failure })
+        };
+      }
+      if (failure.type === "object_lost" && typeof failure.object_id === "string"
+        && !(failure.object_id in world.robot.objects)) {
+        return {
+          status: "failed",
+          detail: json({ authority: "physical_world", condition: failure })
+        };
+      }
+    }
+    const lifecycleOutcome = neuralBoundSkillLifecycleOutcome({
+      hierarchy: this.#checkpoint.neural_hierarchy_state,
+      actionRuntimeState: HumanoidActionRuntimeStateSchema.parse(
+        this.#actions.persistenceState()
+      ),
+      commitment
+    });
+    if (lifecycleOutcome) return lifecycleOutcome;
+    if (!Array.isArray(record.success_conditions)) {
+      return {
+        status: "completed",
+        detail: json({ authority: "legacy_unstructured_termination_contract" })
+      };
+    }
+    const predicates = record.success_conditions.map((condition) => (
+      GoalPredicateSchema.safeParse(condition)
+    ));
+    if (predicates.length === 0 || predicates.some((result) => !result.success)) {
+      return {
+        status: "in_progress",
+        detail: json({
+          authority: "invalid_structured_termination_contract",
+          success_conditions: record.success_conditions
+        })
+      };
+    }
+    const terminationGoal = GoalSchema.parse({
+      summary: `Terminate neural Skill ${commitment.skill}`,
+      predicates: predicates.map((result) => {
+        if (!result.success) throw new Error("Unreachable invalid termination predicate");
+        return result.data;
+      })
+    });
+    const checker = inspectHumanoidGoal(
+      terminationGoal,
+      this.#scenario,
+      world,
+      createHumanoidGoalProgress(terminationGoal, world)
+    );
+    return {
+      status: checker.success ? "completed" : "in_progress",
+      detail: json({ authority: "humanoid_goal_checker", checker })
+    };
   }
 
   async recordNeuralPredictionError(input: {
@@ -1136,12 +1398,22 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   async initializeGoalAutonomy(manifest: AgentManifest): Promise<void> {
+    // A staged action commit is itself the durable authority that checkpoint
+    // recovery must finish.  Its event and reasserted state anchors may have
+    // reached the journals just before process loss while checkpoint.json
+    // still names the preceding anchor.  Finish that two-phase commit first;
+    // its persist writes one aligned authority cut, after which ordinary
+    // latest-anchor verification is meaningful again.
+    const actionCommitRecoveryPending =
+      Object.keys(this.#checkpoint.action_commit_outbox.pending).length > 0
+      || this.#recoveredAcknowledgedActionCommits.length > 0;
+    if (actionCommitRecoveryPending) await this.#reconcileActionCommits();
     await this.#verifyExistingPhysicalStateAnchor();
     await this.#verifyExistingGoalStateAnchor();
     await this.#verifyExistingEmbodiedMemoryStateAnchor();
     await this.#verifyExistingContextMemoryStateAnchor();
     await this.#verifyExistingExecutionLedgerStateAnchor();
-    await this.#reconcileActionCommits();
+    if (!actionCommitRecoveryPending) await this.#reconcileActionCommits();
     this.#scenario = materializeScenarioChunkDeltaState(
       this.#store.definition.scenario,
       await this.#store.readScenarioChunkDeltaState()
@@ -2202,6 +2474,10 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       const cycle = this.#activeCycleRef();
       const modelCallId = randomUUID();
       const at = new Date().toISOString();
+      const invocation = currentAgentHarnessInvocation();
+      const episodeId = invocation?.agentId === agentId
+        ? invocation.invocationId
+        : undefined;
       const rawBudgetRole = this.coordinatorPhase() === "replan_or_retire"
         ? replanBudgetRole(agentId)
         : undefined;
@@ -2218,7 +2494,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       const budgetUpdate = budgetRole && this.#checkpoint.active_cycle
         ? beginHumanoidReplanModelCall(
             this.#checkpoint.active_cycle.replan_budget,
-            { modelCallId, agentId, role: budgetRole, at }
+            {
+              modelCallId,
+              agentId,
+              role: budgetRole,
+              ...(episodeId ? { episodeId } : {}),
+              at
+            }
           )
         : undefined;
       const record = await this.#requiredModelAuthority().recordStarted(
@@ -3665,6 +3947,58 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     return candidate?.status === "active" ? candidate.goal : undefined;
   }
 
+  #activeNeuralSkillCommitmentAuthority(): {
+    commitmentId: string;
+    goalEpochId: string;
+    invocation: HumanoidSkillInvocation;
+  } | undefined {
+    const hierarchy = this.#checkpoint.neural_hierarchy_state;
+    const commitment = hierarchy.active_skill_commitment;
+    if (!commitment
+      || ["completed", "failed", "released"].includes(commitment.state)) {
+      return undefined;
+    }
+    for (const signalId of commitment.source_signal_ids) {
+      const signal = hierarchy.signals[signalId];
+      if (!signal || signal.kind !== "skill_proposal") continue;
+      const payload = object(signal.payload);
+      const proposal = payload?.proposed_skill === undefined
+        ? undefined
+        : object(payload.proposed_skill);
+      const params = proposal?.params === undefined
+        ? undefined
+        : object(proposal.params);
+      const invocation = HumanoidSkillInvocationSchema.safeParse({
+        ...(params ?? {}),
+        skill: proposal?.skill
+      });
+      if (invocation.success && invocation.data.skill === commitment.skill) {
+        return {
+          commitmentId: commitment.commitment_id,
+          goalEpochId: commitment.goal_epoch_id,
+          invocation: invocation.data
+        };
+      }
+    }
+    return undefined;
+  }
+
+  #neuralSignalHasSourceNode(signal: NeuralSignal, sourceNodeId: string): boolean {
+    const hierarchy = this.#checkpoint.neural_hierarchy_state;
+    const pending = [signal.signal_id];
+    const visited = new Set<string>();
+    while (pending.length > 0) {
+      const signalId = pending.pop()!;
+      if (visited.has(signalId)) continue;
+      visited.add(signalId);
+      const candidate = hierarchy.signals[signalId];
+      if (!candidate) continue;
+      if (candidate.source_node_id === sourceNodeId) return true;
+      pending.push(...candidate.causal_parent_ids);
+    }
+    return false;
+  }
+
   #requiredActiveGoal(): Goal {
     const goal = this.#activeGoal();
     if (!goal) throw new Error("No model-selected Goal epoch is active");
@@ -4229,6 +4563,27 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       throw new Error(`Physical state anchor event is missing: ${anchor.event_id}`);
     }
     assertHumanoidPhysicalStateAnchorEvent(event, this.runId, anchor);
+    const latest = await latestDurableRuntimeEventByType(
+      this.#store,
+      "humanoid_physical_state_anchored"
+    );
+    if (!latest) throw new Error("Physical state anchor has no durable state history");
+    if (latest.event_id === anchor.event_id) return;
+    const checkpointPersistedAfterOrphan = Date.parse(this.#checkpoint.updated_at)
+      >= Date.parse(latest.at);
+    const quiescent = Object.keys(
+      this.#checkpoint.action_execution_ledger.active
+    ).length === 0
+      && Object.keys(this.#checkpoint.action_commit_outbox.pending).length === 0;
+    if (!checkpointPersistedAfterOrphan || !quiescent) {
+      throw new Error("Physical state anchor is not the latest durable state");
+    }
+    // The newer anchor was appended before its checkpoint atomic replace and
+    // therefore has no recoverable MuJoCo state. A later quiescent checkpoint
+    // explicitly retained this fully verified cut, so reassert that identical
+    // anchor row as the journal head instead of inventing the orphaned state.
+    const { cursor: _cursor, ...reasserted } = event;
+    await this.#store.appendRuntimeEvents([reasserted]);
     await assertDurableAnchorIsLatest(
       this.#store,
       "humanoid_physical_state_anchored",
@@ -4354,6 +4709,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       const identity = {
         version: 1 as const,
         run_id: this.runId,
+        neural_hierarchy_epoch_id:
+          this.#checkpoint.neural_hierarchy_state.epoch_id,
         context_memory_sha256: memorySha256
       };
       const eventId = `humanoid-context-memory:${actionCommitPayloadSha256(json(identity))}`;
@@ -4792,6 +5149,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const identity = {
       version: 1 as const,
       run_id: this.runId,
+      neural_hierarchy_epoch_id: checkpoint.neural_hierarchy_state.epoch_id,
       context_memory_sha256: memorySha256
     };
     const eventId = `humanoid-context-memory:${actionCommitPayloadSha256(json(identity))}`;
@@ -4814,6 +5172,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       at: anchoredAt,
       data: json({
         version: anchor.version,
+        neural_hierarchy_epoch_id: checkpoint.neural_hierarchy_state.epoch_id,
         context_memory_sha256: anchor.context_memory_sha256,
         context_memory: memory
       })
@@ -5375,6 +5734,41 @@ async function assertDurableAnchorIsLatest(
   throw new Error(`${label} has no durable state history`);
 }
 
+async function latestDurableRuntimeEventByType(
+  store: RunStore,
+  eventType: string
+): Promise<RuntimeEvent | undefined> {
+  const pageSize = 256;
+  const tail = await store.readJournalTail("events", 1);
+  let before = tail.total;
+  while (before > 0) {
+    const from = Math.max(0, before - pageSize);
+    const page = await store.readJournalPage("events", from, before - from);
+    if (page.entries.length === 0) {
+      throw new Error(`Runtime event journal stopped before offset ${before}`);
+    }
+    for (let offset = page.entries.length - 1; offset >= 0; offset -= 1) {
+      const record = object(page.entries[offset]!);
+      if (record.type !== eventType) continue;
+      if (typeof record.event_id !== "string"
+        || typeof record.run_id !== "string"
+        || typeof record.at !== "string") {
+        throw new Error(`Durable ${eventType} event is malformed`);
+      }
+      return {
+        event_id: record.event_id,
+        run_id: record.run_id,
+        type: eventType,
+        at: record.at,
+        data: json(record.data ?? null),
+        ...(typeof record.cursor === "string" ? { cursor: record.cursor } : {})
+      };
+    }
+    before = from;
+  }
+  return undefined;
+}
+
 async function appendDurableModelCallLifecycleRecord(
   store: RunStore,
   record: ModelCallLifecycleRecord
@@ -5454,6 +5848,116 @@ function findLatestProviderModelUsage(
     if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
     if (!("model_usage" in record)) continue;
     return ModelUsageStateSchema.parse(record.model_usage);
+  }
+  return undefined;
+}
+
+function neuralBoundSkillLifecycleOutcome(input: {
+  hierarchy: NeuralHierarchyState;
+  actionRuntimeState: HumanoidActionRuntimeState;
+  commitment: NeuralSkillCommitment;
+}): {
+  status: "completed" | "failed" | "in_progress";
+  detail: JsonValue;
+} | undefined {
+  const rolloutBindings: Array<{
+    signal: NeuralSignal;
+    planningTransactionId: string;
+    skillPlanTransactionId: string;
+    skillNodeId: string;
+    boundSkill: string;
+  }> = [];
+  let observedBoundRollout = false;
+  for (const signalId of input.commitment.transition_signal_ids) {
+    const signal = input.hierarchy.signals[signalId];
+    if (!signal || signal.kind !== "rollout_result") continue;
+    const payload = object(signal.payload);
+    const detail = payload.detail === undefined ? undefined : object(payload.detail);
+    const binding = detail?.skill_binding === undefined
+      ? undefined
+      : object(detail.skill_binding);
+    const invocation = binding?.invocation === undefined
+      ? undefined
+      : object(binding.invocation);
+    if (!binding || !invocation) continue;
+    observedBoundRollout = true;
+    const planningTransactionId = payload.transactionId;
+    const skillPlanTransactionId = binding.skill_plan_transaction_id;
+    const skillNodeId = binding.skill_node_id;
+    const boundSkill = invocation.skill;
+    if (payload.accepted !== true
+      || typeof planningTransactionId !== "string"
+      || typeof skillPlanTransactionId !== "string"
+      || typeof skillNodeId !== "string"
+      || typeof boundSkill !== "string") continue;
+    rolloutBindings.push({
+      signal,
+      planningTransactionId,
+      skillPlanTransactionId,
+      skillNodeId,
+      boundSkill
+    });
+  }
+
+  const exactBindings = rolloutBindings.filter(
+    ({ boundSkill }) => boundSkill === input.commitment.skill
+  );
+  if (exactBindings.length === 0) {
+    return observedBoundRollout
+      ? {
+          status: "in_progress",
+          detail: json({
+            authority: "bound_skill_lifecycle",
+            reason: "commitment_skill_does_not_match_bound_skill",
+            commitment_id: input.commitment.commitment_id,
+            committed_skill: input.commitment.skill,
+            bound_skills: [...new Set(rolloutBindings.map(({ boundSkill }) => boundSkill))]
+          })
+        }
+      : undefined;
+  }
+
+  const signals = Object.values(input.hierarchy.signals);
+  for (const binding of exactBindings.sort(
+    (left, right) => right.signal.sequence - left.signal.sequence
+  )) {
+    const physicalSignals = signals.filter((signal) => {
+      if (signal.kind !== "skill_completed" && signal.kind !== "skill_failed") {
+        return false;
+      }
+      if (signal.source_node_id !== HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+        || signal.target_node_id !== HUMANOID_NEURAL_AGENT_IDS.actionSelection
+        || signal.world_revision < binding.signal.world_revision) return false;
+      const payload = object(signal.payload);
+      const detail = payload.detail === undefined ? undefined : object(payload.detail);
+      return payload.action === "execute_humanoid_skill"
+        && detail?.planning_transaction_id === binding.planningTransactionId;
+    }).sort((left, right) => right.sequence - left.sequence);
+    const physical = physicalSignals[0];
+    const plan = input.actionRuntimeState.skill_plans.find(
+      ({ transaction_id: transactionId }) => (
+        transactionId === binding.skillPlanTransactionId
+      )
+    );
+    const nodeCompleted = plan?.completed_node_ids.includes(binding.skillNodeId) === true;
+    const evidence = {
+      authority: "bound_skill_lifecycle",
+      commitment_id: input.commitment.commitment_id,
+      skill: input.commitment.skill,
+      planning_transaction_id: binding.planningTransactionId,
+      skill_plan_transaction_id: binding.skillPlanTransactionId,
+      skill_node_id: binding.skillNodeId,
+      node_completed: nodeCompleted,
+      completion_signal_id: physical?.signal_id ?? null,
+      execution_code: physical ? object(physical.payload).code ?? null : null
+    };
+    if (physical?.kind === "skill_failed") {
+      return { status: "failed", detail: json(evidence) };
+    }
+    if (physical?.kind === "skill_completed" && nodeCompleted) {
+      return { status: "completed", detail: json(evidence) };
+    }
+    return { status: "in_progress", detail: json(evidence) };
   }
   return undefined;
 }

@@ -16,7 +16,10 @@ import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
 import type { NeuralRolloutExecutionAdmission } from
   "../../domain/action-execution-ledger.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
-import { HUMANOID_SKILL_CONTRACTS } from "../../domain/humanoid-skill.js";
+import {
+  HUMANOID_SKILL_CONTRACTS,
+  type HumanoidSkillInvocation
+} from "../../domain/humanoid-skill.js";
 import { yawFromQuaternion } from "../../world/geometry.js";
 import { humanoidEndEffectorPosition } from "../../world/humanoid/end-effectors.js";
 import type { HumanoidBodyChannel } from "../../world/humanoid/motion-plan.js";
@@ -53,6 +56,7 @@ import {
   validateSkillPlanningReference,
   type ActiveHumanoidSkillBinding
 } from "./skill-binding.js";
+import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
 import {
   createHumanoidRecoveryPolicy,
   humanoidRecoverySelectionAccepted,
@@ -202,6 +206,10 @@ export const HumanoidActionRuntimeStateSchema = z.object({
   }
 });
 
+export type HumanoidActionRuntimeState = z.infer<
+  typeof HumanoidActionRuntimeStateSchema
+>;
+
 const MANIPULATION_APPROACH_RADIUS_METERS = 1;
 const MANIPULATION_BASE_TARGET_TOLERANCE_METERS = 0.04;
 const SKILL_AUTHORITY_OBJECT_DRIFT_METERS = 0.015;
@@ -303,11 +311,22 @@ export interface HumanoidActionRuntimeOptions {
   }) => ScenarioBlockRemovalTransaction | Promise<ScenarioBlockRemovalTransaction>;
   receipts?: Readonly<Record<string, HumanoidActionReceipt>>;
   state?: JsonValue | null;
+  /**
+   * Rebuild receipt-derived planning memory when restoring a normal runtime.
+   * A fresh neural epoch disables this while retaining receipts as physical
+   * and idempotency authority.
+   */
+  replayHistoricalCognitiveState?: boolean;
   neuralHierarchyEpochId?: string;
   realtimeExecution?: boolean;
   retainPhysicalTerminals?: boolean;
   requireSkillBinding?: boolean;
   activeGoal?: () => Goal | undefined;
+  activeNeuralSkillCommitment?: () => {
+    commitmentId: string;
+    goalEpochId: string;
+    invocation: HumanoidSkillInvocation;
+  } | undefined;
   signal?: AbortSignal;
 }
 
@@ -336,6 +355,9 @@ export class HumanoidActionRuntime {
   readonly #retainPhysicalTerminals: boolean;
   readonly #requireSkillBinding: boolean;
   readonly #activeGoal: HumanoidActionRuntimeOptions["activeGoal"];
+  readonly #activeNeuralSkillCommitment: HumanoidActionRuntimeOptions[
+    "activeNeuralSkillCommitment"
+  ];
   readonly #neuralHierarchyEpochId: string | undefined;
   readonly #signal: AbortSignal | undefined;
   readonly #receipts = new Map<string, HumanoidActionReceipt>();
@@ -409,11 +431,14 @@ export class HumanoidActionRuntime {
     this.#retainPhysicalTerminals = options.retainPhysicalTerminals ?? false;
     this.#requireSkillBinding = options.requireSkillBinding ?? false;
     this.#activeGoal = options.activeGoal;
+    this.#activeNeuralSkillCommitment = options.activeNeuralSkillCommitment;
     this.#neuralHierarchyEpochId = options.neuralHierarchyEpochId;
     this.#signal = options.signal;
     if (options.state !== undefined && options.state !== null) {
       this.#restoreState(options.state);
     }
+    const replayHistoricalCognitiveState =
+      options.replayHistoricalCognitiveState ?? true;
     for (const [transactionId, source] of Object.entries(options.receipts ?? {})) {
       const receipt = structuredClone(source);
       if (receipt.transactionId !== transactionId) {
@@ -450,8 +475,10 @@ export class HumanoidActionRuntime {
         this.#planningFailureByFingerprint.clear();
         this.#latestPlanningFailureKeyByAgent.clear();
       }
-      this.#recordPlanningOutcome(receipt);
-      this.#recordNavigationTransitClearance(receipt);
+      if (replayHistoricalCognitiveState) {
+        this.#recordPlanningOutcome(receipt);
+        this.#recordNavigationTransitClearance(receipt);
+      }
       this.#transactions.set(transactionId, {
         fingerprint,
         decisionSha256: receipt.decision
@@ -1460,8 +1487,6 @@ export class HumanoidActionRuntime {
           }
         };
       }
-      const previous = this.#activeSkillPlanTransactionByAgent.get(invocation.agentId);
-      if (previous) this.#skillPlansByTransactionId.delete(previous);
       const plan = registerHumanoidSkillPlan({
         transactionId: invocation.transactionId,
         agentId: invocation.agentId,
@@ -1473,6 +1498,70 @@ export class HumanoidActionRuntime {
           skillPlanProposalObjectIds(proposal)
         )
       });
+      const readyBindings = readyHumanoidSkillPlanBindings(plan);
+      const neuralCommitment = this.#activeNeuralSkillCommitment?.();
+      if (this.#activeNeuralSkillCommitment !== undefined
+        && (!neuralCommitment
+          || readyBindings.length !== 1
+          || !sameHumanoidSkillInvocation(
+            readyBindings[0]!.invocation,
+            neuralCommitment.invocation
+          ))) {
+        return {
+          accepted: false,
+          code: neuralCommitment
+            ? "skill_plan_commitment_entry_mismatch"
+            : "skill_plan_neural_commitment_required",
+          channels: [],
+          detail: {
+            automatic_actuation: false,
+            active_commitment: neuralCommitment ?? null,
+            rejected_ready_nodes: readyBindings.map((binding) => ({
+              skill_node_id: binding.skill_node_id,
+              invocation: binding.invocation
+            })),
+            recovery: neuralCommitment
+              ? "The dependency-ready Skill DAG entry must be exactly the one bounded invocation authorized by the active Action Selection commitment"
+              : "Return to Action Selection and establish one Goal-aligned bounded Skill commitment before motor planning"
+          }
+        };
+      }
+      const activeGoal = this.#activeGoal?.();
+      if (activeGoal) {
+        const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
+        const admission = readyBindings.map((binding) => ({
+          binding,
+          alignment: alignHumanoidSkillToGoal({
+            goal: activeGoal,
+            invocation: binding.invocation,
+            observation,
+            ...(recovery
+              && humanoidRecoverySelectionAccepted(recovery, binding.invocation)
+              ? { recoveryAuthorized: true }
+              : {})
+          })
+        }));
+        if (!admission.some(({ alignment }) => alignment.accepted)) {
+          return {
+            accepted: false,
+            code: "skill_plan_no_goal_aligned_entry",
+            channels: [],
+            detail: {
+              automatic_actuation: false,
+              selected_strategy_id: plan.selected_strategy_id,
+              active_goal: activeGoal,
+              rejected_ready_nodes: admission.map(({ binding, alignment }) => ({
+                skill_node_id: binding.skill_node_id,
+                invocation: binding.invocation,
+                reason: alignment.accepted ? null : alignment.reason
+              })),
+              recovery: "Submit a materially different Skill DAG whose dependency-ready entry advances the active Goal, establishes a matching prerequisite, or is authorized by current physical recovery evidence"
+            }
+          };
+        }
+      }
+      const previous = this.#activeSkillPlanTransactionByAgent.get(invocation.agentId);
+      if (previous) this.#skillPlansByTransactionId.delete(previous);
       this.#skillPlansByTransactionId.set(invocation.transactionId, plan);
       this.#activeSkillPlanTransactionByAgent.set(
         invocation.agentId,
@@ -1480,7 +1569,6 @@ export class HumanoidActionRuntime {
       );
       this.#activeSkillByAgent.delete(invocation.agentId);
       this.#latestPlanningFailureKeyByAgent.delete(invocation.agentId);
-      const readyBindings = readyHumanoidSkillPlanBindings(plan);
       return {
         accepted: true,
         code: "humanoid_skill_plan_registered",
@@ -1508,6 +1596,29 @@ export class HumanoidActionRuntime {
             observed_world_revision: observation?.worldRevision ?? null,
             current_world_revision: currentWorldRevision,
             recovery: "Call observe_humanoid before binding a skill phase"
+          }
+        };
+      }
+      const neuralCommitment = this.#activeNeuralSkillCommitment?.();
+      if (this.#activeNeuralSkillCommitment !== undefined
+        && (!neuralCommitment
+          || !sameHumanoidSkillInvocation(
+            request.invocation,
+            neuralCommitment.invocation
+          ))) {
+        return {
+          accepted: false,
+          code: neuralCommitment
+            ? "skill_binding_commitment_mismatch"
+            : "skill_binding_neural_commitment_required",
+          channels: [],
+          detail: {
+            automatic_actuation: false,
+            active_commitment: neuralCommitment ?? null,
+            rejected_invocation: request.invocation,
+            recovery: neuralCommitment
+              ? "Bind exactly the bounded Skill invocation authorized by the active Action Selection commitment"
+              : "Return to Action Selection and establish one Goal-aligned bounded Skill commitment before binding a motor phase"
           }
         };
       }
@@ -1716,6 +1827,30 @@ export class HumanoidActionRuntime {
       );
       if (!reference.accepted) return reference.result;
       const planningReceipt = this.#receipts.get(input.planning_transaction_id);
+      const skill = this.#skillByPlanningTransactionId.get(
+        input.planning_transaction_id
+      );
+      const neuralCommitment = this.#activeNeuralSkillCommitment?.();
+      if (this.#activeNeuralSkillCommitment !== undefined
+        && (!neuralCommitment
+          || !skill
+          || !sameHumanoidSkillInvocation(
+            skill.invocation,
+            neuralCommitment.invocation
+          ))) {
+        return {
+          accepted: false,
+          code: "skill_execution_commitment_mismatch",
+          channels: [],
+          detail: {
+            planning_transaction_id: input.planning_transaction_id,
+            active_commitment: neuralCommitment ?? null,
+            planned_skill_binding: skill ?? null,
+            automatic_actuation: false,
+            recovery: "Return to Action Selection; physical execution requires the planned Skill binding to exactly match the one active bounded commitment"
+          }
+        };
+      }
       const planKind = planningReceipt
         ? jsonObject(planningReceipt.detail)?.autonomous_plan_kind
         : undefined;
@@ -1771,9 +1906,6 @@ export class HumanoidActionRuntime {
       const executionSignal = combineExecutionSignals(
         this.#signal,
         invocation.signal
-      );
-      const skill = this.#skillByPlanningTransactionId.get(
-        input.planning_transaction_id
       );
       const skillEventStream = skill
         ? this.#skillEventStream(humanoidEmbodiedSkillIdentity(skill))
@@ -3987,6 +4119,13 @@ function stableJson(value: unknown): string {
     )).join(",")}}`;
   }
   throw new Error("Humanoid action input must be JSON serializable");
+}
+
+function sameHumanoidSkillInvocation(
+  left: HumanoidSkillInvocation,
+  right: HumanoidSkillInvocation
+): boolean {
+  return stableJson(left) === stableJson(right);
 }
 
 function combineExecutionSignals(

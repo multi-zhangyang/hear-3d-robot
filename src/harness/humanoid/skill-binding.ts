@@ -31,6 +31,8 @@ import {
 } from "./articulation-control.js";
 import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
 
+const GRASP_REACH_PRECONDITION_DISTANCE_METERS = 0.12;
+
 export type SkillPlanningAction =
   | "plan_humanoid_skill"
   | "plan_whole_body_motion_candidates"
@@ -505,6 +507,60 @@ function validateSkillSemantics(
   observation: HumanoidWorldObservation,
   continuationGoal?: HumanoidArticulationGoal
 ): ReturnType<typeof rejection> | null {
+  if (invocation.skill === "grasp") {
+    const occupied = observation.interaction.carrying.bindings.find(
+      ({ hand }) => hand === invocation.hand
+    );
+    if (occupied && occupied.object_id !== invocation.object_id) {
+      return rejection("skill_precondition_failed", {
+        skill: invocation.skill,
+        object_id: invocation.object_id,
+        hand: invocation.hand,
+        occupied_by_object_id: occupied.object_id,
+        reason: "selected hand must be free before grasp"
+      });
+    }
+    const verified = observation.interaction.manipulable_objects
+      .find(({ object_id: objectId }) => objectId === invocation.object_id)
+      ?.grasp.find(({ hand }) => hand === invocation.hand)?.verified === true;
+    if (!verified) {
+      const point = target?.interaction_points.find(
+        ({ id }) => id === invocation.interaction_point_id
+      );
+      const handSurfaces = observation.handSurfaces.filter(
+        ({ hand }) => hand === invocation.hand
+      );
+      const nearestSurfaceDistance = point && handSurfaces.length > 0
+        ? Math.min(...handSurfaces.map(({ worldPosition }) => distance(
+            worldPosition,
+            point.world_position
+          )))
+        : null;
+      if (nearestSurfaceDistance === null
+        || nearestSurfaceDistance > GRASP_REACH_PRECONDITION_DISTANCE_METERS) {
+        return rejection("skill_precondition_failed", {
+          skill: invocation.skill,
+          object_id: invocation.object_id,
+          hand: invocation.hand,
+          interaction_point_id: invocation.interaction_point_id,
+          reason: "selected hand has not reached the live interaction point",
+          nearest_hand_surface_distance_m: nearestSurfaceDistance,
+          maximum_reach_precondition_distance_m:
+            GRASP_REACH_PRECONDITION_DISTANCE_METERS,
+          required_prerequisite_skill: "reach"
+        });
+      }
+      if (handSurfaces.length < 2) {
+        return rejection("skill_precondition_failed", {
+          skill: invocation.skill,
+          object_id: invocation.object_id,
+          hand: invocation.hand,
+          reason: "two observable hand contact surfaces are required before grasp",
+          observed_hand_surface_count: handSurfaces.length
+        });
+      }
+    }
+  }
   if (invocation.skill === "open" || invocation.skill === "close"
     || invocation.skill === "turn") {
     if (!target?.articulation

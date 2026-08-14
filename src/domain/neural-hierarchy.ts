@@ -792,6 +792,8 @@ const NEURAL_HARNESS_PHASE_TRANSITIONS: Readonly<Record<
   goal_valuation: new Set(["perception", "cycle_completion", "terminal"]),
   perception: new Set([
     "skill_proposal",
+    "motor_assessment",
+    "recovery",
     "goal_valuation",
     "cycle_completion",
     "terminal"
@@ -859,13 +861,17 @@ export function transitionNeuralHarnessPhase(
     enteredByNodeId: string;
     reason: string;
     liveInvocationIds?: readonly string[];
+    resumeFromTerminal?: boolean;
     at?: string;
   }
 ): NeuralHierarchyState {
   const state = NeuralHierarchyStateSchema.parse(structuredClone(stateInput));
   const next = NeuralHarnessPhaseSchema.parse(input.phase);
   const previous = state.harness_phase;
+  const explicitTerminalResume = previous.phase === "terminal"
+    && input.resumeFromTerminal === true;
   if (next !== previous.phase
+    && !explicitTerminalResume
     && !NEURAL_HARNESS_PHASE_TRANSITIONS[previous.phase].has(next)) {
     throw new Error(
       `Invalid neural Harness phase transition: ${previous.phase} -> ${next}`
@@ -897,11 +903,19 @@ export function transitionNeuralHarnessPhase(
   });
   for (const lease of Object.values(state.authority_leases)) {
     if (lease.status !== "active" && lease.status !== "suspended") continue;
-    const incompatibleGoal = lease.goal_epoch_id !== null
-      && lease.goal_epoch_id !== input.goalEpochId;
-    const incompatibleCommitment = lease.commitment_id !== null
-      && lease.commitment_id !== input.commitmentId;
     const invocationIsLive = liveInvocationIds.has(lease.invocation_id);
+    // A nested child may legitimately advance the global phase before its
+    // typed result has unwound through every structural parent. Preserve only
+    // leases on that exact live invocation stack long enough to publish those
+    // already-authorized return edges; non-live leases are revoked immediately.
+    // Terminal entry always closes the graph.
+    const preserveLiveReturnPath = next !== "terminal" && invocationIsLive;
+    const incompatibleGoal = !preserveLiveReturnPath
+      && lease.goal_epoch_id !== null
+      && lease.goal_epoch_id !== input.goalEpochId;
+    const incompatibleCommitment = !preserveLiveReturnPath
+      && lease.commitment_id !== null
+      && lease.commitment_id !== input.commitmentId;
     const expiredRevision = !invocationIsLive
       && input.worldRevision > lease.expires_world_revision;
     const expiredTime = !invocationIsLive
@@ -1454,17 +1468,32 @@ export function compactNeuralHierarchyState(
   const retain = new Set(terminal.slice(0, retainedTerminalSignals).map(
     (signal) => signal.signal_id
   ));
-  const causallyRequired = new Set<string>();
-  for (const signal of Object.values(state.signals)) {
-    if (signal.status === "pending" || retain.has(signal.signal_id)) {
-      for (const parentId of signal.causal_parent_ids) causallyRequired.add(parentId);
+  const protectedSignalIds = new Set<string>([
+    ...Object.values(state.signals)
+      .filter((signal) => signal.status === "pending")
+      .map((signal) => signal.signal_id),
+    ...retain,
+    ...(state.active_skill_commitment?.source_signal_ids ?? []),
+    ...(state.active_skill_commitment?.transition_signal_ids ?? []),
+    ...Object.values(state.rollout_certificates).flatMap((certificate) => [
+      certificate.rollout_signal_id,
+      certificate.predictive_signal_id
+    ])
+  ]);
+  const causalFrontier = [...protectedSignalIds];
+  while (causalFrontier.length > 0) {
+    const signalId = causalFrontier.pop()!;
+    if (protectedSignalIds.has(signalId) && !state.signals[signalId]) continue;
+    const signal = state.signals[signalId];
+    if (!signal) continue;
+    for (const parentId of signal.causal_parent_ids) {
+      if (protectedSignalIds.has(parentId)) continue;
+      protectedSignalIds.add(parentId);
+      causalFrontier.push(parentId);
     }
   }
   for (const signal of terminal.slice(retainedTerminalSignals)) {
-    const commitmentRequired = state.active_skill_commitment !== null
-      && (state.active_skill_commitment.source_signal_ids.includes(signal.signal_id)
-        || state.active_skill_commitment.transition_signal_ids.includes(signal.signal_id));
-    if (!causallyRequired.has(signal.signal_id) && !commitmentRequired) {
+    if (!protectedSignalIds.has(signal.signal_id)) {
       delete state.signals[signal.signal_id];
     }
   }

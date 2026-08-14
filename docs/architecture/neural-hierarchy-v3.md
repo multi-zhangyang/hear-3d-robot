@@ -149,6 +149,15 @@ Selection before Executive can revalue the Goal. Recovery has no
 `risk_assessment` holding state: its bounded decision must either propose a
 replacement Skill or escalate.
 
+A failed physical transaction does not jump directly from Serial Executor into
+Recovery. Its `skill_failed` result first unwinds through Sensorimotor and Action
+Selection, where the old executing commitment is closed. The next event runs
+`Action Selection -> Perception Manager -> Sensor Fusion`, causally binding a
+current world observation to that exact failure. Only then can the strict
+`Executive -> Action Selection -> Sensorimotor -> Recovery` episode open. This
+prevents a replacement Skill from compiling against the pre-failure body or
+world revision.
+
 This is the **ownership graph**, not the data-flow graph. The rollout result,
 body sensation, and reflex error shown later are typed feedback routes; none
 creates another parent. The executable contract rejects multiple parents,
@@ -320,6 +329,7 @@ stateDiagram-v2
     Predictive --> Recovery: error outside local scope
     Execute --> ResolveCommitment: execution_receipt + skill_completed / failed
     ResolveCommitment --> PostExecutionSense: Action Selection closes commitment
+    PostExecutionSense --> Recovery: failed execution plus current failure-bound belief
     Recovery --> CommitmentAuthorization: lease closed with replacement proposal
     Recovery --> Escalate: local recovery unavailable
     PostExecutionSense --> CycleBarrier: current perceptual_belief joined
@@ -385,6 +395,15 @@ and do not produce a rollout signal. Only one accepted semantic planning call
 may return `rollout_result`; a rejected plan returns `escalation` unchanged
 through Premotor. This prevents both the former `skill_transaction_id="null"`
 failure and the former relabeling of a child escalation as `skill_proposal`.
+
+A Premotor planning escalation is still inside Sensorimotor's pathway correction
+scope; it is not yet a supervisory Recovery escalation. Sensorimotor therefore
+returns the typed Premotor result directly to Action Selection. Action Selection
+releases the now-invalid commitment, rebinds that one direct escalation down a
+new Sensorimotor episode, and only then may Sensorimotor open its exclusive
+Recovery lease. Causal ancestry distinguishes this lower-pathway failure from an
+`escalation` actually authored by Recovery: only the latter may continue upward
+to Executive and Goal Valuation.
 
 ## Authority leases and event wake-up
 
@@ -744,12 +763,26 @@ is no second model turn that rewrites the child's payload or causal IDs. This
 does not let the Harness select motion; it removes a redundant transcription
 step after the child has already made and validated the planning decision.
 
+Sensorimotor applies the same direct-result rule to a typed Premotor
+`escalation`. It does not ask its model to quote a nested Motor Intent signal.
+The Harness has already rebound the result to the unique
+`Premotor -> Sensorimotor` edge, so another model-authored envelope would cross
+authority namespaces rather than add a decision.
+
 Sensorimotor cites only its direct Premotor `rollout_result` when activating
 Predictive Critic. The Harness deterministically follows that signal's durable
 causal ancestry to the unique reentrant Rollout Gate signal and binds it into
 the Predictive delegation edge. This preserves single-parent visibility while
 still proving that Predictive evaluated the exact MuJoCo rollout rather than a
 model-authored copy.
+
+The model's delegation arguments do not choose rollout identity. At the
+Predictive boundary the Harness selects the unique current
+`Premotor -> Sensorimotor` rollout from that exact Sensorimotor episode, uses it
+as the descending payload, and resolves the unique reentrant Rollout Gate
+ancestor from durable causality. This prevents a compatible model from binding
+Predictive to a known but nested rollout ID while preserving the model's role in
+deciding when prediction review is required.
 
 There is no `lateral` direction in the signal schema. Siblings cannot build a
 hidden shared-memory network around their Manager.

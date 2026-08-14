@@ -273,12 +273,22 @@ export async function resumeHumanoidMission(input: {
       goal: store.definition.goal,
       world,
       checkpoint,
+      ...(input.freshAgentEpoch
+        ? { freshNeuralHierarchyEpoch: true }
+        : {}),
       ...(densePolicyWriter
         ? { policyFrameSink: densePolicyWriter.recordFrame }
         : {}),
       ...(input.eventSink ? { eventSink: input.eventSink } : {}),
       ...(input.signal ? { signal: input.signal } : {})
     });
+    if (input.freshAgentEpoch) {
+      // RunStore intentionally clears the old per-Agent context together with
+      // the neural epoch. Anchor that new empty context cut before autonomy
+      // initialization verifies the durable history; otherwise the previous
+      // epoch's valid anchor is mistaken for a downgrade of the new epoch.
+      await runtime.resetAgentContextEpoch();
+    }
     return await executeHumanoidMission({
       runtime,
       provider: input.provider,
@@ -1124,6 +1134,7 @@ function neuralCycleInput(
     `Active commitment：${JSON.stringify(neural.active_skill_commitment)}`,
     `Cycle completion：${JSON.stringify(runtime.cycleCompletionReadiness())}`,
     "Sensorimotor 先提出 skill_proposal；Action Selection 独占建立 commitment；只有真实 rollout_result 被批准后才能转 executing 并进入 Serial Executor。",
+    "若物理执行失败，必须先由 Action Selection 关闭旧 commitment，再经 Perception Manager→Sensor Fusion 获取与失败因果绑定的当前世界状态，然后才可沿 Action Selection→Sensorimotor→Recovery 生成替代 Skill 或逐级升级。",
     "物理执行后必须经 Action Selection→Perception Manager→Sensor Fusion 重新观察；只有 Harness 的 cycle completion 已 ready 且 observed_after_execution=true 时，Executive 才能提交完整的 causal evidence ids。",
     "下面是当前 Executive 自己的有界上下文锚点；它不是共享记忆，也不得原样转发给子 Agent。",
     JSON.stringify(humanoidNeuralContextProjection(

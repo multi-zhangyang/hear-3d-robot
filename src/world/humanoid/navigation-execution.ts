@@ -77,16 +77,25 @@ const NAVIGATION_MINIMUM_SHORT_ROUTE_PROGRESS_METERS = 0.02;
 const NAVIGATION_MINIMUM_SHORT_ROUTE_PROGRESS_RATIO = 0.5;
 const NAVIGATION_STARTUP_SECONDS = 10;
 const NAVIGATION_FINAL_CONVERGENCE_BUDGET_SECONDS = 6;
-const NAVIGATION_ARRIVAL_HEADING_BUDGET_SECONDS = 8;
+// Learned locomotion can arrive positionally before its yaw response has
+// converged, especially after a long station-keeping period.  Manipulation
+// approaches require the declared wrist-facing base yaw, so timing out the
+// preview while the robot is upright, inside the position envelope, and still
+// rotating rejects a physically feasible approach.  Keep this as bounded
+// physical rollout time rather than weakening the heading contract.
+const NAVIGATION_ARRIVAL_HEADING_BUDGET_SECONDS = 20;
 const NAVIGATION_ARRIVAL_HEADING_RECOVERY_HYSTERESIS_RADIANS = 0.03;
+const NAVIGATION_ARRIVAL_HEADING_SETTLE_MARGIN_RADIANS = 0.03;
 const NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS = 0.01;
 const NAVIGATION_STOP_SETTLE_BUDGET_SECONDS = 6;
 const NAVIGATION_STOP_SETTLED_STEPS = 4;
 const NAVIGATION_STOP_PLANAR_SPEED_TOLERANCE_METERS_PER_SECOND = 0.08;
+const NAVIGATION_STOP_YAW_SPEED_TOLERANCE_RADIANS_PER_SECOND = 0.08;
 const NAVIGATION_STOP_COMMAND_TOLERANCE_METERS_PER_SECOND = 0.08;
-const NAVIGATION_STOP_YAW_COMMAND_TOLERANCE_RADIANS_PER_SECOND = 0.08;
 const NAVIGATION_STOP_POSITION_HOLD_COMMAND_METERS_PER_SECOND = 0.06;
 const NAVIGATION_PHYSICAL_DEADBAND_COMMAND_TOLERANCE_METERS_PER_SECOND = 0.11;
+const NAVIGATION_MINIMUM_EFFECTIVE_ARRIVAL_YAW_RADIANS_PER_SECOND = 0.45;
+const CARRY_MINIMUM_EFFECTIVE_ARRIVAL_YAW_RADIANS_PER_SECOND = 0.3;
 const MAXIMUM_NAVIGATION_SECONDS = 90;
 const MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED = 1;
 const MAXIMUM_YAW_ACCELERATION_RADIANS_PER_SECOND_SQUARED = 2;
@@ -586,6 +595,13 @@ export class HumanoidNavigationExecution {
       }
       const linearStep = this.#linearAcceleration * this.#controlStepSeconds;
       const yawStep = this.#yawAcceleration * this.#controlStepSeconds;
+      const desiredYawVelocity = aligningArrivalHeading
+        ? this.#arrivalYawVelocityTarget(yawError)
+        : clamp(
+            yawError * 1.8,
+            carrying ? -CARRY_MAXIMUM_YAW_SPEED_RADIANS_PER_SECOND : -1,
+            carrying ? CARRY_MAXIMUM_YAW_SPEED_RADIANS_PER_SECOND : 1
+          );
       this.#reference = targetReference(this.#reference, {
         rootVelocity: [
           approach(this.#reference.rootVelocity[0], desiredForward, linearStep),
@@ -593,11 +609,7 @@ export class HumanoidNavigationExecution {
         ],
         rootYawVelocity: approach(
           this.#reference.rootYawVelocity,
-          clamp(
-            yawError * 1.8,
-            carrying ? -CARRY_MAXIMUM_YAW_SPEED_RADIANS_PER_SECOND : -1,
-            carrying ? CARRY_MAXIMUM_YAW_SPEED_RADIANS_PER_SECOND : 1
-          ),
+          desiredYawVelocity,
           yawStep
         )
       });
@@ -679,8 +691,39 @@ export class HumanoidNavigationExecution {
     // stop gate require a near-zero yaw command while the controller is still
     // deliberately producing one, so an otherwise valid arrival can never
     // accumulate settled frames.
-    if (Math.abs(error) <= this.#arrivalHeading.tolerance_radians) return 0;
-    return clamp(error * 1.8, -1, 1);
+    if (this.#arrivalHeadingCaptured(error)) return 0;
+    return this.#arrivalYawVelocityTarget(error);
+  }
+
+  #arrivalHeadingCaptured(error: number): boolean {
+    if (this.#arrivalHeading === null) return true;
+    // Capture the learned controller inside the declared tolerance rather
+    // than exactly on its boundary.  Otherwise the yaw command decays after
+    // crossing the limit and the physical response drifts a few milliradians
+    // back outside it, creating an endless rotate/stop oscillation.
+    const captureTolerance = Math.max(
+      0.03,
+      this.#arrivalHeading.tolerance_radians
+        - NAVIGATION_ARRIVAL_HEADING_SETTLE_MARGIN_RADIANS
+    );
+    return Math.abs(error) <= captureTolerance;
+  }
+
+  #arrivalYawVelocityTarget(error: number): number {
+    const maximum = this.#carrying
+      ? CARRY_MAXIMUM_YAW_SPEED_RADIANS_PER_SECOND
+      : 1;
+    const minimum = this.#carrying
+      ? CARRY_MINIMUM_EFFECTIVE_ARRIVAL_YAW_RADIANS_PER_SECOND
+      : NAVIGATION_MINIMUM_EFFECTIVE_ARRIVAL_YAW_RADIANS_PER_SECOND;
+    const proportional = clamp(error * 1.8, -maximum, maximum);
+    if (Math.abs(proportional) >= minimum) return proportional;
+    // The locomotion policy has a small-yaw command deadband.  Staying below
+    // it leaves a stable nonzero heading error forever even though the robot
+    // remains upright and positionally settled.  Hold the minimum effective
+    // command until the declared heading tolerance is physically crossed;
+    // the normal stop gate then ramps the command back to zero.
+    return Math.sign(error) * minimum;
   }
 
   #maximumSafeApproachSpeed(
@@ -964,20 +1007,20 @@ export class HumanoidNavigationExecution {
   }
 
   #stoppingFrameIsSettled(): boolean {
-    const pelvisVelocity = this.#final.links?.pelvis?.linearVelocity;
-    const planarSpeed = pelvisVelocity
-      ? Math.hypot(pelvisVelocity.x, pelvisVelocity.z)
+    const pelvis = this.#final.links?.pelvis;
+    const planarSpeed = pelvis
+      ? Math.hypot(pelvis.linearVelocity.x, pelvis.linearVelocity.z)
       : 0;
+    const yawSpeed = Math.abs(pelvis?.angularVelocity.y ?? 0);
     return planarSpeed
         <= NAVIGATION_STOP_PLANAR_SPEED_TOLERANCE_METERS_PER_SECOND
+      && yawSpeed <= NAVIGATION_STOP_YAW_SPEED_TOLERANCE_RADIANS_PER_SECOND
       && Math.hypot(...this.#reference.rootVelocity)
-        <= NAVIGATION_STOP_COMMAND_TOLERANCE_METERS_PER_SECOND
-      && Math.abs(this.#reference.rootYawVelocity)
-        <= NAVIGATION_STOP_YAW_COMMAND_TOLERANCE_RADIANS_PER_SECOND;
+        <= NAVIGATION_STOP_COMMAND_TOLERANCE_METERS_PER_SECOND;
   }
 
   #failedToSettleReason(): string {
-    const pelvisVelocity = this.#final.links?.pelvis?.linearVelocity;
+    const pelvis = this.#final.links?.pelvis;
     const deadbandAcceptedDistance = this.#boundedFinalPositionTolerance(Math.max(
       this.#baseFinalPositionTolerance(),
       NAVIGATION_PHYSICAL_DEADBAND_TOLERANCE_METERS
@@ -985,8 +1028,11 @@ export class HumanoidNavigationExecution {
     return "navigation_failed_to_settle"
       + `:position=${point(this.#final.rootPosition)}`
       + `;distance=${this.#finalWaypointDistance().toFixed(6)}`
-      + `;pelvis_speed=${pelvisVelocity
-        ? Math.hypot(pelvisVelocity.x, pelvisVelocity.z).toFixed(6)
+      + `;pelvis_speed=${pelvis
+        ? Math.hypot(pelvis.linearVelocity.x, pelvis.linearVelocity.z).toFixed(6)
+        : "unavailable"}`
+      + `;pelvis_yaw_speed=${pelvis
+        ? Math.abs(pelvis.angularVelocity.y).toFixed(6)
         : "unavailable"}`
       + `;command=${this.#reference.rootVelocity.map((value) => (
         value.toFixed(3)
@@ -1030,11 +1076,12 @@ export class HumanoidNavigationExecution {
   #finalWaypointSatisfied(): boolean {
     const currentDistance = this.#finalWaypointDistance();
     if (currentDistance > this.#finalAcceptedPositionTolerance()) return false;
-    if (!humanoidNavigationArrivalHeadingSatisfied(
-      this.#arrivalHeading,
-      this.#final.rootPosition,
-      yawFromQuaternion(this.#final.rootRotation)
-    )) return false;
+    if (this.#arrivalHeading !== null
+      && !this.#arrivalHeadingCaptured(humanoidNavigationArrivalHeadingError(
+        this.#arrivalHeading,
+        this.#final.rootPosition,
+        yawFromQuaternion(this.#final.rootRotation)
+      ))) return false;
     return true;
   }
 
@@ -1070,10 +1117,11 @@ export class HumanoidNavigationExecution {
   }
 
   #physicallySettledWithinDeadband(): boolean {
-    const pelvisVelocity = this.#final.links?.pelvis?.linearVelocity;
-    const planarSpeed = pelvisVelocity
-      ? Math.hypot(pelvisVelocity.x, pelvisVelocity.z)
+    const pelvis = this.#final.links?.pelvis;
+    const planarSpeed = pelvis
+      ? Math.hypot(pelvis.linearVelocity.x, pelvis.linearVelocity.z)
       : 0;
+    const yawSpeed = Math.abs(pelvis?.angularVelocity.y ?? 0);
     const acceptedDistance = this.#boundedFinalPositionTolerance(Math.max(
       this.#baseFinalPositionTolerance(),
       NAVIGATION_PHYSICAL_DEADBAND_TOLERANCE_METERS
@@ -1086,15 +1134,14 @@ export class HumanoidNavigationExecution {
       )
       && planarSpeed
         <= NAVIGATION_STOP_PLANAR_SPEED_TOLERANCE_METERS_PER_SECOND
+      && yawSpeed <= NAVIGATION_STOP_YAW_SPEED_TOLERANCE_RADIANS_PER_SECOND
       && Math.hypot(...this.#reference.rootVelocity)
         <= Math.max(
           NAVIGATION_STOP_COMMAND_TOLERANCE_METERS_PER_SECOND,
           NAVIGATION_PHYSICAL_DEADBAND_COMMAND_TOLERANCE_METERS_PER_SECOND,
           this.#minimumPlanarCommandSpeed()
             + NAVIGATION_EFFECTIVE_COMMAND_MARGIN_METERS_PER_SECOND
-        )
-      && Math.abs(this.#reference.rootYawVelocity)
-        <= NAVIGATION_STOP_YAW_COMMAND_TOLERANCE_RADIANS_PER_SECOND;
+        );
   }
 
   #baseFinalPositionTolerance(): number {
