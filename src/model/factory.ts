@@ -136,7 +136,7 @@ function normalizedCompatibleModelResponse<T>(response: T): T {
   const output = response.output.map((item) => {
     if (!isRecord(item) || item.type !== "function_call"
       || typeof item.arguments !== "string") return item;
-    const normalized = normalizeDuplicatedTrailingObjectDelimiters(
+    const normalized = normalizeCompatibleObjectDelimiters(
       item.arguments
     );
     if (normalized === item.arguments) return item;
@@ -146,13 +146,15 @@ function normalizedCompatibleModelResponse<T>(response: T): T {
   return changed ? { ...response, output } as T : response;
 }
 
-export function normalizeDuplicatedTrailingObjectDelimiters(input: string): string {
+export function normalizeCompatibleObjectDelimiters(input: string): string {
   if (jsonObject(input) !== undefined) return input;
   let candidate = input.trimEnd();
   for (let removed = 0; removed < 4 && candidate.endsWith("}"); removed += 1) {
     candidate = candidate.slice(0, -1).trimEnd();
     if (jsonObject(candidate) !== undefined) return candidate;
   }
+  const closedOuterObject = `${input.trimEnd()}}`;
+  if (jsonObject(closedOuterObject) !== undefined) return closedOuterObject;
   return input;
 }
 
