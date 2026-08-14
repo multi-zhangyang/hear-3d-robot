@@ -84,7 +84,6 @@ const NAVIGATION_FINAL_CONVERGENCE_BUDGET_SECONDS = 6;
 // rotating rejects a physically feasible approach.  Keep this as bounded
 // physical rollout time rather than weakening the heading contract.
 const NAVIGATION_ARRIVAL_HEADING_BUDGET_SECONDS = 20;
-const NAVIGATION_ARRIVAL_HEADING_RECOVERY_HYSTERESIS_RADIANS = 0.03;
 const NAVIGATION_ARRIVAL_HEADING_SETTLE_MARGIN_RADIANS = 0.03;
 const NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS = 0.01;
 const NAVIGATION_STOP_SETTLE_BUDGET_SECONDS = 6;
@@ -139,7 +138,8 @@ export const HumanoidNavigationExecutionProgressSchema = z.object({
   online_replan_count: z.number().int().nonnegative().optional(),
   stopping_frame_count: z.number().int().nonnegative(),
   stopping_settled_frame_count: z.number().int().nonnegative().optional(),
-  arrival_position_latched: z.boolean().optional()
+  arrival_position_latched: z.boolean().optional(),
+  arrival_heading_captured: z.boolean().optional()
 }).strict().superRefine((progress, context) => {
   if (progress.stopping_frame_count > progress.committed_frame_count) {
     context.addIssue({
@@ -196,6 +196,7 @@ export class HumanoidNavigationExecution {
   #stopFrames = 0;
   #stopSettledFrames = 0;
   #arrivalPositionLatched = false;
+  #arrivalHeadingCapturedLatched = false;
   #result: HumanoidNavigationExecutionResult | undefined;
   #pendingFrame: HumanoidNavigationPreparedFrame | undefined;
 
@@ -373,6 +374,8 @@ export class HumanoidNavigationExecution {
     this.#stopFrames = progress?.stopping_frame_count ?? 0;
     this.#stopSettledFrames = progress?.stopping_settled_frame_count ?? 0;
     this.#arrivalPositionLatched = progress?.arrival_position_latched ?? false;
+    this.#arrivalHeadingCapturedLatched =
+      progress?.arrival_heading_captured ?? false;
     this.#assertProgress();
   }
 
@@ -418,7 +421,8 @@ export class HumanoidNavigationExecution {
       online_replan_count: this.#onlineReplanCount,
       stopping_frame_count: this.#stopFrames,
       stopping_settled_frame_count: this.#stopSettledFrames,
-      arrival_position_latched: this.#arrivalPositionLatched
+      arrival_position_latched: this.#arrivalPositionLatched,
+      arrival_heading_captured: this.#arrivalHeadingCapturedLatched
     });
   }
 
@@ -443,7 +447,8 @@ export class HumanoidNavigationExecution {
     if (this.#waypointIndex === this.#plan.waypoints.length) {
       if (this.#arrivalPositionLatched
         && this.#finalWaypointDistance() > this.#finalAcceptedPositionTolerance()
-          + NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS) {
+          + NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS
+        && !this.#arrivalHeadingCapturedLatched) {
         this.#arrivalPositionLatched = false;
         this.#waypointIndex = this.#plan.waypoints.length - 1;
         this.#stopFrames = 0;
@@ -467,7 +472,8 @@ export class HumanoidNavigationExecution {
       const distance = Math.hypot(dx, dz);
       if (this.#waypointIndex < this.#plan.waypoints.length - 1
         ? distance <= NAVIGATION_WAYPOINT_TOLERANCE_METERS
-        : this.#finalWaypointSatisfied()) {
+        : this.#finalWaypointSatisfied()
+          || this.#arrivalControlMilestonesCaptured()) {
         this.#waypointIndex += 1;
         continue;
       }
@@ -500,28 +506,37 @@ export class HumanoidNavigationExecution {
       const acceptedPositionTolerance = finalWaypoint
         ? this.#finalAcceptedPositionTolerance()
         : NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS;
+      const arrivalHeadingCapturedNow = finalWaypoint
+        && this.#arrivalHeading !== null
+        && this.#arrivalHeadingCaptured(humanoidNavigationArrivalHeadingError(
+          this.#arrivalHeading,
+          this.#final.rootPosition,
+          yaw
+        ));
+      if (this.#arrivalPositionLatched && arrivalHeadingCapturedNow) {
+        this.#arrivalHeadingCapturedLatched = true;
+      }
       if (finalWaypoint
         && this.#arrivalHeading !== null
         && this.#arrivalPositionLatched
         && distance > acceptedPositionTolerance
-          + NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS) {
+          + NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS
+        && !this.#arrivalHeadingCapturedLatched) {
         this.#arrivalPositionLatched = false;
       }
       if (finalWaypoint
         && this.#arrivalHeading !== null
         && distance <= acceptedPositionTolerance) {
         this.#arrivalPositionLatched = true;
+        if (arrivalHeadingCapturedNow) {
+          this.#arrivalHeadingCapturedLatched = true;
+        }
       }
       const aligningArrivalHeading = finalWaypoint
         && this.#arrivalPositionLatched
         && this.#arrivalHeading !== null;
-      const arrivalHeadingReadyForPositionRecovery = aligningArrivalHeading
-        && Math.abs(humanoidNavigationArrivalHeadingError(
-          this.#arrivalHeading!,
-          this.#final.rootPosition,
-          yaw
-        )) <= this.#arrivalHeading!.tolerance_radians
-          + NAVIGATION_ARRIVAL_HEADING_RECOVERY_HYSTERESIS_RADIANS;
+      const arrivalHeadingCapturedForPositionRecovery = aligningArrivalHeading
+        && arrivalHeadingCapturedNow;
       if (finalWaypoint
         && this.#arrivalHeading === null
         && humanoidNavigationShouldBeginBraking({
@@ -564,7 +579,14 @@ export class HumanoidNavigationExecution {
       );
       const minimumPlanarSpeed = this.#minimumPlanarCommandSpeed();
       const desiredPlanarSpeed = Math.hypot(desiredForward, desiredLateral);
-      if ((!aligningArrivalHeading || arrivalHeadingReadyForPositionRecovery)
+      // A learned velocity policy cannot settle a millimetre-scale position
+      // error with a sub-deadband command. Applying its minimum effective
+      // translation while the final yaw is still converging makes a precise
+      // manipulation stance oscillate across the position boundary. Keep the
+      // latched base effectively stationary until yaw is captured, then use
+      // the minimum effective translation for the remaining position error.
+      if ((!aligningArrivalHeading
+          || arrivalHeadingCapturedForPositionRecovery)
         && distance > acceptedPositionTolerance
         && desiredPlanarSpeed > 1e-9
         && desiredPlanarSpeed < minimumPlanarSpeed) {
@@ -600,7 +622,9 @@ export class HumanoidNavigationExecution {
       const linearStep = this.#linearAcceleration * this.#controlStepSeconds;
       const yawStep = this.#yawAcceleration * this.#controlStepSeconds;
       const desiredYawVelocity = aligningArrivalHeading
-        ? this.#arrivalYawVelocityTarget(yawError)
+        ? arrivalHeadingCapturedNow
+          ? 0
+          : this.#arrivalYawVelocityTarget(yawError)
         : clamp(
             yawError * 1.8,
             carrying ? -CARRY_MAXIMUM_YAW_SPEED_RADIANS_PER_SECOND : -1,
@@ -1004,6 +1028,13 @@ export class HumanoidNavigationExecution {
       this.#finish(true);
       return true;
     }
+    // Position and heading acquisition are monotonic terminal-control
+    // milestones. Once both have been observed, remain in the station-keeping
+    // controller long enough to dissipate the learned policy's residual
+    // velocity. Returning to travel-yaw control here recreates the exact
+    // position/yaw oscillation that the latch is meant to prevent. The normal
+    // bounded stopping deadline still rejects a robot that does not settle.
+    if (this.#arrivalControlMilestonesCaptured()) return false;
     this.#waypointIndex = this.#plan.waypoints.length - 1;
     this.#stopFrames = 0;
     this.#stopSettledFrames = 0;
@@ -1087,6 +1118,12 @@ export class HumanoidNavigationExecution {
         yawFromQuaternion(this.#final.rootRotation)
       ))) return false;
     return true;
+  }
+
+  #arrivalControlMilestonesCaptured(): boolean {
+    return this.#arrivalHeading !== null
+      && this.#arrivalPositionLatched
+      && this.#arrivalHeadingCapturedLatched;
   }
 
   #finalPositionTolerance(): number {
@@ -1177,6 +1214,12 @@ export class HumanoidNavigationExecution {
     }
     if (this.#arrivalPositionLatched && this.#arrivalHeading === null) {
       throw new Error("Humanoid navigation position latch requires an arrival heading");
+    }
+    if (this.#arrivalHeadingCapturedLatched
+      && (!this.#arrivalPositionLatched || this.#arrivalHeading === null)) {
+      throw new Error(
+        "Humanoid navigation heading capture requires a latched arrival position"
+      );
     }
     if (this.#frames > this.#maximumTravelFrames + this.#maximumStoppingFrames) {
       throw new Error("Humanoid navigation progress exceeds its physical frame limit");
