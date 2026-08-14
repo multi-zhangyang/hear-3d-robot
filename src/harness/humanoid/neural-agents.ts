@@ -4218,12 +4218,37 @@ function joinedManagerSignals(
       "skill_failed"
     ];
   }
-  return kinds.length === 0
-    ? []
-    : runtime.pendingNeuralSignals({ targetNodeId, kinds }).filter((signal) => (
-      signal.direction === "descending"
+  return kinds.length === 0 ? [] : durableManagerEpisodeSignals(
+    runtime,
+    targetNodeId,
+    kinds,
+    invocationId
+  );
+}
+
+/**
+ * A Manager episode owns its exact fork/join inputs until the enclosing
+ * Agent.asTool invocation has published the aggregate result. World-revision
+ * TTL is still used for ordinary routing and orphan cleanup, but it cannot
+ * invalidate a persisted sibling result while the same episode is unwinding
+ * through the SDK wrapper after a long-running parallel join.
+ */
+function durableManagerEpisodeSignals(
+  runtime: HumanoidNeuralAgentRuntime,
+  targetNodeId: string,
+  kinds: readonly NeuralSignalKind[],
+  invocationId: string
+): NeuralSignal[] {
+  const acceptedKinds = new Set(kinds);
+  return Object.values(runtime.neuralHierarchyState().signals)
+    .filter((signal) => signal.status === "pending"
+      && signal.target_node_id === targetNodeId
+      && acceptedKinds.has(signal.kind)
+      && (signal.direction === "descending"
         ? signal.invocation_id === invocationId
-        : signal.parent_episode_id === invocationId
+        : signal.parent_episode_id === invocationId))
+    .sort((left, right) => (
+      right.priority - left.priority || left.sequence - right.sequence
     ));
 }
 
@@ -4241,14 +4266,14 @@ function requireManagerJoinEvidence(
   sourceSignalIds: readonly string[]
 ): NeuralSignal[] {
   if (managerKey === "sensorimotorManager" && outputKind === "skill_proposal") {
-    const recoveryProposal = runtime.pendingNeuralSignals({
-      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-      kinds: ["skill_proposal"]
-    }).find((signal) => signal.direction === "ascending"
+    const recoveryProposal = durableManagerEpisodeSignals(
+      runtime,
+      HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+      ["skill_proposal"],
+      invocationId
+    ).find((signal) => signal.direction === "ascending"
       && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.recovery
-      && signal.parent_episode_id === invocationId
-      && sourceSignalIds.includes(signal.signal_id)
-      && isCurrentNeuralSignal(runtime, signal));
+      && sourceSignalIds.includes(signal.signal_id));
     if (recoveryProposal) {
       // Recovery owns a separate, exclusive failure-domain lease. Its proposal
       // is already the formal child result and must not be forced through the
@@ -4264,10 +4289,12 @@ function requireManagerJoinEvidence(
       : [];
   if (requirements.length === 0) return [];
   const targetNodeId = HUMANOID_NEURAL_AGENT_IDS[managerKey];
-  const available = runtime.pendingNeuralSignals({
+  const available = durableManagerEpisodeSignals(
+    runtime,
     targetNodeId,
-    kinds: requirements
-  });
+    requirements,
+    invocationId
+  );
   const cited = new Set(sourceSignalIds);
   return requirements.map((kind) => {
     const signal = available.find((candidate) => (
