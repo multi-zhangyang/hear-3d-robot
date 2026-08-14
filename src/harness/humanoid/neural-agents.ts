@@ -728,7 +728,13 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           && params.signal_kind === "skill_commitment"
           ? activeCommitment
             : {
-              intent: params.intent,
+              control: {
+                protocol: "structural_neural_delegation_v1",
+                parent_node_id: parentId,
+                child_node_id: childId,
+                harness_phase: input.runtime.neuralHarnessPhase().phase,
+                signal_kind: params.signal_kind
+              },
               causal_inputs: exactSourceSignals.map((signal) => ({
                 signal_id: signal!.signal_id,
                 kind: signal!.kind,
@@ -3725,7 +3731,9 @@ function causalSemanticProjection(value: JsonValue): JsonValue {
   const causalInputs = Array.isArray(record.causal_inputs)
     ? record.causal_inputs
     : undefined;
-  if (typeof record.intent !== "string" || causalInputs === undefined) return value;
+  const control = jsonRecord(record.control);
+  const legacyFreeTextDelegation = typeof record.intent === "string";
+  if ((!control && !legacyFreeTextDelegation) || causalInputs === undefined) return value;
   const semanticInputs = causalInputs.flatMap((candidate) => {
     const input = jsonRecord(candidate);
     if (!input) return [];
@@ -3735,11 +3743,14 @@ function causalSemanticProjection(value: JsonValue): JsonValue {
   if (semanticInputs.length === 1) return semanticInputs[0]!;
   if (semanticInputs.length > 1) {
     return jsonValue({
-      intent: record.intent,
+      ...(control ? { control } : {}),
       semantic_inputs: semanticInputs
     });
   }
-  return jsonValue({ intent: record.intent });
+  // Runs created before structural_neural_delegation_v1 can still contain a
+  // prose `intent`. Treat it only as an obsolete routing wrapper: preserving
+  // that text would let stale parent-authored motion choices cross an epoch.
+  return jsonValue(control ? { control } : {});
 }
 
 function jsonValue(value: unknown): JsonValue {
@@ -4342,11 +4353,12 @@ function neuralDelegationSchema(
     ...NeuralSignalKind[]
   ];
   return z.object({
-    signal_kind: z.enum(signalKinds),
-    intent: z.string().trim().min(1).max(8_000).describe(
-      "Concise responsibility for the child. Do not copy context anchors, directed signals, observations, or JSON into this field; the Harness injects the child's authoritative state separately."
+    signal_kind: z.enum(signalKinds).describe(
+      "The allowed typed signal on this fixed structural parent-child edge. It does not authorize choosing a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters."
     ),
-    source_signal_ids: z.array(z.string().uuid()).max(64).default([]),
+    source_signal_ids: z.array(z.string().uuid()).max(64).default([]).describe(
+      "Exact causal signal ids visible in this parent invocation. The Harness supplies all child state and derives the child's responsibility from the structural edge and current phase."
+    ),
     ttl_revisions: z.number().int().min(1).max(1_000_000)
       .default(MODEL_EPISODE_SIGNAL_TTL_REVISIONS),
     priority: z.number().int().min(0).max(100).default(50)
@@ -4393,7 +4405,7 @@ function baseInstructions(key: HumanoidNeuralAgentKey): string[] {
     `Activation cadence: ${descriptor.cadence}; maximum correction scope: ${descriptor.maximumCorrectionScope}.`,
     "This is a strict hierarchy. Never contact siblings, read their Sessions, or bypass your parent.",
     "Treat only directed world-versioned neural signals and your bounded invocation anchor as current.",
-    "When delegating, write only a concise plain-text intent. Never copy your context anchor, observations, directed signals, or JSON into a child tool argument; the Harness injects the child's authoritative state.",
+    "When delegating, choose only one owned child edge, an allowed signal_kind, and exact causal source_signal_ids. The structural edge and current Harness phase define the child's bounded responsibility; there is no free-text delegation channel and you cannot prescribe a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters.",
     "For source_signal_ids copy only exact signal_id values present in the current invocation. Use [] when none exists; never invent a UUID or placeholder.",
     `Submit every final neural signal through ${NEURAL_OUTPUT_SUBMISSION_TOOL_NAME}; never return the envelope as assistant text.`,
     "Pass the structured signal body directly in the submission tool's payload field; do not JSON-stringify it.",
