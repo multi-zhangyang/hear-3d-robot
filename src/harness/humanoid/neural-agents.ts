@@ -870,6 +870,20 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         : {})
       })
     );
+    const sdkEnabled = childTool.isEnabled;
+    childTool.isEnabled = async (context, agent) => {
+      if (inputTool.isEnabled && !inputTool.isEnabled()) return false;
+      if (inputTool.phases
+        && parentId !== HUMANOID_NEURAL_AGENT_IDS.executive
+        && !input.runtime.neuralNodeEnabled({
+          nodeId: parentId,
+          phases: inputTool.phases,
+          ...(inputTool.requireCommitment ? { requireCommitment: true } : {})
+        })) {
+        return false;
+      }
+      return sdkEnabled ? await sdkEnabled(context, agent) : true;
+    };
     // A hierarchy child failure is a control-path failure, not model-visible
     // prose. The SDK function-tool default converts exceptions into
     // "An error occurred...", which destroys the originating node and makes
