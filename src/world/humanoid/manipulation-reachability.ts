@@ -34,6 +34,9 @@ const BASE_PLACEMENT_BOUNDARY_OUTSIDE_MARGIN_METERS = 0.005;
 const NAVIGABLE_BASE_PLACEMENT_YAW_OFFSETS_RADIANS = [
   0, -0.12, 0.12, -0.24, 0.24, -0.36, 0.36
 ] as const;
+const NAVIGABLE_BASE_PLACEMENTS_PER_ALIGNMENT = 8;
+const NAVIGABLE_BASE_ROOTS_PER_ALIGNMENT = 4;
+const NAVIGABLE_BASE_YAWS_PER_ROOT = 2;
 const HUMANOID_PLANAR_BODY_CLEARANCE_METERS = 0.18;
 
 export interface HumanoidManipulationReachabilityMap {
@@ -299,7 +302,7 @@ function reachableRootPlacements(
     left.ikResidualMeters - right.ikResidualMeters
   ));
   const best = ranked[0];
-  const bestNavigable = ranked.find((placement) => (
+  const navigable = ranked.filter((placement) => (
     humanoidManipulationBaseNavigationBlockerIds({
       solidTokens: input.solidTokens,
       objectId: placement.objectId,
@@ -308,8 +311,43 @@ function reachableRootPlacements(
   ));
   return uniquePlacements([
     ...(best ? [best] : []),
-    ...(bestNavigable ? [bestNavigable] : [])
+    ...diverseNavigableBasePlacements(navigable)
   ]);
+}
+
+function diverseNavigableBasePlacements(
+  placements: readonly HumanoidManipulationBasePlacementObservation[]
+): HumanoidManipulationBasePlacementObservation[] {
+  const byRoot = new Map<
+    string,
+    HumanoidManipulationBasePlacementObservation[]
+  >();
+  for (const placement of placements) {
+    const key = `${placement.rootWorldTarget.x.toFixed(4)}:`
+      + `${placement.rootWorldTarget.y.toFixed(4)}:`
+      + placement.rootWorldTarget.z.toFixed(4);
+    const variants = byRoot.get(key) ?? [];
+    variants.push(placement);
+    byRoot.set(key, variants);
+  }
+  const rootGroups = [...byRoot.values()]
+    .sort((left, right) => (
+      left[0]!.ikResidualMeters - right[0]!.ikResidualMeters
+    ));
+  const selected = uniquePlacements(
+    rootGroups
+      .slice(0, NAVIGABLE_BASE_ROOTS_PER_ALIGNMENT)
+      .flatMap((variants) => (
+        variants.slice(0, NAVIGABLE_BASE_YAWS_PER_ROOT)
+      ))
+  );
+  if (selected.length >= NAVIGABLE_BASE_PLACEMENTS_PER_ALIGNMENT) {
+    return selected.slice(0, NAVIGABLE_BASE_PLACEMENTS_PER_ALIGNMENT);
+  }
+  return uniquePlacements([
+    ...selected,
+    ...placements
+  ]).slice(0, NAVIGABLE_BASE_PLACEMENTS_PER_ALIGNMENT);
 }
 
 function humanoidManipulationNavigationBoundaryProbes(
