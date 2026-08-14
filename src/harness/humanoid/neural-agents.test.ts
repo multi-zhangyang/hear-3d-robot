@@ -1757,8 +1757,7 @@ function scriptedHierarchyModel(agentId: string, calls: string[]): Model {
           "goal-continues-epoch",
           "continue_goal_epoch",
           {
-            reason: "The current Goal remains physically relevant",
-            recovery_intent: "Continue through the owned perception branch"
+            reason: "The current Goal remains physically relevant"
           }
         );
       }
@@ -1825,8 +1824,7 @@ function malformedDelegationModel(agentId: string, calls: string[]): Model {
           "goal-continues-after-correction",
           "continue_goal_epoch",
           {
-            reason: "The current Goal remains physically relevant",
-            recovery_intent: "Continue through the owned perception branch"
+            reason: "The current Goal remains physically relevant"
           }
         );
       }

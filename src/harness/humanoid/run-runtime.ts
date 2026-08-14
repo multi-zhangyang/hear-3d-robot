@@ -1852,7 +1852,6 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         status: "goal_epoch_continued",
         cycle: interruptedCycle,
         reason: input.reason,
-        recovery_intent: input.recovery_intent,
         evidence_ref: evidence.ref,
         world_revision: captured.world.worldRevision
       });
@@ -1867,7 +1866,6 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       await this.emit("autonomous_cycle_interrupted", json({
         cycle: interruptedCycle,
         reason: "goal_epoch_continued_after_re_evaluation",
-        recovery_intent: input.recovery_intent,
         evidence_ref: evidence.ref,
         world_revision: captured.world.worldRevision
       }));
@@ -1879,7 +1877,6 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         next_cycle_id: nextCycle.cycle_id,
         next_cycle_index: nextCycle.cycle_index,
         reason: input.reason,
-        recovery_intent: input.recovery_intent,
         evidence_ref: evidence.ref,
         world_revision: captured.world.worldRevision
       });

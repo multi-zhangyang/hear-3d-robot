@@ -87,8 +87,7 @@ const RetireGoalEpochSchema = z.object({
 });
 
 const ContinueGoalEpochSchema = z.object({
-  reason: z.string().trim().min(1),
-  recovery_intent: z.string().trim().min(1)
+  reason: z.string().trim().min(1)
 }).strict();
 
 const RecallGoalHistorySchema = z.object({
@@ -337,7 +336,7 @@ function goalToolDescription(name: string): string {
     return "用候选回执中的短序号显式选择一个已提交且依赖已完成的 Goal。短序号与持久候选身份一对一对应；Harness 不打分、不随机选择，也不提供替代目标。";
   }
   if (name === "continue_goal_epoch") {
-    return "目标重评后保留当前 active Goal，结束已经失败的自主周期并以新的恢复预算开始下一周期。只有 Goal 仍物理可达、但当前周期的 compact replan 已耗尽时使用；必须给出新的恢复意图。";
+    return "目标重评后保留当前 active Goal，结束已经失败的自主周期并以新的恢复预算开始下一周期。只有 Goal 仍物理可达、但当前周期的 compact replan 已耗尽时使用。只说明 Goal 为何仍应继续；不得指定 Skill、手、交互点、坐标、路线或动作参数，下一周期必须从新鲜物理观察重新选择。";
   }
   return "用当前物理证据将 active Goal 退役为 blocked、abandoned、superseded 或 expired。退役后必须由后续模型调用重新提交并选择，Harness 不自动替换。";
 }

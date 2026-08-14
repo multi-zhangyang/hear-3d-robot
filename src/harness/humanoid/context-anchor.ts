@@ -102,7 +102,9 @@ export function createHumanoidContextAnchor(input: {
         })
       },
       cycle_index: input.checkpoint.cycle_index,
-      previous_cycle_transition: input.checkpoint.last_cycle,
+      previous_cycle_transition: previousCycleTransitionContext(
+        input.checkpoint.last_cycle
+      ),
       world_frame: input.world.frame,
       world_revision: input.world.worldRevision,
       robot: {
@@ -208,6 +210,40 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+/**
+ * A prior model output is historical data, not authority for a successor
+ * Cycle. In particular, Goal valuation prose must not smuggle a hand,
+ * interaction point, coordinate or Skill through the Executive into a fresh
+ * perception/action-selection branch. Current observations and receipts carry
+ * the physical facts; only the durable transition identity crosses the cut.
+ */
+function previousCycleTransitionContext(value: JsonValue | null): JsonValue {
+  const source = record(value);
+  if (!source || typeof source.status !== "string") return null;
+  const cycle = record(source.cycle);
+  return json({
+    status: source.status,
+    cycle: cycle
+      ? {
+          cycle_id: typeof cycle.cycle_id === "string" ? cycle.cycle_id : null,
+          cycle_index: typeof cycle.cycle_index === "number" ? cycle.cycle_index : null,
+          goal_epoch_id: typeof cycle.goal_epoch_id === "string"
+            ? cycle.goal_epoch_id
+            : null
+        }
+      : null,
+    evidence_ref: typeof source.evidence_ref === "string"
+      ? source.evidence_ref
+      : null,
+    world_revision: typeof source.world_revision === "number"
+      ? source.world_revision
+      : null,
+    retirement_status: typeof source.retirement_status === "string"
+      ? source.retirement_status
+      : null
+  });
 }
 
 function json(value: unknown): JsonValue {
