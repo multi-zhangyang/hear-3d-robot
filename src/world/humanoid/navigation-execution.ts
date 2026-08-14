@@ -577,6 +577,19 @@ export class HumanoidNavigationExecution {
         carrying ? -CARRY_MAXIMUM_LATERAL_SPEED_METERS_PER_SECOND : -0.22,
         carrying ? CARRY_MAXIMUM_LATERAL_SPEED_METERS_PER_SECOND : 0.22
       );
+      if (aligningArrivalHeading
+        && !arrivalHeadingCapturedForPositionRecovery) {
+        // Position acquisition and heading acquisition are distinct terminal
+        // phases. Merely suppressing the learned policy's minimum translation
+        // still leaves the proportional position servo active inside the
+        // accepted envelope. That command walks the base back out while yaw
+        // velocity is ramping, so the heading phase repeatedly loses
+        // authority before it can start. Decelerate translation to zero until
+        // yaw is captured; only then may the position servo remove residual
+        // drift before the final stop gate.
+        desiredForward = 0;
+        desiredLateral = 0;
+      }
       const minimumPlanarSpeed = this.#minimumPlanarCommandSpeed();
       const desiredPlanarSpeed = Math.hypot(desiredForward, desiredLateral);
       // A learned velocity policy cannot settle a millimetre-scale position

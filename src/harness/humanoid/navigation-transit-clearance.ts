@@ -167,7 +167,36 @@ export function navigationTransitClearanceContext(
         collision_target_contact: "forbidden",
         future_wrist_world_target: "required",
         minimum_wrist_displacement_m: MINIMUM_WRIST_CLEARANCE_DISPLACEMENT_METERS,
-        matching_end_effector_terminal: "required"
+        matching_end_effector_terminal: "required",
+        required_candidate_contract: {
+          every_keyframe_channels: [{
+            type: "end_effector_position",
+            end_effector: "left_ankle",
+            frame: "world",
+            position: requirement.currentFeetWorld.left,
+            tolerance_m: 0.015
+          }, {
+            type: "end_effector_position",
+            end_effector: "right_ankle",
+            frame: "world",
+            position: requirement.currentFeetWorld.right,
+            tolerance_m: 0.015
+          }],
+          future_collision_side_wrist_channel: {
+            type: "end_effector_position",
+            end_effector: requirement.endEffector,
+            frame: "world",
+            position: "model_selected_world_point_at_least_0.05m_from_current_wrist",
+            tolerance_m: 0.05
+          },
+          matching_terminal_predicate: {
+            type: "end_effector_near_point",
+            end_effector: requirement.endEffector,
+            frame: "world",
+            target: "exactly_copy_the_model_selected_future_wrist_position",
+            tolerance_m: 0.05
+          }
+        }
       }
     },
     automatic_actuation: false
@@ -291,7 +320,7 @@ export function navigationTransitClearanceMotionRejection(
     detail: {
       ...navigationTransitClearanceContext(requirement) as Record<string, JsonValue>,
       rejected_candidates: failures,
-      recovery: "This whole-body recovery path requires a model-selected collision-side wrist target while the support base remains fixed. The model may instead choose a materially different navigation strategy."
+      recovery: "For every candidate, copy both fixed ankle world targets into every keyframe, choose a displaced collision-side wrist world target, and copy that exact wrist target into the terminal predicate. The model may instead choose a materially different navigation strategy."
     }
   };
 }
