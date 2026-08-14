@@ -285,7 +285,8 @@ function assertControllerDescriptor(
   }
   for (const optionalPositive of [
     value.commandResponseHorizonSeconds,
-    value.minimumEffectivePlanarSpeedMetersPerSecond
+    value.minimumEffectivePlanarSpeedMetersPerSecond,
+    value.minimumEffectiveYawSpeedRadiansPerSecond
   ]) {
     if (optionalPositive !== undefined && !isPositiveFinite(optionalPositive)) {
       throw new Error("Humanoid controller declares an invalid optional timing value");

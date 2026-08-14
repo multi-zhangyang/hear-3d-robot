@@ -67,6 +67,7 @@ export function stationKeepingHumanoidReference(
     preserveTrackedLowerBody?: boolean;
     previousPlanarCommand?: readonly [number, number];
     controlStepSeconds?: number;
+    minimumEffectiveYawSpeedRadiansPerSecond?: number;
   } = {}
 ): HumanoidReference {
   const validated = HumanoidStationKeepingAnchorSchema.parse(anchor);
@@ -82,6 +83,10 @@ export function stationKeepingHumanoidReference(
   const localLateralVelocity = pelvisVelocity.x * Math.cos(yaw)
     - pelvisVelocity.z * Math.sin(yaw);
   const yawError = normalizeAngle(validated.yaw - yaw);
+  const minimumYawCommand = options.minimumEffectiveYawSpeedRadiansPerSecond ?? 0;
+  if (!Number.isFinite(minimumYawCommand) || minimumYawCommand < 0) {
+    throw new Error("Station-keeping minimum yaw command must be finite and nonnegative");
+  }
   const planarDrift = Math.hypot(deltaX, deltaZ);
   const postureReference = planarDrift
       > MAXIMUM_TRACKED_POSTURE_DRIFT_METERS
@@ -127,18 +132,20 @@ export function stationKeepingHumanoidReference(
       }
     });
   }
+  const proportionalYawCommand = Math.abs(yawError)
+      <= MINIMUM_YAW_CORRECTION_RADIANS
+    ? 0
+    : clamp(yawError * YAW_GAIN, -MAXIMUM_YAW_SPEED, MAXIMUM_YAW_SPEED);
+  const effectiveYawCommand = proportionalYawCommand !== 0
+      && Math.abs(proportionalYawCommand) < minimumYawCommand
+    ? Math.sign(proportionalYawCommand) * minimumYawCommand
+    : proportionalYawCommand;
   return targetReference(stationary, {
     rootVelocity: [
       compensated.forward,
       compensated.lateral
     ],
-    rootYawVelocity: clamp(
-      Math.abs(yawError) <= MINIMUM_YAW_CORRECTION_RADIANS
-        ? 0
-        : yawError * YAW_GAIN,
-      -MAXIMUM_YAW_SPEED,
-      MAXIMUM_YAW_SPEED
-    )
+    rootYawVelocity: effectiveYawCommand
   });
 }
 

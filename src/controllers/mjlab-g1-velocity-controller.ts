@@ -130,6 +130,7 @@ export class MjlabG1VelocityController implements HumanoidWholeBodyController {
     physicsStepSeconds: PHYSICS_STEP_SECONDS,
     commandResponseHorizonSeconds: 0.2,
     minimumEffectivePlanarSpeedMetersPerSecond: 0.15,
+    minimumEffectiveYawSpeedRadiansPerSecond: 0.45,
     learnedPolicy: {
       protocol: "humanoid-learned-policy-v1",
       runtime: "onnxruntime-web/wasm",

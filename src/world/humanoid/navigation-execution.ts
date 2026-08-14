@@ -176,6 +176,7 @@ export class HumanoidNavigationExecution {
   readonly #yawAcceleration: number;
   readonly #carrying: boolean;
   readonly #minimumEffectivePlanarSpeed: number;
+  readonly #minimumEffectiveYawSpeed: number;
   readonly #precisionArrival: boolean;
   readonly #contactConstraints: readonly HumanoidContactConstraint[];
   readonly #graspTargets: readonly G1ContactAwareGraspTarget[];
@@ -281,6 +282,9 @@ export class HumanoidNavigationExecution {
     this.#brakingResponseHorizonSeconds = this.#commandResponseHorizonSeconds;
     this.#minimumEffectivePlanarSpeed = controller
       .minimumEffectivePlanarSpeedMetersPerSecond ?? 0;
+    this.#minimumEffectiveYawSpeed = controller
+      .minimumEffectiveYawSpeedRadiansPerSecond
+        ?? NAVIGATION_MINIMUM_EFFECTIVE_ARRIVAL_YAW_RADIANS_PER_SECOND;
     this.#linearAcceleration = carrying
       ? CARRY_MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED
       : MAXIMUM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED;
@@ -715,7 +719,7 @@ export class HumanoidNavigationExecution {
       : 1;
     const minimum = this.#carrying
       ? CARRY_MINIMUM_EFFECTIVE_ARRIVAL_YAW_RADIANS_PER_SECOND
-      : NAVIGATION_MINIMUM_EFFECTIVE_ARRIVAL_YAW_RADIANS_PER_SECOND;
+      : this.#minimumEffectiveYawSpeed;
     const proportional = clamp(error * 1.8, -maximum, maximum);
     if (Math.abs(proportional) >= minimum) return proportional;
     // The locomotion policy has a small-yaw command deadband.  Staying below

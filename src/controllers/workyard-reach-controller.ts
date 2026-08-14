@@ -180,6 +180,7 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
     physicsStepSeconds: 0.005,
     commandResponseHorizonSeconds: 0.2,
     minimumEffectivePlanarSpeedMetersPerSecond: 0.15,
+    minimumEffectiveYawSpeedRadiansPerSecond: 0.45,
     learnedPolicy: {
       protocol: "humanoid-learned-policy-v1",
       runtime: "onnxruntime-web/wasm",

@@ -113,6 +113,8 @@ const HumanoidSimulationSnapshotSchema = z.object({
     commandResponseHorizonSeconds: z.number().finite().positive().optional(),
     minimumEffectivePlanarSpeedMetersPerSecond:
       z.number().finite().positive().optional(),
+    minimumEffectiveYawSpeedRadiansPerSecond:
+      z.number().finite().positive().optional(),
     learnedPolicy: z.object({
       protocol: z.literal("humanoid-learned-policy-v1"),
       runtime: z.string().trim().min(1),

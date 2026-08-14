@@ -143,6 +143,7 @@ export interface HumanoidControllerDescriptor {
   physicsStepSeconds: number;
   commandResponseHorizonSeconds?: number | undefined;
   minimumEffectivePlanarSpeedMetersPerSecond?: number | undefined;
+  minimumEffectiveYawSpeedRadiansPerSecond?: number | undefined;
   learnedPolicy?: HumanoidLearnedPolicyDescriptor | undefined;
   capabilityRouting?: {
     protocol: "humanoid-controller-capability-routing-v1";

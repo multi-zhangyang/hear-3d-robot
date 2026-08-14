@@ -1983,6 +1983,9 @@ function assertControllerTiming(controller: HumanoidWholeBodyController): void {
     || (descriptor.minimumEffectivePlanarSpeedMetersPerSecond !== undefined
       && (!Number.isFinite(descriptor.minimumEffectivePlanarSpeedMetersPerSecond)
         || descriptor.minimumEffectivePlanarSpeedMetersPerSecond <= 0))
+    || (descriptor.minimumEffectiveYawSpeedRadiansPerSecond !== undefined
+      && (!Number.isFinite(descriptor.minimumEffectiveYawSpeedRadiansPerSecond)
+        || descriptor.minimumEffectiveYawSpeedRadiansPerSecond <= 0))
     || descriptor.controlStepSeconds <= 0
     || descriptor.physicsStepSeconds <= 0
     || ratio < 1

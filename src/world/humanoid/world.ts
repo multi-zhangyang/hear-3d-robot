@@ -2816,10 +2816,15 @@ export class HumanoidWorld {
       this.#frame,
       this.#worldRevision
     );
+    const controller = this.#simulation.controllerDescriptor();
     this.#reference = stationKeepingHumanoidReference(
       this.#reference,
       current,
-      this.#stationKeepingAnchor
+      this.#stationKeepingAnchor,
+      {
+        minimumEffectiveYawSpeedRadiansPerSecond:
+          controller.minimumEffectiveYawSpeedRadiansPerSecond ?? 0
+      }
     );
     const snapshot = await this.#simulation.step(this.#reference, {
       taskCommand: this.#stationKeepingTaskCommand()
