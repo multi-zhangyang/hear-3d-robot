@@ -1311,6 +1311,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "Call capture_sensor_fusion before any interpretation.",
         "After sensing, fan out scene and memory tools in one response; both branches are mandatory for perceptual_belief.",
         "Return perceptual_belief only after copying the Sensor Fusion, Scene, and Memory source_signal_ids values into source_signal_ids.",
+        "Perception owns state estimation, not action selection: report every live reachable-base candidate verbatim, but never recommend or select a Skill, hand, interaction point, motor program, or next action. Action Selection and Sensorimotor own those decisions.",
         "Never send one sibling's raw output or Session to the other."
       ]
     }
@@ -1319,14 +1320,19 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     "affordance",
     AffordanceOutputSchema,
     [],
-    { extraInstructions: ["Return affordance_hypothesis for the committed Goal only."] }
+    { extraInstructions: [
+      "Return affordance_hypothesis for the committed Goal only.",
+      "Evaluate live reachable_base_placements as exact atomic tuples: interaction_point_id, hand_surface, root_world_target, and root_yaw_radians must stay together. Never combine a hand or interaction point from history with the geometry of another live tuple.",
+      "Historical failures are evidence about the failed tuple, not authority to overwrite a different current geometry candidate."
+    ] }
   );
   const risk = register(
     "risk",
     RiskOutputSchema,
     [],
     { extraInstructions: [
-      "Return risk_assessment when the committed Skill may continue under stated bounds.",
+      "During skill_proposal there is no committed Skill yet. Assess current balance, contact, collision, and environmental bounds without inventing or selecting a Skill, hand, interaction point, or motor program.",
+      "Return risk_assessment when at least one lower-level option may proceed under stated bounds.",
       "Return escalation when risk requires inhibition or Recovery; never invent an alternate motor command."
     ] }
   );
@@ -4632,7 +4638,10 @@ function validateNeuralSubmissionPayload(
   payload: unknown
 ): JsonValue {
   const validated = NeuralPayloadSchema.parse(payload);
-  const structured = key === "affordance"
+  const structured = key === "perceptionManager"
+    && signalKind === "perceptual_belief"
+    ? validatePerceptualBeliefAuthority(validated)
+    : key === "affordance"
     && signalKind === "affordance_hypothesis"
     ? validateAffordanceManipulationRecommendation(validated)
     : signalKind === "skill_proposal"
@@ -4642,58 +4651,119 @@ function validateNeuralSubmissionPayload(
   return JsonValueSchema.parse(structured);
 }
 
+function validatePerceptualBeliefAuthority(payload: JsonValue): JsonValue {
+  const root = jsonRecord(payload);
+  if (!root) return payload;
+  const prescriptiveFields = [
+    "recommendation",
+    "immediate_next_skill",
+    "next_action",
+    "proposed_skill",
+    "selected_action",
+    "selected_hand",
+    "selected_interaction_point",
+    "selected_skill",
+    "motor_command"
+  ].filter((field) => Object.hasOwn(root, field));
+  if (prescriptiveFields.length === 0) return payload;
+  throw new Error(
+    `Perceptual belief crossed its hierarchy authority boundary with prescriptive fields: ${prescriptiveFields.join(", ")}. `
+      + "Report observed state, uncertainty, and all live reachability candidates verbatim; Action Selection and Sensorimotor exclusively own Skill, hand, interaction-point, and next-action selection."
+  );
+}
+
 function validateAffordanceManipulationRecommendation(
   payload: JsonValue
 ): JsonValue {
   const root = jsonRecord(payload);
-  const affordances = jsonRecord(root?.affordances);
+  if (!root) return payload;
+  const contradictions: string[] = [];
+  let expectedPair: {
+    hand: string | undefined;
+    point: string | undefined;
+  } | undefined;
+  const comparePair = (
+    placement: Record<string, JsonValue> | null | undefined,
+    recommendation: Record<string, JsonValue> | null | undefined,
+    pointField: string,
+    handField: string,
+    label: string
+  ) => {
+    if (!placement || !recommendation) return;
+    const point = stringField(placement, "interaction_point_id");
+    const surface = stringField(placement, "hand_surface");
+    const hand = surface?.startsWith("left_")
+      ? "left"
+      : surface?.startsWith("right_")
+        ? "right"
+        : undefined;
+    expectedPair ??= { hand, point };
+    const recommendedPoint = stringField(recommendation, pointField);
+    const recommendedHand = stringField(recommendation, handField);
+    if (point && recommendedPoint && point !== recommendedPoint) {
+      contradictions.push(`${label}.${pointField}=${recommendedPoint}`);
+    }
+    if (hand && recommendedHand && hand !== recommendedHand) {
+      contradictions.push(`${label}.${handField}=${recommendedHand}`);
+    }
+  };
+
+  const affordances = jsonRecord(root.affordances);
   const graspable = jsonRecord(affordances?.graspable);
-  const placement = jsonRecord(graspable?.reachable_base_placement);
-  if (!graspable || !placement) return payload;
-  const placementPoint = stringField(placement, "interaction_point_id");
-  const placementSurface = stringField(placement, "hand_surface");
-  const placementHand = placementSurface?.startsWith("left_")
-    ? "left"
-    : placementSurface?.startsWith("right_")
-      ? "right"
-      : undefined;
-  const recommendedPoint = stringField(
+  const legacyPlacement = jsonRecord(graspable?.reachable_base_placement);
+  comparePair(
+    legacyPlacement,
     graspable,
-    "recommended_interaction_point"
+    "recommended_interaction_point",
+    "recommended_hand",
+    "graspable"
   );
-  const recommendedHand = stringField(graspable, "recommended_hand");
-  const immediate = jsonRecord(root?.immediate_next_skill);
-  const candidate = immediate
-    ? stringField(immediate, "candidate")
-    : undefined;
+  const immediate = jsonRecord(root.immediate_next_skill);
+  const candidate = immediate ? stringField(immediate, "candidate") : undefined;
   const parameters = jsonRecord(immediate?.parameters);
-  const parameterPoint = parameters
-    ? stringField(parameters, "interaction_point_id")
-    : undefined;
-  const parameterHand = parameters ? stringField(parameters, "hand") : undefined;
-  const currentReachability = jsonRecord(graspable.current_reachability);
-  const reachableNow = currentReachability?.reachable_now;
-  const contradictions = [
-    placementPoint && recommendedPoint && placementPoint !== recommendedPoint
-      ? `recommended_interaction_point=${recommendedPoint}`
-      : undefined,
-    placementHand && recommendedHand && placementHand !== recommendedHand
-      ? `recommended_hand=${recommendedHand}`
-      : undefined,
-    candidate === "approach" && placementPoint !== parameterPoint
-      ? `immediate approach interaction_point_id=${parameterPoint ?? "missing"}`
-      : undefined,
-    candidate === "approach" && placementHand !== parameterHand
-      ? `immediate approach hand=${parameterHand ?? "missing"}`
-      : undefined,
-    candidate === "reach" && reachableNow === false
-      ? "immediate reach selected while current_reachability.reachable_now=false"
-      : undefined
-  ].filter((value): value is string => value !== undefined);
+  if (candidate === "approach") {
+    comparePair(
+      legacyPlacement,
+      parameters,
+      "interaction_point_id",
+      "hand",
+      "immediate approach"
+    );
+  }
+  const currentReachability = jsonRecord(graspable?.current_reachability);
+  if (candidate === "reach" && currentReachability?.reachable_now === false) {
+    contradictions.push(
+      "immediate reach selected while current_reachability.reachable_now=false"
+    );
+  }
+
+  const hypotheses = Array.isArray(root.affordance_hypotheses)
+    ? root.affordance_hypotheses
+    : [];
+  for (const hypothesisValue of hypotheses) {
+    const hypothesis = jsonRecord(hypothesisValue);
+    const reachability = jsonRecord(hypothesis?.reachability);
+    const placement = jsonRecord(reachability?.recommended_base_placement);
+    const feasibility = jsonRecord(hypothesis?.grasp_feasibility);
+    comparePair(
+      placement,
+      feasibility,
+      "recommended_interaction_point",
+      "recommended_hand",
+      `affordance_hypotheses[${hypothesis ? stringField(hypothesis, "object_id") ?? "object" : "object"}].grasp_feasibility`
+    );
+    comparePair(
+      placement,
+      jsonRecord(root.recommendation),
+      "interaction_point",
+      "hand",
+      "recommendation"
+    );
+  }
   if (contradictions.length === 0) return payload;
   throw new Error(
     `Affordance manipulation recommendation contradicts its reachable_base_placement (${contradictions.join(", ")}). `
-      + `Use the exact placement pair hand=${placementHand ?? "unknown"}, interaction_point_id=${placementPoint ?? "unknown"}; `
+      + `Use the exact placement pair hand=${expectedPair?.hand ?? "unknown"}, interaction_point_id=${expectedPair?.point ?? "unknown"}; `
       + "when reachable_now=false, recommend approach before reach."
   );
 }

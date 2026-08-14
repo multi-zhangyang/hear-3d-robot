@@ -173,7 +173,10 @@ export const HUMANOID_NEURAL_NODES: readonly HumanoidNeuralNodeDescriptor[] = [
     cadence: "world_event",
     maximumCorrectionScope: "pathway",
     objective: "Fuse current sensation with scene interpretation and relevant history.",
-    criteria: ["Parallel specialists remain read-only and world-version bounded."],
+    criteria: [
+      "Parallel specialists remain read-only and world-version bounded.",
+      "Perceptual belief reports state and candidates without selecting a motor program."
+    ],
     capabilities: ["orchestrate_perception"],
     mayDelegate: true,
     parallelSafe: false,
