@@ -623,9 +623,19 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         if (activeRecoveryReplacementCommitment(state)) {
           phase = "motor_assessment";
           reason = "recovery_replacement_commitment_requires_assessment";
-        } else if (recoveryEscalationAwaitsGoalValuation(state)) {
+        } else if (checkpoint.active_cycle?.replan_budget.goal_reevaluation_started
+          || recoveryEscalationAwaitsGoalValuation(state)) {
+          // A fresh neural epoch deliberately inherits no transient escalation
+          // signal, but the exhausted Cycle budget remains durable authority.
+          // Re-enter through Goal Manager so it can continue or retire the
+          // active Goal and atomically open a successor Cycle. Descending into
+          // Motion here would both violate the hierarchy and ask a specialist
+          // to spend compact-replan authority that the checkpoint proves is
+          // already exhausted.
           phase = "goal_valuation";
-          reason = "recovery_escalation_requires_goal_valuation";
+          reason = checkpoint.active_cycle?.replan_budget.goal_reevaluation_started
+            ? "durable_recovery_escalation_requires_goal_valuation"
+            : "recovery_escalation_requires_goal_valuation";
         } else if (!this.pendingNeuralSignals({
           targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
           kinds: ["perceptual_belief"]
