@@ -2,6 +2,7 @@ import type { Quaternion, Vec3 } from "../../domain/schema.js";
 import { yawFromQuaternion } from "../geometry.js";
 import type { HumanoidObjectToken } from "./object-memory.js";
 import type { HumanoidReference } from "./reference.js";
+import type { HumanoidSolidToken } from "./solid-observation.js";
 import {
   HumanoidTaskSpaceIkError,
   type HumanoidHandSurfaceObservation,
@@ -14,11 +15,25 @@ import type {
   HumanoidManipulationReachabilityObservation
 } from "./world-contract.js";
 import { solveG1PregraspPose } from "./pregrasp-pose.js";
+import {
+  HUMANOID_MANIPULATION_SUPPORT_CLEARANCE_MARGIN_METERS,
+  humanoidManipulationBaseNavigationBlockerIds,
+  humanoidManipulationSupportSolids
+} from "./manipulation-base-navigation.js";
+import { HUMANOID_NAVIGATION_PROFILE } from "./environment.js";
+import { navigationObstaclePlanarExpansion } from "../navigation.js";
 
 const SURFACES_WITH_BASE_PLACEMENT_PROBES_PER_HAND = 1;
 const ROOT_TRANSLATION_DISTANCES_METERS = [0, 0.06, 0.12, 0.18] as const;
 const ARM_WORKSPACE_RADII_METERS = [0.28, 0.36, 0.44, 0.52] as const;
 const BASE_PLACEMENT_LATERAL_OFFSETS_METERS = [-0.24, -0.12, 0, 0.12, 0.24] as const;
+const BASE_PLACEMENT_BOUNDARY_TANGENT_OFFSETS_METERS = [
+  -0.18, -0.12, -0.06, 0, 0.06, 0.12, 0.18
+] as const;
+const BASE_PLACEMENT_BOUNDARY_OUTSIDE_MARGIN_METERS = 0.005;
+const NAVIGABLE_BASE_PLACEMENT_YAW_OFFSETS_RADIANS = [
+  0, -0.12, 0.12, -0.24, 0.24, -0.36, 0.36
+] as const;
 const HUMANOID_PLANAR_BODY_CLEARANCE_METERS = 0.18;
 
 export interface HumanoidManipulationReachabilityMap {
@@ -32,6 +47,7 @@ export function probeHumanoidManipulationReachability(input: {
   reference: HumanoidReference;
   robot: HumanoidSimulationSnapshot;
   objectTokens: readonly HumanoidObjectToken[];
+  solidTokens: readonly HumanoidSolidToken[];
   handSurfaces: readonly HumanoidHandSurfaceObservation[];
   interactionTargets?: readonly {
     objectId: string;
@@ -95,13 +111,13 @@ export function probeHumanoidManipulationReachability(input: {
           entry.handSurface === alignment.handSurface
         ));
         if (!surface) return [];
-        const placement = bestReachableRootPlacement(
+        const placements = reachableRootPlacements(
           input,
           target,
           alignment,
           surface
         );
-        return placement ? [placement] : [];
+        return placements;
       });
   });
   input.simulation.restoreState(input.authoritativeState);
@@ -186,7 +202,7 @@ function probeAlignment(
   }
 }
 
-function bestReachableRootPlacement(
+function reachableRootPlacements(
   input: Parameters<typeof probeHumanoidManipulationReachability>[0],
   target: {
     objectId: string;
@@ -198,61 +214,54 @@ function bestReachableRootPlacement(
   },
   alignment: HumanoidManipulationReachabilityObservation,
   surface: HumanoidHandSurfaceObservation
-): HumanoidManipulationBasePlacementObservation | null {
+): HumanoidManipulationBasePlacementObservation[] {
   const wristDelta = subtract(alignment.wristWorldTarget, surface.wristWorldPosition);
   const placements: HumanoidManipulationBasePlacementObservation[] = [];
-  for (const translation of humanoidManipulationRootTranslationProbes(
-    input.robot,
-    wristDelta
-  )) {
-    input.simulation.restoreState(input.authoritativeState);
+  const translations = uniqueTranslations([
+    ...humanoidManipulationRootTranslationProbes(input.robot, wristDelta),
+    ...humanoidManipulationNavigationBoundaryProbes(input, target)
+  ]);
+  for (const translation of translations) {
     const rootWorldTarget = add(input.robot.rootPosition, translation);
     if (!manipulationBasePreservesBodyClearance(rootWorldTarget, target)) {
       continue;
     }
     const currentYaw = yawFromQuaternion(input.robot.rootRotation);
-    const rootYawRadians = handAlignedRootYaw(
+    const alignedRootYaw = handAlignedRootYaw(
       input.robot,
       rootWorldTarget,
       target.worldPosition,
       surface
     );
-    const wristWorldTarget = alignment.wristWorldOrientation
-      ? alignment.wristWorldTarget
-      : subtract(target.worldPosition, rotatePlanar(
-          surface.surfaceFromWristWorld,
-          rootYawRadians - currentYaw
-        ));
-    try {
-      const residual = solveWrist(
-        input.simulation,
-        input.reference,
-        surface,
-        wristWorldTarget,
-        {
-          position: rootWorldTarget,
-          yawRadians: rootYawRadians
-        },
-        alignment.wristWorldOrientation
-      );
-      placements.push({
-        objectId: alignment.objectId,
-        ...(alignment.interactionPointId
-          ? { interactionPointId: alignment.interactionPointId }
-          : {}),
-        handSurface: alignment.handSurface,
-        rootWorldTarget,
-        rootTranslationWorld: translation,
-        rootYawRadians,
-        wristWorldTarget,
-        ikResidualMeters: residual
-      });
-      if (residual <= 0.005) return placements.at(-1)!;
-    } catch (error) {
-      const residual = ikResidual(error);
-      const orientationResidual = ikOrientationResidual(error);
-      if (residual !== null && residual <= 0.12
-        && (orientationResidual === null || orientationResidual <= 0.12)) {
+    const navigationClear = humanoidManipulationBaseNavigationBlockerIds({
+      solidTokens: input.solidTokens,
+      objectId: alignment.objectId,
+      rootWorldTarget
+    }).length === 0;
+    const yawOffsets = navigationClear
+      ? NAVIGABLE_BASE_PLACEMENT_YAW_OFFSETS_RADIANS
+      : [0] as const;
+    for (const yawOffset of yawOffsets) {
+      input.simulation.restoreState(input.authoritativeState);
+      const rootYawRadians = normalizeRadians(alignedRootYaw + yawOffset);
+      const wristWorldTarget = alignment.wristWorldOrientation
+        ? alignment.wristWorldTarget
+        : subtract(target.worldPosition, rotatePlanar(
+            surface.surfaceFromWristWorld,
+            rootYawRadians - currentYaw
+          ));
+      try {
+        const residual = solveWrist(
+          input.simulation,
+          input.reference,
+          surface,
+          wristWorldTarget,
+          {
+            position: rootWorldTarget,
+            yawRadians: rootYawRadians
+          },
+          alignment.wristWorldOrientation
+        );
         placements.push({
           objectId: alignment.objectId,
           ...(alignment.interactionPointId
@@ -265,12 +274,131 @@ function bestReachableRootPlacement(
           wristWorldTarget,
           ikResidualMeters: residual
         });
+      } catch (error) {
+        const residual = ikResidual(error);
+        const orientationResidual = ikOrientationResidual(error);
+        if (residual !== null && residual <= 0.12
+          && (orientationResidual === null || orientationResidual <= 0.12)) {
+          placements.push({
+            objectId: alignment.objectId,
+            ...(alignment.interactionPointId
+              ? { interactionPointId: alignment.interactionPointId }
+              : {}),
+            handSurface: alignment.handSurface,
+            rootWorldTarget,
+            rootTranslationWorld: translation,
+            rootYawRadians,
+            wristWorldTarget,
+            ikResidualMeters: residual
+          });
+        }
       }
     }
   }
-  return placements.sort((left, right) => (
+  const ranked = placements.sort((left, right) => (
     left.ikResidualMeters - right.ikResidualMeters
-  ))[0] ?? null;
+  ));
+  const best = ranked[0];
+  const bestNavigable = ranked.find((placement) => (
+    humanoidManipulationBaseNavigationBlockerIds({
+      solidTokens: input.solidTokens,
+      objectId: placement.objectId,
+      rootWorldTarget: placement.rootWorldTarget
+    }).length === 0
+  ));
+  return uniquePlacements([
+    ...(best ? [best] : []),
+    ...(bestNavigable ? [bestNavigable] : [])
+  ]);
+}
+
+function humanoidManipulationNavigationBoundaryProbes(
+  input: Parameters<typeof probeHumanoidManipulationReachability>[0],
+  target: {
+    objectId: string;
+    worldPosition: Vec3;
+    approachDirection?: Vec3 | undefined;
+    clearanceMeters?: number | undefined;
+  }
+): Vec3[] {
+  const supports = humanoidManipulationSupportSolids(
+    input.solidTokens,
+    target.objectId
+  );
+  if (supports.length === 0) return [];
+  const expansion = navigationObstaclePlanarExpansion(
+    HUMANOID_NAVIGATION_PROFILE.radius
+  ) + HUMANOID_MANIPULATION_SUPPORT_CLEARANCE_MARGIN_METERS
+    + BASE_PLACEMENT_BOUNDARY_OUTSIDE_MARGIN_METERS;
+  return supports.flatMap((support) => {
+    const sides = manipulationBoundarySides(
+      input.robot.rootPosition,
+      support.center,
+      target.approachDirection
+    );
+    return sides.flatMap((side) => {
+      const normalCoordinate = side.axis === "x"
+        ? support.center.x + side.sign * (support.size.x / 2 + expansion)
+        : support.center.z + side.sign * (support.size.z / 2 + expansion);
+      const tangentCenter = side.axis === "x"
+        ? input.robot.rootPosition.z
+        : input.robot.rootPosition.x;
+      return BASE_PLACEMENT_BOUNDARY_TANGENT_OFFSETS_METERS.flatMap((offset) => {
+        const rootWorldTarget = side.axis === "x"
+          ? {
+              x: normalCoordinate,
+              y: input.robot.rootPosition.y,
+              z: tangentCenter + offset
+            }
+          : {
+              x: tangentCenter + offset,
+              y: input.robot.rootPosition.y,
+              z: normalCoordinate
+            };
+        return manipulationBasePreservesBodyClearance(rootWorldTarget, target)
+          && humanoidManipulationBaseNavigationBlockerIds({
+            solidTokens: input.solidTokens,
+            objectId: target.objectId,
+            rootWorldTarget
+          }).length === 0
+          ? [subtract(rootWorldTarget, input.robot.rootPosition)]
+          : [];
+      });
+    });
+  });
+}
+
+function manipulationBoundarySides(
+  rootPosition: Vec3,
+  supportCenter: Vec3,
+  approachDirection?: Vec3
+): Array<{ axis: "x" | "z"; sign: -1 | 1 }> {
+  const planarX = Math.abs(approachDirection?.x ?? 0);
+  const planarZ = Math.abs(approachDirection?.z ?? 0);
+  if (planarX > 1e-6 || planarZ > 1e-6) {
+    if (planarX >= planarZ) {
+      return [{ axis: "x", sign: (approachDirection!.x > 0 ? -1 : 1) }];
+    }
+    return [{ axis: "z", sign: (approachDirection!.z > 0 ? -1 : 1) }];
+  }
+  const radial = subtract(rootPosition, supportCenter);
+  const radialAxis = Math.abs(radial.x) >= Math.abs(radial.z)
+    ? "x"
+    : "z";
+  const radialCoordinate = radialAxis === "x" ? radial.x : radial.z;
+  return [{ axis: radialAxis, sign: radialCoordinate < 0 ? -1 : 1 }];
+}
+
+function uniquePlacements(
+  placements: readonly HumanoidManipulationBasePlacementObservation[]
+): HumanoidManipulationBasePlacementObservation[] {
+  const unique = new Map(placements.map((placement) => [
+    `${placement.objectId}:${placement.interactionPointId ?? ""}:${placement.handSurface}:`
+      + `${placement.rootWorldTarget.x.toFixed(4)}:${placement.rootWorldTarget.z.toFixed(4)}:`
+      + `${placement.rootYawRadians.toFixed(4)}`,
+    placement
+  ]));
+  return [...unique.values()];
 }
 
 export function manipulationBasePreservesBodyClearance(
@@ -442,6 +570,10 @@ function dot(left: Vec3, right: Vec3): number {
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
+}
+
+function normalizeRadians(value: number): number {
+  return Math.atan2(Math.sin(value), Math.cos(value));
 }
 
 function add(left: Vec3, right: Vec3): Vec3 {

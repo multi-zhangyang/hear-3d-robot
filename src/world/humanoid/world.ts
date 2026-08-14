@@ -528,6 +528,7 @@ export class HumanoidWorld {
         reference: this.#reference,
         robot: this.#simulation.snapshot(),
         objectTokens: observation.objectTokens,
+        solidTokens: observation.solidTokens,
         handSurfaces: observation.handSurfaces,
         interactionTargets: manipulationInteractionTargets(observation)
       })

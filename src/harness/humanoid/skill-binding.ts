@@ -25,8 +25,7 @@ import {
 } from "../../world/humanoid/embodied-skill-call.js";
 import type { HumanoidObjectWorldModelEntry } from "../../world/humanoid/object-world-model.js";
 import type { HumanoidSolidToken } from "../../world/humanoid/solid-observation.js";
-import { HUMANOID_NAVIGATION_PROFILE } from "../../world/humanoid/environment.js";
-import { navigationObstaclePlanarExpansion } from "../../world/navigation.js";
+import { humanoidManipulationBaseNavigationBlockerIds } from "../../world/humanoid/manipulation-base-navigation.js";
 import {
   humanoidArticulationGoal,
   type HumanoidArticulationGoal
@@ -34,7 +33,6 @@ import {
 import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
 
 const GRASP_REACH_PRECONDITION_DISTANCE_METERS = 0.12;
-const APPROACH_SUPPORT_CLEARANCE_MARGIN_METERS = 0.01;
 
 export type SkillPlanningAction =
   | "plan_humanoid_skill"
@@ -71,20 +69,11 @@ export function manipulationBasePlacementNavigationBlockerIds(
   observation: HumanoidWorldObservation,
   placement: HumanoidWorldObservation["manipulationBasePlacements"][number]
 ): string[] {
-  const expansion = navigationObstaclePlanarExpansion(
-    HUMANOID_NAVIGATION_PROFILE.radius
-  ) + APPROACH_SUPPORT_CLEARANCE_MARGIN_METERS;
-  return observation.solidTokens.filter((solid) => (
-    solid.currentContacts.some((contact) => (
-      contact.firstObject === placement.objectId && contact.secondSolid === solid.id
-    ) || (
-      contact.secondObject === placement.objectId && contact.firstSolid === solid.id
-    ))
-      && Math.abs(placement.rootWorldTarget.x - solid.center.x)
-        <= solid.size.x / 2 + expansion
-      && Math.abs(placement.rootWorldTarget.z - solid.center.z)
-        <= solid.size.z / 2 + expansion
-  )).map(({ id }) => id);
+  return humanoidManipulationBaseNavigationBlockerIds({
+    solidTokens: observation.solidTokens,
+    objectId: placement.objectId,
+    rootWorldTarget: placement.rootWorldTarget
+  });
 }
 
 export function navigableManipulationBasePlacements(
