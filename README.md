@@ -52,7 +52,30 @@ Executive
       └─ Recovery（父级签发的独占 authority lease episode）
 ```
 
-这是控制权树，不是平级多 Agent 网络。除 Executive 外，每个节点只有一个直接父级；父级通常通过 `Agent.asTool()` 调用模型子级并保留控制权。兄弟节点不互相通信、不共享 Session，只允许由共同父级发起并汇合两组只读并行：Scene + Memory、Affordance + Risk。每次直接子级调用都有独立 `invocation_id`，并绑定共同父级的 `parent_episode_id`；共同父级只能汇合属于自己本次 episode 的返回，禁止依靠队列顺序、payload 相等或“第一个 pending 信号”猜测配对。反馈信号可以沿白名单回路唤醒最近责任层，但不会生成第二父级。
+```mermaid
+flowchart TD
+    E["Executive<br/>唯一根"] --> G["Goal Valuation"]
+    E --> AS["Action Selection<br/>唯一 Skill commitment 权限"]
+    AS --> P["Perception Manager"]
+    P --> SF["Sensor Fusion<br/>确定性"]
+    P --> SI["Scene Interpreter"]
+    P --> MR["Memory Retriever"]
+    AS --> SM["Sensorimotor Manager"]
+    SM --> AF["Affordance"]
+    SM --> RI["Risk / Interoception"]
+    SM --> PC["Predictive Critic"]
+    SM --> PM["Premotor"]
+    SM --> RC["Recovery<br/>独占 lease episode"]
+    PM --> MI["Motor Intent<br/>最低 LLM 边界"]
+    MI --> RG["MuJoCo Rollout Gate<br/>确定性"]
+    SM --> EX["Serial Executor<br/>唯一物理写入者"]
+    EX --> CR["Controller / Reflex<br/>训练策略 + 快速闭环"]
+    CR --> B["MuJoCo Body"]
+```
+
+上图只画**控制权所有权**。Rollout、身体感知、预测误差和执行回执是带因果来源的反馈信号，不是第二父级，也不会把树改成平级 Agent 网络。
+
+这是控制权树，不是平级多 Agent 网络。除 Executive 外，每个节点只有一个直接父级；父级通常通过 `Agent.asTool()` 调用模型子级并保留控制权。兄弟节点不互相通信、不共享 Session，只允许由共同父级发起并汇合两组只读并行：Scene + Memory、Affordance + Risk。每次直接子级调用都有独立 `invocation_id`，并绑定共同父级的 `parent_episode_id`；共同父级只能汇合属于自己本次 episode 的返回，禁止依靠队列顺序、payload 相等或“第一个 pending 信号”猜测配对。父子委派没有自由文本 `intent` 通道：父级只能选择自己拥有的子边、合同允许的信号类型，以及当前父 episode 真正拥有的 pending `source_signal_ids`；旧 episode、兄弟、其他父级、已消费或过期信号即使 UUID 仍在历史中也会被代码拒绝。反馈信号可以沿白名单回路唤醒最近责任层，但不会生成第二父级。
 
 Action Selection 使用两阶段技能协议：Sensorimotor 第一次只能返回
 `skill_proposal`；Action Selection 独占建立一个与 Goal epoch、世界版本和
@@ -165,9 +188,7 @@ Operator 异常退出后，未完成任务会转为可恢复状态。恢复操�
 
 ## Web 界面
 
-![层级智能体执行流](docs/screenshots/hierarchy.png)
-
-3D 世界始终保持在主视图。界面提供跟随、世界和头部三个观察视角，并实时显示：
+3D 世界始终保持在主视图。界面从当前运行的 hierarchy contract 动态显示 18 节点控制树，而不是写死旧版角色数量；同时提供跟随、世界和头部三个观察视角，并实时显示：
 
 - 当前活动节点与 18 节点单父层级
 - 身体通道活动状态

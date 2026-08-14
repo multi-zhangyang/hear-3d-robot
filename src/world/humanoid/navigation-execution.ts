@@ -470,10 +470,23 @@ export class HumanoidNavigationExecution {
       const dx = waypoint.x - this.#final.rootPosition.x;
       const dz = waypoint.z - this.#final.rootPosition.z;
       const distance = Math.hypot(dx, dz);
-      if (this.#waypointIndex < this.#plan.waypoints.length - 1
+      const finalWaypoint = this.#waypointIndex === this.#plan.waypoints.length - 1;
+      const finalWaypointSatisfied = finalWaypoint && this.#finalWaypointSatisfied();
+      if (!finalWaypoint
         ? distance <= NAVIGATION_WAYPOINT_TOLERANCE_METERS
-        : this.#finalWaypointSatisfied()
+        : finalWaypointSatisfied
           || this.#arrivalControlMilestonesCaptured()) {
+        // A direct final-waypoint success enters the stopping phase before the
+        // later travel-control branch has a chance to populate its latches.
+        // Preserve the physical milestones now; otherwise stop control sees no
+        // position authority, emits no yaw correction after small response
+        // drift, and can reject a stance that was already achieved.
+        if (finalWaypointSatisfied) {
+          this.#arrivalPositionLatched = true;
+          if (this.#arrivalHeading !== null) {
+            this.#arrivalHeadingCapturedLatched = true;
+          }
+        }
         this.#waypointIndex += 1;
         continue;
       }
@@ -502,10 +515,13 @@ export class HumanoidNavigationExecution {
         return null;
       }
       const yaw = yawFromQuaternion(this.#final.rootRotation);
-      const finalWaypoint = this.#waypointIndex === this.#plan.waypoints.length - 1;
       const acceptedPositionTolerance = finalWaypoint
         ? this.#finalAcceptedPositionTolerance()
         : NAVIGATION_FINAL_WAYPOINT_TOLERANCE_METERS;
+      const arrivalPositionCaptureTolerance = finalWaypoint
+        && this.#arrivalHeading !== null
+        ? this.#finalStoppingPositionTolerance()
+        : acceptedPositionTolerance;
       const arrivalHeadingCapturedNow = finalWaypoint
         && this.#arrivalHeading !== null
         && this.#arrivalHeadingCaptured(humanoidNavigationArrivalHeadingError(
@@ -519,14 +535,14 @@ export class HumanoidNavigationExecution {
       if (finalWaypoint
         && this.#arrivalHeading !== null
         && this.#arrivalPositionLatched
-        && distance > acceptedPositionTolerance
+        && distance > arrivalPositionCaptureTolerance
           + NAVIGATION_ARRIVAL_POSITION_LATCH_HYSTERESIS_METERS
         && !this.#arrivalHeadingCapturedLatched) {
         this.#arrivalPositionLatched = false;
       }
       if (finalWaypoint
         && this.#arrivalHeading !== null
-        && distance <= acceptedPositionTolerance) {
+        && distance <= arrivalPositionCaptureTolerance) {
         this.#arrivalPositionLatched = true;
         if (arrivalHeadingCapturedNow) {
           this.#arrivalHeadingCapturedLatched = true;
@@ -686,8 +702,12 @@ export class HumanoidNavigationExecution {
     const dx = target.x - this.#final.rootPosition.x;
     const dz = target.z - this.#final.rootPosition.z;
     const distance = Math.hypot(dx, dz);
-    if (this.#requestedPositionToleranceMeters !== null
-      && distance <= this.#finalAcceptedPositionTolerance()) {
+    // The terminal deadband is already the authoritative physical acceptance
+    // envelope for this controller. Continuing to force its minimum effective
+    // travel command inside that same envelope makes the stop predicate
+    // unreachable. Hold translation at zero while yaw and residual body
+    // velocity settle; this does not change the accepted position contract.
+    if (distance <= this.#finalStoppingPositionTolerance()) {
       return [0, 0];
     }
     const yaw = yawFromQuaternion(this.#final.rootRotation);
@@ -1037,7 +1057,7 @@ export class HumanoidNavigationExecution {
       || this.#stopSettledFrames < NAVIGATION_STOP_SETTLED_STEPS) {
       return false;
     }
-    if (this.#finalWaypointSatisfied()) {
+    if (this.#finalWaypointSatisfied() || this.#physicallySettledWithinDeadband()) {
       this.#finish(true);
       return true;
     }
@@ -1069,10 +1089,7 @@ export class HumanoidNavigationExecution {
 
   #failedToSettleReason(): string {
     const pelvis = this.#final.links?.pelvis;
-    const deadbandAcceptedDistance = this.#boundedFinalPositionTolerance(Math.max(
-      this.#baseFinalPositionTolerance(),
-      NAVIGATION_PHYSICAL_DEADBAND_TOLERANCE_METERS
-    )) + NAVIGATION_POSITION_DISCRETIZATION_METERS;
+    const deadbandAcceptedDistance = this.#finalStoppingPositionTolerance();
     return "navigation_failed_to_settle"
       + `:position=${point(this.#final.rootPosition)}`
       + `;distance=${this.#finalWaypointDistance().toFixed(6)}`
@@ -1176,10 +1193,7 @@ export class HumanoidNavigationExecution {
       ? Math.hypot(pelvis.linearVelocity.x, pelvis.linearVelocity.z)
       : 0;
     const yawSpeed = Math.abs(pelvis?.angularVelocity.y ?? 0);
-    const acceptedDistance = this.#boundedFinalPositionTolerance(Math.max(
-      this.#baseFinalPositionTolerance(),
-      NAVIGATION_PHYSICAL_DEADBAND_TOLERANCE_METERS
-    )) + NAVIGATION_POSITION_DISCRETIZATION_METERS;
+    const acceptedDistance = this.#finalStoppingPositionTolerance();
     return this.#finalWaypointDistance() <= acceptedDistance
       && humanoidNavigationArrivalHeadingSatisfied(
         this.#arrivalHeading,
@@ -1210,6 +1224,13 @@ export class HumanoidNavigationExecution {
 
   #finalAcceptedPositionTolerance(): number {
     return this.#finalPositionTolerance() + NAVIGATION_POSITION_DISCRETIZATION_METERS;
+  }
+
+  #finalStoppingPositionTolerance(): number {
+    return this.#boundedFinalPositionTolerance(Math.max(
+      this.#baseFinalPositionTolerance(),
+      NAVIGATION_PHYSICAL_DEADBAND_TOLERANCE_METERS
+    )) + NAVIGATION_POSITION_DISCRETIZATION_METERS;
   }
 
   #assertProgress(): void {
