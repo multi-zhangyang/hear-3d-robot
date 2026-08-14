@@ -47,7 +47,10 @@ import {
   stableAgentToolInvocationId,
   withAgentInvocation
 } from "../agent-scope.js";
-import { createToolInputRecovery } from "../tool-input-recovery.js";
+import {
+  createToolInputRecovery,
+  normalizeDuplicatedTrailingObjectDelimiters
+} from "../tool-input-recovery.js";
 import {
   humanoidNeuralAgentToolName,
   type NeuralAgentHierarchy,
@@ -4384,7 +4387,7 @@ function neuralOutputSubmissionTool<TOutput extends z.ZodObject>(
   // internal/Agent output representation for compatibility, but expose one
   // native JSON payload field at the model boundary and canonicalize it here.
   const submissionParameters = neuralSubmissionParameters(outputType, key);
-  return tool({
+  const submissionTool = tool({
     name: NEURAL_OUTPUT_SUBMISSION_TOOL_NAME,
     description: "Submit this node's final typed neural signal to its structural parent.",
     parameters: submissionParameters as never,
@@ -4437,6 +4440,13 @@ function neuralOutputSubmissionTool<TOutput extends z.ZodObject>(
       return JSON.stringify(parsed);
     }
   }) as unknown as FunctionTool<unknown, TOutput, unknown>;
+  const invoke = submissionTool.invoke;
+  submissionTool.invoke = (context, rawInput, details) => invoke(
+    context,
+    normalizeDuplicatedTrailingObjectDelimiters(rawInput),
+    details
+  );
+  return submissionTool;
 }
 
 function neuralSubmissionRejection(

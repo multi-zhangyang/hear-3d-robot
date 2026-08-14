@@ -21,6 +21,22 @@ export interface ToolInputRecovery {
   ): string | undefined;
 }
 
+/**
+ * Some OpenAI-compatible tool streams duplicate the final object delimiter
+ * while assembling an otherwise complete function-call argument object.  This
+ * normalizes only that framing defect: valid JSON is untouched, semantic
+ * fields are never repaired, and no incomplete object is synthesized.
+ */
+export function normalizeDuplicatedTrailingObjectDelimiters(input: string): string {
+  if (jsonObject(input) !== undefined) return input;
+  let candidate = input.trimEnd();
+  for (let removed = 0; removed < 4 && candidate.endsWith("}"); removed += 1) {
+    candidate = candidate.slice(0, -1).trimEnd();
+    if (jsonObject(candidate) !== undefined) return candidate;
+  }
+  return input;
+}
+
 export function recoverInvalidToolInputOutput(
   output: string,
   input: string,
