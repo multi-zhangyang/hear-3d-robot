@@ -1162,7 +1162,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         reason: "No active Goal exists for Skill commitment admission"
       };
     }
-    const observation = this.#world.observe();
+    const observation = this.#actions.skillCommitmentObservation(
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent
+    );
+    if (!observation) {
+      return {
+        accepted: false,
+        invocation: json(invocation.data),
+        reason: "The Sensor Fusion manipulation observation is no longer physically current; obtain a new perceptual belief before committing this Skill"
+      };
+    }
     const recoveryAuthorized = this.#neuralSignalHasSourceNode(
       signal,
       HUMANOID_NEURAL_AGENT_IDS.recovery

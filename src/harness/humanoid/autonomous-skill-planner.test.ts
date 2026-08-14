@@ -55,7 +55,7 @@ describe("autonomous humanoid navigation Goal constraints", () => {
     expect(plan.targets[0]?.acceptedPositionToleranceMeters).toBeCloseTo(0.02, 12);
   });
 
-  it("keeps approach bases outside a contacted support solid footprint", () => {
+  it("does not replace an obstructed IK base contract with geometric approach", () => {
     const binding = {
       phase_authority: "navigation",
       invocation: {
@@ -116,10 +116,7 @@ describe("autonomous humanoid navigation Goal constraints", () => {
 
     expect(plan.kind).toBe("navigation");
     if (plan.kind !== "navigation") return;
-    expect(plan.targets.some(({ target }) => (
-      target.x === rejectedIkTarget.x && target.z === rejectedIkTarget.z
-    ))).toBe(false);
-    expect(plan.targets[0]?.target.z).toBeLessThan(4.46);
+    expect(plan.targets).toEqual([]);
   });
 });
 

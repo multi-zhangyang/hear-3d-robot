@@ -228,10 +228,10 @@ function navigationSkillPlan(
     observation,
     invocation.object_id
   );
-  const selectedBasePlacements = observation.manipulationBasePlacements
-    .filter((placement) => placement.objectId === invocation.object_id
-      && (invocation.interaction_point_id === null
-        || placement.interactionPointId === undefined
+  const objectBasePlacements = observation.manipulationBasePlacements
+    .filter((placement) => placement.objectId === invocation.object_id);
+  const selectedBasePlacements = objectBasePlacements
+    .filter((placement) => (invocation.interaction_point_id === null
         || placement.interactionPointId === invocation.interaction_point_id)
       && (!invocation.hand
         || placement.handSurface.startsWith(`${invocation.hand}_`)));
@@ -281,7 +281,7 @@ function navigationSkillPlan(
     // Once live IK has produced an exact base-placement contract, a generic
     // face-the-object pose is not an equivalent fallback: it can complete
     // navigation while leaving the committed hand target unreachable.
-    targets: (selectedBasePlacements.length > 0
+    targets: (objectBasePlacements.length > 0
       ? reachabilityTargets
       : geometricTargets).sort((left, right) => right.score - left.score)
   };

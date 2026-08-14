@@ -819,6 +819,13 @@ export class HumanoidActionRuntime {
       : null;
   }
 
+  skillCommitmentObservation(
+    agentId: string
+  ): HumanoidWorldObservation | undefined {
+    const observation = this.#renewObservationAuthority(agentId.trim());
+    return observation ? structuredClone(observation) : undefined;
+  }
+
   async invoke(
     name: HumanoidActionName,
     rawInput: unknown,
@@ -1172,9 +1179,16 @@ export class HumanoidActionRuntime {
       compatible
     );
     if (!compatible) return undefined;
-    this.#observationRevisionByAgent.set(agentId, current.worldRevision);
-    this.#observationByAgent.set(agentId, current);
-    return current;
+    // Manipulation reachability is expensive rollout-derived sensor evidence.
+    // A synchronous authority renewal only refreshes the cheap world snapshot,
+    // whose reachability arrays are intentionally empty.  Keep the derived
+    // evidence while its strict root/object/carry compatibility contract still
+    // holds; otherwise model latency silently erases the exact IK base pose and
+    // turns a manipulation approach back into generic face-the-object motion.
+    const renewed = retainCompatibleManipulationEvidence(observed, current);
+    this.#observationRevisionByAgent.set(agentId, renewed.worldRevision);
+    this.#observationByAgent.set(agentId, renewed);
+    return renewed;
   }
 
   #reconcileSkillPlanWorldAuthority(
@@ -2770,6 +2784,23 @@ function humanoidSkillObservationCompatible(
       || pointDistance(before.size, after.size) > 1e-9) return false;
   }
   return true;
+}
+
+function retainCompatibleManipulationEvidence(
+  observed: HumanoidWorldObservation,
+  current: HumanoidWorldObservation
+): HumanoidWorldObservation {
+  if (observed.manipulationReachability.length === 0
+    && observed.manipulationBasePlacements.length === 0) return current;
+  return {
+    ...current,
+    manipulationReachability: structuredClone(
+      observed.manipulationReachability
+    ),
+    manipulationBasePlacements: structuredClone(
+      observed.manipulationBasePlacements
+    )
+  };
 }
 
 function pointDistance(left: Vec3, right: Vec3): number {
