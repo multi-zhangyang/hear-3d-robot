@@ -1546,6 +1546,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     {
       toolUseBehavior: actionSelectionToolUseBehavior(input.runtime),
       extraInstructions: [
+        "Treat neural_hierarchy.harness_phase.phase as binding route authority: in perception or feedback, delegate Perception Manager before any Sensorimotor call; Sensorimotor is not a valid child route until the Harness itself enters skill_proposal, motor_assessment, motor_planning, rollout_review, execution, or recovery.",
         "Perception precedes sensorimotor selection whenever the belief is absent or stale.",
         "Sensorimotor may return only a skill_proposal before authorization.",
         "A skill_proposal must select exactly one next bounded catalog Skill in proposed_skill.skill. A multi-step skill_sequence may describe future causal order, but skill_name, skill_id, or the whole sequence is never the proposed Skill commitment.",
