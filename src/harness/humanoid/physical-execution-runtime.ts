@@ -41,7 +41,11 @@ import type {
 } from "./runtime.js";
 import { groundHumanoidPhysicalExecution } from "./dispatch-grounding.js";
 
-const EXECUTION_FRAME_CHECKPOINT_INTERVAL = 10;
+// Every terminal physical cut is persisted independently of this interval.
+// Periodic cuts only bound crash recovery loss, so checkpoint once per second
+// of controller time instead of serializing the full MuJoCo state several
+// times per simulated second.
+const EXECUTION_CHECKPOINT_INTERVAL_SECONDS = 1;
 const STATIONARY_CHECKPOINT_INTERVAL_SECONDS = 5 * 60;
 
 type HumanoidPersistenceCut = Awaited<
@@ -432,10 +436,14 @@ export class HumanoidPhysicalExecutionRuntime {
     if (!entry) {
       throw new Error("Physical frame was committed without a durable execution intent");
     }
+    const checkpointIntervalFrames = Math.max(1, Math.round(
+      EXECUTION_CHECKPOINT_INTERVAL_SECONDS
+        / cut.world.robot.controller.controlStepSeconds
+    ));
     if (!physicalExecutionCheckpointDue(
       entry,
       cut,
-      EXECUTION_FRAME_CHECKPOINT_INTERVAL
+      checkpointIntervalFrames
     )) return;
     if (entry.status !== "terminal") this.#recordExecutionProgress(entry, cut);
     await this.#persist(false);
@@ -656,8 +664,11 @@ export class HumanoidPhysicalExecutionRuntime {
 
   #applyPhysicalCut(cut: HumanoidPersistenceCut): void {
     const checkpoint = this.#checkpoint();
-    checkpoint.world = structuredClone(cut.world);
-    checkpoint.world_checkpoint = structuredClone(cut.worldCheckpoint);
+    // capturePersistenceState() returns a detached snapshot. Re-cloning both
+    // trees on every physical frame doubles the hottest execution-path work
+    // without creating any additional ownership boundary.
+    checkpoint.world = cut.world;
+    checkpoint.world_checkpoint = cut.worldCheckpoint;
   }
 }
 

@@ -718,9 +718,11 @@ export class HumanoidWorld {
     }
   }
 
-  #capturePersistenceState(): HumanoidWorldPersistenceState {
+  #capturePersistenceState(
+    world: HumanoidWorldSnapshot = this.snapshot()
+  ): HumanoidWorldPersistenceState {
     return {
-      world: this.snapshot(),
+      world,
       worldCheckpoint: this.checkpoint(),
       authority: this.#authorityIdentity()
     };
@@ -1242,7 +1244,9 @@ export class HumanoidWorld {
           }
           if (!step.done) {
             const snapshot = this.snapshot();
-            await options.persistenceSink?.(this.#capturePersistenceState());
+            await options.persistenceSink?.(
+              this.#capturePersistenceState(snapshot)
+            );
             if (skillEvents && stored.skillCallIdentity
               && !options.deferSkillProgress) {
               await skillEvents.progress(humanoidSkillStatus({
@@ -2214,7 +2218,9 @@ export class HumanoidWorld {
           }
           if (!step.done) {
             const snapshot = this.snapshot();
-            await options.persistenceSink?.(this.#capturePersistenceState());
+            await options.persistenceSink?.(
+              this.#capturePersistenceState(snapshot)
+            );
             if (skillEvents && stored.skillCallIdentity
               && !options.deferSkillProgress) {
               await skillEvents.progress(humanoidSkillStatus({
