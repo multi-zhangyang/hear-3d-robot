@@ -1369,13 +1369,14 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     motorIntentPlanningTools(input.runtime),
     {
       toolChoice: "required",
-      toolUseBehavior: planningReceiptToolUseBehavior(),
+      toolUseBehavior: planningReceiptToolUseBehavior(input.runtime),
       extraInstructions: [
         "Complete the existing embodied Skill lifecycle in this one SDK episode: when planning_tool_state requires submit_humanoid_skill_plan, submit the committed short Skill DAG; when it requires begin_humanoid_skill, copy one ready_skill_binding verbatim; only then call the enabled semantic planning tool with the real bound skill_transaction_id.",
         "submit_humanoid_skill_plan and begin_humanoid_skill are lifecycle transitions, not rollout results. Continue after each accepted transition and inspect the next planning_tool_state exposed by the Harness.",
         "Compile object-relative preparation with object-relative Skills. approach(object_id=...) is the navigation Skill that moves the base to a manipulation stance chosen from live reachable_base_placements; navigate_to_zone moves only the robot root into a semantic zone and cannot prepare an uncarried object for grasping or placement.",
         "For an object_placed termination contract, preserve one causal object chain in the Skill DAG: an uncarried object needs an object-targeted approach/reach/grasp/lift path before carry_to_zone/place. You choose the hand, interaction point, standoff, and exact bounded nodes from current geometry; never substitute the destination zone for the source object in the first ready node.",
         "If Skill-plan admission rejects a ready node, change the contradictory invocation before retrying. Repeating the same rejected Skill and parameters is not recovery.",
+        "A rejected physical plan is not terminal while planning_tool_state exposes an admissible same-commitment recovery. In particular, when transit_clearance.status=required, stay in this Motor Intent SDK episode and use the supplied collision geometry, fixed feet, current wrist, and skill_transaction_id to plan a materially different whole-body clearance posture or alternate route before escalating.",
         "The planning tool already performs the deterministic MuJoCo rollout gate.",
         "Never emit joint trajectories, controller commands, or physical writes."
       ]
@@ -2071,6 +2072,7 @@ function motorIntentPlanningTools(
         }
         return JSON.stringify({
           ...outputRecord,
+          planning_tool_state: currentMotorIntentPlanningToolState(runtime),
           source_signal_ids: [
             rolloutResult.signal_id,
             predictiveRollout.signal_id
@@ -5086,7 +5088,9 @@ function runtimeImplementationContract(key: HumanoidNeuralAgentKey): string {
   return contract;
 }
 
-function planningReceiptToolUseBehavior(): ToolUseBehavior {
+function planningReceiptToolUseBehavior(
+  runtime: HumanoidNeuralAgentRuntime
+): ToolUseBehavior {
   return (_context, results) => {
     for (const result of results) {
       if (result.type !== "function_output") continue;
@@ -5100,6 +5104,17 @@ function planningReceiptToolUseBehavior(): ToolUseBehavior {
       const rejectedSkillStateTransition = receipt?.transactionId
         && receipt.accepted === false
         && MOTOR_INTENT_SKILL_STATE_ACTIONS.has(String(receipt.action));
+      if (physicalPlanningResult
+        && receipt.accepted === false
+        && motorIntentRecoveryPlanningAvailable(runtime)) {
+        // The SDK's native Agent loop is the owner of intra-episode tool
+        // recovery. A physical rejection has already updated the Runtime's
+        // planning state; keep the same Motor Intent episode alive so the
+        // model can consume that state and select a bounded alternate plan.
+        // Escalating here would discard the active Skill authority before its
+        // collision-clearance branch can run.
+        continue;
+      }
       if ((physicalPlanningResult || rejectedSkillStateTransition)
         && typeof receipt?.accepted === "boolean") {
         const sourceSignalIds = z.array(z.string().uuid()).max(64).catch([]).parse(
@@ -5121,6 +5136,32 @@ function planningReceiptToolUseBehavior(): ToolUseBehavior {
     }
     return { isFinalOutput: false, isInterrupted: undefined };
   };
+}
+
+function currentMotorIntentPlanningToolState(
+  runtime: HumanoidNeuralAgentRuntime
+): JsonValue {
+  const anchor = jsonRecord(runtime.contextAnchor(
+    HUMANOID_NEURAL_AGENT_IDS.motorIntent
+  ));
+  return anchor?.planning_tool_state ?? null;
+}
+
+function motorIntentRecoveryPlanningAvailable(
+  runtime: HumanoidNeuralAgentRuntime
+): boolean {
+  const state = jsonRecord(currentMotorIntentPlanningToolState(runtime));
+  const transitClearance = jsonRecord(state?.transit_clearance);
+  if (transitClearance?.status !== "required") return false;
+  const actions = Array.isArray(state?.planning_actions)
+    ? state.planning_actions
+    : [];
+  return actions.some((value) => {
+    const action = jsonRecord(value);
+    return action?.available === true
+      && (action.action === "plan_whole_body_motion_candidates"
+        || action.action === "plan_humanoid_navigation");
+  });
 }
 
 function goalValuationToolUseBehavior(): ToolUseBehavior {
