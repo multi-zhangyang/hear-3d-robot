@@ -507,6 +507,55 @@ function validateSkillSemantics(
   observation: HumanoidWorldObservation,
   continuationGoal?: HumanoidArticulationGoal
 ): ReturnType<typeof rejection> | null {
+  if (invocation.skill === "approach"
+    && invocation.interaction_point_id !== null) {
+    const objectPlacements = observation.manipulationBasePlacements.filter(
+      (placement) => placement.objectId === invocation.object_id
+    );
+    const selectedPlacements = objectPlacements.filter((placement) => (
+      placement.interactionPointId === invocation.interaction_point_id
+        && placement.handSurface.startsWith(`${invocation.hand}_`)
+    ));
+    if (objectPlacements.length > 0 && selectedPlacements.length === 0) {
+      return rejection("skill_manipulation_base_unavailable", {
+        skill: invocation.skill,
+        object_id: invocation.object_id,
+        hand: invocation.hand,
+        interaction_point_id: invocation.interaction_point_id,
+        reason: "the selected hand and interaction point have no live IK-derived base placement",
+        reachable_base_placements: manipulationBasePlacementChoices(objectPlacements),
+        recovery: "Choose one exact hand and interaction_point_id pair from reachable_base_placements; do not substitute a merely eligible geometric point"
+      });
+    }
+  }
+  if (invocation.skill === "reach") {
+    const selectedReachability = observation.manipulationReachability.filter(
+      (entry) => entry.objectId === invocation.object_id
+        && entry.interactionPointId === invocation.interaction_point_id
+        && entry.handSurface.startsWith(`${invocation.hand}_`)
+    );
+    if (!selectedReachability.some((entry) => entry.ikReferenceReachable)) {
+      const objectPlacements = observation.manipulationBasePlacements.filter(
+        (placement) => placement.objectId === invocation.object_id
+      );
+      return rejection("skill_reach_pose_unreachable", {
+        skill: invocation.skill,
+        object_id: invocation.object_id,
+        hand: invocation.hand,
+        interaction_point_id: invocation.interaction_point_id,
+        tolerance_m: invocation.tolerance_m,
+        current_reachability: selectedReachability.map((entry) => ({
+          hand_surface: entry.handSurface,
+          ik_reference_reachable: entry.ikReferenceReachable,
+          ik_residual_m: entry.ikResidualMeters
+        })),
+        reachable_base_placements: manipulationBasePlacementChoices(objectPlacements),
+        reason: "the selected wrist target is not reachable from the current physical root pose",
+        required_prerequisite_skill: "approach",
+        recovery: "Approach one exact live reachable_base_placements sample first, preserving both its root target and root yaw; then observe again before binding reach"
+      });
+    }
+  }
   if (invocation.skill === "grasp") {
     const occupied = observation.interaction.carrying.bindings.find(
       ({ hand }) => hand === invocation.hand
@@ -752,6 +801,19 @@ function validateSkillSemantics(
     }
   }
   return null;
+}
+
+function manipulationBasePlacementChoices(
+  placements: HumanoidWorldObservation["manipulationBasePlacements"]
+): JsonValue {
+  return placements.map((placement) => ({
+    object_id: placement.objectId,
+    interaction_point_id: placement.interactionPointId ?? null,
+    hand_surface: placement.handSurface,
+    root_world_target: placement.rootWorldTarget,
+    root_yaw_radians: placement.rootYawRadians,
+    ik_residual_m: placement.ikResidualMeters
+  }));
 }
 
 function validateNavigationOutcome(

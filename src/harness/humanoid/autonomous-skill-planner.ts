@@ -228,15 +228,18 @@ function navigationSkillPlan(
     observation,
     invocation.object_id
   );
-  const reachabilityTargets = observation.manipulationBasePlacements
+  const selectedBasePlacements = observation.manipulationBasePlacements
     .filter((placement) => placement.objectId === invocation.object_id
       && (invocation.interaction_point_id === null
         || placement.interactionPointId === undefined
         || placement.interactionPointId === invocation.interaction_point_id)
       && (!invocation.hand
-        || placement.handSurface.startsWith(`${invocation.hand}_`))
-      && planarDistance(current, placement.rootWorldTarget) > 0.025
-      && rootClearsNavigationSolids(placement.rootWorldTarget, contactedSolids))
+        || placement.handSurface.startsWith(`${invocation.hand}_`)));
+  const reachabilityTargets = selectedBasePlacements
+    .filter((placement) => (
+      planarDistance(current, placement.rootWorldTarget) > 0.025
+      && rootClearsNavigationSolids(placement.rootWorldTarget, contactedSolids)
+    ))
     .map((placement) => ({
       target: { ...placement.rootWorldTarget },
       arrivalHeading: {
@@ -247,9 +250,7 @@ function navigationSkillPlan(
       score: 4 - placement.ikResidualMeters
         - planarDistance(current, placement.rootWorldTarget) * 0.05
     }));
-  return {
-    kind: "navigation",
-    targets: [...reachabilityTargets, ...directions.flatMap((direction, directionIndex) => (
+  const geometricTargets = directions.flatMap((direction, directionIndex) => (
       lateralOffsets.map((lateralOffset, lateralIndex) => {
       const lateral = { x: direction.z, y: 0, z: -direction.x };
       const standoff = Math.max(
@@ -274,7 +275,15 @@ function navigationSkillPlan(
           - planarDistance(current, target) * 0.05
           - directionIndex * 0.01 - lateralIndex * 0.005
       };
-    })))].sort((left, right) => right.score - left.score)
+    })));
+  return {
+    kind: "navigation",
+    // Once live IK has produced an exact base-placement contract, a generic
+    // face-the-object pose is not an equivalent fallback: it can complete
+    // navigation while leaving the committed hand target unreachable.
+    targets: (selectedBasePlacements.length > 0
+      ? reachabilityTargets
+      : geometricTargets).sort((left, right) => right.score - left.score)
   };
 }
 
