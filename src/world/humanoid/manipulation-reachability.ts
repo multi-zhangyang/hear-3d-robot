@@ -16,7 +16,7 @@ import type {
 import { solveG1PregraspPose } from "./pregrasp-pose.js";
 
 const SURFACES_WITH_BASE_PLACEMENT_PROBES_PER_HAND = 1;
-const ROOT_TRANSLATION_DISTANCES_METERS = [0.06, 0.12, 0.18] as const;
+const ROOT_TRANSLATION_DISTANCES_METERS = [0, 0.06, 0.12, 0.18] as const;
 const ARM_WORKSPACE_RADII_METERS = [0.28, 0.36, 0.44, 0.52] as const;
 const BASE_PLACEMENT_LATERAL_OFFSETS_METERS = [-0.24, -0.12, 0, 0.12, 0.24] as const;
 const HUMANOID_PLANAR_BODY_CLEARANCE_METERS = 0.18;

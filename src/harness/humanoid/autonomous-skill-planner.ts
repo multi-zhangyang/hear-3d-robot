@@ -220,6 +220,7 @@ function navigationSkillPlan(
   const around = point?.world_position ?? requiredTargetPosition(binding);
   const directions = approachDirections(point?.approach_direction_world);
   const current = observation.robot.rootPosition;
+  const currentYaw = yawFromQuaternion(observation.robot.rootRotation);
   const lateralOffsets = approachLateralOffsets(invocation.hand ?? null);
   const requestedStandoff = Math.max(
     invocation.standoff_m,
@@ -244,6 +245,10 @@ function navigationSkillPlan(
   const reachabilityTargets = selectedBasePlacements
     .filter((placement) => (
       planarDistance(current, placement.rootWorldTarget) > 0.025
+        || Math.abs(Math.atan2(
+          Math.sin(placement.rootYawRadians - currentYaw),
+          Math.cos(placement.rootYawRadians - currentYaw)
+        )) > 0.03
     ))
     .map((placement) => ({
       target: { ...placement.rootWorldTarget },
