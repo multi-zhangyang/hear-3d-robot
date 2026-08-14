@@ -1493,6 +1493,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "A skill_proposal must cite the current perceptual_belief plus both Affordance and Risk harness signal ids in source_signal_ids.",
         "Return exactly one next bounded catalog Skill as proposed_skill={skill, phase, params, rationale}. Future steps may appear only in phase_sequence; never make a compound skill_name or the whole task the proposal.",
         "For an object placement Goal whose object is not grasped, preparation is object-relative: propose approach(object_id), then reach/grasp/lift, before carry_to_zone/place. Never approach the destination zone to make the source object reachable.",
+        "For approach, params are exactly object_id, interaction_point_id, hand, and standoff_m. Preserve the selected live hand+interaction-point pair, but never add root_world_target, root_yaw_radians, or base_placement; the Harness binds that pair to its authoritative IK placement.",
         "Premotor waits for Action Selection to accept that joined proposal as the active commitment; never repeat Affordance/Risk for the same accepted proposal. Predictive waits for a real rollout result.",
         "Predictive judges admission of the current bounded rollout chunk, not whether that chunk already completes the final Goal predicate.",
         "Predictive acceptance completes the motor-assessment episode and returns a certified rollout to Action Selection; do not call or synthesize execution in that episode.",
