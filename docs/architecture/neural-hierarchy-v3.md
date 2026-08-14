@@ -31,8 +31,15 @@ The hierarchy is a recursive control system rather than a long prompt chain:
 
 Every model-to-model delegation has the same wire law:
 
-- the parent sends only a concise typed `intent`, exact causal `signal_id`
-  references, priority, and horizon;
+- the parent chooses only one owned child edge, an allowed typed `signal_kind`,
+  exact causal `source_signal_ids`, priority, and horizon; there is no
+  parent-authored free-text intent channel;
+- every cited signal must be pending, current, directed to that parent, and
+  bound to that exact parent episode; a UUID from an earlier episode, sibling,
+  foreign parent, consumed signal, or expired signal is rejected even if it
+  still exists in durable history;
+- the Harness derives the immutable control tuple
+  `(parent, child, harness_phase, signal_kind)` from the structural contract;
 - the Harness constructs the child's own context anchor and injects the cited
   world-versioned signals;
 - parent context, sibling output, Sessions, and JSON-encoded copies of an
@@ -367,8 +374,8 @@ sequenceDiagram
     participant BD as MuJoCo Body
 
     AS->>SM: skill_commitment signal
-    SM->>PM: Agent.asTool(intent + exact signal ids)
-    PM->>MI: Agent.asTool(compilation intent + exact signal ids)
+    SM->>PM: Agent.asTool(structural signal kind + current parent-episode ids)
+    PM->>MI: Agent.asTool(structural signal kind + current parent-episode ids)
     MI->>SR: submit_humanoid_skill_plan(committed local DAG)
     SR-->>MI: ready_skill_bindings
     MI->>SR: begin_humanoid_skill(selected binding verbatim)
@@ -377,7 +384,7 @@ sequenceDiagram
     RG-->>MI: rollout_result
     MI-->>PM: rollout_result
     PM-->>SM: rollout_result
-    SM->>PC: Agent.asTool(exact reentrant rollout signal)
+    SM->>PC: Agent.asTool(current direct rollout id; Harness resolves reentrant provenance)
     PC-->>SM: accepted forward_prediction or prediction_error
     SM-->>AS: certificate-bound rollout_result
     AS->>SM: transition same commitment to executing
@@ -755,6 +762,13 @@ child's internal source IDs and the closed `source_authority_lease_id` remain
 in durable Harness state as causal ancestry; they are not exposed as a second
 competing ID namespace in the tool receipt. A parent therefore always copies
 the returned `source_signal_ids` when citing its immediate child.
+
+Before opening the next child episode, the common delegation gate intersects
+those model-cited IDs with the pending signals owned by the exact current
+parent episode. Descending inputs must carry that parent's `invocation_id`;
+ascending or reentrant returns must carry its `parent_episode_id`. This check is
+performed in code before a child lease or Session is opened, so a model's long
+Session can remember historical UUIDs without gaining authority to reuse them.
 
 Premotor is a structural pass-through after it has composed and delegated one
 bounded Motor Intent: the typed Motor Intent `rollout_result` or `escalation`

@@ -26,7 +26,7 @@ import {
   type HumanoidNeuralNodeDescriptor
 } from "./humanoid/neural-hierarchy-contract.js";
 
-const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 35;
+const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 36;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",

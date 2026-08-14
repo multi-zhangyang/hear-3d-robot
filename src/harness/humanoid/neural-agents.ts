@@ -928,6 +928,39 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           recovery: "Call this same delegation tool once with only exact signal_id values present in the current invocation. Use [] when no causal source signal exists; never invent or substitute a UUID."
         });
       }
+      const parentInvocation = requiredHarnessInvocation(parentId);
+      const currentParentSignals = currentDelegationSourceSignals(
+        input.runtime,
+        parentId,
+        parentInvocation.invocationId
+      );
+      const currentParentSignalIds = new Set(currentParentSignals.map(
+        (signal) => signal.signal_id
+      ));
+      const outOfScopeSourceSignalIds = delegation.source_signal_ids.filter(
+        (signalId) => !currentParentSignalIds.has(signalId)
+      );
+      if (outOfScopeSourceSignalIds.length > 0) {
+        return JSON.stringify({
+          accepted: false,
+          code: "neural_source_signal_out_of_scope",
+          tool: childTool.name,
+          parent_node_id: parentId,
+          parent_episode_id: parentInvocation.invocationId,
+          rejected_source_signal_ids: outOfScopeSourceSignalIds,
+          current_parent_episode_signal_ids: currentParentSignals.map(
+            (signal) => signal.signal_id
+          ),
+          automatic_actuation: false,
+          next_response_contract: {
+            mode: "corrected_tool_call_only",
+            tool: childTool.name,
+            preserve_valid_fields: true,
+            narration_allowed: false
+          },
+          recovery: "Call this same direct-child tool once using only pending signal_id values directed to this parent in the current parent episode. Do not cite a consumed, expired, sibling-owned, foreign-parent, or earlier-episode signal; use [] when no causal source signal is required."
+        });
+      }
       if (inputTool.isEnabled && !inputTool.isEnabled()) {
         return JSON.stringify({
           accepted: false,
@@ -4101,6 +4134,29 @@ function currentManagerEpisodeSignals(
   ));
 }
 
+/**
+ * The model-visible Session may remember UUIDs from earlier episodes, but a
+ * direct-child delegation may cite only signals currently owned by this exact
+ * parent episode. Descending inputs bind through the parent's invocation id;
+ * child/reentrant returns bind through parent_episode_id. This is the causal
+ * authority boundary that prevents a valid old UUID from becoming shared
+ * memory or a cross-layer control channel.
+ */
+function currentDelegationSourceSignals(
+  runtime: HumanoidNeuralAgentRuntime,
+  parentNodeId: string,
+  parentEpisodeId: string
+): NeuralSignal[] {
+  return runtime.pendingNeuralSignals({ targetNodeId: parentNodeId }).filter(
+    (signal) => (
+      (signal.direction === "descending"
+        ? signal.invocation_id === parentEpisodeId
+        : signal.parent_episode_id === parentEpisodeId)
+        && isCurrentNeuralSignal(runtime, signal)
+    )
+  );
+}
+
 function currentManagerChildSignals(
   runtime: HumanoidNeuralAgentRuntime,
   managerNodeId: string,
@@ -4357,7 +4413,7 @@ function neuralDelegationSchema(
       "The allowed typed signal on this fixed structural parent-child edge. It does not authorize choosing a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters."
     ),
     source_signal_ids: z.array(z.string().uuid()).max(64).default([]).describe(
-      "Exact causal signal ids visible in this parent invocation. The Harness supplies all child state and derives the child's responsibility from the structural edge and current phase."
+      "Exact pending causal signal ids owned by this current parent episode. Consumed, expired, sibling-owned, foreign-parent, and earlier-episode ids are rejected even when their UUID still exists. The Harness supplies all child state and derives the child's responsibility from the structural edge and current phase."
     ),
     ttl_revisions: z.number().int().min(1).max(1_000_000)
       .default(MODEL_EPISODE_SIGNAL_TTL_REVISIONS),
