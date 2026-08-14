@@ -670,6 +670,24 @@ export class HumanoidActionRuntime {
     return authority ? structuredClone(authority) : undefined;
   }
 
+  #invocationMatchesActiveNeuralCommitment(
+    invocation: HumanoidSkillInvocation
+  ): boolean {
+    if (this.#activeNeuralSkillCommitment === undefined) return true;
+    const commitment = this.#activeNeuralSkillCommitment();
+    return commitment !== undefined
+      && sameHumanoidSkillInvocation(invocation, commitment.invocation);
+  }
+
+  #skillPlanMatchesActiveNeuralCommitment(
+    plan: RegisteredHumanoidSkillPlan | null
+  ): boolean {
+    if (!plan) return false;
+    const ready = readyHumanoidSkillPlanBindings(plan);
+    return ready.length === 1
+      && this.#invocationMatchesActiveNeuralCommitment(ready[0]!.invocation);
+  }
+
   isActionAvailable(name: HumanoidActionName, agentId: string): boolean {
     const normalizedAgentId = agentId.trim();
     if (!isCurrentHumanoidPlanningActor(normalizedAgentId)) return true;
@@ -703,6 +721,7 @@ export class HumanoidActionRuntime {
         && this.#observationByAgent.has(normalizedAgentId)
         && (!this.#requireSkillBinding
           || (activePlan !== null
+            && this.#skillPlanMatchesActiveNeuralCommitment(activePlan)
             && !this.#activeSkillByAgent.has(normalizedAgentId)));
     }
     if (name === "submit_humanoid_skill_plan") {
@@ -714,7 +733,8 @@ export class HumanoidActionRuntime {
         && (!this.#requireSkillBinding
           || (!this.#activeSkillByAgent.has(normalizedAgentId)
             && (activePlan === null
-              || activePlan.world_revision !== observation.worldRevision))
+              || activePlan.world_revision !== observation.worldRevision
+              || !this.#skillPlanMatchesActiveNeuralCommitment(activePlan)))
           || hasCurrentPlanningFailure);
     }
     if (!isPlanningAction(name)) return true;
@@ -727,7 +747,9 @@ export class HumanoidActionRuntime {
       const clearanceRecoveryAction = transitClearance
         && (name === "plan_whole_body_motion_candidates"
           || name === "plan_humanoid_navigation");
-      if (!skill && !clearanceRecoveryAction) return false;
+      if ((!skill || !this.#invocationMatchesActiveNeuralCommitment(
+        skill.invocation
+      )) && !clearanceRecoveryAction) return false;
       if (skill
         && (skill.observed_world_revision < this.#latestPhysicalExecutionRevision
           || (skill.planning_action !== name && !clearanceRecoveryAction))) {
@@ -745,8 +767,16 @@ export class HumanoidActionRuntime {
 
   planningToolState(agentId: string): JsonValue {
     const normalizedAgentId = agentId.trim();
-    const activeSkill = this.#activeSkillByAgent.get(normalizedAgentId);
-    const activePlan = this.#activeSkillPlan(normalizedAgentId);
+    const neuralCommitment = this.#activeNeuralSkillCommitment?.();
+    const storedSkill = this.#activeSkillByAgent.get(normalizedAgentId);
+    const activeSkill = storedSkill
+      && this.#invocationMatchesActiveNeuralCommitment(storedSkill.invocation)
+      ? storedSkill
+      : undefined;
+    const storedPlan = this.#activeSkillPlan(normalizedAgentId);
+    const activePlan = this.#skillPlanMatchesActiveNeuralCommitment(storedPlan)
+      ? storedPlan
+      : null;
     const readySkillBindings = activePlan && !activeSkill
       ? readyHumanoidSkillPlanBindings(activePlan)
       : [];
@@ -796,7 +826,9 @@ export class HumanoidActionRuntime {
       ready_skill_bindings: readySkillBindings,
       required_next_tool: readySkillBindings.length > 0
         ? "begin_humanoid_skill"
-        : null,
+        : neuralCommitment && !activeSkill
+          ? "submit_humanoid_skill_plan"
+          : null,
       active_skill: activeSkill
         ? {
             transaction_id: activeSkill.transaction_id,

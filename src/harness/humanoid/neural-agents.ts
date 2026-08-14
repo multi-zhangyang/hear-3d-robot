@@ -83,21 +83,6 @@ import {
 
 const EmptyDelegationSchema = z.object({}).strict();
 const NEURAL_OUTPUT_SUBMISSION_TOOL_NAME = "submit_neural_output";
-const NeuralHarnessPhaseSchemaValues: readonly NeuralHarnessPhase[] = [
-  "bootstrapping",
-  "goal_valuation",
-  "perception",
-  "skill_proposal",
-  "commitment_authorization",
-  "motor_assessment",
-  "motor_planning",
-  "rollout_review",
-  "execution",
-  "feedback",
-  "recovery",
-  "cycle_completion",
-  "terminal"
-];
 const MODEL_EPISODE_SIGNAL_TTL_REVISIONS = 10_000;
 const MOTOR_INTENT_PLANNING_ACTIONS: ReadonlySet<string> = new Set([
   "plan_humanoid_skill",
@@ -924,16 +909,31 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         });
       }
       if (inputTool.isEnabled && !inputTool.isEnabled()) {
-        throw new Error(
-          `Neural child is not enabled in the current Harness phase: ${childId}`
-        );
+        return JSON.stringify({
+          accepted: false,
+          code: "neural_child_not_enabled",
+          tool: childTool.name,
+          child_node_id: childId,
+          harness_phase: input.runtime.neuralHarnessPhase().phase,
+          automatic_actuation: false,
+          recovery: "Choose a child tool enabled by the current Harness phase and directed signals; do not bypass the phase barrier."
+        });
       }
       if (inputTool.phases && !input.runtime.neuralNodeEnabled({
         nodeId: parentId,
         phases: inputTool.phases,
         ...(inputTool.requireCommitment ? { requireCommitment: true } : {})
       }) && parentId !== HUMANOID_NEURAL_AGENT_IDS.executive) {
-        throw new Error(`Parent neural authority is invalid for phase: ${parentId}`);
+        return JSON.stringify({
+          accepted: false,
+          code: "neural_parent_authority_invalid",
+          tool: childTool.name,
+          parent_node_id: parentId,
+          child_node_id: childId,
+          harness_phase: input.runtime.neuralHarnessPhase().phase,
+          automatic_actuation: false,
+          recovery: "Use only the child edge authorized for the current Harness phase and active commitment."
+        });
       }
       try {
         const output = await invoke(context, rawInput, details);
@@ -1227,20 +1227,11 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         invocationInputSignalIds = [];
       }
     });
-    const sdkEnabled = childTool.isEnabled;
-    childTool.isEnabled = async (context, agent) => (
-      (!inputTool.isEnabled || inputTool.isEnabled())
-        && (!inputTool.phases
-          || inputTool.phases.includes(input.runtime.neuralHarnessPhase().phase))
-        && (parentId === HUMANOID_NEURAL_AGENT_IDS.executive
-          || input.runtime.neuralNodeEnabled({
-            nodeId: parentId,
-            phases: inputTool.phases
-              ?? NeuralHarnessPhaseSchemaValues,
-            ...(inputTool.requireCommitment ? { requireCommitment: true } : {})
-          }))
-        && await sdkEnabled(context, agent)
-    );
+    // Agent.asTool delegation is an episode-stable capability surface.  The
+    // SDK freezes the visible tool set for a run turn sequence, so changing
+    // isEnabled after a child returns makes a later/recovered model call see
+    // "Tool not found" even though the Harness explicitly requests that edge.
+    // The invocation wrapper above remains the single dynamic phase/lease gate.
     return childTool;
   };
 
@@ -1971,7 +1962,11 @@ function motorIntentPlanningTools(
       "plan_whole_body_motion_candidates",
       "plan_humanoid_navigation"
     ],
-    { availability: "dynamic" }
+    // The Agents SDK freezes an Agent's tool surface for the whole episode.
+    // Motor Intent deliberately performs submit -> begin -> plan in one
+    // episode, so every lifecycle endpoint must remain registered while the
+    // Harness state machine still owns when each call is admissible.
+    { availability: "stable" }
   ).map((planningTool) => {
     if (planningTool.type !== "function") return planningTool;
     // Skill-plan registration and phase binding are control-state transitions,
@@ -4637,11 +4632,70 @@ function validateNeuralSubmissionPayload(
   payload: unknown
 ): JsonValue {
   const validated = NeuralPayloadSchema.parse(payload);
-  const structured = signalKind === "skill_proposal"
-    && (key === "sensorimotorManager" || key === "recovery")
-    ? BoundedSkillProposalPayloadSchema.parse(validated)
-    : validated;
+  const structured = key === "affordance"
+    && signalKind === "affordance_hypothesis"
+    ? validateAffordanceManipulationRecommendation(validated)
+    : signalKind === "skill_proposal"
+      && (key === "sensorimotorManager" || key === "recovery")
+      ? BoundedSkillProposalPayloadSchema.parse(validated)
+      : validated;
   return JsonValueSchema.parse(structured);
+}
+
+function validateAffordanceManipulationRecommendation(
+  payload: JsonValue
+): JsonValue {
+  const root = jsonRecord(payload);
+  const affordances = jsonRecord(root?.affordances);
+  const graspable = jsonRecord(affordances?.graspable);
+  const placement = jsonRecord(graspable?.reachable_base_placement);
+  if (!graspable || !placement) return payload;
+  const placementPoint = stringField(placement, "interaction_point_id");
+  const placementSurface = stringField(placement, "hand_surface");
+  const placementHand = placementSurface?.startsWith("left_")
+    ? "left"
+    : placementSurface?.startsWith("right_")
+      ? "right"
+      : undefined;
+  const recommendedPoint = stringField(
+    graspable,
+    "recommended_interaction_point"
+  );
+  const recommendedHand = stringField(graspable, "recommended_hand");
+  const immediate = jsonRecord(root?.immediate_next_skill);
+  const candidate = immediate
+    ? stringField(immediate, "candidate")
+    : undefined;
+  const parameters = jsonRecord(immediate?.parameters);
+  const parameterPoint = parameters
+    ? stringField(parameters, "interaction_point_id")
+    : undefined;
+  const parameterHand = parameters ? stringField(parameters, "hand") : undefined;
+  const currentReachability = jsonRecord(graspable.current_reachability);
+  const reachableNow = currentReachability?.reachable_now;
+  const contradictions = [
+    placementPoint && recommendedPoint && placementPoint !== recommendedPoint
+      ? `recommended_interaction_point=${recommendedPoint}`
+      : undefined,
+    placementHand && recommendedHand && placementHand !== recommendedHand
+      ? `recommended_hand=${recommendedHand}`
+      : undefined,
+    candidate === "approach" && placementPoint !== parameterPoint
+      ? `immediate approach interaction_point_id=${parameterPoint ?? "missing"}`
+      : undefined,
+    candidate === "approach" && placementHand !== parameterHand
+      ? `immediate approach hand=${parameterHand ?? "missing"}`
+      : undefined,
+    candidate === "reach" && reachableNow === false
+      ? "immediate reach selected while current_reachability.reachable_now=false"
+      : undefined
+  ].filter((value): value is string => value !== undefined);
+  if (contradictions.length === 0) return payload;
+  throw new Error(
+    `Affordance manipulation recommendation contradicts its reachable_base_placement (${contradictions.join(", ")}). `
+      + `Use the exact placement pair hand=${placementHand ?? "unknown"}, interaction_point_id=${placementPoint ?? "unknown"}; `
+      + "when reachable_now=false, recommend approach before reach."
+  );
 }
 
 function validateBoundedSkillProposalOutput(
