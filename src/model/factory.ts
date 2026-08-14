@@ -56,7 +56,10 @@ export function createConfiguredModel(
       apiKey: config.apiKey,
       fetch: openAICompatibleRequestFetch(timedFetch)
     });
-    model = agentsModelFromAiSdk(provider.chatModel(config.model));
+    model = agentsModelFromAiSdk(
+      provider.chatModel(config.model),
+      true
+    );
   } else if (config.protocol === "openai_responses") {
     const provider = createOpenAI({
       name: "configured-openai-responses",
@@ -91,22 +94,75 @@ export function createConfiguredModel(
  * the adapter's native retry advice for the Agents runner.
  */
 function agentsModelFromAiSdk(
-  model: Parameters<typeof aisdk>[0]
+  model: Parameters<typeof aisdk>[0],
+  normalizeCompatibleToolArguments = false
 ): Model {
   const adapted = aisdk(model);
   const getResponse: Model["getResponse"] = async (request) => {
-    const response = await adapted.getResponse(request);
+    const rawResponse = await adapted.getResponse(request);
+    const response = normalizeCompatibleToolArguments
+      ? normalizedCompatibleModelResponse(rawResponse)
+      : rawResponse;
     if (response.rawUsage === undefined) {
       const { rawUsage: _rawUsage, ...normalized } = response;
       return normalized;
     }
     return { ...response, rawUsage: response.rawUsage };
   };
+  const getStreamedResponse: Model["getStreamedResponse"] = async function* (
+    request
+  ) {
+    for await (const event of adapted.getStreamedResponse(request)) {
+      if (normalizeCompatibleToolArguments && event.type === "response_done") {
+        yield {
+          ...event,
+          response: normalizedCompatibleModelResponse(event.response)
+        };
+      } else {
+        yield event;
+      }
+    }
+  };
   return {
     getResponse,
-    getStreamedResponse: (request) => adapted.getStreamedResponse(request),
+    getStreamedResponse,
     getRetryAdvice: (input) => adapted.getRetryAdvice(input)
   };
+}
+
+function normalizedCompatibleModelResponse<T>(response: T): T {
+  if (!isRecord(response) || !Array.isArray(response.output)) return response;
+  let changed = false;
+  const output = response.output.map((item) => {
+    if (!isRecord(item) || item.type !== "function_call"
+      || typeof item.arguments !== "string") return item;
+    const normalized = normalizeDuplicatedTrailingObjectDelimiters(
+      item.arguments
+    );
+    if (normalized === item.arguments) return item;
+    changed = true;
+    return { ...item, arguments: normalized };
+  });
+  return changed ? { ...response, output } as T : response;
+}
+
+export function normalizeDuplicatedTrailingObjectDelimiters(input: string): string {
+  if (jsonObject(input) !== undefined) return input;
+  let candidate = input.trimEnd();
+  for (let removed = 0; removed < 4 && candidate.endsWith("}"); removed += 1) {
+    candidate = candidate.slice(0, -1).trimEnd();
+    if (jsonObject(candidate) !== undefined) return candidate;
+  }
+  return input;
+}
+
+function jsonObject(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function openAICompatibleRequestFetch(
