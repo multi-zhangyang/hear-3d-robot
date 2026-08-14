@@ -25,6 +25,8 @@ import {
 } from "../../world/humanoid/embodied-skill-call.js";
 import type { HumanoidObjectWorldModelEntry } from "../../world/humanoid/object-world-model.js";
 import type { HumanoidSolidToken } from "../../world/humanoid/solid-observation.js";
+import { HUMANOID_NAVIGATION_PROFILE } from "../../world/humanoid/environment.js";
+import { navigationObstaclePlanarExpansion } from "../../world/navigation.js";
 import {
   humanoidArticulationGoal,
   type HumanoidArticulationGoal
@@ -32,6 +34,7 @@ import {
 import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
 
 const GRASP_REACH_PRECONDITION_DISTANCE_METERS = 0.12;
+const APPROACH_SUPPORT_CLEARANCE_MARGIN_METERS = 0.01;
 
 export type SkillPlanningAction =
   | "plan_humanoid_skill"
@@ -62,6 +65,39 @@ export interface ActiveHumanoidSkillBinding {
   learned_policy_required_capabilities: HumanoidLearnedPolicyCapability[];
   learned_policy_missing_capabilities: HumanoidLearnedPolicyCapability[];
   control_mode: "learned_policy" | "reference_control_fallback";
+}
+
+export function manipulationBasePlacementNavigationBlockerIds(
+  observation: HumanoidWorldObservation,
+  placement: HumanoidWorldObservation["manipulationBasePlacements"][number]
+): string[] {
+  const expansion = navigationObstaclePlanarExpansion(
+    HUMANOID_NAVIGATION_PROFILE.radius
+  ) + APPROACH_SUPPORT_CLEARANCE_MARGIN_METERS;
+  return observation.solidTokens.filter((solid) => (
+    solid.currentContacts.some((contact) => (
+      contact.firstObject === placement.objectId && contact.secondSolid === solid.id
+    ) || (
+      contact.secondObject === placement.objectId && contact.firstSolid === solid.id
+    ))
+      && Math.abs(placement.rootWorldTarget.x - solid.center.x)
+        <= solid.size.x / 2 + expansion
+      && Math.abs(placement.rootWorldTarget.z - solid.center.z)
+        <= solid.size.z / 2 + expansion
+  )).map(({ id }) => id);
+}
+
+export function navigableManipulationBasePlacements(
+  observation: HumanoidWorldObservation,
+  objectId: string
+): HumanoidWorldObservation["manipulationBasePlacements"] {
+  return observation.manipulationBasePlacements.filter((placement) => (
+    placement.objectId === objectId
+      && manipulationBasePlacementNavigationBlockerIds(
+        observation,
+        placement
+      ).length === 0
+  ));
 }
 
 const PersistedInteractionPointSchema = z.object({
@@ -343,6 +379,18 @@ export function bindHumanoidSkill(input: {
       });
     }
   }
+  const approachPlacement = invocation.skill === "approach"
+    && invocation.interaction_point_id !== null
+    ? navigableManipulationBasePlacements(
+        input.observation,
+        invocation.object_id
+      ).filter((placement) => (
+        placement.interactionPointId === invocation.interaction_point_id
+          && placement.handSurface.startsWith(`${invocation.hand}_`)
+      )).sort((left, right) => (
+        left.ikResidualMeters - right.ikResidualMeters
+      ))[0]
+    : undefined;
   const learnedPolicyRequiredCapabilities =
     humanoidSkillPhaseLearnedPolicyCapabilities(invocation, request.phase);
   const learnedPolicyCapabilities = new Set(
@@ -373,7 +421,9 @@ export function bindHumanoidSkill(input: {
         ? { active_goal_sha256: modelPayloadSha256(input.activeGoal) }
         : {}),
       ...(input.recoveryAuthorized ? { recovery_authorized: true } : {}),
-      target_position: invocation.skill === "carry_to_zone" && target && targetZone
+      target_position: approachPlacement
+        ? { ...approachPlacement.rootWorldTarget }
+        : invocation.skill === "carry_to_zone" && target && targetZone
         ? {
             x: input.observation.robot.rootPosition.x
               + targetZone.center.x - target.pose.position.x,
@@ -509,21 +559,42 @@ function validateSkillSemantics(
 ): ReturnType<typeof rejection> | null {
   if (invocation.skill === "approach"
     && invocation.interaction_point_id !== null) {
-    const objectPlacements = observation.manipulationBasePlacements.filter(
+    const observedObjectPlacements = observation.manipulationBasePlacements.filter(
       (placement) => placement.objectId === invocation.object_id
+    );
+    const objectPlacements = navigableManipulationBasePlacements(
+      observation,
+      invocation.object_id
     );
     const selectedPlacements = objectPlacements.filter((placement) => (
       placement.interactionPointId === invocation.interaction_point_id
         && placement.handSurface.startsWith(`${invocation.hand}_`)
     ));
-    if (objectPlacements.length > 0 && selectedPlacements.length === 0) {
+    if (observedObjectPlacements.length > 0 && selectedPlacements.length === 0) {
       return rejection("skill_manipulation_base_unavailable", {
         skill: invocation.skill,
         object_id: invocation.object_id,
         hand: invocation.hand,
         interaction_point_id: invocation.interaction_point_id,
-        reason: "the selected hand and interaction point have no live IK-derived base placement",
+        reason: "the selected hand and interaction point have no navigation-clear live IK-derived base placement",
         reachable_base_placements: manipulationBasePlacementChoices(objectPlacements),
+        navigation_blocked_base_placements: observedObjectPlacements
+          .filter((placement) => manipulationBasePlacementNavigationBlockerIds(
+            observation,
+            placement
+          ).length > 0)
+          .map((placement) => ({
+            object_id: placement.objectId,
+            interaction_point_id: placement.interactionPointId ?? null,
+            hand_surface: placement.handSurface,
+            root_world_target: placement.rootWorldTarget,
+            root_yaw_radians: placement.rootYawRadians,
+            ik_residual_m: placement.ikResidualMeters,
+            blocking_solid_ids: manipulationBasePlacementNavigationBlockerIds(
+              observation,
+              placement
+            )
+          })),
         recovery: "Choose one exact hand and interaction_point_id pair from reachable_base_placements; do not substitute a merely eligible geometric point"
       });
     }
@@ -535,8 +606,9 @@ function validateSkillSemantics(
         && entry.handSurface.startsWith(`${invocation.hand}_`)
     );
     if (!selectedReachability.some((entry) => entry.ikReferenceReachable)) {
-      const objectPlacements = observation.manipulationBasePlacements.filter(
-        (placement) => placement.objectId === invocation.object_id
+      const objectPlacements = navigableManipulationBasePlacements(
+        observation,
+        invocation.object_id
       );
       return rejection("skill_reach_pose_unreachable", {
         skill: invocation.skill,

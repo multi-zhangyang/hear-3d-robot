@@ -53,6 +53,7 @@ import {
   bindHumanoidSkill,
   ActiveHumanoidSkillBindingSchema,
   humanoidEmbodiedSkillIdentity,
+  navigableManipulationBasePlacements,
   validateSkillPlanningReference,
   type ActiveHumanoidSkillBinding
 } from "./skill-binding.js";
@@ -3170,8 +3171,10 @@ function motionPlanningObservation(
         object_id: object.id,
         object_center_world: object.pose.position,
         object_size: object.size,
-        reachable_base_placements: snapshot.manipulationBasePlacements
-          .filter((entry) => entry.objectId === object.id)
+        reachable_base_placements: navigableManipulationBasePlacements(
+          snapshot,
+          object.id
+        )
           .sort((left, right) => left.ikResidualMeters - right.ikResidualMeters)
           .slice(0, MOTION_GROUNDING_BASE_PLACEMENT_LIMIT)
           .map((entry) => ({
@@ -3440,8 +3443,10 @@ function modelObservation(snapshot: HumanoidWorldObservation): unknown {
           object_id: object.id,
           object_center_world: object.pose.position,
           object_size: object.size,
-          reachable_base_placements: snapshot.manipulationBasePlacements
-            .filter((entry) => entry.objectId === object.id)
+          reachable_base_placements: navigableManipulationBasePlacements(
+            snapshot,
+            object.id
+          )
             .map((entry) => ({
               interaction_point_id: entry.interactionPointId ?? null,
               hand_surface: entry.handSurface,
@@ -3765,10 +3770,11 @@ function manipulationBasePlacementRequirement(
     ));
     if (reachability.length === 0
       || reachability.some((entry) => entry.ikReferenceReachable)) return [];
-    const placements = observation.manipulationBasePlacements.filter((entry) => (
+    const observedPlacements = observation.manipulationBasePlacements.filter((entry) => (
       entry.objectId === object.id
     ));
-    return placements.length === 0
+    const placements = navigableManipulationBasePlacements(observation, object.id);
+    return observedPlacements.length === 0
       ? []
       : [{
           objectId: object.id,
@@ -3795,10 +3801,11 @@ function legacyManipulationBasePlacementRequirement(
     ));
     if (reachability.length === 0
       || reachability.some((entry) => entry.ikReferenceReachable)) return [];
-    const placements = observation.manipulationBasePlacements.filter((entry) => (
+    const observedPlacements = observation.manipulationBasePlacements.filter((entry) => (
       entry.objectId === object.id
     ));
-    return placements.length === 0 ? [] : [{
+    const placements = navigableManipulationBasePlacements(observation, object.id);
+    return observedPlacements.length === 0 ? [] : [{
       objectId: object.id,
       objectCenterWorld: { ...object.position },
       placements: structuredClone(placements)
@@ -3931,6 +3938,7 @@ function reachableBasePlacementContext(
 ): Array<Record<string, unknown>> {
   return objects.flatMap((object) => object.placements.map((placement) => ({
     object_id: object.objectId,
+    interaction_point_id: placement.interactionPointId ?? null,
     hand_surface: placement.handSurface,
     root_world_target: placement.rootWorldTarget,
     root_yaw_radians: placement.rootYawRadians,

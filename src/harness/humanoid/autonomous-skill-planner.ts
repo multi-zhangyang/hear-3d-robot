@@ -5,7 +5,10 @@ import type { HumanoidMotionOptionContract } from "../../world/humanoid/motion-o
 import type { HumanoidWorldObservation } from "../../world/humanoid/world.js";
 import type { G1HandCoordination } from "../../world/humanoid/hand-coordination.js";
 import type { G1HandContactSurfaceName } from "../../world/humanoid/morphology.js";
-import type { ActiveHumanoidSkillBinding } from "./skill-binding.js";
+import {
+  navigableManipulationBasePlacements,
+  type ActiveHumanoidSkillBinding
+} from "./skill-binding.js";
 import {
   MINIMUM_BLOCK_REMOVAL_NORMAL_FORCE_N,
   MINIMUM_BLOCK_REMOVAL_STABLE_FRAMES
@@ -230,7 +233,10 @@ function navigationSkillPlan(
   );
   const objectBasePlacements = observation.manipulationBasePlacements
     .filter((placement) => placement.objectId === invocation.object_id);
-  const selectedBasePlacements = objectBasePlacements
+  const selectedBasePlacements = navigableManipulationBasePlacements(
+    observation,
+    invocation.object_id
+  )
     .filter((placement) => (invocation.interaction_point_id === null
         || placement.interactionPointId === invocation.interaction_point_id)
       && (!invocation.hand
@@ -238,7 +244,6 @@ function navigationSkillPlan(
   const reachabilityTargets = selectedBasePlacements
     .filter((placement) => (
       planarDistance(current, placement.rootWorldTarget) > 0.025
-      && rootClearsNavigationSolids(placement.rootWorldTarget, contactedSolids)
     ))
     .map((placement) => ({
       target: { ...placement.rootWorldTarget },
@@ -330,19 +335,6 @@ function objectContactedSolids(
     ) || (
       contact.secondObject === objectId && contact.firstSolid === solid.id
     ))
-  ));
-}
-
-function rootClearsNavigationSolids(
-  root: Vec3,
-  solids: HumanoidWorldObservation["solidTokens"]
-): boolean {
-  const expansion = navigationObstaclePlanarExpansion(
-    HUMANOID_NAVIGATION_PROFILE.radius
-  ) + APPROACH_SUPPORT_CLEARANCE_MARGIN_METERS;
-  return solids.every((solid) => (
-    Math.abs(root.x - solid.center.x) > solid.size.x / 2 + expansion
-      || Math.abs(root.z - solid.center.z) > solid.size.z / 2 + expansion
   ));
 }
 
