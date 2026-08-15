@@ -20,6 +20,8 @@ const KNOWN_HUMANOID_CONTROLLER_MODULES = [
   "hear/controllers/workyard-reach",
   "hear/controllers/workyard-contact"
 ] as const;
+const BUNDLED_YAHMP_CONTROLLER_SOURCE =
+  "hear-bundled-yahmp-recovery-controller-v1";
 const BUNDLED_WORKYARD_CONTROLLER_SOURCE =
   "hear-bundled-workyard-whole-body-contact-controller-v3";
 const HUMANOID_CONTROLLER_MODULE_FACTORY =
@@ -57,7 +59,7 @@ export async function loadConfiguredHumanoidControllerSource(
   baseDirectory = process.cwd()
 ): Promise<HumanoidControllerSource> {
   const specifier = environment[HUMANOID_CONTROLLER_MODULE_ENV]?.trim();
-  if (!specifier) return loadBundledWorkyardControllerSource(environment);
+  if (!specifier) return loadBundledYahmpControllerSource(environment);
   return loadHumanoidControllerSource(specifier, baseDirectory);
 }
 
@@ -74,12 +76,39 @@ export async function findKnownHumanoidControllerSource(
       continue;
     }
   }
-  try {
-    const bundled = await loadBundledWorkyardControllerSource(environment);
-    return bundled.sourceSha256 === sourceSha256 ? bundled : undefined;
-  } catch {
-    return undefined;
+  for (const loadBundled of [
+    loadBundledYahmpControllerSource,
+    loadBundledWorkyardControllerSource
+  ]) {
+    try {
+      const bundled = await loadBundled(environment);
+      if (bundled.sourceSha256 === sourceSha256) return bundled;
+    } catch {
+      continue;
+    }
   }
+  return undefined;
+}
+
+async function loadBundledYahmpControllerSource(
+  environment: NodeJS.ProcessEnv
+): Promise<HumanoidControllerSource> {
+  const namespace: unknown = await import(
+    "../../controllers/yahmp-module.js"
+  );
+  const assets = await loadControllerAssets(
+    namespace,
+    fileURLToPath(import.meta.url),
+    environment
+  );
+  return createControllerSource(
+    namespace,
+    controllerSourceSha256(
+      sha256(BUNDLED_YAHMP_CONTROLLER_SOURCE),
+      assets
+    ),
+    assets
+  );
 }
 
 async function loadBundledWorkyardControllerSource(
