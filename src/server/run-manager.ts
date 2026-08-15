@@ -24,7 +24,10 @@ import {
   resumeHumanoidMission,
   startHumanoidMission
 } from "../runtime/humanoid-mission-runner.js";
-import { RunPauseRequestedError } from "../runtime/run-pause.js";
+import {
+  RunPauseRequestedError,
+  RunRestartRequestedError
+} from "../runtime/run-pause.js";
 import type {
   HumanoidControllerSource
 } from "../world/humanoid/controller-module.js";
@@ -113,6 +116,16 @@ export class RunManager {
         checkpoint,
         persistCheckpoint: () => store.writeCheckpoint(checkpoint)
       });
+      if (checkpoint.status === "interrupted") {
+        if (store.definition.run_mode === "continuous") {
+          continuousCandidates.push({
+            runId: store.definition.run_id,
+            updatedAt: checkpoint.updated_at ?? checkpoint.created_at,
+            store
+          });
+        }
+        continue;
+      }
       if (checkpoint.status !== "starting" && checkpoint.status !== "running") continue;
       // Preserve the last activity ordering before recovery rewrites every
       // orphan with a new interruption timestamp.  Sorting on the rewritten
@@ -363,18 +376,30 @@ export class RunManager {
   }
 
   stopAll(reason = "Operator server stopped"): void {
-    this.#launchController?.abort(new RunPauseRequestedError(reason));
-    for (const controller of this.#controllers.values()) {
-      controller.abort(new RunPauseRequestedError(reason));
-    }
+    this.#abortAll(() => new RunPauseRequestedError(reason));
   }
 
   async drain(reason = "Operator server stopped"): Promise<void> {
+    await this.#drain(() => new RunPauseRequestedError(reason));
+  }
+
+  async drainForRestart(reason = "Operator server stopped"): Promise<void> {
+    await this.#drain(() => new RunRestartRequestedError(reason));
+  }
+
+  async #drain(reason: () => Error): Promise<void> {
     this.#accepting = false;
-    this.stopAll(reason);
+    this.#abortAll(reason);
     const operations = new Set(this.#operations.values());
     if (this.#launchOperation) operations.add(this.#launchOperation);
     await Promise.allSettled([...operations]);
+  }
+
+  #abortAll(reason: () => Error): void {
+    this.#launchController?.abort(reason());
+    for (const controller of this.#controllers.values()) {
+      controller.abort(reason());
+    }
   }
 
   stop(runId: string, reason = "Mission stopped by operator"): void {

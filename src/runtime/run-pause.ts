@@ -7,6 +7,15 @@ export class RunPauseRequestedError extends Error {
   }
 }
 
+export class RunRestartRequestedError extends Error {
+  readonly code = "run_restart_requested";
+
+  constructor(message = "Run interrupted for process restart") {
+    super(message);
+    this.name = "RunRestartRequestedError";
+  }
+}
+
 export function isRunPauseRequested(value: unknown): value is RunPauseRequestedError {
   return value instanceof RunPauseRequestedError
     || value instanceof Error

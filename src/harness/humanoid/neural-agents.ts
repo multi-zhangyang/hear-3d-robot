@@ -2664,21 +2664,31 @@ function authorizeSkillExecutionTool(
           !== certificate.rollout_payload_sha256) {
         throw new Error("Execution authorization lost its certified raw rollout");
       }
-      const rollouts = currentManagerChildSignals(
-        runtime,
-        HUMANOID_NEURAL_AGENT_IDS.actionSelection,
-        ["rollout_result"]
-      ).filter((signal) => signal.source_node_id
-          === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+      // The Predictive certificate and its direct Sensorimotor return are
+      // durable control authority. A process pause can end the SDK invocation
+      // that received the return without invalidating either artifact. Resolve
+      // the one still-live structural child edge by certificate causality,
+      // rather than requiring its parent_episode_id to equal the replacement
+      // Action Selection episode created after resume.
+      const rollouts = Object.values(hierarchy.signals).filter((signal) => (
+        signal.status === "pending"
+          && isCurrentNeuralSignal(runtime, signal)
+          && signal.kind === "rollout_result"
+          && signal.direction === "ascending"
+          && signal.source_node_id
+            === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+          && signal.target_node_id
+            === HUMANOID_NEURAL_AGENT_IDS.actionSelection
         && signal.causal_parent_ids.includes(certificate.predictive_signal_id)
         && neuralSignalHasAncestorId(
           hierarchy,
           signal,
           certifiedRawRollout.signal_id
-        ));
+        )
+      ));
       if (rollouts.length !== 1) {
         throw new Error(
-          `Execution authorization requires one direct certified Sensorimotor rollout; found ${rollouts.length}`
+          `Execution authorization requires one live direct certified Sensorimotor rollout; found ${rollouts.length}`
         );
       }
       const sourceSignalIds = [rollouts[0]!.signal_id];

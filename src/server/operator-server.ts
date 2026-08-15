@@ -332,7 +332,9 @@ export async function createOperatorServer(input: {
   lease = await acquireOperatorLease(input.server.runsDir);
   const onLeaseLost = (): void => {
     for (const close of [...activeStreams]) close();
-    leaseLossDrain ??= manager.drain("Operator lost the runs-directory lease");
+    leaseLossDrain ??= manager.drainForRestart(
+      "Operator lost the runs-directory lease"
+    );
     void leaseLossDrain.catch((error) => {
       app.log.error({ err: error }, "Failed to drain after losing the Operator lease");
     });
@@ -349,7 +351,7 @@ export async function createOperatorServer(input: {
   }
   app.addHook("preClose", async () => {
     for (const close of [...activeStreams]) close();
-    await (leaseLossDrain ?? manager.drain());
+    await (leaseLossDrain ?? manager.drainForRestart());
   });
   app.addHook("onClose", async () => {
     lease.signal.removeEventListener("abort", onLeaseLost);
