@@ -267,7 +267,11 @@ export class G1RecoveryGatedController implements HumanoidWholeBodyController {
     this.#handoffStep = parsed.data.handoff_step;
     this.#handoffReady = parsed.data.handoff_ready;
     this.#recoveryCallId = parsed.data.recovery_call_id;
-    this.#lastInvoked = this.#mode === "normal" ? "body" : "recovery";
+    this.#lastInvoked = this.#mode === "normal"
+      ? "body"
+      : this.#mode === "handoff"
+        ? "both"
+        : "recovery";
     this.#lastTrace = null;
   }
 

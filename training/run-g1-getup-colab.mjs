@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   rmdirSync,
   writeFileSync
@@ -53,6 +54,11 @@ const config = resolve(temporaryDirectory, `${session}.json`);
 const driveBackup = resolve(temporaryDirectory, `${session}-drive-backup.py`);
 const driveDirectory = options.driveDirectory ?? `HEAR/g1-getup/${session}`;
 const remoteDriveOutputRoot = `/content/drive/MyDrive/${driveDirectory}`;
+const desktopDriveRoot = options.desktopDriveRoot
+  ?? process.env.HEAR_G1_GETUP_DESKTOP_DRIVE_ROOT?.trim();
+const remoteTrainingOutputRoot = desktopDriveRoot
+  ? `/content/hear-g1-getup-output-${session}`
+  : remoteDriveOutputRoot;
 
 let activeSession = null;
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -82,7 +88,7 @@ async function main() {
     eval_steps: options.evalSteps ?? (mode === "train" ? 750 : 20),
     seed: options.seed ?? 42,
     archive: REMOTE_ARCHIVE,
-    ...(mode === "train" ? { output_root: remoteDriveOutputRoot } : {})
+    ...(mode === "train" ? { output_root: remoteTrainingOutputRoot } : {})
   }), "utf8");
   await create({ gzip: true, file: bundle, cwd: workspace }, BUNDLE_PATHS);
   writeDriveBackup();
@@ -100,7 +106,7 @@ async function main() {
     requireSuccess(colab([
       "upload", "--session", session, toWslPath(config), REMOTE_CONFIG
     ]), "upload G1 get-up configuration");
-    if (mode === "train") {
+    if (mode === "train" && !desktopDriveRoot) {
       requireSuccess(colab([
         "drivemount", "--session", session, "/content/drive"
       ], 300_000), "mount Google Drive for G1 get-up checkpoints");
@@ -120,13 +126,6 @@ async function main() {
       "download", "--session", session, REMOTE_ARCHIVE, toWslPath(archive)
     ]), "download G1 get-up artifacts");
     await extractArtifacts();
-    if (mode === "train") {
-      const backupStatus = colab([
-        "exec", "--session", session, "--file", toWslPath(driveBackup),
-        "--timeout", "1200"
-      ], 1_260_000);
-      requireSuccess(backupStatus, "persist G1 get-up artifacts to Google Drive");
-    }
     const parsed = validateReport();
     if (executionStatus !== 0
       || (mode === "train" && parsed.evaluation.deployment_accepted !== true)) {
@@ -134,8 +133,21 @@ async function main() {
         `G1 get-up training completed but did not pass deployment: ${report}`
       );
     }
+    if (mode === "train") {
+      if (desktopDriveRoot) {
+        persistDesktopDriveBackup(desktopDriveRoot);
+      } else {
+        const backupStatus = colab([
+          "exec", "--session", session, "--file", toWslPath(driveBackup),
+          "--timeout", "1200"
+        ], 1_260_000);
+        requireSuccess(backupStatus, "persist G1 get-up artifacts to Google Drive");
+      }
+    }
     console.log(`G1 get-up policy: ${output}`);
-    console.log(`G1 get-up Drive backup: MyDrive/${driveDirectory}`);
+    console.log(`G1 get-up Drive backup: ${desktopDriveRoot
+      ? resolve(desktopDriveRoot, ...driveDirectory.split("/"))
+      : `MyDrive/${driveDirectory}`}`);
   } catch (error) {
     failure = error;
   } finally {
@@ -241,6 +253,52 @@ function writeDriveBackup() {
   ].join("\n"), "utf8");
 }
 
+function persistDesktopDriveBackup(rootInput) {
+  const root = resolve(rootInput);
+  if (!existsSync(root)) {
+    throw new Error(`Desktop Google Drive root is unavailable: ${root}`);
+  }
+  const destination = resolve(root, ...driveDirectory.split("/"));
+  assertInsideRoot(root, destination, "desktop Google Drive destination");
+  if (existsSync(destination)) {
+    throw new Error(`Desktop Google Drive backup already exists: ${destination}`);
+  }
+  const parent = dirname(destination);
+  mkdirSync(parent, { recursive: true });
+  const staging = resolve(parent, `.${session}-${randomUUID()}.partial`);
+  assertInsideRoot(root, staging, "desktop Google Drive staging directory");
+  mkdirSync(staging);
+  try {
+    const files = [...ARTIFACT_FILES].map((path) => (
+      path.slice(path.lastIndexOf("/") + 1)
+    ));
+    for (const filename of files) {
+      copyVerified(resolve(output, filename), resolve(staging, filename));
+    }
+    copyVerified(archive, resolve(staging, "training-artifacts.tar.gz"));
+    copyVerified(report, resolve(staging, "remote-report.json"));
+    renameSync(staging, destination);
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function copyVerified(source, destination) {
+  copyFileSync(source, destination);
+  if (sha256(source) !== sha256(destination)) {
+    throw new Error(`Desktop Google Drive copy changed bytes: ${destination}`);
+  }
+}
+
+function assertInsideRoot(root, candidate, label) {
+  const child = relative(root, candidate);
+  if (!child || child === ".." || child.startsWith("../")
+    || child.startsWith("..\\")) {
+    throw new Error(`Unsafe ${label}: ${candidate}`);
+  }
+}
+
 function colab(args, timeoutMs = 600_000) {
   const result = spawnSync("wsl.exe", ["-d", distro, "--", colabPath, ...args], {
     cwd: workspace,
@@ -274,6 +332,7 @@ function parseOptions(args) {
     ["--session", ["session", String]],
     ["--output", ["output", String]],
     ["--drive-directory", ["driveDirectory", String]],
+    ["--desktop-drive-root", ["desktopDriveRoot", String]],
     ["--iterations", ["iterations", positiveInteger]],
     ["--num-envs", ["numEnvs", positiveInteger]],
     ["--eval-envs", ["evalEnvs", positiveInteger]],

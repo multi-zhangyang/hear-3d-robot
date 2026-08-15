@@ -23,6 +23,8 @@ const output = insideWorkspace(
   options.output ?? "artifacts/training/g1-getup/formal-v1"
 );
 const session = options.session ?? "hear-g1-getup-formal-v1";
+const desktopDriveRoot = options.desktopDriveRoot
+  ?? process.env.HEAR_G1_GETUP_DESKTOP_DRIVE_ROOT?.trim();
 const waitTimeoutMs = (options.waitTimeoutSeconds ?? 64_800) * 1000;
 const pollMs = (options.pollSeconds ?? 120) * 1000;
 const node = process.execPath;
@@ -73,7 +75,10 @@ async function main() {
       "--num-envs", String(options.numEnvs ?? 2048),
       "--eval-envs", String(options.evalEnvs ?? 500),
       "--eval-steps", String(options.evalSteps ?? 750),
-      "--timeout-seconds", String(options.trainingTimeoutSeconds ?? 21_600)
+      "--timeout-seconds", String(options.trainingTimeoutSeconds ?? 21_600),
+      ...(desktopDriveRoot
+        ? ["--desktop-drive-root", desktopDriveRoot]
+        : [])
     ]);
     if (!qualifiedOutput(output)) {
       throw new Error("G1 get-up trainer returned without a qualified policy");
@@ -225,7 +230,8 @@ function parseOptions(args) {
     ["--eval-steps", ["evalSteps", positiveInteger]],
     ["--wait-timeout-seconds", ["waitTimeoutSeconds", positiveInteger]],
     ["--poll-seconds", ["pollSeconds", positiveInteger]],
-    ["--training-timeout-seconds", ["trainingTimeoutSeconds", positiveInteger]]
+    ["--training-timeout-seconds", ["trainingTimeoutSeconds", positiveInteger]],
+    ["--desktop-drive-root", ["desktopDriveRoot", String]]
   ]);
   for (let index = 0; index < args.length; index += 2) {
     const entry = names.get(args[index]);
