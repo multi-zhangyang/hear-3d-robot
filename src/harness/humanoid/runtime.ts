@@ -3132,6 +3132,13 @@ function humanoidSkillPhasePostconditionSatisfied(input: {
   const invocation = binding.invocation;
   if (binding.phase_authority !== "navigation") return true;
 
+  if (invocation.skill === "navigate_to_point") {
+    return Math.hypot(
+      observation.robot.rootPosition.x - invocation.target.x,
+      observation.robot.rootPosition.z - invocation.target.z
+    ) <= invocation.tolerance_m;
+  }
+
   if (invocation.skill === "navigate_to_zone") {
     const zone = observation.interaction.zones.find(
       ({ zone_id: zoneId }) => zoneId === invocation.zone_id

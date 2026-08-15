@@ -747,9 +747,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         }
       } else if (current.phase === "bootstrapping"
         || current.phase === "goal_valuation"
-        || current.phase === "cycle_completion") {
+        || current.phase === "cycle_completion"
+        || current.phase === "terminal") {
         phase = "perception";
-        reason = "active_goal_requires_current_perception";
+        reason = current.phase === "terminal"
+          ? "resumed_active_goal_requires_current_perception"
+          : "active_goal_requires_current_perception";
       } else {
         return structuredClone(current);
       }

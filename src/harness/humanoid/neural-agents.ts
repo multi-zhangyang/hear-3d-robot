@@ -706,11 +706,26 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         if (suppliedSourceSignals.some((signal) => signal === undefined)) {
           throw new Error("Neural delegation references an unknown source signal");
         }
-        const exactSourceSignals = inputTool.parentKey === "sensorimotorManager"
+        const selectedSourceSignals = inputTool.parentKey === "sensorimotorManager"
           && inputTool.childKey === "predictive"
           && params.signal_kind === "rollout_result"
           ? [currentDirectPremotorRollout(input.runtime, parentEpisodeId)]
           : suppliedSourceSignals as NeuralSignal[];
+        const lifecycleFeedback = inputTool.parentKey === "executive"
+          && inputTool.childKey === "actionSelection"
+          && input.runtime.neuralHarnessPhase().phase === "feedback"
+          && activeCommitment?.state === "executing"
+          ? currentCommitmentLifecycleFeedback(
+              input.runtime,
+              activeCommitment
+            )
+          : undefined;
+        const exactSourceSignals = lifecycleFeedback
+          && !selectedSourceSignals.some(
+            (signal) => signal.signal_id === lifecycleFeedback.signal_id
+          )
+          ? [...selectedSourceSignals, lifecycleFeedback]
+          : selectedSourceSignals;
         const currentBelief = inputTool.parentKey === "actionSelection"
           && inputTool.childKey === "sensorimotorManager"
           ? currentActionSelectionBelief(
@@ -773,29 +788,33 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         }
         if (inputTool.parentKey === "actionSelection"
           && inputTool.childKey === "perceptionManager"
-          && input.runtime.neuralHarnessPhase().phase === "feedback") {
-          const hierarchyState = input.runtime.neuralHierarchyState();
-          const directCompletion = Object.values(hierarchyState.signals).filter(
-            (signal) => signal.kind === "skill_completed"
-              && signal.source_node_id
-                === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
-              && signal.target_node_id === parentId
-              && signal.status === "pending"
-              && activeCommitment?.state === "completed"
-              && activeCommitment.transition_signal_ids.includes(
-                signal.signal_id
-              )
+          && ["feedback", "perception"].includes(
+            input.runtime.neuralHarnessPhase().phase
+          )
+          && activeCommitment !== null
+          && (activeCommitment.state === "completed"
+            || activeCommitment.state === "failed")) {
+          const lifecycleKind = activeCommitment.state === "completed"
+            ? "skill_completed"
+            : "skill_failed";
+          const directLifecycleFeedback = currentCommitmentLifecycleFeedback(
+            input.runtime,
+            activeCommitment,
+            { pendingOnly: false }
           );
-          if (directCompletion.length !== 1) {
+          if (!directLifecycleFeedback
+            || directLifecycleFeedback.kind !== lifecycleKind) {
             throw new Error(
-              `Post-execution Perception requires one causally routed Sensorimotor completion; found ${directCompletion.length}`
+              `Post-execution Perception requires one committed Sensorimotor ${lifecycleKind} transition`
             );
           }
           // A new Action Selection episode sees only Executive's direct signal.
-          // Resolve the previous Sensorimotor edge inside the Harness and bind
-          // it into the next descending signal; never ask the model to quote a
-          // grandchild's signal id across episodes.
-          routedCausalParentIds.push(directCompletion[0]!.signal_id);
+          // Resolve the durable transition edge inside the Harness and bind it
+          // into the next descending signal even after its delivery TTL has
+          // elapsed; never ask the model to quote a grandchild's signal id
+          // across episodes. The closed commitment is the authority that makes
+          // this historical signal a live causal predecessor, not a fallback.
+          routedCausalParentIds.push(directLifecycleFeedback.signal_id);
         }
         const descendingPayload = inputTool.parentKey === "actionSelection"
           && inputTool.childKey === "sensorimotorManager"
@@ -4037,6 +4056,64 @@ function acceptedSkillProposal(
   return proposals[0]!;
 }
 
+/**
+ * A physical execution can finish after the SDK episode that launched it was
+ * paused and resumed. The durable Sensorimotor completion then belongs to the
+ * previous Action Selection invocation, while the new Executive episode owns
+ * the only live structural edge back into Action Selection. Rebind that exact
+ * lifecycle signal as causal input instead of asking Executive to reproduce a
+ * grandchild signal id or letting the new manager episode guess the outcome.
+ */
+function currentCommitmentLifecycleFeedback(
+  runtime: HumanoidNeuralAgentRuntime,
+  commitment: NeuralSkillCommitment,
+  options: { pendingOnly?: boolean } = {}
+): NeuralSignal | undefined {
+  const outcome = runtime.neuralSkillCommitmentOutcome(commitment);
+  if (outcome.status === "in_progress") return undefined;
+  const detail = jsonRecord(outcome.detail);
+  const signalId = detail?.completion_signal_id;
+  if (typeof signalId !== "string") {
+    throw new Error(
+      `Resolved ${outcome.status} Skill outcome has no completion signal identity`
+    );
+  }
+  const signal = runtime.neuralHierarchyState().signals[signalId];
+  if (!signal
+    || signal.kind !== (outcome.status === "completed"
+      ? "skill_completed"
+      : "skill_failed")
+    || signal.source_node_id !== HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+    || signal.target_node_id !== HUMANOID_NEURAL_AGENT_IDS.actionSelection) {
+    throw new Error(
+      `Resolved ${outcome.status} Skill feedback is not a direct Sensorimotor signal`
+    );
+  }
+  if (options.pendingOnly !== false && !runtime.pendingNeuralSignals({
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+    kinds: [signal.kind]
+  }).some((candidate) => candidate.signal_id === signal.signal_id)) {
+    throw new Error(
+      `Resolved ${outcome.status} Skill feedback is no longer pending for Action Selection`
+    );
+  }
+  if ((commitment.state === "completed" || commitment.state === "failed")
+    && !commitment.transition_signal_ids.some((transitionSignalId) => {
+      const transition = runtime.neuralHierarchyState().signals[transitionSignalId];
+      return transitionSignalId === signal.signal_id
+        || transition !== undefined && neuralSignalHasAncestorId(
+          runtime.neuralHierarchyState(),
+          transition,
+          signal.signal_id
+        );
+    })) {
+    throw new Error(
+      `Closed ${outcome.status} Skill commitment is not causally bound to its physical feedback`
+    );
+  }
+  return signal;
+}
+
 function neuralInvocationInput(
   runtime: HumanoidNeuralAgentRuntime,
   parentAgentId: string,
@@ -4214,6 +4291,8 @@ function compactInteractionProjection(value: JsonValue | undefined): JsonValue {
           "parameters",
           "required_affordances",
           "preconditions",
+          "process",
+          "success_conditions",
           "available",
           "unavailable_reasons",
           "observable_target_ids",
@@ -4331,6 +4410,14 @@ function collectGoalPredicateSkillIds(
   predicateType: string,
   target: Set<string>
 ): void {
+  if (predicateType === "robot_at") {
+    target.add("navigate_to_point");
+    return;
+  }
+  if (predicateType === "robot_in_zone") {
+    target.add("navigate_to_zone");
+    return;
+  }
   if (predicateType === "object_placed"
     || predicateType === "object_in_zone"
     || predicateType === "object_at"

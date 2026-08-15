@@ -5,6 +5,7 @@ import type {
 } from "./humanoid-policy.js";
 
 export const HUMANOID_SKILL_IDS = [
+  "navigate_to_point",
   "navigate_to_zone",
   "explore",
   "break_block",
@@ -75,6 +76,11 @@ const PlacementDestinationSchema = z.discriminatedUnion("type", [
 ]);
 
 export const HumanoidSkillInvocationSchema = z.discriminatedUnion("skill", [
+  z.object({
+    skill: z.literal("navigate_to_point"),
+    target: Vec3Schema,
+    tolerance_m: z.number().finite().positive().max(1)
+  }).strict(),
   z.object({
     skill: z.literal("navigate_to_zone"),
     zone_id: ObjectIdSchema
@@ -301,6 +307,11 @@ export const HUMANOID_SKILL_CONTRACTS: Readonly<Record<
   HumanoidSkillId,
   HumanoidSkillContract
 >> = Object.freeze({
+  navigate_to_point: contract("navigate_to_point", ["target", "tolerance_m"], [],
+    ["target is expressed in the current world frame", "route to the target is physically reachable"],
+    [["observe", "sensor"], ["route_to_point", "navigation"], ["verify_arrival", "checker"]],
+    ["robot root reaches the selected world point within the requested planar tolerance while remaining upright"],
+    ["path_blocked", "unreachable"], ["navigate_to_point", "explore", "retreat"]),
   navigate_to_zone: contract("navigate_to_zone", ["zone_id"], [],
     ["zone exists in the current observation", "route into the zone is physically reachable"],
     [["observe", "sensor"], ["enter_zone", "navigation"], ["verify_zone_membership", "checker"]],

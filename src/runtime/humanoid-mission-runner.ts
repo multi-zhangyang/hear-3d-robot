@@ -738,6 +738,20 @@ async function executeHumanoidMission(input: {
               serializedState
             );
           } catch (error) {
+            if (recoverableSessionBoundRunStateError(error)) {
+              await input.runtime.store.clearAgentState();
+              serializedState = undefined;
+              await input.runtime.recordProvider({
+                status: "sdk_state_rebased",
+                source: "persisted_session_history",
+                rebase_reason: "output_guardrail_session_transaction_authority",
+                session_history_preserved: true,
+                session_history_authoritative: true,
+                physical_checkpoint_preserved: true,
+                automatic_actuation: false
+              }, input.runtime.rootAgentId);
+              continue;
+            }
             const unavailableTool = recoverableDynamicToolRunStateError(
               error,
               hierarchy.root.tools.map((tool) => tool.name)
@@ -775,21 +789,17 @@ async function executeHumanoidMission(input: {
         for await (const event of stream) {
           await persistAgentEvent(HUMANOID_NEURAL_AGENT_IDS.executive, event);
           if (!shouldPersistHumanoidAgentState(event)) continue;
-          const persistedSessionBaseline = await captureHumanoidSessionStateIdentity(
-            sessions
-          );
-          await input.runtime.store.writeAgentState(
+          await persistHumanoidAgentStateSnapshot(
+            input.runtime,
+            sessions,
             stream.state.toString(),
-            humanoidAgentStateFingerprint(input.runtime.checkpoint),
-            persistedSessionBaseline
           );
         }
         await stream.completed;
-        const finalSessionBaseline = await captureHumanoidSessionStateIdentity(sessions);
-        await input.runtime.store.writeAgentState(
+        await persistHumanoidAgentStateSnapshot(
+          input.runtime,
+          sessions,
           stream.state.toString(),
-          humanoidAgentStateFingerprint(input.runtime.checkpoint),
-          finalSessionBaseline
         );
         input.signal?.throwIfAborted();
         const output = typeof stream.finalOutput === "string"
@@ -1028,6 +1038,51 @@ export function recoverableDynamicToolRunStateError(
   const match = /^Tool (.+) not found$/u.exec(error.message);
   if (!match?.[1] || !configuredToolNames.includes(match[1])) return undefined;
   return match[1];
+}
+
+const NON_RESUMABLE_SESSION_TRANSACTION_ERROR =
+  "Serialized output guardrail session transaction authority cannot be resumed safely. Start a new run from the persisted session history.";
+
+export function recoverableSessionBoundRunStateError(error: unknown): boolean {
+  return error instanceof UserError
+    && error.message === NON_RESUMABLE_SESSION_TRANSACTION_ERROR;
+}
+
+async function persistHumanoidAgentStateSnapshot(
+  runtime: HumanoidRunRuntime,
+  sessions: ReadonlyMap<string, FileSession>,
+  serializedState: string
+): Promise<void> {
+  if (serializedStateRequiresPersistedSessionHistory(serializedState)) {
+    // The SDK deliberately refuses to deserialize a RunState after a
+    // transaction-aware Session has executed a tool effect. The Session and
+    // the physical Harness checkpoint are already durable at this boundary;
+    // retaining the serialized SDK branch would make the next process fail
+    // before it can start the next event-driven episode from those records.
+    await runtime.store.clearAgentState();
+    return;
+  }
+  const sessionBaseline = await captureHumanoidSessionStateIdentity(sessions);
+  await runtime.store.writeAgentState(
+    serializedState,
+    humanoidAgentStateFingerprint(runtime.checkpoint),
+    sessionBaseline
+  );
+}
+
+function serializedStateRequiresPersistedSessionHistory(
+  serializedState: string
+): boolean {
+  const value = JSON.parse(serializedState) as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("OpenAI Agents SDK serialized an invalid RunState root");
+  }
+  const state = value as Record<string, unknown>;
+  const deferredIndexes = state.currentTurnDeferredSessionItemIndexes;
+  return (Array.isArray(deferredIndexes) && deferredIndexes.length > 0)
+    || state.currentTurnBlockedSessionStartIndex !== undefined
+    || state.currentTurnExecutedWithSessionBinding === true
+    || state.pendingSessionHistoryTransaction !== undefined;
 }
 
 async function recordPromptCacheRequest(

@@ -20,6 +20,7 @@ const requestedScenarioId = optionalText("HEAR_LIVE_SCENARIO")
   ?? "humanoid_courtyard";
 const requestedSeed = optionalSeed("HEAR_LIVE_SEED") ?? drawSeed();
 const resumeRunId = optionalText("HEAR_LIVE_RESUME_RUN_ID");
+const freshAgentEpoch = optionalBoolean("HEAR_LIVE_FRESH_AGENT_EPOCH") ?? false;
 const observationMs = optionalPositiveInteger("HEAR_LIVE_OBSERVATION_MS")
   ?? (optionalPositiveInteger("HEAR_LIVE_TIMEOUT_MINUTES") ?? 30) * 60_000;
 const runsDir = resolve(optionalText("HEAR_RUNS_DIR") ?? "runs");
@@ -47,7 +48,9 @@ try {
     assert.equal(store.definition.run_mode, "continuous",
       "Only a continuous run can be resumed by the continuous observer");
     scenario = structuredClone(store.definition.scenario);
-    runId = await manager.resume(resumeRunId);
+    runId = await manager.resume(resumeRunId, {
+      ...(freshAgentEpoch ? { freshAgentEpoch: true } : {})
+    });
   } else {
     scenario = catalog.materialize(requestedScenarioId, requestedSeed);
     runId = await manager.start({
@@ -170,4 +173,12 @@ function optionalPositiveInteger(name) {
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+
+function optionalBoolean(name) {
+  const value = optionalText(name)?.toLowerCase();
+  if (value === undefined) return undefined;
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  throw new Error(`${name} must be a boolean`);
 }

@@ -476,6 +476,7 @@ export function bindHumanoidSkill(input: {
         ? { ...target.pose.position }
         : targetZone ? { ...targetZone.center }
         : explorationFrontier ? { ...explorationFrontier.target }
+        : invocation.skill === "navigate_to_point" ? { ...invocation.target }
         : targetSolid ? { ...targetSolid.center }
         : null,
       target_position: approachPlacement
@@ -492,7 +493,8 @@ export function bindHumanoidSkill(input: {
         ? { ...target.pose.position }
         : targetZone ? { ...targetZone.center }
         : explorationFrontier ? { ...explorationFrontier.target }
-          : targetSolid ? { ...targetSolid.center } : null,
+        : invocation.skill === "navigate_to_point" ? { ...invocation.target }
+        : targetSolid ? { ...targetSolid.center } : null,
       target_solid: targetSolid ? {
         id: targetSolid.id,
         sourceId: targetSolid.sourceId,
@@ -951,7 +953,9 @@ function validateNavigationOutcome(
   const target = vector(input?.target);
   if (!target) return rejection("skill_navigation_target_invalid", {});
   const invocation = binding.invocation;
-  const expected = invocation.skill === "carry"
+  const expected = invocation.skill === "navigate_to_point"
+    ? invocation.target
+    : invocation.skill === "carry"
     || invocation.skill === "bimanual_carry"
     || invocation.skill === "retreat"
     ? invocation.target

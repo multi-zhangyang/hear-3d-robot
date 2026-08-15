@@ -221,6 +221,17 @@ function navigationSkillPlan(
   observation: HumanoidWorldObservation
 ): Extract<AutonomousHumanoidSkillPlan, { kind: "navigation" }> {
   const invocation = binding.invocation;
+  if (invocation.skill === "navigate_to_point") {
+    return {
+      kind: "navigation",
+      targets: [{
+        target: { ...invocation.target },
+        arrivalHeading: null,
+        acceptedPositionToleranceMeters: invocation.tolerance_m,
+        score: 1
+      }]
+    };
+  }
   if (invocation.skill === "navigate_to_zone") {
     const zone = observation.interaction.zones.find(
       ({ zone_id: zoneId }) => zoneId === invocation.zone_id

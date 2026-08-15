@@ -211,6 +211,9 @@ function navigationTarget(
   invocation: HumanoidSkillInvocation,
   observation: HumanoidWorldObservation
 ): Vec3 | undefined {
+  if (invocation.skill === "navigate_to_point") {
+    return invocation.target;
+  }
   if (invocation.skill === "explore") {
     return observation.spatialBelief.frontiers.find(
       ({ id }) => id === invocation.frontier_id

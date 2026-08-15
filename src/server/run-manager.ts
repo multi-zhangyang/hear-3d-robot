@@ -212,7 +212,10 @@ export class RunManager {
     return this.#trackLaunch(operation, created, controller);
   }
 
-  async resume(runId: string): Promise<string> {
+  async resume(
+    runId: string,
+    options: { freshAgentEpoch?: boolean } = {}
+  ): Promise<string> {
     const provider = this.#requireProvider();
     this.#assertCapacity();
     const runDir = resolveRunDirectory(this.#runsDir, runId);
@@ -225,6 +228,7 @@ export class RunManager {
       runDir,
       catalog: this.#catalog,
       provider,
+      ...(options.freshAgentEpoch ? { freshAgentEpoch: true } : {}),
       ...(this.#densePolicyRolloutDir
         ? { densePolicyRolloutDir: this.#densePolicyRolloutDir }
         : {}),

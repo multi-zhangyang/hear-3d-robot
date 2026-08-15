@@ -56,7 +56,7 @@ export const HumanoidActionInputs = {
 
 export const HumanoidActionDescriptions: Record<HumanoidActionName, string> = {
   observe_humanoid: "读取当前人形机器人的根姿态、关键 Link、双脚接触、平衡、末端位置、手部协调状态、掌指碰撞面真实几何、必要接触、头部传感器可见物体、持久 3D 物体记录、抓取证据、携带生命周期和目标区域。不会暴露视野外且从未见过且未被当前持握的对象。",
-  submit_humanoid_skill_plan: "提交一个局部 Skill DAG，可同时给出多个合法策略并由模型显式选择其中一个。Harness 验证节点、依赖、无环性以及所选策略的依赖就绪入口是否与当前 Goal 对齐，再绑定当前世界版本。物体操作的基座重定位使用 approach(object_id, ...)，navigate_to_zone 只让机器人进入语义区域，不能为尚未持握的物体建立抓取或放置前置条件；Harness 不会替模型补参数、选择策略或生成动作。",
+  submit_humanoid_skill_plan: "提交一个局部 Skill DAG，可同时给出多个合法策略并由模型显式选择其中一个。Harness 验证节点、依赖、无环性以及所选策略的依赖就绪入口是否与当前 Goal 对齐，再绑定当前世界版本。任意世界坐标导航使用 navigate_to_point(target, tolerance_m)，物体操作的基座重定位使用 approach(object_id, ...)，navigate_to_zone 只让机器人进入语义区域，不能为尚未持握的物体建立抓取或放置前置条件；Harness 不会替模型补参数、选择策略或生成动作。",
   begin_humanoid_skill: "从实时对象世界模型中绑定一个统一人形 Skill 及其当前执行阶段。Harness 验证对象可见性、Affordance、交互点、手、关节、携带状态、世界版本和阶段执行权限；只建立模型选择的技能契约，不生成动作或坐标。",
   plan_humanoid_skill: "将模型选择的 Skill、对象、交互点、手和策略交给通用运动求解层。求解层自动生成并排序可达基座、闭环任务空间轨迹或信息增益 frontier 路线，逐个通过 Recast 与 MuJoCo 预演；不选择目标或任务策略。",
   execute_humanoid_skill: "执行 plan_humanoid_skill 产生且已通过真实物理预演的路线或全身轨迹。执行期间持续使用当前 MuJoCo 状态闭环修正末端和双足控制，不直接改写姿态。",

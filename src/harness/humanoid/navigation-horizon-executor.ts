@@ -388,6 +388,12 @@ function navigationPhaseSatisfied(
   latestPlan: NavigationPlanReceipt | null
 ): boolean {
   const invocation = binding.invocation;
+  if (invocation.skill === "navigate_to_point") {
+    return Math.hypot(
+      observation.robot.rootPosition.x - invocation.target.x,
+      observation.robot.rootPosition.z - invocation.target.z
+    ) <= invocation.tolerance_m;
+  }
   if (invocation.skill === "navigate_to_zone") {
     return observation.interaction.zones.find(
       ({ zone_id: zoneId }) => zoneId === invocation.zone_id
