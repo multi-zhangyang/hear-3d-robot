@@ -88,6 +88,11 @@ const GoalHistoryPredicateOutcomeSchema = GoalHistoryDimensionOutcomeBaseSchema
   .strict()
   .superRefine(validateDimensionOutcome);
 
+const GoalHistoryGoalOutcomeSchema = GoalHistoryDimensionOutcomeBaseSchema
+  .extend({ goal_constraint_sha256: Sha256Schema })
+  .strict()
+  .superRefine(validateDimensionOutcome);
+
 const GoalHistoryEntityOutcomeSchema = GoalHistoryDimensionOutcomeBaseSchema
   .extend({
     entity_kind: z.enum(GOAL_HISTORY_ENTITY_KINDS),
@@ -99,10 +104,21 @@ const GoalHistoryEntityOutcomeSchema = GoalHistoryDimensionOutcomeBaseSchema
 export const GoalHistoryOutcomeSummarySchema = z.object({
   selected: GoalHistorySelectedOutcomesSchema,
   not_selected: z.number().int().nonnegative(),
+  goal_outcomes: z.array(GoalHistoryGoalOutcomeSchema).optional(),
   predicate_outcomes: z.array(GoalHistoryPredicateOutcomeSchema),
   entity_outcomes: z.array(GoalHistoryEntityOutcomeSchema)
 }).strict().superRefine((summary, context) => {
   const predicateKeys = summary.predicate_outcomes.map((entry) => entry.predicate_type);
+  const goalKeys = (summary.goal_outcomes ?? []).map(
+    (entry) => entry.goal_constraint_sha256
+  );
+  if (!uniqueSorted(goalKeys)) {
+    context.addIssue({
+      code: "custom",
+      path: ["goal_outcomes"],
+      message: "Exact Goal outcome dimensions must be unique and sorted"
+    });
+  }
   if (!uniqueSorted(predicateKeys)) {
     context.addIssue({
       code: "custom",
@@ -127,6 +143,7 @@ export const GoalHistorySummarySchema = z.object({
   archived_epoch_count: z.number().int().nonnegative(),
   last_record_sha256: Sha256Schema.nullable(),
   records_without_alternate_history: z.number().int().nonnegative(),
+  exact_goal_outcomes_complete: z.boolean().optional(),
   outcomes: GoalHistoryOutcomeSummarySchema
 }).strict().superRefine((summary, context) => {
   const empty = summary.archived_epoch_count === 0;

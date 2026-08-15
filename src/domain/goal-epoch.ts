@@ -252,6 +252,7 @@ const EmptyGoalDAGArchiveState: GoalDAGArchiveState = {
     archived_epoch_count: 0,
     last_record_sha256: null,
     records_without_alternate_history: 0,
+    exact_goal_outcomes_complete: true,
     outcomes: {
       selected: {
         total: 0,
@@ -262,6 +263,7 @@ const EmptyGoalDAGArchiveState: GoalDAGArchiveState = {
         expired: 0
       },
       not_selected: 0,
+      goal_outcomes: [],
       predicate_outcomes: [],
       entity_outcomes: []
     }

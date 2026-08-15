@@ -47,6 +47,11 @@ export function createHumanoidAutonomyContext(input: {
     unsuccessful: 0,
     active: 0
   };
+  const lifetimeMissionGoal = missionGoalIdentity === null
+    ? undefined
+    : lifetime.goal_outcomes.find((entry) => (
+        entry.goal_constraint_sha256 === missionGoalIdentity
+      ));
   for (const { epoch, candidate } of history) {
     if (missionGoalIdentity !== null
       && goalConstraintSha256(candidate.goal) === missionGoalIdentity) {
@@ -74,10 +79,11 @@ export function createHumanoidAutonomyContext(input: {
     continuous_drive_state: input.runMode === "continuous"
       ? {
           bootstrap_mission_goal_completed: missionGoalOutcomes.completed > 0
+            || (lifetimeMissionGoal?.selected.completed ?? 0) > 0
             ? true
-            : input.goalDAG.archive.record_count > 0 ? null : false,
+            : lifetime.exact_goal_outcomes_complete ? false : null,
           exact_mission_goal_history_complete:
-            input.goalDAG.archive.record_count === 0,
+            lifetime.exact_goal_outcomes_complete,
           working_exact_mission_goal_outcomes: missionGoalOutcomes,
           untried_visible_object_ids: observation.objects
             .filter((object) => !objectCounts.has(object.id))

@@ -1,4 +1,5 @@
 import type { GoalPredicate } from "./schema.js";
+import { goalConstraintSha256 } from "./goal-identity.js";
 import {
   GoalHistoryOutcomeSummarySchema,
   GoalHistorySummarySchema,
@@ -28,6 +29,7 @@ function createEmptyGoalHistoryOutcomeSummary(): GoalHistoryOutcomeSummary {
   return {
     selected: emptySelectedOutcomes(),
     not_selected: 0,
+    goal_outcomes: [],
     predicate_outcomes: [],
     entity_outcomes: []
   };
@@ -39,6 +41,7 @@ export function createEmptyGoalHistorySummary(): GoalHistorySummary {
     archived_epoch_count: 0,
     last_record_sha256: null,
     records_without_alternate_history: 0,
+    exact_goal_outcomes_complete: true,
     outcomes: createEmptyGoalHistoryOutcomeSummary()
   };
 }
@@ -80,6 +83,8 @@ export function appendGoalHistorySummary(
     last_record_sha256: input.recordSha256,
     records_without_alternate_history: summary.records_without_alternate_history
       + (input.alternateHistoryComplete ? 0 : 1),
+    exact_goal_outcomes_complete:
+      summary.exact_goal_outcomes_complete ?? false,
     outcomes
   });
 }
@@ -117,6 +122,7 @@ export function goalHistoryLifetimeProjection(goalDAG: GoalDAG) {
     }
   }
   outcomes = GoalHistoryOutcomeSummarySchema.parse(outcomes);
+  const goalOutcomes = outcomes.goal_outcomes ?? [];
   return {
     total_selected_epoch_count: goalDAG.next_epoch_index,
     resolved_selected_goal_count: outcomes.selected.total,
@@ -125,7 +131,11 @@ export function goalHistoryLifetimeProjection(goalDAG: GoalDAG) {
     working_selected_goal_count: goalDAG.epochs.length,
     records_without_alternate_history:
       archived?.records_without_alternate_history ?? 0,
-    ...outcomes
+    exact_goal_outcomes_complete: archived
+      ? archived.exact_goal_outcomes_complete === true
+      : true,
+    ...outcomes,
+    goal_outcomes: goalOutcomes
   };
 }
 
@@ -172,6 +182,21 @@ function updateDimensions(
   candidate: GoalCandidate,
   update: (outcome: GoalHistoryDimensionOutcome) => void
 ): void {
+  const goalOutcomes = new Map((summary.goal_outcomes ?? []).map((entry) => [
+    entry.goal_constraint_sha256,
+    entry
+  ]));
+  const goalIdentity = goalConstraintSha256(candidate.goal);
+  const goalOutcome = goalOutcomes.get(goalIdentity) ?? {
+    goal_constraint_sha256: goalIdentity,
+    ...emptyDimensionOutcome()
+  };
+  update(goalOutcome);
+  goalOutcomes.set(goalIdentity, goalOutcome);
+  summary.goal_outcomes = [...goalOutcomes.values()].sort((left, right) => (
+    compare(left.goal_constraint_sha256, right.goal_constraint_sha256)
+  ));
+
   const predicates = new Set(candidate.goal.predicates.map((predicate) => predicate.type));
   const predicateOutcomes = new Map(summary.predicate_outcomes.map((entry) => [
     entry.predicate_type,
