@@ -92,7 +92,7 @@ describe("LongRunContextManager hierarchy identity", () => {
       contextAnchor: () => ({
         world_frame: 41,
         world_revision: 41,
-        coordinator_phase: "execute_plan",
+        autonomy_readiness: "execute_plan",
         goal_context: { evidence_ref: evidenceRef },
         goal_dag: {
           candidates: { [candidateId]: { status: "proposed" } },
@@ -155,7 +155,7 @@ describe("LongRunContextManager hierarchy identity", () => {
       contextAnchor: () => ({
         world_frame: worldRevision,
         world_revision: worldRevision,
-        coordinator_phase: "plan"
+        autonomy_readiness: "plan"
       }),
       contextMemory: () => structuredClone(memory),
       contextWorldIdentity: () => ({ worldRevision }),
@@ -608,7 +608,7 @@ describe("LongRunContextManager hierarchy identity", () => {
       activeNode: () => node,
       contextAnchor: () => ({
         world_revision: 8,
-        coordinator_phase: "plan",
+        autonomy_readiness: "plan",
         execution_authority: null
       }),
       contextMemory: () => structuredClone(memory),

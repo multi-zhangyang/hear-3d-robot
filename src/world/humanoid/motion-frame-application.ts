@@ -178,13 +178,14 @@ export async function applyHumanoidMotionArtifactFrame(
   };
 }
 
-function controllerTaskCommand(input: {
+export function controllerTaskCommand(input: {
   taskId: string;
   taskGoal: HumanoidControllerTaskGoal | null;
   skillIdentity?: HumanoidEmbodiedSkillIdentity;
   authority?: { worldFrame: number; worldRevision: number };
   controlWindow?: { maximumSteps: number; stepIndex: number };
   authorizedContacts: readonly HumanoidContactConstraint[];
+  recoverySafety?: boolean;
   snapshot?: HumanoidSimulationSnapshot;
   controlStepSeconds: number;
   reference: HumanoidReference;
@@ -277,12 +278,20 @@ function controllerTaskCommand(input: {
       }))
     },
     contract: input.taskGoal ? structuredClone(input.taskGoal) : null,
-    safety: {
-      authorizedContacts: input.authorizedContacts.map((contact) => ({ ...contact })),
-      stopOnFall: true,
-      stopOnUnauthorizedContact: true,
-      stopOnContractViolation: true
-    },
+    safety: input.recoverySafety
+      ? {
+          authorizedContacts: input.authorizedContacts.map((contact) => ({ ...contact })),
+          stopOnFall: false as const,
+          stopOnUnauthorizedContact: true as const,
+          stopOnContractViolation: true as const,
+          recoveryTerrainContact: true as const
+        }
+      : {
+          authorizedContacts: input.authorizedContacts.map((contact) => ({ ...contact })),
+          stopOnFall: true as const,
+          stopOnUnauthorizedContact: true as const,
+          stopOnContractViolation: true as const
+        },
     feedback: {
       mode: "event_driven",
       progressDelta: 0.1,
@@ -305,6 +314,9 @@ function requestedPolicyCapabilities(input: {
   graspTargets: readonly G1ContactAwareGraspTarget[];
 }): HumanoidLearnedPolicyCapability[] {
   const capabilities = new Set<HumanoidLearnedPolicyCapability>();
+  if (input.taskGoal?.protocol === "humanoid-embodied-recovery-contract-v1") {
+    capabilities.add("whole_body_recovery");
+  }
   if (input.taskSpaceTargets.length > 0
     || input.carryTaskSpaceTargets.length > 0) {
     capabilities.add("joint_reference_tracking");

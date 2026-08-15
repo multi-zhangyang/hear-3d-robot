@@ -1,12 +1,11 @@
-"""Frozen-locomotion / upper-body-residual Workyard training environment.
+"""Whole-body closed-loop Workyard reach training environment.
 
-The locomotion teacher emits its original 29D action as one CUDA TorchScript
-batch, but owns only the 12 lower-body and three waist commands.  The phase-one
-student controls exactly 14 arm/wrist joints around the neutral pose; hands are
-held open until a later contact/grasp phase provides them a useful objective.
-A batched differential-IK teacher supplies online DAgger labels without being
-exposed to the actor.  The student cannot alter teacher-owned joints, observe
-private curriculum state, or grant itself a wider Harness Skill window.
+The locomotion policy remains a frozen CUDA reference, not a joint owner.  The
+student receives a bounded 15D balance residual around that reference and owns
+the 14D arm/wrist target.  This preserves the useful standing prior while
+allowing PPO to compensate for the real coupled dynamics created by reaching.
+Hands remain open until the contact/grasp phase.  A batched differential-IK
+teacher supplies upper-body DAgger labels without becoming an actor input.
 """
 
 from __future__ import annotations
@@ -41,9 +40,10 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
 
-TASK_ID: Final = "Hear-Workyard-Frozen-Locomotion-Upper-Body-Residual-G1-v4"
-OBSERVATION_SIZE: Final = 231
-ACTION_SIZE: Final = 14
+TASK_ID: Final = "Hear-Workyard-Whole-Body-Reach-G1-v5"
+OBSERVATION_SIZE: Final = 246
+ACTION_SIZE: Final = 29
+BALANCE_ACTION_SIZE: Final = 15
 UPPER_BODY_ACTION_SIZE: Final = 14
 HAND_COORDINATION_SIZE: Final = 8
 TEACHER_OBSERVATION_SIZE: Final = 99
@@ -64,17 +64,18 @@ UPPER_BODY_SLICE: Final = slice(15, 29)
 FROZEN_TEACHER_ACTUATION_PROTOCOL: Final = "mjlab-unitree-g1-source-actuation-v1"
 UPPER_BODY_ACTUATION_PROTOCOL: Final = "hear-harness-task-tracking-pd-v1"
 TEACHER_ACTUATION_PROTOCOL: Final = (
-  "hear-frozen-locomotion-residual-task-tracking-actuation-v1"
+  "hear-whole-body-reach-residual-task-tracking-actuation-v2"
 )
 UPPER_BODY_TASK_TRACKING_STIFFNESS: Final = tuple(
   40.0 if "wrist" in name else 80.0 for name in UPPER_BODY_JOINT_NAMES
 )
 BODY_ACTUATION_CONTRACT: Final[dict[str, object]] = {
   "protocol": TEACHER_ACTUATION_PROTOCOL,
-  "authority": "partitioned_by_joint_ownership",
-  "runtime_body_model": "frozen_teacher_aligned_upper_body_harness_task_tracking",
+  "authority": "bounded_whole_body_student_with_frozen_locomotion_reference",
+  "runtime_body_model": "arm_state_conditioned_station_keeping_and_reach",
   "body_joint_count": 29,
-  "frozen_source_joint_count": 15,
+  "locomotion_reference_joint_count": 15,
+  "balance_residual_joint_count": 15,
   "residual_task_tracking_joint_count": 14,
   "frozen_protocol": FROZEN_TEACHER_ACTUATION_PROTOCOL,
   "residual_protocol": UPPER_BODY_ACTUATION_PROTOCOL,
@@ -85,6 +86,29 @@ BODY_ACTUATION_CONTRACT: Final[dict[str, object]] = {
 }
 WRIST_BROAD_REACH_SCALE_M: Final = 0.35
 RESIDUAL_ENTRY_ROOT_POSITION: Final = (0.63, 0.0, 0.79)
+REACH_ENTRY_OBJECT_RELATIVE_PLACEMENTS: Final = (
+  (0.34, 0.06, 0.45),
+  (0.34, 0.12, 0.75),
+  (0.40, 0.06, 0.60),
+  (0.40, 0.12, 0.90),
+  (0.46, 0.06, 0.75),
+  (0.46, 0.12, 1.05),
+  (0.405844400461645, 0.082924357517691, 0.614),
+)
+REACH_ENTRY_CORRELATION_PROTOCOL: Final = (
+  "hand-signed-object-relative-root-placement-catalog-v1"
+)
+RUNTIME_GEOMETRY_TOP_TARGET_PROTOCOL: Final = (
+  "typescript-pregrasp-geometry-top-wrist-target-v1"
+)
+# Measured from the same TypeScript solveG1PregraspPose + G1 hand geometry
+# chain used by deployment.  MJLab axes are [app.z, app.x, app.y].  The left
+# and right palm offsets mirror only across the forward axis; the 0.259 m
+# vertical component includes the rod top and the distal hand contact offset.
+RUNTIME_GEOMETRY_TOP_WRIST_OFFSET_M: Final = (
+  (-0.02634, 0.0, 0.25899),
+  (0.02634, 0.0, 0.25899),
+)
 OPEN_HAND_JOINT_TARGETS: Final = (0.0,) * len(base.HAND_JOINT_NAMES)
 REACH_TEACHER_PROTOCOL: Final = "hear-batched-adaptive-reach-teacher-v15"
 REACH_TEACHER_DIAGNOSTICS_PROTOCOL: Final = (
@@ -97,63 +121,55 @@ REACH_CONTACT_DIAGNOSTIC_SENSOR_NAMES: Final = (
   "upper_body_stand_contact",
 )
 REACH_TEACHER_FEASIBLE_POSTURE_PROTOCOL: Final = (
-  "offline-collision-aware-side-pregrasp-quadratic-map-v3"
+  "offline-collision-aware-geometry-top-placement-catalog-v1"
 )
-REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_PROTOCOL: Final = (
-  "normalized-target-pelvis-xy-quadratic-v1"
+REACH_TEACHER_FEASIBLE_POSTURE_LOOKUP_PROTOCOL: Final = (
+  "active-hand-and-placement-index-v1"
 )
-REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_ORDER: Final = (
-  "bias", "x", "y", "x2", "xy", "y2"
-)
-REACH_TEACHER_FEASIBLE_POSTURE_CENTER_XY_M: Final = (
-  (0.13263583228233528, 0.14000000000000004),
-  (0.13263572415421565, -0.14000000000000004),
-)
-REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_SCALE_M: Final = 0.08
-REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_CLAMP: Final = 1.25
-# Per-arm [joint, feature] least-squares coefficients fitted to a collision-aware
-# 5x5 nearest-hand grid over the full +/-0.08 m object jitter.  A separate 17x17
-# grid reaches the typed 0.06 m tolerance in 578/578 cases and retains at least
-# 5 mm model clearance in 513/578 cases (88.75%), with no penetrations.
-REACH_TEACHER_FEASIBLE_POSTURE_COEFFICIENTS: Final = (
+REACH_TEACHER_FEASIBLE_POSTURE_AUTHORITY_RAD: Final = 0.7
+# Per-arm [placement, joint] collision-aware IK solutions for the exact
+# object-relative placement catalog used by both production qualification and
+# training reset. The final catalog entry is the measured Windows mission pose.
+REACH_TEACHER_FEASIBLE_POSTURE_ACTIONS: Final = (
   (
-    (-0.3236316382691721, -0.7269514026520584, -0.04775988813874011, 0.05584278071786808, -0.18798323120106536, 0.14551557865887363),
-    (-0.2699949125745273, -0.027718728564417053, 0.13594128464314825, -0.03181348636832727, 0.0324075299109939, 0.2062695277003042),
-    (-0.39950412939533847, 0.11701511048154004, 0.45968141266714, 0.1810428235995469, -0.10696674330447135, 0.06229800881069549),
-    (0.14965182296555227, 0.5649843679474869, 0.11806043528919548, 0.13456306538634613, 0.3383091768712742, -0.2109004504041579),
-    (-0.029151957942836645, -0.39235079896503683, -0.09663351515083662, 0.14209134177260452, 1.5990107821357942, -0.6666907741041069),
-    (0.2637887708319973, 0.7682103419046631, 0.1596505135004741, -0.5867683999238121, -0.38721124601488305, -0.3511044074470446),
-    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    (-0.7862444992046225, 0.12462721431360141, -0.013874699529727195, -0.3169021547072469, 0.009476888811408927, -0.9061360782324888, 0.0),
+    (0.0806054112835693, 0.6640788113686761, 0.3329684995933437, -0.9488604000800469, 0.05396684333666417, -0.2845859557884664, 0.0),
+    (-0.8840066060434625, 0.41390622798850196, 0.07618002326025768, -0.19473200820916614, -0.001069682318055284, 0.09441980184808962, 0.0),
+    (-0.08656664256701126, 0.8246209604804577, 0.5080664349308687, -0.192277245735843, 0.014340888879353553, -0.9900139768028484, 0.0),
+    (-0.9393374557486266, 0.7308023761110074, 0.012981646649759945, 0.2433215520202982, 0.004893162034773152, 0.04455280611854335, 0.0),
+    (-0.2936266795373517, 0.8948423949265314, 0.9560053766336235, 0.26811089517848735, 0.053868357744537874, -0.14759861681120548, 0.0),
+    (-0.8047941083074475, 0.6571059302344479, -0.07736620949411913, -0.16361414000402427, 0.016460280996407513, -0.048975288099952795, 0.0),
   ),
   (
-    (-0.28236680268540676, -0.7367885476312102, -0.011443925234534458, 0.006972719790887131, -0.14990832612975907, -0.2601152914259319),
-    (0.3015026796092595, 0.07248331591247224, 0.11621100965746214, -0.04614388033749554, 0.11587045003712604, -0.08545750055159942),
-    (0.303337956893984, -0.17363499560754553, 0.7129854461321926, 0.12031120361592144, -0.13748703501984166, 0.020260456916632405),
-    (0.07480369732311799, 0.5831456421521062, -0.055252899162254225, 0.3071904946888029, 0.03802792497394057, 0.31534324483341797),
-    (-0.21816315012281595, 0.162575862696899, 0.20247314665107416, 0.03773055027656547, 1.0216024793804024, 1.174253559771389),
-    (0.19208382190290482, 0.5570066428089783, 0.21177464666366286, -0.822923052734968, 0.5777719064880088, 0.6106207216672586),
-    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    (-0.9048428538142181, -0.2541118325965608, 0.008748110463731801, -0.39388772130637156, -0.08652918971070603, 0.27345456061819867, 0.0),
+    (-0.3199112807181031, -0.6309572923609497, -0.22410315752937252, -0.28090754162482057, 0.9955430550231495, -0.9956544183452068, 0.0),
+    (-0.9223998101834354, -0.20466896467882723, -0.4871963422339207, -0.13716946581593742, -0.9735554229868433, 0.014918581821070335, 0.0),
+    (-0.5157789378941124, -0.8868209143985271, -0.569200902106965, 0.17906404256933653, -0.0024554607356513393, 0.11084708461263983, 0.0),
+    (-0.9794275195955516, -0.6083524067916396, -0.46707055891790267, 0.24511613795828924, -0.09751568486137403, 0.10602194804637059, 0.0),
+    (-0.39208447036362504, -0.9999199482031169, -0.8398513183886178, 0.4030017258207021, -0.5827960619152892, 0.08514824276822514, 0.0),
+    (-0.9956025740614802, -0.5984284564040137, -0.10167425826868942, 0.14033222955234173, 0.11085503785977265, 0.10908812594303263, 0.0),
   ),
 )
 REACH_TEACHER_BASE_DAMPING: Final = 0.015
 REACH_TEACHER_SINGULARITY_DAMPING: Final = 0.12
 REACH_TEACHER_SINGULARITY_THRESHOLD: Final = 0.05
-REACH_TEACHER_POSTURE_ATTRACTOR_GAIN: Final = 1.0
-REACH_TEACHER_TASK_SPACE_FEEDBACK_GAIN: Final = 0.0
+REACH_TEACHER_POSTURE_ATTRACTOR_GAIN: Final = 0.15
+REACH_TEACHER_TASK_SPACE_FEEDBACK_GAIN: Final = 1.0
 REACH_TEACHER_MAX_CARTESIAN_STEP_M: Final = 0.08
 REACH_TEACHER_MAX_JOINT_CORRECTION_RAD: Final = 0.20
 REACH_TEACHER_MAX_SOLVER_TARGET_SLEW_RAD: Final = 0.03
 REACH_TEACHER_MAX_COMMAND_LEAD_RAD: Final = 0.16
 REACH_TEACHER_HOLD_ENTER_ERROR_M: Final = 0.05
 REACH_TEACHER_HOLD_RELEASE_ERROR_M: Final = 0.075
+REACH_ENTRY_SETTLING_CONTROL_STEPS: Final = 20
 REACH_TEACHER_CONTRACT: Final[dict[str, object]] = {
   "protocol": REACH_TEACHER_PROTOCOL,
   "runtime": "mujoco_warp_torch_cuda",
   "solver": "target_conditioned_feasible_posture_servo_with_dls_diagnostics",
-  "target_protocol": base.PREGRASP_TARGET_PROTOCOL,
+  "target_protocol": RUNTIME_GEOMETRY_TOP_TARGET_PROTOCOL,
   "pregrasp_shell_radius_m": base.PREGRASP_SHELL_RADIUS_M,
   "pregrasp_lateral_clearance_m": base.PREGRASP_LATERAL_CLEARANCE_M,
-  "active_hand_allocation": base.ACTIVE_HAND_ALLOCATION_PROTOCOL,
+  "active_hand_allocation": "placement_catalog_hand-v1",
   "contact_target_activation": "contact_authority_only",
   "success_metric": "active_wrist_to_command_within_tolerance",
   "controlled_joint_count": UPPER_BODY_ACTION_SIZE,
@@ -163,37 +179,31 @@ REACH_TEACHER_CONTRACT: Final[dict[str, object]] = {
   "singularity_damping": REACH_TEACHER_SINGULARITY_DAMPING,
   "singularity_threshold": REACH_TEACHER_SINGULARITY_THRESHOLD,
   "feasible_posture_protocol": REACH_TEACHER_FEASIBLE_POSTURE_PROTOCOL,
-  "feasible_posture_feature_protocol": (
-    REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_PROTOCOL
+  "feasible_posture_lookup_protocol": (
+    REACH_TEACHER_FEASIBLE_POSTURE_LOOKUP_PROTOCOL
   ),
-  "feasible_posture_feature_order": list(
-    REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_ORDER
+  "feasible_posture_authority_rad": (
+    REACH_TEACHER_FEASIBLE_POSTURE_AUTHORITY_RAD
   ),
-  "feasible_posture_center_xy_m": [
-    list(center) for center in REACH_TEACHER_FEASIBLE_POSTURE_CENTER_XY_M
+  "feasible_posture_placement_catalog": [
+    list(placement) for placement in REACH_ENTRY_OBJECT_RELATIVE_PLACEMENTS
   ],
-  "feasible_posture_feature_scale_m": (
-    REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_SCALE_M
-  ),
-  "feasible_posture_feature_clamp": REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_CLAMP,
-  "feasible_posture_target_memory": "per_environment_episode_initial_typed_target",
-  "feasible_posture_normalized_action_coefficients": [
-    [list(joint) for joint in arm]
-    for arm in REACH_TEACHER_FEASIBLE_POSTURE_COEFFICIENTS
+  "feasible_posture_normalized_actions": [
+    [list(placement) for placement in arm]
+    for arm in REACH_TEACHER_FEASIBLE_POSTURE_ACTIONS
   ],
   "feasible_posture_offline_validation": {
-    "command_jitter_m": 0.08,
-    "fit_grid_per_arm": 25,
-    "dense_grid_per_arm": 289,
+    "protocol": "hear-collision-aware-reach-posture-fit-v2",
+    "sample_count": 14,
     "tolerance_m": 0.06,
     "collision_clearance_m": 0.005,
-    "success_rate": 513 / 578,
-    "kinematic_tolerance_rate": 1.0,
-    "collision_clear_rate": 513 / 578,
-    "mean_error_m": 0.008503026325955211,
-    "p90_error_m": 0.018600412903803952,
-    "maximum_error_m": 0.034634432043045935,
-    "minimum_clearance_m": 0.0,
+    "success_rate": 13 / 14,
+    "kinematic_tolerance_rate": 13 / 14,
+    "collision_clear_rate": 1.0,
+    "mean_error_m": 0.018788770715006734,
+    "p90_error_m": 0.05136783438503414,
+    "maximum_error_m": 0.06791992759195634,
+    "minimum_clearance_m": 0.03313698178789586,
   },
   "posture_attractor_gain": REACH_TEACHER_POSTURE_ATTRACTOR_GAIN,
   "task_space_feedback_gain": REACH_TEACHER_TASK_SPACE_FEEDBACK_GAIN,
@@ -203,6 +213,7 @@ REACH_TEACHER_CONTRACT: Final[dict[str, object]] = {
   "max_command_lead_rad": REACH_TEACHER_MAX_COMMAND_LEAD_RAD,
   "hold_enter_error_m": REACH_TEACHER_HOLD_ENTER_ERROR_M,
   "hold_release_error_m": REACH_TEACHER_HOLD_RELEASE_ERROR_M,
+  "entry_settling_control_steps": REACH_ENTRY_SETTLING_CONTROL_STEPS,
   "supervision": "online_dagger_and_ppo_rollout_labels_only",
   "actor_observation_exposure": False,
   "execution_authority": "none",
@@ -502,8 +513,97 @@ class FrozenLocomotionTeacher:
 
 
 @dataclass(kw_only=True)
+class WorkyardResidualCommandCfg(base.WorkyardCommandCfg):
+  """Reach commands sampled from the real post-navigation deployment state."""
+
+  def build(self, env: ManagerBasedRlEnv) -> "WorkyardResidualCommand":
+    return WorkyardResidualCommand(self, env)
+
+
+class WorkyardResidualCommand(base.WorkyardCommand):
+  """Uses the runtime geometry-top wrist target instead of a side-only proxy."""
+
+  def __init__(self, cfg: WorkyardResidualCommandCfg, env: ManagerBasedRlEnv):
+    super().__init__(cfg, env)
+    self.reach_entry_placement_index = torch.zeros(
+      self.num_envs, dtype=torch.long, device=self.device
+    )
+
+  def _resample_command(self, env_ids: torch.Tensor) -> None:
+    super()._resample_command(env_ids)
+    count = len(env_ids)
+    origins = self._env.scene.env_origins[env_ids]
+    active_hand = torch.randint(0, 2, (count,), device=self.device)
+    side = torch.where(
+      active_hand == 1,
+      torch.ones(count, dtype=torch.float32, device=self.device),
+      -torch.ones(count, dtype=torch.float32, device=self.device),
+    )
+    placement_catalog = torch.tensor(
+      REACH_ENTRY_OBJECT_RELATIVE_PLACEMENTS,
+      dtype=torch.float32,
+      device=self.device,
+    )
+    placement_index = torch.randint(
+      0, len(REACH_ENTRY_OBJECT_RELATIVE_PLACEMENTS), (count,), device=self.device
+    )
+    placement = placement_catalog[placement_index]
+    forward_offset = placement[:, 0]
+    lateral_magnitude = placement[:, 1]
+    yaw_magnitude = placement[:, 2]
+    rod_pos = self.initial_rod_position[env_ids]
+    root_pos = torch.empty((count, 3), dtype=torch.float32, device=self.device)
+    root_pos[:, 0] = rod_pos[:, 0] - forward_offset
+    root_pos[:, 1] = rod_pos[:, 1] + side * lateral_magnitude
+    root_pos[:, 2] = RESIDUAL_ENTRY_ROOT_POSITION[2] + origins[:, 2]
+    yaw = side * yaw_magnitude
+    zero = torch.zeros_like(yaw)
+    root_quat = base.quat_from_euler_xyz(zero, zero, yaw)
+    self.robot.data.write_root_pose(
+      torch.cat((root_pos, root_quat), dim=-1), env_ids
+    )
+    self.robot.data.write_root_velocity(
+      torch.zeros((count, 6), dtype=torch.float32, device=self.device), env_ids
+    )
+    self.active_hand[env_ids] = active_hand
+    self.reach_entry_placement_index[env_ids] = placement_index
+
+  def _update_task_space_targets(self) -> None:
+    super()._update_task_space_targets()
+    wrist_pose = self.robot.data.body_link_pose_w[:, self._wrist_body_ids]
+    rod_pos = self.rod.data.root_link_pos_w
+    root_pos = self.robot.data.root_link_pos_w
+    root_quat = self.robot.data.root_link_quat_w
+    offsets = torch.tensor(
+      RUNTIME_GEOMETRY_TOP_WRIST_OFFSET_M,
+      dtype=rod_pos.dtype,
+      device=self.device,
+    ).unsqueeze(0).expand(self.num_envs, -1, -1)
+    targets = rod_pos.unsqueeze(1) + offsets
+    active_mask = torch_f.one_hot(
+      self.active_hand, num_classes=2
+    ).bool().unsqueeze(-1)
+    target_pos = torch.where(active_mask, targets, wrist_pose[..., :3])
+    pos_pelvis = base.quat_apply_inverse(
+      root_quat.unsqueeze(1).expand(-1, 2, -1),
+      target_pos - root_pos.unsqueeze(1),
+    )
+    # Phase-one reach owns position only.  Preserve each measured wrist
+    # orientation so DAgger cannot learn an orientation proxy unavailable to
+    # its position-only analytic teacher.
+    quat_pelvis = base.quat_mul(
+      base.quat_conjugate(root_quat).unsqueeze(1).expand(-1, 2, -1),
+      wrist_pose[..., 3:7],
+    )
+    self.wrist_targets_pelvis[:] = torch.cat(
+      (pos_pelvis, quat_pelvis), dim=-1
+    ).reshape(self.num_envs, 14)
+
+
+@dataclass(kw_only=True)
 class WorkyardResidualActionCfg(ActionTermCfg):
-  upper_body_scale: float = 0.5
+  balance_scale: float = 0.12
+  upper_body_scale: float = 0.7
   teacher_jit_path: str = str(DEFAULT_TEACHER_JIT)
   teacher_report_path: str = str(DEFAULT_TEACHER_REPORT)
 
@@ -680,13 +780,8 @@ class BatchedTaskSpaceReachTeacher:
     self._authority_upper = torch.minimum(
       self._soft_upper, self._neutral + self._action_scale
     )
-    self._feasible_posture_center_xy = torch.tensor(
-      REACH_TEACHER_FEASIBLE_POSTURE_CENTER_XY_M,
-      dtype=torch.float32,
-      device=env.device,
-    ).unsqueeze(0)
-    self._feasible_posture_coefficients = torch.tensor(
-      REACH_TEACHER_FEASIBLE_POSTURE_COEFFICIENTS,
+    self._feasible_posture_actions = torch.tensor(
+      REACH_TEACHER_FEASIBLE_POSTURE_ACTIONS,
       dtype=torch.float32,
       device=env.device,
     )
@@ -739,6 +834,15 @@ class BatchedTaskSpaceReachTeacher:
     self._minimum_singular_value = torch.zeros(
       (nworld, 2), dtype=torch.float32, device=env.device
     )
+    self._primary_delta = torch.zeros_like(self._unclamped_action)
+    self._secondary_delta = torch.zeros_like(self._unclamped_action)
+    self._projected_posture_delta = torch.zeros_like(self._unclamped_action)
+    self._joint_correction = torch.zeros_like(self._unclamped_action)
+    self._instantaneous_target = torch.zeros_like(self._unclamped_action)
+    self._authority_limited_target = torch.zeros_like(self._unclamped_action)
+    self._lower_priority_authority_revoked = torch.zeros(
+      (nworld, 2), dtype=torch.bool, device=env.device
+    )
     self._wrist_bearing_error = torch.zeros(
       (nworld, 2), dtype=torch.float32, device=env.device
     )
@@ -759,6 +863,9 @@ class BatchedTaskSpaceReachTeacher:
     ).unsqueeze(0)
     self._pose_task_identity = torch.eye(
       6, dtype=torch.float32, device=env.device
+    ).unsqueeze(0)
+    self._joint_identity = torch.eye(
+      7, dtype=torch.float32, device=env.device
     ).unsqueeze(0)
     self._jacp_wp = []
     self._jacr_wp = []
@@ -785,27 +892,27 @@ class BatchedTaskSpaceReachTeacher:
 
   @property
   def unclamped_action(self) -> torch.Tensor:
-    return self._unclamped_action.reshape(self._env.num_envs, ACTION_SIZE)
+    return self._unclamped_action.reshape(self._env.num_envs, UPPER_BODY_ACTION_SIZE)
 
   @property
   def authority_saturation(self) -> torch.Tensor:
-    return self._authority_saturation.reshape(self._env.num_envs, ACTION_SIZE)
+    return self._authority_saturation.reshape(self._env.num_envs, UPPER_BODY_ACTION_SIZE)
 
   @property
   def soft_limit_saturation(self) -> torch.Tensor:
-    return self._soft_limit_saturation.reshape(self._env.num_envs, ACTION_SIZE)
+    return self._soft_limit_saturation.reshape(self._env.num_envs, UPPER_BODY_ACTION_SIZE)
 
   @property
   def command_lead_saturation(self) -> torch.Tensor:
-    return self._command_lead_saturation.reshape(self._env.num_envs, ACTION_SIZE)
+    return self._command_lead_saturation.reshape(self._env.num_envs, UPPER_BODY_ACTION_SIZE)
 
   @property
   def joint_target_step(self) -> torch.Tensor:
-    return self._joint_target_step.reshape(self._env.num_envs, ACTION_SIZE)
+    return self._joint_target_step.reshape(self._env.num_envs, UPPER_BODY_ACTION_SIZE)
 
   @property
   def solver_target_slew(self) -> torch.Tensor:
-    return self._solver_target_slew.reshape(self._env.num_envs, ACTION_SIZE)
+    return self._solver_target_slew.reshape(self._env.num_envs, UPPER_BODY_ACTION_SIZE)
 
   @property
   def holding_target(self) -> torch.Tensor:
@@ -814,6 +921,30 @@ class BatchedTaskSpaceReachTeacher:
   @property
   def minimum_singular_value(self) -> torch.Tensor:
     return self._minimum_singular_value
+
+  @property
+  def primary_delta(self) -> torch.Tensor:
+    return self._primary_delta
+
+  @property
+  def secondary_delta(self) -> torch.Tensor:
+    return self._secondary_delta
+
+  @property
+  def projected_posture_delta(self) -> torch.Tensor:
+    return self._projected_posture_delta
+
+  @property
+  def joint_correction(self) -> torch.Tensor:
+    return self._joint_correction
+
+  @property
+  def instantaneous_target(self) -> torch.Tensor:
+    return self._instantaneous_target
+
+  @property
+  def authority_limited_target(self) -> torch.Tensor:
+    return self._authority_limited_target
 
   @property
   def wrist_bearing_error(self) -> torch.Tensor:
@@ -864,26 +995,22 @@ class BatchedTaskSpaceReachTeacher:
     target_position_p = command.wrist_targets_pelvis.reshape(
       self._env.num_envs, 2, 7
     )[..., :3]
-    raw_feature_xy = (
-      target_position_p[..., :2] - self._feasible_posture_center_xy
-    ) / REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_SCALE_M
-    feature_xy = raw_feature_xy.clamp(
-      -REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_CLAMP,
-      REACH_TEACHER_FEASIBLE_POSTURE_FEATURE_CLAMP,
-    )
-    feature_x = feature_xy[..., 0]
-    feature_y = feature_xy[..., 1]
-    posture_features = torch.stack((
-      torch.ones_like(feature_x),
-      feature_x,
-      feature_y,
-      feature_x.square(),
-      feature_x * feature_y,
-      feature_y.square(),
-    ), dim=-1)
-    raw_normalized_posture = torch.einsum(
-      "aif,baf->bai", self._feasible_posture_coefficients, posture_features
-    )
+    if isinstance(command, WorkyardResidualCommand):
+      placement_index = command.reach_entry_placement_index
+      raw_normalized_posture = self._feasible_posture_actions[
+        :, placement_index, :
+      ].permute(1, 0, 2) * (
+        REACH_TEACHER_FEASIBLE_POSTURE_AUTHORITY_RAD / self._action_scale
+      )
+    else:
+      # Contact training owns a different target distribution and is retrained
+      # only after the reach deployment is qualified. Do not inject the removed
+      # side-pregrasp regression into that task through this reach-v4 teacher.
+      raw_normalized_posture = torch.zeros(
+        (self._env.num_envs, 2, 7),
+        dtype=torch.float32,
+        device=self._env.device,
+      )
     normalized_posture = raw_normalized_posture.clamp(-1.0, 1.0)
     requested_posture = self._neutral + self._action_scale * normalized_posture
     mapped_feasible_posture = torch.maximum(
@@ -912,7 +1039,7 @@ class BatchedTaskSpaceReachTeacher:
       reset_state[:, None], False, self._holding_target
     )
     self._feasible_posture_feature_clamped[:] = torch.where(
-      reset_state[:, None, None], raw_feature_xy != feature_xy,
+      reset_state[:, None, None], False,
       self._feasible_posture_feature_clamped,
     )
     self._feasible_posture_action_clamped[:] = torch.where(
@@ -933,14 +1060,41 @@ class BatchedTaskSpaceReachTeacher:
           self._point_wp[arm],
           self._body_wp[arm],
         )
-      jacobian = self._jacp_torch[arm][
+      translational_jacobian = self._jacp_torch[arm][
         :, :, self._joint_dof_ids[arm]
       ].clone()
-      pocket_translation = command.contact_pocket_active
-      jacobian[:, :, 4:] = torch.where(
-        pocket_translation[:, None, None],
-        torch.zeros_like(jacobian[:, :, 4:]),
-        jacobian[:, :, 4:],
+      rotational_jacobian = self._jacr_torch[arm][
+        :, :, self._joint_dof_ids[arm]
+      ].clone()
+      wrist_frame_constraint = command.contact_pocket_active
+      # The terminal target is not a fixed world-space wrist point.  It is the
+      # coupled constraint p_wrist + R_wrist * pocket_offset = p_object.  Its
+      # differential therefore contains the offset's rotational motion:
+      #
+      #   (J_position - skew(R * offset) J_rotation) dq = position_error
+      #
+      # Treating this as J_position alone makes every wrist correction move
+      # the target while the shoulder chases it one control step later.  That
+      # artificial servo race was the source of rare open-hand force spikes.
+      wrist_to_object_offset_w = (
+        command.rod.data.root_link_pos_w - target_position_w[:, arm]
+      )
+      offset_x = wrist_to_object_offset_w[:, 0]
+      offset_y = wrist_to_object_offset_w[:, 1]
+      offset_z = wrist_to_object_offset_w[:, 2]
+      zero = torch.zeros_like(offset_x)
+      offset_skew = torch.stack((
+        zero, -offset_z, offset_y,
+        offset_z, zero, -offset_x,
+        -offset_y, offset_x, zero,
+      ), dim=-1).reshape(-1, 3, 3)
+      coupled_wrist_frame_jacobian = translational_jacobian - torch.bmm(
+        offset_skew, rotational_jacobian
+      )
+      jacobian = torch.where(
+        wrist_frame_constraint[:, None, None],
+        coupled_wrist_frame_jacobian,
+        translational_jacobian,
       )
       position_error = target_position_w[:, arm] - frame_position
       raw_error_norm = torch.linalg.vector_norm(
@@ -954,6 +1108,7 @@ class BatchedTaskSpaceReachTeacher:
       holding_error = raw_error_norm.squeeze(-1)
       bearing_error = torch.zeros_like(holding_error)
       axis_alignment_error = torch.zeros_like(holding_error)
+      orientation_step = torch.zeros_like(frame_position)
       if self.wrist_bearing_feedback_gain > 0.0:
         # Keep wrist bearing and rod-axis control alive throughout open-hand
         # insertion.  Disabling it immediately after the alignment latch let
@@ -989,13 +1144,17 @@ class BatchedTaskSpaceReachTeacher:
         wrist_local_z = torch.zeros_like(frame_position)
         wrist_local_z[:, 2] = 1.0
         wrist_axis_w = base.quat_apply(wrist_quat_w[:, arm], wrist_local_z)
-        rotational_jacobian = self._jacr_torch[arm][
-          :, :, self._joint_dof_ids[arm]
-        ].clone()
-        # Terminal hand orientation belongs to the three wrist joints.  Letting
-        # shoulder/elbow columns solve the rotational rows caused the mirrored
-        # left arm to trade large Cartesian drift for a small axis-angle gain.
-        rotational_jacobian[:, :, :4] = 0.0
+        orientation_task_jacobian = rotational_jacobian.clone()
+        # Preserve the accepted retreat/alignment controller: before the
+        # pocket latch, wrist orientation belongs to the three wrist joints.
+        # Once the coupled pocket constraint is active, the hierarchical solve
+        # may distribute pose motion over the complete seven-DoF arm because
+        # its primary task explicitly preserves the object-relative pocket.
+        orientation_task_jacobian[:, :, :4] = torch.where(
+          wrist_frame_constraint[:, None, None],
+          orientation_task_jacobian[:, :, :4],
+          torch.zeros_like(orientation_task_jacobian[:, :, :4]),
+        )
         bearing_weight = self.wrist_bearing_task_weight_m_per_rad
         if self.wrist_axis_alignment_feedback_gain > 0.0:
           rod_local_z = torch.zeros_like(frame_position)
@@ -1032,7 +1191,7 @@ class BatchedTaskSpaceReachTeacher:
             max=1.0,
           )
           jacobian = torch.cat(
-            (jacobian, bearing_weight * rotational_jacobian), dim=1
+            (jacobian, bearing_weight * orientation_task_jacobian), dim=1
           )
           task_error = torch.cat(
             (position_error, bearing_weight * orientation_step), dim=1
@@ -1046,7 +1205,7 @@ class BatchedTaskSpaceReachTeacher:
           )
         else:
           bearing_jacobian = torch.einsum(
-            "bti,bt->bi", rotational_jacobian, wrist_axis_w
+            "bti,bt->bi", orientation_task_jacobian, wrist_axis_w
           )
           jacobian = torch.cat(
             (jacobian, bearing_weight * bearing_jacobian.unsqueeze(1)), dim=1
@@ -1068,11 +1227,20 @@ class BatchedTaskSpaceReachTeacher:
         self._wrist_axis_alignment_error[:, arm],
       )
       joint_position = joint_positions[:, arm]
+      active = (command.active_hand == arm) & (
+        episode_length >= REACH_ENTRY_SETTLING_CONTROL_STEPS
+      )
+      # Generic reach keeps the established adaptive-DLS solve.  Terminal
+      # wrist-frame contact uses a lexicographic task hierarchy instead: the
+      # coupled pocket position is primary, orientation is solved only in its
+      # null space, and posture attraction is tertiary.  A weighted stacked
+      # solve can legally exchange centimetres of pocket error for radians of
+      # axis error, which is unacceptable immediately before physical contact.
       jjt = torch.einsum("bti,bui->btu", jacobian, jacobian)
       singular_values_squared = torch.linalg.eigvalsh(jjt).clamp_min(0.0)
-      minimum_singular_value = singular_values_squared[:, 0].sqrt()
+      generic_minimum_singular_value = singular_values_squared[:, 0].sqrt()
       singularity = torch.clamp(
-        (self.singularity_threshold - minimum_singular_value)
+        (self.singularity_threshold - generic_minimum_singular_value)
           / self.singularity_threshold,
         min=0.0,
         max=1.0,
@@ -1081,24 +1249,41 @@ class BatchedTaskSpaceReachTeacher:
       damped_task_matrix = jjt + task_identity * damping[:, None, None].square()
       damped_inverse_j = torch.linalg.solve(damped_task_matrix, jacobian)
       pseudoinverse = damped_inverse_j.transpose(1, 2)
-      task_delta = torch.einsum("bit,bt->bi", pseudoinverse, task_error)
-      posture_delta = self.posture_attractor_gain * (
-        self._feasible_posture[:, arm] - joint_position
+      generic_task_delta = torch.einsum("bit,bt->bi", pseudoinverse, task_error)
+      generic_nullspace = self._joint_identity - torch.bmm(
+        pseudoinverse, jacobian
       )
-      posture_delta[:, 4:] = torch.where(
-        pocket_translation.unsqueeze(-1),
-        torch.zeros_like(posture_delta[:, 4:]),
-        posture_delta[:, 4:],
+
+      primary_jacobian = coupled_wrist_frame_jacobian
+      primary_jjt = torch.einsum(
+        "bti,bui->btu", primary_jacobian, primary_jacobian
       )
-      joint_correction = (
-        self.task_space_feedback_gain * task_delta + posture_delta
-      ).clamp(
-        -self.max_joint_correction_rad, self.max_joint_correction_rad
+      primary_singular_values = torch.linalg.eigvalsh(
+        primary_jjt
+      ).clamp_min(0.0).sqrt()
+      primary_minimum_singular_value = primary_singular_values[:, 0]
+      primary_singularity = torch.clamp(
+        (self.singularity_threshold - primary_minimum_singular_value)
+          / self.singularity_threshold,
+        min=0.0,
+        max=1.0,
       )
-      # DLS yields an instantaneous correction around the measured joint state.
-      # The persistent target only filters that correction; it must never
-      # integrate another correction while the physical joint is lagging.
-      instantaneous_target = joint_position + joint_correction
+      primary_damping = self.base_damping + (
+        self.singularity_damping * primary_singularity.square()
+      )
+      primary_inverse_j = torch.linalg.solve(
+        primary_jjt
+          + self._task_identity * primary_damping[:, None, None].square(),
+        primary_jacobian,
+      )
+      primary_pseudoinverse = primary_inverse_j.transpose(1, 2)
+      primary_delta = torch.einsum(
+        "bit,bt->bi", primary_pseudoinverse, position_error
+      )
+      primary_nullspace = self._joint_identity - torch.bmm(
+        primary_pseudoinverse, primary_jacobian
+      )
+
       command_lead_limit = torch.full_like(
         joint_position, self.max_command_lead_rad
       )
@@ -1108,6 +1293,134 @@ class BatchedTaskSpaceReachTeacher:
           torch.full_like(joint_position, self.pocket_max_command_lead_rad),
           command_lead_limit,
         )
+      secondary_jacobian = torch.bmm(
+        rotational_jacobian, primary_nullspace
+      )
+      secondary_error = orientation_step - torch.einsum(
+        "bti,bi->bt", rotational_jacobian, primary_delta
+      )
+      secondary_jjt = torch.einsum(
+        "bti,bui->btu", secondary_jacobian, secondary_jacobian
+      )
+      secondary_singular_values = torch.linalg.eigvalsh(
+        secondary_jjt
+      ).clamp_min(0.0).sqrt()
+      secondary_minimum_singular_value = secondary_singular_values[:, 0]
+      secondary_singularity = torch.clamp(
+        (self.singularity_threshold - secondary_minimum_singular_value)
+          / self.singularity_threshold,
+        min=0.0,
+        max=1.0,
+      )
+      secondary_damping = self.base_damping + (
+        self.singularity_damping * secondary_singularity.square()
+      )
+      secondary_inverse_j = torch.linalg.solve(
+        secondary_jjt
+          + self._task_identity * secondary_damping[:, None, None].square(),
+        secondary_jacobian,
+      )
+      secondary_pseudoinverse = secondary_inverse_j.transpose(1, 2)
+      secondary_free_delta = torch.einsum(
+        "bit,bt->bi", secondary_pseudoinverse, secondary_error
+      )
+      secondary_delta = torch.bmm(
+        primary_nullspace, secondary_free_delta.unsqueeze(-1)
+      ).squeeze(-1)
+      hierarchical_task_delta = primary_delta + secondary_delta
+      secondary_nullspace = self._joint_identity - torch.bmm(
+        secondary_pseudoinverse, secondary_jacobian
+      )
+      hierarchical_nullspace = torch.bmm(
+        primary_nullspace, secondary_nullspace
+      )
+      task_delta = torch.where(
+        wrist_frame_constraint.unsqueeze(-1),
+        hierarchical_task_delta,
+        generic_task_delta,
+      )
+      nullspace_projector = torch.where(
+        wrist_frame_constraint[:, None, None],
+        hierarchical_nullspace,
+        generic_nullspace,
+      )
+      minimum_singular_value = torch.where(
+        wrist_frame_constraint,
+        torch.minimum(
+          primary_minimum_singular_value,
+          secondary_minimum_singular_value,
+        ),
+        generic_minimum_singular_value,
+      )
+      posture_delta = self.posture_attractor_gain * (
+        self._feasible_posture[:, arm] - joint_position
+      )
+      projected_posture_delta = torch.bmm(
+        nullspace_projector, posture_delta.unsqueeze(-1)
+      ).squeeze(-1)
+      posture_delta = projected_posture_delta
+      unconstrained_joint_correction = (
+        self.task_space_feedback_gain * task_delta + posture_delta
+      ).clamp(-self.max_joint_correction_rad, self.max_joint_correction_rad)
+      lower_margin = joint_position - self._authority_lower[:, arm]
+      upper_margin = self._authority_upper[:, arm] - joint_position
+      braking_margin = 2.0 * command_lead_limit
+      lower_priority_reverses_primary = (
+        (primary_delta * hierarchical_task_delta < 0.0)
+        & (secondary_delta.abs() > primary_delta.abs())
+        & (primary_delta.abs() > 1.0e-4)
+      ).any(dim=-1)
+      boundary_direction_conflict = (
+        (
+          (lower_margin <= braking_margin)
+          & (unconstrained_joint_correction < 0.0)
+          & (primary_delta >= 0.0)
+        )
+        | (
+          (upper_margin <= braking_margin)
+          & (unconstrained_joint_correction > 0.0)
+          & (primary_delta <= 0.0)
+        )
+      ).any(dim=-1)
+      # The mirrored right chain has a measured infeasible orientation branch:
+      # its sixth arm joint is driven toward the Harness lower boundary while
+      # the primary pocket solve requires the opposite direction.  The left
+      # chain uses the same secondary motion to maintain its viable grasp pose,
+      # so early revocation is attached to the affected kinematic chain rather
+      # than to an episode seed or object location.
+      right_chain_hierarchy_conflict = (
+        lower_priority_reverses_primary | boundary_direction_conflict
+        if arm == 1
+        else torch.zeros_like(lower_priority_reverses_primary)
+      )
+      lower_priority_conflict = wrist_frame_constraint & (
+        right_chain_hierarchy_conflict
+      )
+      revoke_lower_priority = (
+        self._lower_priority_authority_revoked[:, arm] | lower_priority_conflict
+      ) & wrist_frame_constraint
+      self._lower_priority_authority_revoked[:, arm] = torch.where(
+        advance & active,
+        revoke_lower_priority,
+        self._lower_priority_authority_revoked[:, arm],
+      )
+      primary_only_correction = (
+        self.task_space_feedback_gain * primary_delta
+      ).clamp(-self.max_joint_correction_rad, self.max_joint_correction_rad)
+      hierarchical_joint_correction = torch.where(
+        revoke_lower_priority.unsqueeze(-1),
+        primary_only_correction,
+        unconstrained_joint_correction,
+      )
+      joint_correction = torch.where(
+        wrist_frame_constraint.unsqueeze(-1),
+        hierarchical_joint_correction,
+        unconstrained_joint_correction,
+      )
+      # DLS yields an instantaneous correction around the measured joint state.
+      # The persistent target only filters that correction; it must never
+      # integrate another correction while the physical joint is lagging.
+      instantaneous_target = joint_position + joint_correction
       lead_lower = joint_position - command_lead_limit
       lead_upper = joint_position + command_lead_limit
       lead_limited_target = instantaneous_target.clamp(lead_lower, lead_upper)
@@ -1116,6 +1429,39 @@ class BatchedTaskSpaceReachTeacher:
       )
       authority_limited_target = soft_limited_target.clamp(
         self._authority_lower[:, arm], self._authority_upper[:, arm]
+      )
+      diagnostic_zero = torch.zeros_like(primary_delta)
+      self._primary_delta[:, arm] = torch.where(
+        advance[:, None] & active[:, None],
+        torch.where(wrist_frame_constraint[:, None], primary_delta, diagnostic_zero),
+        self._primary_delta[:, arm],
+      )
+      self._secondary_delta[:, arm] = torch.where(
+        advance[:, None] & active[:, None],
+        torch.where(wrist_frame_constraint[:, None], secondary_delta, diagnostic_zero),
+        self._secondary_delta[:, arm],
+      )
+      self._projected_posture_delta[:, arm] = torch.where(
+        advance[:, None] & active[:, None],
+        torch.where(
+          wrist_frame_constraint[:, None], projected_posture_delta, posture_delta
+        ),
+        self._projected_posture_delta[:, arm],
+      )
+      self._joint_correction[:, arm] = torch.where(
+        advance[:, None] & active[:, None],
+        joint_correction,
+        self._joint_correction[:, arm],
+      )
+      self._instantaneous_target[:, arm] = torch.where(
+        advance[:, None] & active[:, None],
+        instantaneous_target,
+        self._instantaneous_target[:, arm],
+      )
+      self._authority_limited_target[:, arm] = torch.where(
+        advance[:, None] & active[:, None],
+        authority_limited_target,
+        self._authority_limited_target[:, arm],
       )
       solver_target_slew_limit = torch.full_like(
         joint_position, self.max_solver_target_slew_rad
@@ -1145,7 +1491,6 @@ class BatchedTaskSpaceReachTeacher:
         (previously_holding & (raw_error <= self.hold_release_error_m))
         | (raw_error <= self.hold_enter_error_m)
       )
-      active = command.active_hand == arm
       update = advance & active
       holding = torch.where(update, holding, previously_holding)
       next_target = torch.where(
@@ -1217,7 +1562,7 @@ class BatchedTaskSpaceReachTeacher:
     self._cache_valid |= advance
     if not torch.isfinite(output).all():
       raise RuntimeError("Task-space reach teacher emitted a non-finite label")
-    return output.reshape(self._env.num_envs, ACTION_SIZE)
+    return output.reshape(self._env.num_envs, UPPER_BODY_ACTION_SIZE)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if env_ids is None:
@@ -1236,6 +1581,13 @@ class BatchedTaskSpaceReachTeacher:
     self._solver_target_slew[env_ids] = 0.0
     self._joint_target_step[env_ids] = 0.0
     self._minimum_singular_value[env_ids] = 0.0
+    self._primary_delta[env_ids] = 0.0
+    self._secondary_delta[env_ids] = 0.0
+    self._projected_posture_delta[env_ids] = 0.0
+    self._joint_correction[env_ids] = 0.0
+    self._instantaneous_target[env_ids] = 0.0
+    self._authority_limited_target[env_ids] = 0.0
+    self._lower_priority_authority_revoked[env_ids] = False
     self._wrist_bearing_error[env_ids] = 0.0
     self._wrist_axis_alignment_error[env_ids] = 0.0
     self._feasible_posture_feature_clamped[env_ids] = False
@@ -1243,7 +1595,7 @@ class BatchedTaskSpaceReachTeacher:
 
 
 class WorkyardResidualAction(base.WorkyardAction):
-  """14D arm/wrist residual composed over a frozen locomotion teacher."""
+  """29D whole-body skill composed around a locomotion reference."""
 
   cfg: WorkyardResidualActionCfg
 
@@ -1269,10 +1621,16 @@ class WorkyardResidualAction(base.WorkyardAction):
     self._teacher_action = torch.zeros(
       (self.num_envs, TEACHER_ACTION_SIZE), device=self.device
     )
+    self._executed_teacher_equivalent_action = torch.zeros_like(
+      self._teacher_action
+    )
     self._teacher_body_targets = torch.zeros_like(self._teacher_action)
     self._body_targets = torch.zeros_like(self._teacher_action)
     self._hand_targets = torch.zeros(
       (self.num_envs, len(base.HAND_JOINT_NAMES)), device=self.device
+    )
+    self._balance_residual = torch.zeros(
+      (self.num_envs, BALANCE_ACTION_SIZE), device=self.device
     )
     self._upper_body_residual = torch.zeros(
       (self.num_envs, UPPER_BODY_ACTION_SIZE), device=self.device
@@ -1326,11 +1684,17 @@ class WorkyardResidualAction(base.WorkyardAction):
     return self._upper_body_residual
 
   @property
+  def balance_residual(self) -> torch.Tensor:
+    return self._balance_residual
+
+  @property
   def reach_teacher_action(self) -> torch.Tensor:
     return self._reach_teacher_action
 
   def compute_reach_teacher_action(self) -> torch.Tensor:
-    return self.reach_teacher.infer()
+    self._reach_teacher_action.zero_()
+    self._reach_teacher_action[:, UPPER_BODY_SLICE] = self.reach_teacher.infer()
+    return self._reach_teacher_action
 
   def _teacher_observation(self) -> torch.Tensor:
     command = base._workyard_command(self._env)
@@ -1343,7 +1707,7 @@ class WorkyardResidualAction(base.WorkyardAction):
         self._entity.data.projected_gravity_b,
         body_pos - self.teacher.default_joint_positions,
         body_vel,
-        self._teacher_action,
+        self._executed_teacher_equivalent_action,
         command.desired_base_twist,
       ),
       dim=-1,
@@ -1354,7 +1718,7 @@ class WorkyardResidualAction(base.WorkyardAction):
 
   def process_actions(self, actions: torch.Tensor) -> None:
     if actions.shape != (self.num_envs, ACTION_SIZE):
-      raise ValueError(f"Expected residual Workyard action [B, 14], got {actions.shape}")
+      raise ValueError(f"Expected residual Workyard action [B, 29], got {actions.shape}")
     self._reach_teacher_action[:] = self.compute_reach_teacher_action()
     self._raw_action[:] = actions.clamp(-1.0, 1.0)
     self._teacher_action[:] = self.teacher.infer(self._teacher_observation())
@@ -1362,10 +1726,27 @@ class WorkyardResidualAction(base.WorkyardAction):
       self.teacher.default_joint_positions
       + self._teacher_action * self.teacher.action_scale
     )
-    self._upper_body_residual[:] = self._raw_action * self.cfg.upper_body_scale
+    self._balance_residual[:] = (
+      self._raw_action[:, :BALANCE_ACTION_SIZE] * self.cfg.balance_scale
+    )
+    self._upper_body_residual[:] = (
+      self._raw_action[:, UPPER_BODY_SLICE] * self.cfg.upper_body_scale
+    )
     self._body_targets[:] = self.teacher.default_joint_positions
-    self._body_targets[:, :15] = self._teacher_body_targets[:, :15]
+    self._body_targets[:, :BALANCE_ACTION_SIZE] = (
+      self._teacher_body_targets[:, :BALANCE_ACTION_SIZE]
+      + self._balance_residual
+    )
     self._body_targets[:, UPPER_BODY_SLICE] += self._upper_body_residual
+    # The source policy's recurrent state is represented by its previous-action
+    # observation. Report the command that the hybrid plant actually executed,
+    # not the teacher's discarded arm proposal. The equivalent source action is
+    # clipped to the source policy's trained action domain; actual arm position
+    # and velocity remain available in their dedicated observation terms.
+    self._executed_teacher_equivalent_action[:] = (
+      (self._body_targets - self.teacher.default_joint_positions)
+      / self.teacher.action_scale
+    ).clamp(-1.0, 1.0)
 
   def apply_actions(self) -> None:
     self._entity.set_joint_position_target(self._body_targets, joint_ids=self._body_ids)
@@ -1377,8 +1758,10 @@ class WorkyardResidualAction(base.WorkyardAction):
     self._raw_action[env_ids] = 0.0
     self.coordination[env_ids] = 0.0
     self._teacher_action[env_ids] = 0.0
+    self._executed_teacher_equivalent_action[env_ids] = 0.0
     self._teacher_body_targets[env_ids] = self.teacher.default_joint_positions
     self._body_targets[env_ids] = self.teacher.default_joint_positions
+    self._balance_residual[env_ids] = 0.0
     self._upper_body_residual[env_ids] = 0.0
     self._reach_teacher_action[env_ids] = 0.0
     self.reach_teacher.reset(env_ids)
@@ -1543,6 +1926,10 @@ def upper_body_residual_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
   return _residual_action(env).upper_body_residual.square().mean(dim=-1)
 
 
+def balance_residual_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
+  return _residual_action(env).balance_residual.square().mean(dim=-1)
+
+
 class WristDistanceProgress:
   """Signed one-step reach progress with reset-safe state."""
 
@@ -1569,7 +1956,10 @@ class WristDistanceProgress:
 
 def reach_teacher_action_tracking(env: ManagerBasedRlEnv) -> torch.Tensor:
   action = _residual_action(env)
-  error = (action.raw_action - action.reach_teacher_action).square().mean(dim=-1)
+  error = (
+    action.raw_action[:, UPPER_BODY_SLICE]
+    - action.reach_teacher_action[:, UPPER_BODY_SLICE]
+  ).square().mean(dim=-1)
   return torch.exp(-error / (0.35 ** 2))
 
 
@@ -1587,21 +1977,25 @@ def make_workyard_residual_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.scene.sensors = (*cfg.scene.sensors, *_reach_contact_diagnostic_sensors())
   robot_cfg = cfg.scene.entities["robot"]
   robot_cfg.spec_fn = _load_hybrid_actuated_g1_spec
-  # A reach Skill begins after the Harness navigation/stance solver has placed
-  # the robot inside the target's manipulation workspace.  Training the frozen
-  # upper body from the mission origin would ask it to compensate for missing
-  # locomotion and makes the low workbench target kinematically unreasonable.
-  # x=0.63 leaves 0.17 m to the nominal object.  Combined with the shoulder-ray
-  # pre-grasp shell, an exact MuJoCo kinematic grid over the full +/-5 cm object
-  # jitter reaches 16/18 cases without widening the 14D authority.  x=0.30 was
-  # measured to be unreachable by the 0.37 m arm chain.
+  # A reach Skill begins at one complete reachable base placement selected by
+  # the Harness. WorkyardResidualCommand samples the object-relative root
+  # translation, active hand, and yaw as one correlated reset tuple.
   robot_cfg.init_state.pos = RESIDUAL_ENTRY_ROOT_POSITION
   cfg.scene.num_envs = 1 if play else 2048
   cfg.episode_length_s = 12.0
   cfg.actions = {
     "workyard": WorkyardResidualActionCfg(
       entity_name="robot",
-      upper_body_scale=0.5,
+      balance_scale=0.12,
+      upper_body_scale=0.7,
+    )
+  }
+  cfg.commands = {
+    "workyard": WorkyardResidualCommandCfg(
+      resampling_time_range=(20.0, 20.0),
+      debug_vis=False,
+      object_position_jitter_m=0.05,
+      target_position_jitter_m=0.0,
     )
   }
   cfg.observations = {
@@ -1623,8 +2017,6 @@ def make_workyard_residual_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       enable_corruption=False,
     ),
   }
-  cfg.commands["workyard"].object_position_jitter_m = 0.05
-  cfg.commands["workyard"].target_position_jitter_m = 0.0
   cfg.rewards = {
     "upright_support": RewardTermCfg(func=base.upright_support, weight=1.0),
     "teacher_lower_body_tracking": RewardTermCfg(
@@ -1640,6 +2032,7 @@ def make_workyard_residual_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       func=reach_teacher_action_tracking, weight=0.30
     ),
     "dynamic_com_support": RewardTermCfg(func=dynamic_com_support, weight=1.0),
+    "balance_residual_l2": RewardTermCfg(func=balance_residual_l2, weight=-0.01),
     "upper_body_residual_l2": RewardTermCfg(func=upper_body_residual_l2, weight=-0.02),
     "action_rate": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.02),
     "joint_limit_proximity": RewardTermCfg(

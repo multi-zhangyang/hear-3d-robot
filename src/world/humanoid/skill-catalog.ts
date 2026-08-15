@@ -115,6 +115,13 @@ function catalogEntry(
   const learnedPolicyMissingCapabilities = learnedPolicyRequiredCapabilities.filter(
     (capability) => !availableCapabilities.has(capability)
   );
+  if (learnedPolicyMissingCapabilities.length > 0) {
+    reasons.push(
+      `installed controller lacks trained capabilities: ${
+        learnedPolicyMissingCapabilities.join(", ")
+      }`
+    );
+  }
   return {
     ...contract,
     observable_target_ids: observable,

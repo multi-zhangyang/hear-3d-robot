@@ -6,6 +6,11 @@
   gap: 14px;
 }
 
+.trail-toolbar {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .trail-hero > div:first-child > span,
 .final-story-card > span {
   color: #73dbae;

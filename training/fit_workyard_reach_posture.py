@@ -24,20 +24,15 @@ ARM_JOINT_NAMES = (
   base.BODY_JOINT_NAMES[15:22],
   base.BODY_JOINT_NAMES[22:29],
 )
-SHOULDER_BODY_NAMES = ("left_shoulder_pitch_link", "right_shoulder_pitch_link")
 WRIST_BODY_NAMES = ("left_wrist_yaw_link", "right_wrist_yaw_link")
-ROOT_POSITION_WORLD = np.asarray(residual.RESIDUAL_ENTRY_ROOT_POSITION, dtype=np.float64)
 ROD_CENTER_WORLD = np.asarray(base.ROD_START_POSITION, dtype=np.float64)
 NEUTRAL = np.asarray(base.BODY_DEFAULT_POSITIONS[15:], dtype=np.float64).reshape(2, 7)
-AUTHORITY_RAD = 0.5
+AUTHORITY_RAD = 0.7
 
 
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser()
-  parser.add_argument("--fit-grid", type=int, default=5)
-  parser.add_argument("--validation-grid", type=int, default=17)
-  parser.add_argument("--command-jitter-m", type=float, default=0.08)
-  parser.add_argument("--lateral-clearance-m", type=float, default=0.08)
+  parser.add_argument("--feature-scale-m", type=float, default=0.16)
   parser.add_argument("--collision-clearance-m", type=float, default=0.005)
   parser.add_argument("--maximum-iterations", type=int, default=180)
   parser.add_argument(
@@ -46,10 +41,8 @@ def parse_args() -> argparse.Namespace:
     default=Path("artifacts/training/workyard-residual-teacher/collision-aware-fit-v1.json"),
   )
   args = parser.parse_args()
-  if args.fit_grid < 3 or args.validation_grid < 3:
-    parser.error("fit and validation grids must contain at least three points")
-  if not 0.0 < args.lateral_clearance_m <= 0.15:
-    parser.error("lateral clearance must be inside (0, 0.15]")
+  if not 0.05 <= args.feature_scale_m <= 0.5:
+    parser.error("feature scale must be inside [0.05, 0.5]")
   return args
 
 
@@ -76,7 +69,7 @@ def initialize_model() -> tuple[mujoco.MjModel, mujoco.MjData]:
   if free_joints.size != 1:
     raise ValueError(f"Expected one G1 free joint, found {free_joints.size}")
   root_adr = int(model.jnt_qposadr[int(free_joints[0])])
-  data.qpos[root_adr : root_adr + 3] = ROOT_POSITION_WORLD
+  data.qpos[root_adr : root_adr + 3] = residual.RESIDUAL_ENTRY_ROOT_POSITION
   data.qpos[root_adr + 3 : root_adr + 7] = (1.0, 0.0, 0.0, 0.0)
 
   for joint_name, value in zip(
@@ -155,20 +148,41 @@ def rearmatch(name: str, side: str) -> bool:
   )) and name.endswith("_link")
 
 
-def target_world(
-  shoulder_world: np.ndarray,
+def geometry_top_sample(
+  model: mujoco.MjModel,
+  data: mujoco.MjData,
   arm: int,
-  dx: float,
-  dy: float,
-  lateral_clearance_m: float,
-) -> np.ndarray:
-  rod = ROD_CENTER_WORLD + np.asarray((dx, dy, 0.0), dtype=np.float64)
-  ray = shoulder_world - rod
-  ray /= max(float(np.linalg.norm(ray)), 1e-9)
-  offset = base.PREGRASP_SHELL_RADIUS_M * ray
-  side = 1.0 if arm == 0 else -1.0
-  offset[1] = side * max(abs(float(offset[1])), lateral_clearance_m)
-  return rod + offset
+  forward_offset_m: float,
+  lateral_magnitude_m: float,
+  yaw_magnitude_rad: float,
+) -> tuple[np.ndarray, np.ndarray]:
+  """Set one production-correlated base placement and return world/pelvis target."""
+
+  side = -1.0 if arm == 0 else 1.0
+  yaw = side * yaw_magnitude_rad
+  root = np.asarray((
+    ROD_CENTER_WORLD[0] - forward_offset_m,
+    ROD_CENTER_WORLD[1] + side * lateral_magnitude_m,
+    residual.RESIDUAL_ENTRY_ROOT_POSITION[2],
+  ), dtype=np.float64)
+  free_joints = np.flatnonzero(model.jnt_type == mujoco.mjtJoint.mjJNT_FREE)
+  root_adr = int(model.jnt_qposadr[int(free_joints[0])])
+  data.qpos[root_adr : root_adr + 3] = root
+  data.qpos[root_adr + 3 : root_adr + 7] = (
+    math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)
+  )
+  target = ROD_CENTER_WORLD + np.asarray(
+    residual.RUNTIME_GEOMETRY_TOP_WRIST_OFFSET_M[arm], dtype=np.float64
+  )
+  delta = target - root
+  cosine = math.cos(yaw)
+  sine = math.sin(yaw)
+  target_pelvis = np.asarray((
+    cosine * delta[0] + sine * delta[1],
+    -sine * delta[0] + cosine * delta[1],
+    delta[2],
+  ), dtype=np.float64)
+  return target, target_pelvis
 
 
 class ArmProblem:
@@ -268,24 +282,18 @@ def features(targets_xy: np.ndarray, center: np.ndarray, scale: float) -> np.nda
 
 def fit(args: argparse.Namespace) -> dict[str, object]:
   model, data = initialize_model()
-  shoulder_ids = [
-    name_id(model, mujoco.mjtObj.mjOBJ_BODY, name) for name in SHOULDER_BODY_NAMES
-  ]
-  shoulder_world = data.xpos[shoulder_ids].copy()
-  fit_x_axis = np.linspace(
-    -args.command_jitter_m, args.command_jitter_m, args.fit_grid
-  )
-  validation_x_axis = np.linspace(
-    -args.command_jitter_m, args.command_jitter_m, args.validation_grid
+  placements = np.asarray(
+    residual.REACH_ENTRY_OBJECT_RELATIVE_PLACEMENTS, dtype=np.float64
   )
   output: dict[str, object] = {
-    "protocol": "hear-collision-aware-reach-posture-fit-v1",
-    "target_protocol": "shoulder-ray-side-clearance-pregrasp-v1",
-    "command_jitter_m": args.command_jitter_m,
-    "lateral_clearance_m": args.lateral_clearance_m,
+    "protocol": "hear-collision-aware-reach-posture-fit-v2",
+    "target_protocol": residual.RUNTIME_GEOMETRY_TOP_TARGET_PROTOCOL,
+    "entry_correlation_protocol": residual.REACH_ENTRY_CORRELATION_PROTOCOL,
+    "object_relative_placement_catalog": placements.tolist(),
     "collision_clearance_m": args.collision_clearance_m,
-    "active_hand_allocation": "nearest_lateral_hand_centerline_balanced",
-    "feature_scale_m": args.command_jitter_m,
+    "active_hand_allocation": "hand_signed_root_placement",
+    "authority_rad": AUTHORITY_RAD,
+    "feature_scale_m": args.feature_scale_m,
     "feature_order": ["bias", "x", "y", "x2", "xy", "y2"],
     "arms": [],
   }
@@ -300,39 +308,31 @@ def fit(args: argparse.Namespace) -> dict[str, object]:
     training_solutions = []
     fit_samples = []
     previous = NEUTRAL[arm].copy()
-    fit_y_axis = np.linspace(
-      0.0 if arm == 0 else -args.command_jitter_m,
-      args.command_jitter_m if arm == 0 else 0.0,
-      args.fit_grid,
-    )
-    validation_y_axis = np.linspace(
-      0.0 if arm == 0 else -args.command_jitter_m,
-      args.command_jitter_m if arm == 0 else 0.0,
-      args.validation_grid,
-    )
-    for dx in fit_x_axis:
-      for dy in fit_y_axis:
-        target = target_world(
-          shoulder_world[arm], arm, float(dx), float(dy), args.lateral_clearance_m
-        )
-        seed = previous.copy()
-        result = problem.solve(
-          target,
-          (seed, NEUTRAL[arm].copy()),
-          args.maximum_iterations,
-        )
-        previous = result["q"].copy()
-        training_targets.append(target - ROOT_POSITION_WORLD)
-        training_solutions.append(result["q"])
-        fit_samples.append({
-          "dx": float(dx),
-          "dy": float(dy),
-          "target_pelvis": (target - ROOT_POSITION_WORLD).tolist(),
-          "wrist_error_m": result["wrist_error_m"],
-          "minimum_clearance_m": result["minimum_clearance_m"],
-          "optimizer_success": result["optimizer_success"],
-          "optimizer_message": result["optimizer_message"],
-        })
+    for forward, lateral, yaw in placements:
+      target, target_pelvis = geometry_top_sample(
+        model, data, arm, float(forward), float(lateral), float(yaw)
+      )
+      result = problem.solve(
+        target,
+        (previous.copy(), NEUTRAL[arm].copy()),
+        args.maximum_iterations,
+      )
+      previous = result["q"].copy()
+      training_targets.append(target_pelvis)
+      training_solutions.append(result["q"])
+      fit_samples.append({
+        "object_forward_offset_m": float(forward),
+        "object_lateral_magnitude_m": float(lateral),
+        "yaw_magnitude_rad": float(yaw),
+        "target_pelvis": target_pelvis.tolist(),
+        "normalized_action": (
+          (result["q"] - NEUTRAL[arm]) / AUTHORITY_RAD
+        ).tolist(),
+        "wrist_error_m": result["wrist_error_m"],
+        "minimum_clearance_m": result["minimum_clearance_m"],
+        "optimizer_success": result["optimizer_success"],
+        "optimizer_message": result["optimizer_message"],
+      })
 
     training_targets_array = np.asarray(training_targets)
     training_actions = (
@@ -340,27 +340,28 @@ def fit(args: argparse.Namespace) -> dict[str, object]:
     ) / AUTHORITY_RAD
     center = training_targets_array[:, :2].mean(axis=0)
     design = features(
-      training_targets_array[:, :2], center, args.command_jitter_m
+      training_targets_array[:, :2], center, args.feature_scale_m
     )
     coefficients = np.linalg.lstsq(design, training_actions, rcond=None)[0].T
 
     validation = []
-    for dx in validation_x_axis:
-      for dy in validation_y_axis:
-        target = target_world(
-          shoulder_world[arm], arm, float(dx), float(dy), args.lateral_clearance_m
-        )
-        predicted_action = coefficients @ features(
-          (target - ROOT_POSITION_WORLD)[None, :2], center, args.command_jitter_m
-        )[0]
-        predicted_action = np.clip(predicted_action, -1.0, 1.0)
-        q = NEUTRAL[arm] + predicted_action * AUTHORITY_RAD
-        problem.set_q(q)
-        validation.append({
-          "wrist_error_m": float(np.linalg.norm(problem.wrist() - target)),
-          "minimum_clearance_m": problem.minimum_clearance(),
-          "action_clamped": bool(np.any(np.abs(predicted_action) >= 1.0 - 1e-9)),
-        })
+    for forward, lateral, yaw in placements:
+      target, target_pelvis = geometry_top_sample(
+        model, data, arm, float(forward), float(lateral), float(yaw)
+      )
+      predicted_action = coefficients @ features(
+        target_pelvis[None, :2], center, args.feature_scale_m
+      )[0]
+      predicted_action = np.clip(predicted_action, -1.0, 1.0)
+      q = NEUTRAL[arm] + predicted_action * AUTHORITY_RAD
+      problem.set_q(q)
+      validation.append({
+        "wrist_error_m": float(np.linalg.norm(problem.wrist() - target)),
+        "minimum_clearance_m": problem.minimum_clearance(),
+        "action_clamped": bool(
+          np.any(np.abs(predicted_action) >= 1.0 - 1e-9)
+        ),
+      })
 
     errors = np.asarray([sample["wrist_error_m"] for sample in validation])
     clearances = np.asarray([sample["minimum_clearance_m"] for sample in validation])

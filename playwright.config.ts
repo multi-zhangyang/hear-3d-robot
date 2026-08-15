@@ -3,6 +3,7 @@ import { E2E_RUNS_DIR } from "./tests/browser/e2e-runs.js";
 
 const port = Number(process.env.HEAR_E2E_PORT ?? 8877);
 const operatorPassword = process.env.HEAR_E2E_PASSWORD ?? "hear-e2e-local";
+const browserExecutable = process.env.HEAR_E2E_BROWSER_PATH?.trim();
 const ciBrowserArgs = process.env.CI
   ? ["--use-gl=angle", "--use-angle=swiftshader"]
   : [];
@@ -21,7 +22,8 @@ export default defineConfig({
     trace: "retain-on-failure",
     video: "retain-on-failure",
     launchOptions: {
-      args: ciBrowserArgs
+      args: ciBrowserArgs,
+      ...(browserExecutable ? { executablePath: browserExecutable } : {})
     }
   },
   projects: [

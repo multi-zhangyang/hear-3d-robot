@@ -7,7 +7,13 @@ import {
   NeuralRolloutExecutionAdmissionSchema,
   type ActionExecutionLedgerEntry
 } from "../../domain/action-execution-ledger.js";
-import { consumeNeuralRolloutCertificate } from
+import {
+  beginNeuralReflexArc,
+  completeNeuralReflexArc,
+  consumeNeuralRolloutCertificate,
+  neuralReflexArcSummary,
+  recordNeuralSafetyInterrupt
+} from
   "../../domain/neural-hierarchy.js";
 import type { PendingActionCommit } from "../../domain/action-commit-outbox.js";
 import {
@@ -40,6 +46,7 @@ import type {
   HumanoidPhysicalExecutionIntent
 } from "./runtime.js";
 import { groundHumanoidPhysicalExecution } from "./dispatch-grounding.js";
+import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 
 // Every terminal physical cut is persisted independently of this interval.
 // Periodic cuts only bound crash recovery loss, so checkpoint once per second
@@ -142,7 +149,7 @@ export class HumanoidPhysicalExecutionRuntime {
   ): Promise<HumanoidGroundingReceipt | undefined> {
     if (!intent.decision || !intent.toolAuthority) {
       throw new Error(
-        `Physical execution has no durable Coordinator delegation: ${intent.transactionId}`
+        `Physical execution has no durable Action Selection admission: ${intent.transactionId}`
       );
     }
     const toolCallAuthority = ExecutionGateToolCallAuthoritySchema.parse(
@@ -169,6 +176,17 @@ export class HumanoidPhysicalExecutionRuntime {
       const cut = await this.#capturePhysicalCut();
       this.#applyPhysicalCut(cut);
       this.#assertExecutionIntent(existing, intent);
+      const existingCertificate = existing.admission.neural_rollout_certificate;
+      if (existingCertificate) {
+        checkpoint.neural_hierarchy_state = beginNeuralReflexArc(
+          checkpoint.neural_hierarchy_state,
+          {
+            executionTransactionId: existing.transaction_id,
+            commitmentId: existingCertificate.commitment_id,
+            simulatedTimeSeconds: cut.world.robot.simulatedTime
+          }
+        );
+      }
       if (existing.status !== "terminal") {
         this.#synchronizeExecutionProgress(existing, cut);
       }
@@ -188,6 +206,9 @@ export class HumanoidPhysicalExecutionRuntime {
       intent,
       observation,
       authorityStateSha256: cut.authority.stateSha256,
+      recoveryInterrupts: Object.values(
+        checkpoint.neural_hierarchy_state.safety_interrupts
+      ),
       ...(activeGoal ? { activeGoal } : {})
     });
     if (!grounding.accepted) return grounding;
@@ -219,14 +240,21 @@ export class HumanoidPhysicalExecutionRuntime {
       }
     );
     const nextNeuralState = neuralRolloutCertificate
-      ? consumeNeuralRolloutCertificate(checkpoint.neural_hierarchy_state, {
-          certificateId: neuralRolloutCertificate.certificate_id,
-          commitmentId: neuralRolloutCertificate.commitment_id,
-          planningTransactionId: neuralRolloutCertificate.planning_transaction_id,
-          planningAction: neuralRolloutCertificate.planning_action,
-          executionTransactionId: intent.transactionId,
-          worldRevision: cut.world.worldRevision
-        }).state
+      ? beginNeuralReflexArc(
+          consumeNeuralRolloutCertificate(checkpoint.neural_hierarchy_state, {
+            certificateId: neuralRolloutCertificate.certificate_id,
+            commitmentId: neuralRolloutCertificate.commitment_id,
+            planningTransactionId: neuralRolloutCertificate.planning_transaction_id,
+            planningAction: neuralRolloutCertificate.planning_action,
+            executionTransactionId: intent.transactionId,
+            worldRevision: cut.world.worldRevision
+          }).state,
+          {
+            executionTransactionId: intent.transactionId,
+            commitmentId: neuralRolloutCertificate.commitment_id,
+            simulatedTimeSeconds: cut.world.robot.simulatedTime
+          }
+        )
       : checkpoint.neural_hierarchy_state;
     // One checkpoint cut is the physical admission boundary: the ledger and
     // one-shot neural certificate can never be durably advanced separately.
@@ -264,6 +292,7 @@ export class HumanoidPhysicalExecutionRuntime {
       );
     }
     await this.synchronizeProgress(receipt.transactionId);
+    this.#recordFallenExecutionInterrupt(receipt);
     const current = checkpoint.action_execution_ledger.active[receipt.transactionId]!;
     const frameCount = current.progress.committed_frame_count;
     const detail = object(receipt.detail);
@@ -283,6 +312,21 @@ export class HumanoidPhysicalExecutionRuntime {
         current.progress.completed_plan_terminals
       );
     }
+    if (current.admission.neural_rollout_certificate) {
+      checkpoint.neural_hierarchy_state = completeNeuralReflexArc(
+        checkpoint.neural_hierarchy_state,
+        {
+          executionTransactionId: receipt.transactionId,
+          status: neuralReflexTerminalStatus(receipt),
+          terminalCode: receipt.code,
+          simulatedTimeSeconds: checkpoint.world.robot.simulatedTime,
+          at: receipt.committedAt
+        }
+      );
+      detail.reflex_arc = neuralReflexArcSummary(
+        checkpoint.neural_hierarchy_state.reflex_arc
+      );
+    }
     return {
       ...receipt,
       worldBeforeRevision: current.admission.world_revision,
@@ -290,6 +334,42 @@ export class HumanoidPhysicalExecutionRuntime {
       frameCount,
       detail
     };
+  }
+
+  #recordFallenExecutionInterrupt(receipt: HumanoidActionReceipt): void {
+    const checkpoint = this.#checkpoint();
+    if (!checkpoint.world.robot.fallen) return;
+    const alreadyRecorded = Object.values(
+      checkpoint.neural_hierarchy_state.safety_interrupts
+    ).some((interrupt) => (
+      interrupt.kind === "stationary_fall"
+      && interrupt.status !== "resolved"
+    ));
+    if (alreadyRecorded) return;
+    const commitment = checkpoint.neural_hierarchy_state.active_skill_commitment;
+    const recorded = recordNeuralSafetyInterrupt(
+      checkpoint.neural_hierarchy_state,
+      {
+        kind: "stationary_fall",
+        sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.body,
+        relayNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
+        targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+        worldFrame: checkpoint.world.frame,
+        worldRevision: checkpoint.world.worldRevision,
+        commitmentId: commitment
+          && !["completed", "failed", "released"].includes(commitment.state)
+          ? commitment.commitment_id
+          : null,
+        detail: json({
+          reason: "robot_fallen_during_physical_execution",
+          execution_transaction_id: receipt.transactionId,
+          terminal_code: receipt.code,
+          root_position: checkpoint.world.robot.rootPosition,
+          balance: checkpoint.world.robot.balance
+        })
+      }
+    );
+    checkpoint.neural_hierarchy_state = recorded.state;
   }
 
   async synchronizeProgress(transactionId: string): Promise<void> {
@@ -807,6 +887,20 @@ function physicalPlanTerminals(
     unique.set(key, terminal);
   }
   return [...unique.values()];
+}
+
+function neuralReflexTerminalStatus(
+  receipt: HumanoidActionReceipt
+): "succeeded" | "failed" | "interrupted" {
+  if (/interrupt|cancel|abort/i.test(receipt.code)) return "interrupted";
+  return receipt.accepted && (
+    receipt.code === "motion_completed"
+      || receipt.code === "navigation_completed"
+      || receipt.code === "motion_option_succeeded"
+      || receipt.code === "recovery_completed"
+  )
+    ? "succeeded"
+    : "failed";
 }
 
 function unknownRecord(value: unknown): Record<string, unknown> {

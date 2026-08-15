@@ -26,7 +26,7 @@ import {
   type HumanoidNeuralNodeDescriptor
 } from "./humanoid/neural-hierarchy-contract.js";
 
-const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 36;
+const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 41;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
@@ -37,6 +37,33 @@ const PROTOCOL_ADAPTER_PACKAGE = {
   openai_responses: "@ai-sdk/openai",
   anthropic_messages: "@ai-sdk/anthropic"
 } as const satisfies Record<ModelProviderConfig["protocol"], string>;
+
+/**
+ * Stateful domain tools are exclusive neural capabilities. Child delegation
+ * ownership is derived from the structural tree below; this table covers the
+ * non-child tools whose accidental reuse would create a hidden flat control
+ * plane around that tree.
+ */
+const EXCLUSIVE_NEURAL_TOOL_OWNER = {
+  recall_goal_history: HUMANOID_NEURAL_AGENT_IDS.goalManager,
+  submit_goal_candidates: HUMANOID_NEURAL_AGENT_IDS.goalManager,
+  select_goal_candidate: HUMANOID_NEURAL_AGENT_IDS.goalManager,
+  retire_goal_epoch: HUMANOID_NEURAL_AGENT_IDS.goalManager,
+  continue_goal_epoch: HUMANOID_NEURAL_AGENT_IDS.goalManager,
+  retrieve_relevant_embodied_memory: HUMANOID_NEURAL_AGENT_IDS.memoryRetriever,
+  establish_skill_commitment: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+  authorize_skill_execution: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+  complete_skill_commitment: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+  fail_skill_commitment: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+  release_skill_commitment: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+  submit_humanoid_skill_plan: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+  begin_humanoid_skill: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+  plan_humanoid_skill: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+  plan_whole_body_motion_candidates: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+  plan_humanoid_navigation: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+  complete_neural_autonomous_cycle: HUMANOID_NEURAL_AGENT_IDS.executive,
+  complete_neural_satisfied_goal: HUMANOID_NEURAL_AGENT_IDS.executive
+} as const satisfies Readonly<Record<string, string>>;
 
 export interface NeuralRuntimeService {
   id: string;
@@ -245,15 +272,35 @@ function assertRuntimeHierarchyMatchesContract(
     humanoidNeuralAgentToolName(descriptor.key),
     HUMANOID_NEURAL_AGENT_IDS[descriptor.parentKey!]
   ] as const));
+  const exclusiveToolOwnerByName = new Map<string, string>([
+    ...controlToolOwnerByName,
+    ...Object.entries(EXCLUSIVE_NEURAL_TOOL_OWNER)
+  ]);
+  const exclusiveToolCounts = new Map<string, number>();
   for (const [agentId, agent] of hierarchy.agents) {
     for (const candidate of agent.tools) {
       if (candidate.type !== "function") continue;
-      const expectedOwner = controlToolOwnerByName.get(candidate.name);
+      const expectedOwner = exclusiveToolOwnerByName.get(candidate.name);
       if (expectedOwner !== undefined && expectedOwner !== agentId) {
         throw new Error(
-          `Neural child control tool crossed its structural parent: ${candidate.name} on ${agentId}`
+          `Exclusive neural tool crossed its ownership boundary: ${candidate.name} on ${agentId}`
         );
       }
+      if (expectedOwner !== undefined) {
+        exclusiveToolCounts.set(
+          candidate.name,
+          (exclusiveToolCounts.get(candidate.name) ?? 0) + 1
+        );
+      }
+    }
+  }
+  for (const [toolName, expectedOwner] of Object.entries(
+    EXCLUSIVE_NEURAL_TOOL_OWNER
+  )) {
+    if (exclusiveToolCounts.get(toolName) !== 1) {
+      throw new Error(
+        `Exclusive neural tool ${toolName} must exist exactly once on ${expectedOwner}`
+      );
     }
   }
   for (const descriptor of exposedControlChildren) {

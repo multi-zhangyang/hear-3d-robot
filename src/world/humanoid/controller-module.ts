@@ -14,8 +14,8 @@ import {
 } from "./whole-body-controller.js";
 
 export const HUMANOID_CONTROLLER_MODULE_ENV = "HEAR_HUMANOID_CONTROLLER_MODULE";
-const BUNDLED_MJLAB_G1_CONTROLLER_SOURCE =
-  "hear-bundled-mjlab-g1-velocity-controller-v1";
+const BUNDLED_WORKYARD_CONTROLLER_SOURCE =
+  "hear-bundled-workyard-whole-body-contact-controller-v3";
 const HUMANOID_CONTROLLER_MODULE_FACTORY =
   "createHumanoidWholeBodyController";
 const HUMANOID_CONTROLLER_MODULE_ASSETS = "humanoidControllerAssets";
@@ -51,15 +51,15 @@ export async function loadConfiguredHumanoidControllerSource(
   baseDirectory = process.cwd()
 ): Promise<HumanoidControllerSource> {
   const specifier = environment[HUMANOID_CONTROLLER_MODULE_ENV]?.trim();
-  if (!specifier) return loadBundledMjlabG1ControllerSource(environment);
+  if (!specifier) return loadBundledWorkyardControllerSource(environment);
   return loadHumanoidControllerSource(specifier, baseDirectory);
 }
 
-async function loadBundledMjlabG1ControllerSource(
+async function loadBundledWorkyardControllerSource(
   environment: NodeJS.ProcessEnv
 ): Promise<HumanoidControllerSource> {
   const namespace: unknown = await import(
-    "../../controllers/mjlab-g1-velocity-module.js"
+    "../../controllers/workyard-contact-module.js"
   );
   const assets = await loadControllerAssets(
     namespace,
@@ -69,7 +69,7 @@ async function loadBundledMjlabG1ControllerSource(
   return createControllerSource(
     namespace,
     controllerSourceSha256(
-      sha256(BUNDLED_MJLAB_G1_CONTROLLER_SOURCE),
+      sha256(BUNDLED_WORKYARD_CONTROLLER_SOURCE),
       assets
     ),
     assets

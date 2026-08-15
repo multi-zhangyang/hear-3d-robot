@@ -23,6 +23,9 @@ export class HumanoidPhysicsClock {
   readonly #world: ContinuousWorld;
   readonly #frameSink: HumanoidFrameSink;
   readonly #onError: (error: unknown) => void | Promise<void>;
+  readonly #onSafetyEvent: (
+    error: HumanoidStationarySafetyError
+  ) => void | Promise<void>;
   readonly #intervalMilliseconds: number;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #inFlight: Promise<void> | undefined;
@@ -33,10 +36,14 @@ export class HumanoidPhysicsClock {
     world: ContinuousWorld;
     frameSink: HumanoidFrameSink;
     onError: (error: unknown) => void | Promise<void>;
+    onSafetyEvent?: (
+      error: HumanoidStationarySafetyError
+    ) => void | Promise<void>;
   }) {
     this.#world = input.world;
     this.#frameSink = input.frameSink;
     this.#onError = input.onError;
+    this.#onSafetyEvent = input.onSafetyEvent ?? input.onError;
     const controlStepSeconds = input.world.snapshot().robot.controller.controlStepSeconds;
     if (!Number.isFinite(controlStepSeconds) || controlStepSeconds <= 0) {
       throw new Error("Humanoid continuous physics requires a positive control step");
@@ -91,22 +98,38 @@ export class HumanoidPhysicsClock {
     const startedAt = performance.now();
     try {
       const snapshot = await this.#world.advanceStationary(this.#frameSink);
-      if (snapshot?.robot.fallen) throw new HumanoidStationarySafetyError(snapshot);
-    } catch (error) {
-      this.#failure = error;
-      this.#running = false;
-      try {
-        await this.#onError(error);
-      } catch (reportingError) {
-        this.#failure = new AggregateError(
-          [error, reportingError],
-          "Humanoid continuous physics failed and its failure could not be recorded"
-        );
+      if (snapshot?.robot.fallen) {
+        this.#running = false;
+        const safetyError = new HumanoidStationarySafetyError(snapshot);
+        try {
+          await this.#onSafetyEvent(safetyError);
+        } catch (reportingError) {
+          await this.#stopWithFailure(new AggregateError(
+            [safetyError, reportingError],
+            "Humanoid stationary safety interruption could not be routed"
+          ));
+        }
+        return;
       }
+    } catch (error) {
+      await this.#stopWithFailure(error);
       return;
     }
     if (!this.#running) return;
     const elapsed = performance.now() - startedAt;
     this.#schedule(Math.max(0, this.#intervalMilliseconds - elapsed));
+  }
+
+  async #stopWithFailure(error: unknown): Promise<void> {
+    this.#failure = error;
+    this.#running = false;
+    try {
+      await this.#onError(error);
+    } catch (reportingError) {
+      this.#failure = new AggregateError(
+        [error, reportingError],
+        "Humanoid continuous physics failed and its failure could not be recorded"
+      );
+    }
   }
 }

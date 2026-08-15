@@ -35,12 +35,12 @@ const ActionTermSchema = SizedTermSchema.extend({
 }).strict();
 
 const WorkyardResidualTrainingContractSchema = z.object({
-  protocol: z.literal("hear-workyard-residual-training-contract-v4"),
+  protocol: z.literal("hear-workyard-whole-body-reach-training-contract-v5"),
   scenario_id: z.literal("humanoid_workyard"),
   environment: z.object({
     framework: z.literal("mjlab"),
     task_id: z.literal(
-      "Hear-Workyard-Frozen-Locomotion-Upper-Body-Residual-G1-v4"
+      "Hear-Workyard-Whole-Body-Reach-G1-v5"
     ),
     module: z.literal("training/workyard_residual_mjlab_env.py"),
     implementation_status: z.enum(["contract_only", "implemented"])
@@ -75,14 +75,17 @@ const WorkyardResidualTrainingContractSchema = z.object({
     }).strict(),
     actuation: z.object({
       protocol: z.literal(
-        "hear-frozen-locomotion-residual-task-tracking-actuation-v1"
+        "hear-whole-body-reach-residual-task-tracking-actuation-v2"
       ),
-      authority: z.literal("partitioned_by_joint_ownership"),
+      authority: z.literal(
+        "bounded_whole_body_student_with_frozen_locomotion_reference"
+      ),
       runtime_body_model: z.literal(
-        "frozen_teacher_aligned_upper_body_harness_task_tracking"
+        "arm_state_conditioned_station_keeping_and_reach"
       ),
       body_joint_count: z.literal(29),
-      frozen_source_joint_count: z.literal(15),
+      locomotion_reference_joint_count: z.literal(15),
+      balance_residual_joint_count: z.literal(15),
       residual_task_tracking_joint_count: z.literal(14),
       frozen_protocol: z.literal("mjlab-unitree-g1-source-actuation-v1"),
       residual_protocol: z.literal("hear-harness-task-tracking-pd-v1"),
@@ -107,11 +110,13 @@ const WorkyardResidualTrainingContractSchema = z.object({
     solver: z.literal(
       "target_conditioned_feasible_posture_servo_with_dls_diagnostics"
     ),
-    target_protocol: z.literal("shoulder-ray-side-clearance-pregrasp-v1"),
+    target_protocol: z.literal(
+      "typescript-pregrasp-geometry-top-wrist-target-v1"
+    ),
     pregrasp_shell_radius_m: z.literal(0.1),
     pregrasp_lateral_clearance_m: z.literal(0.1),
     active_hand_allocation: z.literal(
-      "nearest_lateral_hand_centerline_balanced-v1"
+      "placement_catalog_hand-v1"
     ),
     contact_target_activation: z.literal("contact_authority_only"),
     success_metric: z.literal("active_wrist_to_command_within_tolerance"),
@@ -124,52 +129,40 @@ const WorkyardResidualTrainingContractSchema = z.object({
     singularity_damping: z.literal(0.12),
     singularity_threshold: z.literal(0.05),
     feasible_posture_protocol: z.literal(
-      "offline-collision-aware-side-pregrasp-quadratic-map-v3"
+      "offline-collision-aware-geometry-top-placement-catalog-v1"
     ),
-    feasible_posture_feature_protocol: z.literal(
-      "normalized-target-pelvis-xy-quadratic-v1"
+    feasible_posture_lookup_protocol: z.literal(
+      "active-hand-and-placement-index-v1"
     ),
-    feasible_posture_feature_order: z.tuple([
-      z.literal("bias"),
-      z.literal("x"),
-      z.literal("y"),
-      z.literal("x2"),
-      z.literal("xy"),
-      z.literal("y2")
-    ]),
-    feasible_posture_center_xy_m: z.array(
-      z.array(z.number().finite()).length(2)
-    ).length(2),
-    feasible_posture_feature_scale_m: z.literal(0.08),
-    feasible_posture_feature_clamp: z.literal(1.25),
-    feasible_posture_target_memory: z.literal(
-      "per_environment_episode_initial_typed_target"
-    ),
-    feasible_posture_normalized_action_coefficients: z.array(
-      z.array(z.array(z.number().finite()).length(6)).length(7)
+    feasible_posture_authority_rad: z.literal(0.7),
+    feasible_posture_placement_catalog: z.array(
+      z.array(z.number().finite()).length(3)
+    ).length(7),
+    feasible_posture_normalized_actions: z.array(
+      z.array(z.array(z.number().finite()).length(7)).length(7)
     ).length(2),
     feasible_posture_offline_validation: z.object({
-      command_jitter_m: z.literal(0.08),
-      fit_grid_per_arm: z.literal(25),
-      dense_grid_per_arm: z.literal(289),
+      protocol: z.literal("hear-collision-aware-reach-posture-fit-v2"),
+      sample_count: z.literal(14),
       tolerance_m: z.literal(0.06),
       collision_clearance_m: z.literal(0.005),
-      success_rate: z.literal(0.8875432525951558),
-      kinematic_tolerance_rate: z.literal(1),
-      collision_clear_rate: z.literal(0.8875432525951558),
-      mean_error_m: z.literal(0.008503026325955211),
-      p90_error_m: z.literal(0.018600412903803952),
-      maximum_error_m: z.literal(0.034634432043045935),
-      minimum_clearance_m: z.literal(0)
+      success_rate: z.literal(0.9285714285714286),
+      kinematic_tolerance_rate: z.literal(0.9285714285714286),
+      collision_clear_rate: z.literal(1),
+      mean_error_m: z.literal(0.018788770715006734),
+      p90_error_m: z.literal(0.05136783438503414),
+      maximum_error_m: z.literal(0.06791992759195634),
+      minimum_clearance_m: z.literal(0.03313698178789586)
     }).strict(),
-    posture_attractor_gain: z.literal(1),
-    task_space_feedback_gain: z.literal(0),
+    posture_attractor_gain: z.literal(0.15),
+    task_space_feedback_gain: z.literal(1),
     max_cartesian_step_m: z.literal(0.08),
     max_joint_correction_rad: z.literal(0.2),
     max_solver_target_slew_rad: z.literal(0.03),
     max_command_lead_rad: z.literal(0.16),
     hold_enter_error_m: z.literal(0.05),
     hold_release_error_m: z.literal(0.075),
+    entry_settling_control_steps: z.literal(20),
     supervision: z.literal("online_dagger_and_ppo_rollout_labels_only"),
     actor_observation_exposure: z.literal(false),
     execution_authority: z.literal("none"),
@@ -203,7 +196,9 @@ const WorkyardResidualTrainingContractSchema = z.object({
     optimizer: z.literal("separate_actor_critic_learning_rates"),
     actor_distribution: z.literal("beta_bounded_minus_one_one"),
     teacher_supervision: z.literal("every_stored_learner_rollout_state"),
-    teacher_action_scope: z.literal("authorized_14d_actor_action"),
+    teacher_action_scope: z.literal(
+      "authorized_14d_upper_body_slice_of_29d_actor_action"
+    ),
     loss: z.literal("smooth_l1_plus_excess_std_penalty"),
     loss_coupling: z.literal("same_ppo_minibatch"),
     default_teacher_loss_coefficient: z.literal(1),
@@ -213,65 +208,90 @@ const WorkyardResidualTrainingContractSchema = z.object({
     acceptance_comparison: z.literal("identical_held_out_seed")
   }).strict(),
   student: z.object({
-    phase: z.literal("task_space_reach_dagger_warm_start"),
+    phase: z.literal("whole_body_reach_dagger_warm_start"),
     role: z.literal("autonomous_skill_window_executor"),
     conditioned_by: z.literal("humanoid-embodied-skill-call-v2"),
     entry_state: z.object({
-      protocol: z.literal("hear-workyard-reach-entry-v1"),
-      authority: z.literal("harness_prepositioned_stance"),
-      root_position_world: z.tuple([
-        z.literal(0.63), z.literal(0), z.literal(0.79)
+      protocol: z.literal("hear-workyard-reach-entry-v3"),
+      authority: z.literal("harness_reachable_base_placement"),
+      object_relative_placement_catalog: z.tuple([
+        z.tuple([z.literal(0.34), z.literal(0.06), z.literal(0.45)]),
+        z.tuple([z.literal(0.34), z.literal(0.12), z.literal(0.75)]),
+        z.tuple([z.literal(0.4), z.literal(0.06), z.literal(0.6)]),
+        z.tuple([z.literal(0.4), z.literal(0.12), z.literal(0.9)]),
+        z.tuple([z.literal(0.46), z.literal(0.06), z.literal(0.75)]),
+        z.tuple([z.literal(0.46), z.literal(0.12), z.literal(1.05)]),
+        z.tuple([
+          z.literal(0.405844400461645),
+          z.literal(0.082924357517691),
+          z.literal(0.614)
+        ])
       ]),
+      correlation_protocol: z.literal(
+        "hand-signed-object-relative-root-placement-catalog-v1"
+      ),
+      root_height_m: z.literal(0.79),
       desired_base_twist: z.tuple([
         z.literal(0), z.literal(0), z.literal(0)
       ]),
-      nominal_object_distance_m: z.literal(0.17)
+      measured_deployment_example: z.object({
+        root_forward_m: z.literal(0.394155599538355),
+        root_lateral_m: z.literal(0.082924357517691),
+        root_yaw_rad: z.literal(0.614),
+        object_forward_offset_m: z.literal(0.405844400461645),
+        initial_wrist_error_m: z.literal(0.327)
+      }).strict()
     }).strict(),
-    trainable_joint_names: z.array(z.string().trim().min(1)).length(14),
+    trainable_joint_names: z.array(z.string().trim().min(1)).length(29),
     forbidden_observations: z.array(z.string().trim().min(1)).min(1),
     next_phase: z.object({
       name: z.literal("hand_synergy_contact_grasp"),
-      action_size: z.literal(22),
+      action_size: z.literal(37),
       additional_joint_names: z.array(z.string().trim().min(1)).length(8),
       requires_checkpoint_expansion: z.literal(true),
       activation_gate: z.literal("held_out_reach_and_dynamic_com_acceptance")
     }).strict(),
     later_phase: z.object({
-      name: z.literal("low_amplitude_waist_residual"),
-      action_size: z.literal(25),
-      additional_joint_names: z.array(z.string().trim().min(1)).length(3),
-      requires_checkpoint_expansion: z.literal(true),
+      name: z.literal("contact_conditioned_transport"),
+      action_size: z.literal(37),
+      additional_joint_names: z.array(z.string().trim().min(1)).length(0),
+      requires_checkpoint_expansion: z.literal(false),
       activation_gate: z.literal(
         "held_out_contact_grasp_and_dynamic_com_acceptance"
       )
     }).strict()
   }).strict(),
   composition: z.object({
-    protocol: z.literal("hear-teacher-residual-composition-v1"),
+    protocol: z.literal("hear-whole-body-teacher-residual-composition-v2"),
     teacher_reference: z.literal(
       "default_joint_position_plus_teacher_action_times_teacher_scale"
     ),
-    frozen_joint_command: z.literal("teacher_reference"),
-    trainable_joint_command: z.literal("neutral_joint_position_plus_student_residual"),
+    balance_joint_command: z.literal(
+      "locomotion_reference_plus_bounded_student_residual"
+    ),
+    upper_body_joint_command: z.literal(
+      "neutral_joint_position_plus_student_target"
+    ),
     hand_command: z.literal("fixed_neutral_open_pose"),
     attribution: z.object({
       teacher_action_count: z.literal(29),
-      frozen_teacher_joint_count: z.literal(15),
+      locomotion_reference_joint_count: z.literal(15),
+      balance_residual_joint_count: z.literal(15),
       upper_body_residual_joint_count: z.literal(14),
       hand_synergy_count: z.literal(0),
       segments_reported_separately: z.literal(true)
     }).strict()
   }).strict(),
   observation: z.object({
-    protocol: z.literal("hear-workyard-residual-observation-v4"),
-    size: z.literal(231),
+    protocol: z.literal("hear-workyard-whole-body-reach-observation-v5"),
+    size: z.literal(246),
     history_steps: z.literal(1),
     terms: z.array(SizedTermSchema).min(1)
   }).strict(),
   action: z.object({
-    protocol: z.literal("hear-workyard-upper-body-residual-action-v4"),
-    size: z.literal(14),
-    terms: z.array(ActionTermSchema).length(1)
+    protocol: z.literal("hear-workyard-whole-body-reach-action-v5"),
+    size: z.literal(29),
+    terms: z.array(ActionTermSchema).length(2)
   }).strict(),
   rewards: z.object({
     phase_scope: z.literal("balance_and_reach_only"),
@@ -290,6 +310,26 @@ const WorkyardResidualTrainingContractSchema = z.object({
     excluded_until_later_phase: z.array(z.string().trim().min(1)).min(1)
   }).strict(),
   randomization: z.object({
+    reach_entry_object_relative_placement_catalog: z.tuple([
+      z.tuple([z.literal(0.34), z.literal(0.06), z.literal(0.45)]),
+      z.tuple([z.literal(0.34), z.literal(0.12), z.literal(0.75)]),
+      z.tuple([z.literal(0.4), z.literal(0.06), z.literal(0.6)]),
+      z.tuple([z.literal(0.4), z.literal(0.12), z.literal(0.9)]),
+      z.tuple([z.literal(0.46), z.literal(0.06), z.literal(0.75)]),
+      z.tuple([z.literal(0.46), z.literal(0.12), z.literal(1.05)]),
+      z.tuple([
+        z.literal(0.405844400461645),
+        z.literal(0.082924357517691),
+        z.literal(0.614)
+      ])
+    ]),
+    reach_entry_correlation_protocol: z.literal(
+      "hand-signed-object-relative-root-placement-catalog-v1"
+    ),
+    runtime_geometry_top_wrist_offsets_m: z.tuple([
+      z.tuple([z.literal(-0.02634), z.literal(0), z.literal(0.25899)]),
+      z.tuple([z.literal(0.02634), z.literal(0), z.literal(0.25899)])
+    ]),
     object_position_jitter_m: z.number().finite().nonnegative(),
     target_position_jitter_m: z.number().finite().nonnegative(),
     object_mass_scale: z.tuple([
@@ -317,6 +357,7 @@ const WorkyardResidualTrainingContractSchema = z.object({
     analytic_teacher_preflight_minimum_mean_error_maximum_m: (
       z.number().finite().positive()
     ),
+    deployment_initial_wrist_error_coverage_minimum_m: z.literal(0.35),
     wrist_target_success_rate_minimum: UnitRateSchema,
     fall_rate_maximum: UnitRateSchema,
     teacher_frozen_joint_rms_error_maximum_rad: z.number().finite().positive(),
@@ -346,6 +387,8 @@ const WorkyardResidualTrainingContractSchema = z.object({
   validateDeclaredSize(contract.action, context, ["action"]);
   for (const [name, range] of Object.entries(contract.randomization).filter(
     ([, value]) => Array.isArray(value)
+      && value.length === 2
+      && value.every((entry) => typeof entry === "number")
   ) as Array<[string, readonly [number, number]]>) {
     if (range[1] < range[0]) {
       context.addIssue({
@@ -386,7 +429,7 @@ const ExpectedTeacherObservation = [
 const ExpectedObservation = [
   ["body_joint_position_offset", 29],
   ["body_joint_velocity", 29],
-  ["previous_upper_body_residual", 14],
+  ["previous_whole_body_skill_action", 29],
   ["hand_joint_position_fraction", 14],
   ["hand_joint_velocity", 14],
   ["support_relative_dynamic_com", 4],
@@ -409,6 +452,7 @@ const ExpectedObservation = [
   ["grasp_requirements", 4]
 ] as const;
 const ExpectedAction = [
+  ["balance_joint_position_residual", 15],
   ["upper_body_joint_position_residual", 14]
 ] as const;
 const PhaseOneRewardIds = [
@@ -420,6 +464,7 @@ const PhaseOneRewardIds = [
   "wrist_orientation_tracking",
   "reach_teacher_action_tracking",
   "dynamic_com_support",
+  "balance_residual_l2",
   "upper_body_residual_l2",
   "action_rate",
   "joint_limit_proximity",
@@ -461,7 +506,7 @@ interface TeacherJitIdentity {
 }
 
 export interface WorkyardResidualDryRunReport {
-  protocol: "hear-workyard-residual-training-dry-run-v4";
+  protocol: "hear-workyard-whole-body-reach-training-dry-run-v5";
   contract_sha256: string;
   scenario_id: "humanoid_workyard";
   morphology: {
@@ -491,13 +536,14 @@ export interface WorkyardResidualDryRunReport {
     checkpoint_comparison: "identical_held_out_seed";
   };
   student: {
-    phase: "task_space_reach_dagger_warm_start";
-    observation_size: 231;
-    action_size: 14;
+    phase: "whole_body_reach_dagger_warm_start";
+    observation_size: 246;
+    action_size: 29;
+    balance_residual_count: 15;
     upper_body_residual_count: 14;
     hand_synergy_count: 0;
-    next_phase_action_size: 22;
-    later_phase_action_size: 25;
+    next_phase_action_size: 37;
+    later_phase_action_size: 37;
   };
   contract_ready: true;
   colab_smoke_ready: boolean;
@@ -557,7 +603,7 @@ export function dryRunWorkyardResidualTrainingContract(
   assertExactValues(contract.morphology.body_joint_names, HUMANOID_JOINT_NAMES, "body joints");
   assertExactValues(contract.morphology.hand_joint_names, G1_HAND_JOINT_NAMES, "hand joints");
   assertExactValues(contract.teacher.frozen_joint_names, HUMANOID_JOINT_NAMES.slice(0, 15), "frozen teacher joints");
-  assertExactValues(contract.student.trainable_joint_names, HUMANOID_JOINT_NAMES.slice(15), "trainable upper-body joints");
+  assertExactValues(contract.student.trainable_joint_names, HUMANOID_JOINT_NAMES, "trainable whole-body joints");
   assertExactValues(
     contract.student.next_phase.additional_joint_names,
     PhaseTwoHandSynergies,
@@ -565,8 +611,8 @@ export function dryRunWorkyardResidualTrainingContract(
   );
   assertExactValues(
     contract.student.later_phase.additional_joint_names,
-    HUMANOID_JOINT_NAMES.slice(12, 15),
-    "later-phase waist joints"
+    [],
+    "later-phase additional joints"
   );
   assertLayout(contract.teacher.observation.terms, ExpectedTeacherObservation, "teacher observation");
   assertLayout(contract.observation.terms, ExpectedObservation, "student observation");
@@ -579,7 +625,7 @@ export function dryRunWorkyardResidualTrainingContract(
   const composed = composeWorkyardResidualAction(
     contract,
     neutralTeacherTargets,
-    Array.from({ length: 14 }, () => 0),
+    Array.from({ length: 29 }, () => 0),
     emptyHands()
   );
   if (composed.body_joint_targets.slice(0, 15).some(
@@ -588,7 +634,7 @@ export function dryRunWorkyardResidualTrainingContract(
     (value, index) => value !== YAHMP_POLICY.defaultJointPositions[15 + index]
   )) {
     throw new Error(
-      "A neutral residual action must preserve teacher-owned joints and the upper neutral pose"
+      "A neutral whole-body action must preserve the locomotion reference and upper neutral pose"
     );
   }
 
@@ -599,7 +645,7 @@ export function dryRunWorkyardResidualTrainingContract(
     ...teacherEvidence.blockers
   ];
   return {
-    protocol: "hear-workyard-residual-training-dry-run-v4",
+    protocol: "hear-workyard-whole-body-reach-training-dry-run-v5",
     contract_sha256: sha256(Buffer.from(JSON.stringify(contract))),
     scenario_id: contract.scenario_id,
     morphology: {
@@ -631,12 +677,13 @@ export function dryRunWorkyardResidualTrainingContract(
     },
     student: {
       phase: contract.student.phase,
-      observation_size: 231,
-      action_size: 14,
+      observation_size: 246,
+      action_size: 29,
+      balance_residual_count: 15,
       upper_body_residual_count: 14,
       hand_synergy_count: 0,
-      next_phase_action_size: 22,
-      later_phase_action_size: 25
+      next_phase_action_size: 37,
+      later_phase_action_size: 37
     },
     contract_ready: true,
     colab_smoke_ready: blockers.length === 0,
@@ -651,7 +698,8 @@ export function composeWorkyardResidualAction(
   currentHands: G1HandCoordination
 ): {
   body_joint_targets: number[];
-  frozen_teacher_joint_targets: number[];
+  locomotion_reference_joint_targets: number[];
+  balance_residuals: number[];
   upper_body_residuals: number[];
   hand_coordination: G1HandCoordination;
   hand_joint_targets: ReturnType<typeof createG1HandArtifactCommand>["jointTargets"];
@@ -661,15 +709,19 @@ export function composeWorkyardResidualAction(
   if (teacherBodyTargets.length !== 29 || !teacherBodyTargets.every(Number.isFinite)) {
     throw new Error("Residual composition requires 29 finite teacher targets");
   }
-  if (studentAction.length !== 14 || !studentAction.every(
+  if (studentAction.length !== 29 || !studentAction.every(
     (value) => Number.isFinite(value) && value >= -1 && value <= 1
   )) {
-    throw new Error("Residual student action must contain 14 values inside [-1, 1]");
+    throw new Error("Whole-body student action must contain 29 values inside [-1, 1]");
   }
-  const upperScale = contract.action.terms[0]!.scale;
-  const upper = studentAction.map((value) => value * upperScale);
+  const balanceScale = contract.action.terms[0]!.scale;
+  const upperScale = contract.action.terms[1]!.scale;
+  const balance = studentAction.slice(0, 15).map((value) => value * balanceScale);
+  const upper = studentAction.slice(15).map((value) => value * upperScale);
   const body: number[] = Array.from(YAHMP_POLICY.defaultJointPositions);
-  body.splice(0, 15, ...teacherBodyTargets.slice(0, 15));
+  body.splice(0, 15, ...teacherBodyTargets.slice(0, 15).map(
+    (value, index) => value + balance[index]!
+  ));
   for (const [offset, residual] of upper.entries()) {
     body[15 + offset] = body[15 + offset]! + residual;
   }
@@ -677,7 +729,8 @@ export function composeWorkyardResidualAction(
   const handCoordination = emptyHands();
   return {
     body_joint_targets: body,
-    frozen_teacher_joint_targets: body.slice(0, 15),
+    locomotion_reference_joint_targets: teacherBodyTargets.slice(0, 15),
+    balance_residuals: balance,
     upper_body_residuals: upper,
     hand_coordination: handCoordination,
     hand_joint_targets: createG1HandArtifactCommand(handCoordination).jointTargets

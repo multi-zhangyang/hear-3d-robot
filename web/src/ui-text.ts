@@ -45,6 +45,55 @@ const BODY_CHANNEL: Record<HumanoidBodyChannel, string> = {
 };
 
 const ACTION_LABELS: Record<string, string> = {
+  manage_goal: "维护任务目标",
+  authorize_skill_execution: "授权技能执行",
+  capture_sensor_fusion: "捕获传感融合",
+  complete_neural_autonomous_cycle: "闭合神经自主循环",
+  complete_skill_commitment: "完成技能承诺",
+  delegate_action_selection: "委派动作选择",
+  delegate_affordance_assessment: "委派可供性评估",
+  delegate_goal_valuation: "委派目标估值",
+  delegate_motor_intent: "委派运动意图",
+  delegate_perception_manager: "委派感知联想管理",
+  delegate_predictive_critic: "委派预测评估",
+  delegate_premotor_composition: "委派运动前编排",
+  delegate_relevant_memory: "委派相关记忆检索",
+  delegate_risk_interoception: "委派风险与内感受评估",
+  delegate_scene_interpretation: "委派场景解释",
+  delegate_sensorimotor_manager: "委派感觉运动管理",
+  complete_cycle: "闭合自主循环",
+  manage_goal_epoch: "管理目标阶段",
+  continue_goal_epoch: "延续目标阶段",
+  select_pathway: "选择感觉运动通路",
+  gate_skill_commitment: "签发技能承诺",
+  orchestrate_perception: "编排感知汇合",
+  interpret_scene: "解释场景与空间关系",
+  orchestrate_sensorimotor: "编排感觉运动通路",
+  execute_accepted_plan: "提交已接纳计划",
+  execute_certified_motor_intent: "执行已认证运动意图",
+  establish_skill_commitment: "建立技能承诺",
+  assess_affordances: "评估环境可供性",
+  assess_risk: "评估平衡与接触风险",
+  interpret_rollout: "解释物理预演",
+  estimate_prediction_error: "估计预测误差",
+  compose_skill: "编排短程技能",
+  plan_skill: "编译技能意图",
+  plan_navigation: "求解导航计划",
+  mujoco_rollout_validation: "验证 MuJoCo 预演",
+  execute_plan: "串行写入物理计划",
+  learned_control: "学习式全身控制",
+  reference_control: "跟踪运动参考",
+  contact_reflex: "接触反射闭环",
+  mujoco_physics: "推进 MuJoCo 物理",
+  proprioception: "输出本体感觉",
+  contact_sensing: "输出接触感觉",
+  recover_balance: "恢复身体平衡",
+  recover_path: "恢复运动通路",
+  release_skill_commitment: "释放技能承诺",
+  retrieve_relevant_embodied_memory: "检索相关具身记忆",
+  run_recovery_lease_episode: "运行恢复租约回合",
+  escalate_failure: "上报不可恢复故障",
+  submit_neural_output: "提交层级神经输出",
   observe_humanoid: "感知人形世界",
   recall_embodied_history: "召回具身历史",
   recall_goal_history: "召回目标历史",
@@ -80,6 +129,8 @@ const RESULT_CODES: Record<string, string> = {
   autonomous_skill_route_validated: "技能路线已通过物理预演",
   autonomous_skill_route_rejected: "技能路线未通过物理预演",
   navigation_transit_clearance_required: "正在规划碰撞净空动作",
+  motor_intent_local_recovery_exhausted: "局部运动恢复已穷尽，正在逐级上送",
+  repeated_planning_failure: "同一物理方案已被重复证伪",
   fresh_skill_observation_required: "技能规划需要最新感知",
   plan_revalidation_failed: "执行前物理复验未通过",
   skill_plan_node_unknown: "技能计划中不存在该节点",
@@ -130,14 +181,50 @@ const RESULT_CODES: Record<string, string> = {
 const SCENARIO_LABELS: Record<string, string> = {
   humanoid_frontier: "人形方块边境",
   humanoid_realm: "人形方块疆域",
-  humanoid_courtyard: "人形庭院"
+  humanoid_courtyard: "人形庭院",
+  humanoid_workyard: "人形装配场"
 };
 
 const AGENT_NAMES: Record<string, string> = {
+  "humanoid executive": "执行目标价值管理器",
+  "humanoid goal manager": "目标价值专员",
+  "humanoid action selection gate": "动作选择门",
+  "humanoid perceptual association manager": "感知联想管理器",
+  "humanoid sensor fusion": "传感融合服务",
+  "humanoid scene interpreter": "场景与世界模型解释器",
+  "humanoid relevant memory retriever": "具身记忆检索器",
+  "humanoid sensorimotor manager": "感觉运动管理器",
+  "humanoid affordance specialist": "可供性专员",
+  "humanoid risk interoception critic": "风险与内感受评估器",
+  "humanoid cerebellar predictive critic": "小脑预测评估器",
+  "humanoid premotor skill composer": "运动前技能编排器",
+  "humanoid motor intent compiler": "运动意图编译器",
+  "humanoid rollout gate": "MuJoCo 预测预演门",
+  "humanoid controller reflex": "学习控制与反射环",
+  "humanoid mujoco body": "MuJoCo 具身本体",
+  "humanoid recovery controller": "恢复控制专员",
+  "executive goal valuation manager": "执行目标价值管理器",
+  "goal valuation specialist": "目标价值专员",
+  "action selection gate": "动作选择门",
+  "perceptual association manager": "感知联想管理器",
+  "sensor fusion service": "传感融合服务",
+  "scene and world model interpreter": "场景与世界模型解释器",
+  "relevant embodied memory retriever": "具身记忆检索器",
+  "sensorimotor manager": "感觉运动管理器",
+  "affordance specialist": "可供性专员",
+  "risk and interoception critic": "风险与内感受评估器",
+  "cerebellar predictive critic": "小脑预测评估器",
+  "premotor skill composer": "运动前技能编排器",
+  "motor intent compiler": "运动意图编译器",
+  "mujoco predictive rollout gate": "MuJoCo 预测预演门",
+  "serial physical execution gate": "串行物理执行门",
+  "learned controller and reflex loop": "学习控制与反射环",
+  "mujoco embodied plant": "MuJoCo 具身本体",
+  "recovery control specialist": "恢复控制专员",
   "humanoid coordinator": "自主协调智能体",
   "humanoid sentry": "人形感知哨兵",
   "humanoid motion reference": "全身运动参考智能体",
-  "humanoid executor": "人形物理执行智能体"
+  "humanoid executor": "串行物理执行门"
 };
 
 const CHINESE_AGENT_NAMES: Record<string, string> = {
@@ -156,7 +243,13 @@ const ENTITY_NAMES: Record<string, string> = {
   rest_clearing: "休整区",
   courtyard_beacon: "庭院信标区",
   stone_column: "石柱",
-  low_block: "低矮障碍"
+  low_block: "低矮障碍",
+  pickup_stand: "取料台",
+  assembly_rod: "装配杆",
+  assembly_bay: "装配区域",
+  north_storage: "北侧储物架",
+  central_pillar: "中央立柱",
+  south_storage: "南侧储物架"
 };
 
 export function runStatusLabel(status: RunListItem["status"]): string {
@@ -191,8 +284,19 @@ export function humanoidControllerLabel(implementation: string): string {
   const normalized = implementation.toLowerCase();
   if (normalized === "yahmp_onnx") return "YAHMP";
   if (normalized === "mjlab_g1_velocity_onnx") return "mjlab G1";
+  if (normalized === "workyard_frozen_reach_onnx") return "Workyard Reach";
+  if (normalized === "workyard_contact_8d_onnx") return "Workyard Contact";
   if (normalized.includes("sonic")) return "SONIC";
   return "全身控制器";
+}
+
+export function humanoidPolicyCapabilityLabel(capability: string): string {
+  if (capability === "balance") return "平衡";
+  if (capability === "locomotion") return "移动";
+  if (capability === "joint_reference_tracking") return "到达";
+  if (capability === "contact_rich_manipulation") return "接触操作";
+  if (capability === "bimanual_manipulation") return "双手操作";
+  return capability;
 }
 
 export function humanoidControllerExecutionLabel(
@@ -245,9 +349,9 @@ export function entityLabel(id: string): string {
 
 export function nodePurposeLabel(node: TaskNode, goal: Goal | null): string {
   if (node.depth === 0) return goal ? goalSummaryLabel(goal) : "等待选择本轮目标";
-  if (node.may_delegate) return "协调下级智能体 · 汇总物理回执";
   const capabilities = [...new Set(node.capabilities.map(actionLabel))].slice(0, 3);
-  return capabilities.length > 0 ? capabilities.join(" · ") : "执行当前分配";
+  if (capabilities.length > 0) return capabilities.join(" · ");
+  return node.may_delegate ? "协调直接下级 · 汇合因果信号" : "执行当前分配";
 }
 
 export function nodeResultLabel(node: TaskNode): string | null {

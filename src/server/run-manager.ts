@@ -28,6 +28,10 @@ import { RunPauseRequestedError } from "../runtime/run-pause.js";
 import type {
   HumanoidControllerSource
 } from "../world/humanoid/controller-module.js";
+import {
+  buildFoxgloveMcap,
+  type FoxgloveMcapArtifact
+} from "./foxglove-mcap.js";
 
 export interface RunListItem {
   run_id: string;
@@ -80,9 +84,18 @@ export class RunManager {
     this.#densePolicyRolloutDir = input.densePolicyRolloutDir;
   }
 
-  /** Converts process-owned nonterminal checkpoints left by a prior operator into resumable state. */
+  /**
+   * Reclaims process-owned checkpoints after an unclean operator exit. The
+   * newest continuous run is resumed immediately under the new process lease;
+   * finite missions remain explicitly resumable by an operator.
+   */
   async recoverOrphanedRuns(): Promise<number> {
     const directories = await listRunDirectories(this.#runsDir, this.#storeOptions());
+    const continuousCandidates: Array<{
+      runId: string;
+      updatedAt: string;
+      store: RunStore;
+    }> = [];
     let recovered = 0;
     for (const directory of directories) {
       let store: RunStore;
@@ -101,6 +114,12 @@ export class RunManager {
         persistCheckpoint: () => store.writeCheckpoint(checkpoint)
       });
       if (checkpoint.status !== "starting" && checkpoint.status !== "running") continue;
+      // Preserve the last activity ordering before recovery rewrites every
+      // orphan with a new interruption timestamp.  Sorting on the rewritten
+      // value can resume whichever directory happened to be enumerated first,
+      // rather than the continuous robot that was actually active most
+      // recently.
+      const lastActivityAt = checkpoint.updated_at ?? checkpoint.created_at;
       const at = new Date().toISOString();
       const reason = "The previous operator process ended before this mission reached a terminal state.";
       checkpoint.status = "interrupted";
@@ -124,6 +143,36 @@ export class RunManager {
         persistCheckpoint: () => store.writeCheckpoint(checkpoint)
       });
       recovered += 1;
+      if (store.definition.run_mode === "continuous") {
+        continuousCandidates.push({
+          runId: store.definition.run_id,
+          updatedAt: lastActivityAt,
+          store
+        });
+      }
+    }
+    const autonomousResume = continuousCandidates.sort(
+      (left, right) => right.updatedAt.localeCompare(left.updatedAt)
+    )[0];
+    if (autonomousResume && this.#provider) {
+      const at = new Date().toISOString();
+      await autonomousResume.store.append("provider", {
+        status: "operator_process_autonomous_resume_requested",
+        source: "continuous_run_lease_recovery",
+        automatic_actuation: true,
+        at
+      });
+      try {
+        await this.resume(autonomousResume.runId);
+      } catch (error) {
+        await autonomousResume.store.append("provider", {
+          status: "operator_process_autonomous_resume_failed",
+          source: "continuous_run_lease_recovery",
+          error: error instanceof Error ? error.message : String(error),
+          automatic_actuation: false,
+          at: new Date().toISOString()
+        });
+      }
     }
     return recovered;
   }
@@ -386,6 +435,22 @@ export class RunManager {
       this.#storeOptions()
     );
     return store.readJournalPage(name, from, limit);
+  }
+
+  async foxgloveMcap(runId: string): Promise<FoxgloveMcapArtifact> {
+    const store = await RunStore.open(
+      resolveRunDirectory(this.#runsDir, runId),
+      this.#storeOptions()
+    );
+    const [checkpoint, events] = await Promise.all([
+      store.readCheckpoint(),
+      store.readJournal("events")
+    ]);
+    return buildFoxgloveMcap({
+      definition: store.definition,
+      checkpoint,
+      events
+    });
   }
 
   /** Replays the suffix after an exact durable journal row. */

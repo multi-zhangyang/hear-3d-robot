@@ -24,11 +24,11 @@ from torch import nn
 from torch.nn import functional as torch_f
 
 
-PROTOCOL = "hear-frozen-contact-policy-export-v1"
-SOURCE_REPORT_PROTOCOL = "hear-workyard-contact-run-v1"
-OBSERVATION_PROTOCOL = "hear-workyard-contact-observation-v1"
+PROTOCOL = "hear-frozen-contact-policy-export-v2"
+SOURCE_REPORT_PROTOCOL = "hear-workyard-contact-run-v2"
+OBSERVATION_PROTOCOL = "hear-workyard-contact-observation-v2"
 ACTION_PROTOCOL = "hear-active-hand-synergy-action-v1"
-OBSERVATION_SIZE = 247
+OBSERVATION_SIZE = 262
 ACTION_SIZE = 8
 NORMALIZER_EPS = 1.0e-2
 COORDINATION_STEP = 0.0075
@@ -38,6 +38,10 @@ FORCE_RELEASE_THRESHOLD_N = 6.0
 EMERGENCY_FORCE_RELEASE_THRESHOLD_N = 12.0
 HAND_POSITION_KP = 2.5
 HAND_VELOCITY_DAMPING = 0.3
+HAND_CONTACT_COLLISION_COUNT = 14
+HAND_CONTACT_PRIORITY = 2
+HAND_CONTACT_SOLREF_TIME_CONSTANT_S = 0.04
+HAND_CONTACT_SOLREF_DAMPING_RATIO = 1.0
 HAND_JOINT_NAMES = (
   "left_hand_thumb_0_joint", "left_hand_thumb_1_joint",
   "left_hand_thumb_2_joint", "left_hand_middle_0_joint",
@@ -46,6 +50,11 @@ HAND_JOINT_NAMES = (
   "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
   "right_hand_middle_0_joint", "right_hand_middle_1_joint",
   "right_hand_index_0_joint", "right_hand_index_1_joint",
+)
+HAND_CONTACT_MESH_NAMES = frozenset(
+  joint_name.removesuffix("_joint") + "_link"
+  for joint_name in HAND_JOINT_NAMES
+  if not joint_name.endswith("_thumb_1_joint")
 )
 
 
@@ -75,20 +84,50 @@ def validate_plant(path: Path) -> dict[str, object]:
     raise FileNotFoundError(f"Contact deployment plant is missing: {path}")
   root = ElementTree.parse(path).getroot()
   hand_default = root.find(".//default[@class='hand_pd']/position")
+  hand_contact_default = root.find(
+    ".//default[@class='hand_collision']/geom"
+  )
   actuators = root.findall(".//actuator/position[@class='hand_pd']")
+  hand_contact_geoms = root.findall(".//geom[@class='hand_collision']")
   joints = {actuator.get("joint") for actuator in actuators}
+  hand_contact_meshes = {
+    geom.get("mesh") for geom in hand_contact_geoms if geom.get("mesh")
+  }
+  hand_contact_box_count = sum(
+    geom.get("type") == "box" for geom in hand_contact_geoms
+  )
+  solref = tuple(
+    float(value)
+    for value in (hand_contact_default.get("solref", "").split()
+      if hand_contact_default is not None else ())
+  )
   if (
     hand_default is None
     or float(hand_default.get("kp", "nan")) != HAND_POSITION_KP
     or float(hand_default.get("kv", "nan")) != HAND_VELOCITY_DAMPING
     or joints != set(HAND_JOINT_NAMES)
     or len(actuators) != len(HAND_JOINT_NAMES)
+    or hand_contact_default is None
+    or int(hand_contact_default.get("priority", "-1")) != HAND_CONTACT_PRIORITY
+    or solref != (
+      HAND_CONTACT_SOLREF_TIME_CONSTANT_S,
+      HAND_CONTACT_SOLREF_DAMPING_RATIO,
+    )
+    or len(hand_contact_geoms) != HAND_CONTACT_COLLISION_COUNT
+    or hand_contact_meshes != HAND_CONTACT_MESH_NAMES
+    or hand_contact_box_count != 2
   ):
-    raise ValueError("Contact deployment plant drifted from trained hand actuation")
+    raise ValueError(
+      "Contact deployment plant drifted from trained hand actuation or contact skin"
+    )
   return {
     "file": path.name,
     "bytes": path.stat().st_size,
     "sha256": sha256(path),
+    "hand_contact_collision_count": len(hand_contact_geoms),
+    "hand_contact_priority": HAND_CONTACT_PRIORITY,
+    "hand_contact_solref_time_constant_s": HAND_CONTACT_SOLREF_TIME_CONSTANT_S,
+    "hand_contact_solref_damping_ratio": HAND_CONTACT_SOLREF_DAMPING_RATIO,
   }
 
 
@@ -154,6 +193,7 @@ def validate_source(
   acceptance = report.get("acceptance")
   training = report.get("training")
   selection = training.get("checkpoint_selection") if isinstance(training, dict) else None
+  frozen_reach = training.get("frozen_reach") if isinstance(training, dict) else None
   selected = selection.get("selected_checkpoint") if isinstance(selection, dict) else None
   final_gate = acceptance.get("final_gate") if isinstance(acceptance, dict) else None
   if (
@@ -177,6 +217,15 @@ def validate_source(
     or not isinstance(bundle, dict)
     or bundle.get("contract_sha256") != sha256(contract_path)
     or bundle.get("environment_sha256") != sha256(environment_path)
+    or not isinstance(frozen_reach, dict)
+    or frozen_reach.get("protocol")
+      != "hear-frozen-qualified-whole-body-reach-runtime-v2"
+    or frozen_reach.get("gradient_parameter_count") != 0
+    or frozen_reach.get("execution_authority")
+      != "frozen_29d_whole_body_reach"
+    or frozen_reach.get("jit_sha256") != bundle.get("reach_jit_sha256")
+    or not isinstance(frozen_reach.get("source_checkpoint_sha256"), str)
+    or not isinstance(frozen_reach.get("report_sha256"), str)
   ):
     raise ValueError(
       "Contact checkpoint is not backed by an accepted formal 500-seed gate"
@@ -310,6 +359,7 @@ def main() -> None:
 
   source_evaluation = source_report["evaluation"]
   source_selection = source_report["training"]["checkpoint_selection"]
+  frozen_reach = source_report["training"]["frozen_reach"]
   payload = {
     "protocol": PROTOCOL,
     "created_at": datetime.now(timezone.utc).isoformat(),
@@ -329,6 +379,15 @@ def main() -> None:
       "maximum_active_hand_force_n": source_evaluation[
         "maximum_active_hand_force_n"
       ],
+      "frozen_reach": {
+        "protocol": "hear-frozen-contact-reach-binding-v1",
+        "runtime_protocol": frozen_reach["protocol"],
+        "source_checkpoint_sha256": frozen_reach[
+          "source_checkpoint_sha256"
+        ],
+        "jit_sha256": frozen_reach["jit_sha256"],
+        "report_sha256": frozen_reach["report_sha256"],
+      },
     },
     "plant": {
       "protocol": "hear-workyard-contact-deployment-plant-v1",

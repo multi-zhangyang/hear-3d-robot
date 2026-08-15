@@ -22,5 +22,9 @@ __pycache__/
 .DS_Store
 runs/*
 !runs/.gitkeep
-artifacts/training/
-artifacts/benchmarks/
+artifacts/
+assets/humanoid/controllers/workyard-reach/
+assets/humanoid/controllers/workyard-contact/
+assets/humanoid/controllers/g1-getup/
+assets/humanoid/controllers/.workyard-policy-install-*/
+assets/humanoid/controllers/.g1-getup-install-*/

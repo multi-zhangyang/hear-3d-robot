@@ -46,24 +46,28 @@
   letter-spacing: 0.08em;
 }
 
-.brand-cube {
+.brand-mark {
   position: relative;
+  display: grid;
   width: 34px;
   height: 34px;
+  place-items: center;
   border: 1px solid #78d2aa;
   border-radius: 10px;
+  color: #9be7bd;
   background: #1a4a3a;
   box-shadow: 0 7px 18px rgb(0 0 0 / 28%), inset 0 0 0 1px rgb(255 255 255 / 8%);
 }
 
-.brand-cube i {
-  position: absolute;
-  background: #9be7bd;
+.brand-mark svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
 }
-
-.brand-cube i:nth-child(1) { inset: 6px 7px auto; height: 2px; }
-.brand-cube i:nth-child(2) { inset: 12px 7px auto; height: 2px; }
-.brand-cube i:nth-child(3) { inset: 18px 7px auto; height: 7px; opacity: 0.45; }
 
 .game-toolbar {
   min-width: 0;
@@ -132,6 +136,46 @@
   gap: 8px;
 }
 
+.telemetry-export {
+  border-color: rgb(91 154 181 / 32%);
+  color: #b9e7f4;
+  background: linear-gradient(180deg, rgb(36 50 55 / 96%), rgb(25 35 39 / 96%));
+}
+
+.telemetry-export:hover:not(:disabled) {
+  border-color: rgb(105 201 226 / 58%);
+  background: linear-gradient(180deg, rgb(42 64 71 / 96%), rgb(29 43 48 / 96%));
+}
+
+.telemetry-export-label {
+  display: grid;
+  justify-items: start;
+  gap: 1px;
+  font-family: "JetBrains Mono Variable", monospace;
+  letter-spacing: .06em;
+}
+
+.telemetry-export svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.6;
+}
+
+.telemetry-export-label strong {
+  font-size: 9px;
+  line-height: 1;
+}
+
+.telemetry-export-label small {
+  color: #7098a4;
+  font-size: 7px;
+  line-height: 1;
+}
+
 .system-controls {
   display: flex;
   align-items: center;
@@ -148,6 +192,16 @@
   font: 20px/1 "JetBrains Mono Variable", monospace;
   cursor: pointer;
   box-shadow: 0 6px 16px rgb(0 0 0 / 18%);
+}
+
+.system-controls button svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.6;
 }
 
 .system-controls button:hover,
@@ -296,10 +350,16 @@
   font: 9px/1 "JetBrains Mono Variable", monospace;
 }
 
-.hotbar-slot b {
+.hotbar-slot > svg {
+  width: 18px;
+  height: 18px;
   padding-top: 3px;
   color: #cbd2cf;
-  font-size: 20px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.45;
 }
 
 .hotbar-slot span {
@@ -322,6 +382,8 @@
   background: linear-gradient(145deg, #34755a, #275441);
   box-shadow: 0 8px 20px rgb(20 63 45 / 35%), inset 0 0 0 1px rgb(255 255 255 / 8%);
 }
+
+.hotbar-slot.active > svg { color: #fff; }
 
 @media (max-width: 900px) {
   .game-header {
@@ -354,6 +416,7 @@
   .operator-toolbar > .run-context { width: auto; min-width: 0; flex: 1; flex-wrap: nowrap; }
   .run-context > .run-status { display: none; }
   .operator-toolbar > .mission-actions { width: auto; flex: 0 0 auto; justify-content: flex-end; }
+  .telemetry-export { display: none; }
   .run-select { width: 100%; }
   .game-main { height: auto; min-height: 0; }
   .game-hotbar {
@@ -362,6 +425,6 @@
     justify-content: center;
   }
   .hotbar-slot { width: min(72px, 24vw); height: 52px; }
-  .hotbar-slot b { font-size: 17px; }
+  .hotbar-slot > svg { width: 17px; height: 17px; }
   .hotbar-slot span { font-size: 8px; }
 }

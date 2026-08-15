@@ -28,9 +28,13 @@ import type {
 import type { HumanoidCarryTaskSpaceTarget } from "./carry-task-space-servo.js";
 import type { HumanoidNavigationArrivalHeading } from "./navigation-arrival.js";
 import type { HumanoidEmbodiedSkillIdentity } from "./embodied-skill-call.js";
+import type {
+  HumanoidRecoveryExecutionContract
+} from "./recovery-execution-contract.js";
 
 export interface StoredHumanoidMotionPlan {
   plan: HumanoidMotionPlan;
+  recoveryContract?: HumanoidRecoveryExecutionContract | undefined;
   skillCallIdentity: HumanoidEmbodiedSkillIdentity | null;
   artifact: HumanoidMotionArtifact;
   rollout: HumanoidMotionRollout | null;

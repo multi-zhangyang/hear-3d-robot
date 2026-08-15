@@ -25,51 +25,128 @@
     "execute_humanoid_navigation"
   ],
   "status": "succeeded",
-  "root_id": "humanoid-coordinator",
+  "root_id": "humanoid-executive",
   "active_agent_id": null,
   "active_agent_ids": [],
   "nodes": {
-    "humanoid-coordinator": {
-      "id": "humanoid-coordinator",
-      "name": "人形自主协调智能体",
+    "humanoid-executive": {
+      "id": "humanoid-executive",
+      "name": "Executive Goal Valuation Manager",
       "parent_id": null,
       "child_ids": [
-        "humanoid-sentry",
-        "humanoid-motion-reference",
-        "humanoid-executor"
+        "humanoid-goal-manager",
+        "humanoid-action-selection-gate"
       ],
-      "objective": "观察当前庭院，规划并执行安全的双足路线，到达前方坐标后用物理回执完成任务。",
+      "objective": "在当前世界中自主完成场景定义的物体搬运与稳放目标；遇到真实物理阻塞时保持目标并通过层级 Recovery 自主改换技能。",
       "success_criteria": [
-        "双足移动到前方目标"
+        "将装配杆稳放到装配区域。",
+        "Never emit trajectories or directly write physical state."
       ],
       "evidence_requirements": [],
       "goal_predicate_indexes": [
         0
       ],
       "capabilities": [
-        "observe_humanoid",
-        "plan_whole_body_motion",
-        "execute_whole_body_motion",
-        "plan_humanoid_navigation",
-        "execute_humanoid_navigation"
+        "manage_goal",
+        "delegate_action_selection",
+        "complete_cycle"
       ],
       "may_delegate": true,
       "references": [],
       "depth": 0,
       "status": "completed",
       "steps_used": 0,
-      "model_calls_used": 41,
-      "created_at": "2026-08-02T20:43:50.468Z",
-      "updated_at": "2026-08-02T21:01:21.959Z"
+      "model_calls_used": 96,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
     },
-    "humanoid-sentry": {
-      "id": "humanoid-sentry",
-      "name": "人形感知哨兵",
-      "parent_id": "humanoid-coordinator",
+    "humanoid-goal-manager": {
+      "id": "humanoid-goal-manager",
+      "name": "Goal Valuation Specialist",
+      "parent_id": "humanoid-executive",
       "child_ids": [],
-      "objective": "从当前头部传感器、本体感觉和接触状态建立受限观察。",
+      "objective": "Propose, select, continue, or retire observable Goal epochs.",
       "success_criteria": [
-        "返回当前世界版本的传感器权威回执。"
+        "Bind every Goal transition to current world evidence."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "recall_goal_history",
+        "manage_goal_epoch"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 1,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 4,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-action-selection-gate": {
+      "id": "humanoid-action-selection-gate",
+      "name": "Action Selection Gate",
+      "parent_id": "humanoid-executive",
+      "child_ids": [
+        "humanoid-perceptual-association-manager",
+        "humanoid-sensorimotor-manager"
+      ],
+      "objective": "Gate competing sensorimotor programs and maintain one skill commitment.",
+      "success_criteria": [
+        "Escalate only errors that lower layers cannot correct locally."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "select_pathway",
+        "gate_skill_commitment"
+      ],
+      "may_delegate": true,
+      "references": [],
+      "depth": 1,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 222,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-perceptual-association-manager": {
+      "id": "humanoid-perceptual-association-manager",
+      "name": "Perceptual Association Manager",
+      "parent_id": "humanoid-action-selection-gate",
+      "child_ids": [
+        "humanoid-sensor-fusion",
+        "humanoid-scene-interpreter",
+        "humanoid-relevant-memory-retriever"
+      ],
+      "objective": "Fuse current sensation with scene interpretation and relevant history.",
+      "success_criteria": [
+        "Parallel specialists remain read-only and world-version bounded.",
+        "Perceptual belief reports state and candidates without selecting a motor program."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "orchestrate_perception"
+      ],
+      "may_delegate": true,
+      "references": [],
+      "depth": 2,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 143,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:17:09.281Z"
+    },
+    "humanoid-sensor-fusion": {
+      "id": "humanoid-sensor-fusion",
+      "name": "Sensor Fusion Service",
+      "parent_id": "humanoid-perceptual-association-manager",
+      "child_ids": [],
+      "objective": "Capture vision, proprioception, contact, and world revision from MuJoCo.",
+      "success_criteria": [
+        "Do not infer goals or motor programs."
       ],
       "evidence_requirements": [],
       "goal_predicate_indexes": [],
@@ -78,61 +155,339 @@
       ],
       "may_delegate": false,
       "references": [],
-      "depth": 1,
+      "depth": 3,
       "status": "ready",
-      "steps_used": 7,
-      "model_calls_used": 7,
-      "created_at": "2026-08-02T20:43:50.468Z",
-      "updated_at": "2026-08-02T21:01:21.840Z"
+      "steps_used": 46,
+      "model_calls_used": 0,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
     },
-    "humanoid-motion-reference": {
-      "id": "humanoid-motion-reference",
-      "name": "全身运动参考智能体",
-      "parent_id": "humanoid-coordinator",
+    "humanoid-scene-interpreter": {
+      "id": "humanoid-scene-interpreter",
+      "name": "Scene and World Model Interpreter",
+      "parent_id": "humanoid-perceptual-association-manager",
       "child_ids": [],
-      "objective": "根据实时状态生成连续全身参考或双足路线，并通过完整物理预演。",
+      "objective": "Interpret spatial relations, occlusion, contacts, and task-relevant changes.",
       "success_criteria": [
-        "产生 accepted 规划回执或带物理证据的拒绝回执。"
+        "Return beliefs with confidence and evidence, never invented coordinates."
       ],
       "evidence_requirements": [],
       "goal_predicate_indexes": [],
       "capabilities": [
-        "observe_humanoid",
-        "plan_whole_body_motion",
-        "plan_humanoid_navigation"
+        "interpret_scene"
       ],
       "may_delegate": false,
       "references": [],
-      "depth": 1,
+      "depth": 3,
       "status": "ready",
-      "steps_used": 10,
-      "model_calls_used": 11,
-      "created_at": "2026-08-02T20:43:50.468Z",
-      "updated_at": "2026-08-02T21:01:21.840Z"
+      "steps_used": 0,
+      "model_calls_used": 50,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-relevant-memory-retriever": {
+      "id": "humanoid-relevant-memory-retriever",
+      "name": "Relevant Embodied Memory Retriever",
+      "parent_id": "humanoid-perceptual-association-manager",
+      "child_ids": [],
+      "objective": "Retrieve only prior experiences relevant to the present state and active Goal.",
+      "success_criteria": [
+        "Historical state never substitutes for current sensory authority."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "recall_embodied_history"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 3,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 45,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-sensorimotor-manager": {
+      "id": "humanoid-sensorimotor-manager",
+      "name": "Sensorimotor Manager",
+      "parent_id": "humanoid-action-selection-gate",
+      "child_ids": [
+        "humanoid-affordance-specialist",
+        "humanoid-risk-interoception-critic",
+        "humanoid-cerebellar-predictive-critic",
+        "humanoid-premotor-skill-composer",
+        "humanoid-executor",
+        "humanoid-recovery-controller"
+      ],
+      "objective": "Integrate affordance, risk, prediction, and premotor proposals into action.",
+      "success_criteria": [
+        "Parallel critics are advisory; one serial physical writer remains authoritative."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "orchestrate_sensorimotor",
+        "execute_accepted_plan"
+      ],
+      "may_delegate": true,
+      "references": [],
+      "depth": 2,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 132,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-affordance-specialist": {
+      "id": "humanoid-affordance-specialist",
+      "name": "Affordance Specialist",
+      "parent_id": "humanoid-sensorimotor-manager",
+      "child_ids": [],
+      "objective": "Identify currently reachable and task-relevant object and terrain affordances.",
+      "success_criteria": [
+        "Affordances remain hypotheses until deterministic planning validates them."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "assess_affordances"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 3,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 23,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-risk-interoception-critic": {
+      "id": "humanoid-risk-interoception-critic",
+      "name": "Risk and Interoception Critic",
+      "parent_id": "humanoid-sensorimotor-manager",
+      "child_ids": [],
+      "objective": "Assess balance, collision, contact, fatigue proxy, and commitment risk.",
+      "success_criteria": [
+        "High risk inhibits action but does not invent an alternate motor command."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "assess_risk"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 3,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 24,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-cerebellar-predictive-critic": {
+      "id": "humanoid-cerebellar-predictive-critic",
+      "name": "Cerebellar Predictive Critic",
+      "parent_id": "humanoid-sensorimotor-manager",
+      "child_ids": [],
+      "objective": "Judge whether one bounded rollout chunk safely advances the active Skill toward its terminal contract.",
+      "success_criteria": [
+        "Report prediction error independently of executive preference.",
+        "Intermediate chunks need progress and safety, not premature completion of the final Goal predicate."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "interpret_rollout",
+        "estimate_prediction_error"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 3,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 4,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-premotor-skill-composer": {
+      "id": "humanoid-premotor-skill-composer",
+      "name": "Premotor Skill Composer",
+      "parent_id": "humanoid-sensorimotor-manager",
+      "child_ids": [
+        "humanoid-motor-intent-compiler"
+      ],
+      "objective": "Compose a short skill DAG and delegate one bounded motor intent at a time.",
+      "success_criteria": [
+        "Specify semantics and termination, never joint trajectories."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "compose_skill",
+        "delegate_motor_intent"
+      ],
+      "may_delegate": true,
+      "references": [],
+      "depth": 3,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 19,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-motor-intent-compiler": {
+      "id": "humanoid-motor-intent-compiler",
+      "name": "Motor Intent Compiler",
+      "parent_id": "humanoid-premotor-skill-composer",
+      "child_ids": [
+        "humanoid-rollout-gate"
+      ],
+      "objective": "Compile one semantic intent into an existing deterministic planning tool call.",
+      "success_criteria": [
+        "Copy current bindings and let solvers derive geometry and trajectories."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "plan_skill",
+        "plan_navigation",
+        "plan_whole_body_motion"
+      ],
+      "may_delegate": true,
+      "references": [],
+      "depth": 4,
+      "status": "ready",
+      "steps_used": 81,
+      "model_calls_used": 92,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-rollout-gate": {
+      "id": "humanoid-rollout-gate",
+      "name": "MuJoCo Predictive Rollout Gate",
+      "parent_id": "humanoid-motor-intent-compiler",
+      "child_ids": [],
+      "objective": "Validate candidate motion in a cloned MuJoCo state before admission.",
+      "success_criteria": [
+        "Only certified plans may reach the physical writer."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "mujoco_rollout_validation"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 5,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 0,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
     },
     "humanoid-executor": {
       "id": "humanoid-executor",
-      "name": "人形物理执行智能体",
-      "parent_id": "humanoid-coordinator",
-      "child_ids": [],
-      "objective": "消费已接受规划回执并在 YAHMP 与 MuJoCo 闭环中执行。",
+      "name": "Serial Physical Execution Gate",
+      "parent_id": "humanoid-sensorimotor-manager",
+      "child_ids": [
+        "humanoid-controller-reflex"
+      ],
+      "objective": "Consume one accepted plan and own the only physical mutation transaction.",
       "success_criteria": [
-        "返回包含世界版本增长与物理终态的执行回执。"
+        "All body writes pass through one mutex-protected authority."
       ],
       "evidence_requirements": [],
       "goal_predicate_indexes": [],
       "capabilities": [
-        "execute_whole_body_motion",
-        "execute_humanoid_navigation"
+        "execute_plan",
+        "remove_world_block"
       ],
       "may_delegate": false,
       "references": [],
-      "depth": 1,
+      "depth": 3,
       "status": "ready",
       "steps_used": 3,
-      "model_calls_used": 3,
-      "created_at": "2026-08-02T20:43:50.468Z",
-      "updated_at": "2026-08-02T21:01:21.840Z"
+      "model_calls_used": 0,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-controller-reflex": {
+      "id": "humanoid-controller-reflex",
+      "name": "Learned Controller and Reflex Loop",
+      "parent_id": "humanoid-executor",
+      "child_ids": [
+        "humanoid-mujoco-body"
+      ],
+      "objective": "Track references, reject disturbances, and report local control error at control rate.",
+      "success_criteria": [
+        "No LLM is present in the per-frame loop."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "learned_control",
+        "reference_control",
+        "contact_reflex"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 4,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 0,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-mujoco-body": {
+      "id": "humanoid-mujoco-body",
+      "name": "MuJoCo Embodied Plant",
+      "parent_id": "humanoid-controller-reflex",
+      "child_ids": [],
+      "objective": "Evolve the authoritative physical state under admitted controller commands.",
+      "success_criteria": [
+        "Expose sensation and contacts; never accept a model-authored state write."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "mujoco_physics",
+        "proprioception",
+        "contact_sensing"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 5,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 0,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
+    },
+    "humanoid-recovery-controller": {
+      "id": "humanoid-recovery-controller",
+      "name": "Recovery Control Specialist",
+      "parent_id": "humanoid-sensorimotor-manager",
+      "child_ids": [],
+      "objective": "Use an exclusive parent-issued lease to decide one bounded recovery response.",
+      "success_criteria": [
+        "Remain a child of Sensorimotor Manager and close the lease after recovery or escalation."
+      ],
+      "evidence_requirements": [],
+      "goal_predicate_indexes": [],
+      "capabilities": [
+        "recover_balance",
+        "recover_path",
+        "escalate_failure"
+      ],
+      "may_delegate": false,
+      "references": [],
+      "depth": 3,
+      "status": "ready",
+      "steps_used": 0,
+      "model_calls_used": 43,
+      "created_at": "2026-08-14T03:23:13.801Z",
+      "updated_at": "2026-08-14T17:16:56.613Z"
     }
   },
   "world": {

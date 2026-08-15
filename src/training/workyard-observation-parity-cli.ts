@@ -20,20 +20,20 @@ const MAXIMUM_ERROR = 2e-5;
 const FEATURE_GROUPS = [
   ["body_position", 0, 29],
   ["body_velocity", 29, 58],
-  ["previous_reach_action", 58, 72],
-  ["hand_position", 72, 86],
-  ["hand_velocity", 86, 100],
-  ["dynamic_com", 100, 104],
-  ["previous_locomotion_action", 104, 133],
-  ["root_kinematics", 133, 142],
-  ["end_effector_pose", 142, 170],
-  ["foot_contact", 170, 176],
-  ["hand_contact", 176, 182],
-  ["object_pose_twist", 182, 195],
-  ["target_zone", 195, 200],
-  ["capability_progress_hand", 200, 208],
-  ["task_command", 208, 231],
-  ["hand_history", 231, 247]
+  ["previous_reach_action", 58, 87],
+  ["hand_position", 87, 101],
+  ["hand_velocity", 101, 115],
+  ["dynamic_com", 115, 119],
+  ["previous_locomotion_action", 119, 148],
+  ["root_kinematics", 148, 157],
+  ["end_effector_pose", 157, 185],
+  ["foot_contact", 185, 191],
+  ["hand_contact", 191, 197],
+  ["object_pose_twist", 197, 210],
+  ["target_zone", 210, 215],
+  ["capability_progress_hand", 215, 226],
+  ["task_command", 226, 246],
+  ["hand_history", 246, 262]
 ] as const;
 
 interface Fixture {
@@ -120,14 +120,14 @@ function validateFixture(
       components: [{
         protocol: "humanoid-controller-tensor-trace-v1",
         role: "fallback",
-        implementation: "workyard_frozen_reach_onnx",
+          implementation: "workyard_whole_body_reach_onnx",
         observation: {
           protocol: WORKYARD_REACH_OBSERVATION_PROTOCOL,
           values: [...reach]
         },
         action: {
-          protocol: "bounded-upper-body-residual-mean",
-          values: new Array(14).fill(0)
+          protocol: "bounded-whole-body-reach-mean",
+          values: new Array(29).fill(0)
         }
       }]
     },

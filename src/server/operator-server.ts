@@ -198,6 +198,18 @@ export async function createOperatorServer(input: {
     };
   });
 
+  app.get("/api/runs/:runId/telemetry.mcap", async (request, reply) => {
+    const { runId } = RunParams.parse(request.params);
+    const artifact = await manager.foxgloveMcap(runId);
+    return reply
+      .header("content-type", "application/octet-stream")
+      .header("content-disposition", `attachment; filename="${runId}.mcap"`)
+      .header("content-length", artifact.data.byteLength)
+      .header("x-hear-mcap-messages", artifact.messageCount)
+      .header("x-hear-mcap-snapshots", artifact.snapshotCount)
+      .send(artifact.data);
+  });
+
   app.get("/api/runs/:runId/events", async (request, reply) => {
     const { runId } = RunParams.parse(request.params);
     const query = EventsQuery.parse(request.query);

@@ -153,6 +153,27 @@ export async function stopRun(runId: string): Promise<void> {
   });
 }
 
+export async function downloadRunTelemetry(runId: string): Promise<void> {
+  const response = await fetch(
+    `/api/runs/${encodeURIComponent(runId)}/telemetry.mcap`,
+    { headers: authHeaders() }
+  );
+  if (!response.ok) throw await responseError(response);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${runId}.mcap`;
+  anchor.style.display = "none";
+  document.body.append(anchor);
+  try {
+    anchor.click();
+  } finally {
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  }
+}
+
 export function subscribeToRun(
   runId: string,
   onEvent: (event: RuntimeEvent) => void,

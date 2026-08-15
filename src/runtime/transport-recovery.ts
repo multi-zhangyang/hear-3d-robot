@@ -44,18 +44,22 @@ export interface TransportRetryPlan {
  * a fresh recovery window for a later, independent outage.
  */
 export class ConsecutiveTransportRecovery {
-  readonly maximumAttempts: number;
+  readonly maximumAttempts: number | null;
   #attempts = 0;
 
-  constructor(maximumAttempts: number) {
-    if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1) {
+  constructor(maximumAttempts: number | null) {
+    if (maximumAttempts !== null
+      && (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1)) {
       throw new Error("Maximum transport recovery attempts must be a positive safe integer");
     }
     this.maximumAttempts = maximumAttempts;
   }
 
   nextAttempt(): number | null {
-    if (this.#attempts >= this.maximumAttempts) return null;
+    if (this.maximumAttempts !== null && this.#attempts >= this.maximumAttempts) {
+      return null;
+    }
+    if (this.#attempts >= Number.MAX_SAFE_INTEGER) this.#attempts = 0;
     this.#attempts += 1;
     return this.#attempts;
   }
@@ -68,11 +72,12 @@ export class ConsecutiveTransportRecovery {
 }
 
 export class PerAgentTransportRecovery {
-  readonly maximumAttempts: number;
+  readonly maximumAttempts: number | null;
   readonly #recoveries = new Map<string, ConsecutiveTransportRecovery>();
 
-  constructor(maximumAttempts: number) {
-    if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1) {
+  constructor(maximumAttempts: number | null) {
+    if (maximumAttempts !== null
+      && (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1)) {
       throw new Error("Maximum transport recovery attempts must be a positive safe integer");
     }
     this.maximumAttempts = maximumAttempts;

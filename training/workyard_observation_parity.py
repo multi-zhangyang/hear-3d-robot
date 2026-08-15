@@ -1,7 +1,7 @@
 """Serialize cross-runtime Workyard observation fixtures from live MJLab state.
 
 The fixture contains physical quantities, command history and the exact Python
-231D/247D tensors.  It deliberately contains no teacher-private curriculum
+246D/262D tensors.  It deliberately contains no teacher-private curriculum
 state and grants no execution authority; TypeScript rebuilds the observations
 from this payload to prove the deployment contract before formal training.
 """
@@ -23,6 +23,7 @@ def capture_workyard_observation_fixture(
   raw_env,
   actor_observation: torch.Tensor,
   environment_index: int,
+  episode_seed: int,
   control_step: int,
   milestone: str,
 ) -> dict[str, Any]:
@@ -183,9 +184,7 @@ def capture_workyard_observation_fixture(
   }
   return {
     "protocol": PROTOCOL,
-    "episode_seed": int(
-      command.cfg.evaluation_episode_seed_base + index
-    ),
+    "episode_seed": int(episode_seed),
     "active_hand": active_hand,
     "control_step": int(control_step),
     "milestone": milestone,

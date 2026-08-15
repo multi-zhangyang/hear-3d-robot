@@ -1,10 +1,14 @@
 import type { Goal, Quaternion, Vec3 } from "../../domain/schema.js";
+import type { NeuralSafetyInterrupt } from "../../domain/neural-hierarchy.js";
 import type { HumanoidSkillInvocation } from "../../domain/humanoid-skill.js";
 import type { HumanoidMotionCandidateBatch } from "../../world/humanoid/motion-plan.js";
 import type { HumanoidMotionOptionContract } from "../../world/humanoid/motion-option.js";
 import type { HumanoidWorldObservation } from "../../world/humanoid/world.js";
 import type { G1HandCoordination } from "../../world/humanoid/hand-coordination.js";
-import type { G1HandContactSurfaceName } from "../../world/humanoid/morphology.js";
+import {
+  G1_HAND_CONTACT_SURFACE_NAMES,
+  type G1HandContactSurfaceName
+} from "../../world/humanoid/morphology.js";
 import {
   navigableManipulationBasePlacements,
   type ActiveHumanoidSkillBinding
@@ -35,6 +39,15 @@ import { minimumHumanoidManipulationRootStandoff } from "../../world/humanoid/ma
 import { HUMANOID_NAVIGATION_PROFILE } from "../../world/humanoid/environment.js";
 import { navigationObstaclePlanarExpansion } from "../../world/navigation.js";
 import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
+import {
+  HUMANOID_RECOVERY_HANDOFF_STEPS,
+  HUMANOID_RECOVERY_MAXIMUM_STEPS,
+  HUMANOID_RECOVERY_STABLE_STEPS,
+  type HumanoidRecoveryPlan
+} from "../../world/humanoid/recovery-execution-contract.js";
+import {
+  humanoidRecoverySafetyInterruptIsCurrent
+} from "./recovery-safety-authority.js";
 
 type HumanoidMotionOptionPredicate = HumanoidMotionOptionContract["predicates"][number];
 
@@ -53,7 +66,8 @@ export type AutonomousHumanoidSkillPlan =
         score: number;
       }>;
     }
-  | { kind: "motion"; batch: HumanoidMotionCandidateBatch };
+  | { kind: "motion"; batch: HumanoidMotionCandidateBatch }
+  | { kind: "recovery"; plan: HumanoidRecoveryPlan };
 
 export function planAutonomousHumanoidSkill(input: {
   binding: ActiveHumanoidSkillBinding;
@@ -61,6 +75,7 @@ export function planAutonomousHumanoidSkill(input: {
   articulationGoal?: HumanoidArticulationGoal;
   activeGoal?: Goal;
   recoveryAuthorized?: boolean;
+  recoveryInterrupt?: NeuralSafetyInterrupt;
 }): AutonomousHumanoidSkillPlan {
   if (input.activeGoal) {
     const alignment = alignHumanoidSkillToGoal({
@@ -91,6 +106,12 @@ export function planAutonomousHumanoidSkill(input: {
       }))
     };
   }
+  if (input.binding.invocation.skill === "stabilize"
+    && input.binding.phase === "recover_support"
+    && (input.observation.robot.fallen
+      || input.recoveryAuthorized && input.recoveryInterrupt !== undefined)) {
+    return recoverySkillPlan(input);
+  }
   return {
     kind: "motion",
     batch: motionSkillPlan(
@@ -99,6 +120,80 @@ export function planAutonomousHumanoidSkill(input: {
       input.articulationGoal
     )
   };
+}
+
+function recoverySkillPlan(input: {
+  binding: ActiveHumanoidSkillBinding;
+  observation: HumanoidWorldObservation;
+  recoveryAuthorized?: boolean;
+  recoveryInterrupt?: NeuralSafetyInterrupt;
+}): Extract<AutonomousHumanoidSkillPlan, { kind: "recovery" }> {
+  const interrupt = input.recoveryInterrupt;
+  if (!input.recoveryAuthorized || !interrupt
+    || input.binding.recovery_interrupt_id !== interrupt.interrupt_id
+    || !humanoidRecoverySafetyInterruptIsCurrent(interrupt, {
+      worldRevision: input.observation.worldRevision,
+      interruptId: input.binding.recovery_interrupt_id
+    })) {
+    throw new Error(
+      "Fallen recovery requires the current acknowledged Body-to-Reflex safety interrupt"
+    );
+  }
+  const invocation = input.binding.invocation;
+  if (invocation.skill !== "stabilize") {
+    throw new Error("Only stabilize.recover_support may plan fallen recovery");
+  }
+  return {
+    kind: "recovery",
+    plan: {
+      id: `recovery:${input.binding.transaction_id}:${interrupt.interrupt_id}`,
+      contract: {
+        protocol: "humanoid-embodied-recovery-contract-v1",
+        safetyInterrupt: structuredClone(interrupt),
+        minimumSupportMarginMeters: invocation.minimum_support_margin_m,
+        stableSteps: HUMANOID_RECOVERY_STABLE_STEPS,
+        handoffSteps: HUMANOID_RECOVERY_HANDOFF_STEPS,
+        maximumSteps: HUMANOID_RECOVERY_MAXIMUM_STEPS,
+        authorizedContacts: recoveryCarriedObjectContacts(input.observation),
+        standing: {
+          minimumRootHeightMeters: 0.7,
+          minimumUpright: 0.9,
+          maximumRootLinearSpeedMetersPerSecond: 0.35,
+          maximumRootAngularSpeedRadiansPerSecond: 0.5,
+          maximumJointSpeedRadiansPerSecond: 1.5,
+          requireBothFeetContact: true
+        },
+        safetyLimits: {
+          maximumPeakContactNormalForceN: 2500,
+          maximumTotalContactNormalForceN: 4000,
+          maximumTotalContactForceRiseRateNPerSecond: 100000,
+          maximumJointSpeedRadiansPerSecond: 40,
+          minimumJointLimitMarginRadians: -0.1
+        }
+      }
+    }
+  };
+}
+
+function recoveryCarriedObjectContacts(
+  observation: HumanoidWorldObservation
+): Array<{
+  hand_surface: G1HandContactSurfaceName;
+  object_id: string;
+  required: false;
+}> {
+  const knownSurfaces = new Set<string>(G1_HAND_CONTACT_SURFACE_NAMES);
+  return observation.interaction.carrying.bindings.flatMap((binding) => (
+    observation.interaction.grasp_authority.hand_surfaces[binding.hand]
+      .filter((surface): surface is G1HandContactSurfaceName => (
+        knownSurfaces.has(surface)
+      ))
+      .map((surface) => ({
+        hand_surface: surface,
+        object_id: binding.object_id,
+        required: false as const
+      }))
+  ));
 }
 
 function goalConstrainedPositionTolerance(

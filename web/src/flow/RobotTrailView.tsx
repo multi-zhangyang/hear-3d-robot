@@ -23,8 +23,7 @@ export function RobotTrailView({ actions }: { actions: HumanoidActionReceipt[] }
 
   return (
     <section className="robot-trail-view" aria-label="机器人行动历程">
-      <header className="trail-hero">
-        <div><span>机器人行动历程</span><h2>动作轨迹</h2></div>
+      <header className="trail-toolbar" aria-label="动作统计">
         <div className="trail-summary">
           <Summary value={moved} label="运动" />
           <Summary value={physicalFrames.toLocaleString("zh-CN")} label="物理帧" />

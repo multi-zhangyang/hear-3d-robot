@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
+  downloadRunTelemetry,
   getBootstrap,
   getRun,
   getRuns,
@@ -79,6 +80,7 @@ export function App(): React.JSX.Element {
   const [submitting, setSubmitting] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
+  const [exportingRunId, setExportingRunId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const selectedRunRef = useRef<string | null>(null);
   const eventCursorRef = useRef<{ runId: string; eventId?: string } | null>(null);
@@ -422,6 +424,18 @@ export function App(): React.JSX.Element {
     }
   };
 
+  const exportSelectedTelemetry = async (): Promise<void> => {
+    if (!selectedRunId || exportingRunId !== null) return;
+    setExportingRunId(selectedRunId);
+    try {
+      await downloadRunTelemetry(selectedRunId);
+    } catch {
+      showError("遥测导出失败，请稍后重试。");
+    } finally {
+      setExportingRunId(null);
+    }
+  };
+
   if (loading && !bootstrap && !authRequired) return <CenteredSpin />;
   if (authRequired) {
     return (
@@ -498,6 +512,20 @@ export function App(): React.JSX.Element {
               {selectedRun && <RunStatus status={selectedRun.status} />}
             </div>
             <div className="mission-actions">
+              {details && (
+                <UiButton
+                  className="telemetry-export"
+                  busy={exportingRunId === selectedRunId}
+                  disabled={exportingRunId !== null && exportingRunId !== selectedRunId}
+                  title="导出只读 Foxglove MCAP 遥测"
+                  onClick={() => void exportSelectedTelemetry()}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 4v11M8 11l4 4 4-4M5 19h14" />
+                  </svg>
+                  <span className="telemetry-export-label">MCAP</span>
+                </UiButton>
+              )}
               {details && selectedIsActive && (
                 <UiButton
                   tone="danger"

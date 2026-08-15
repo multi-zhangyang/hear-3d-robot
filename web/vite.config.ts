@@ -6,12 +6,6 @@ export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
   publicDir: fileURLToPath(new URL("../assets/", import.meta.url)),
   plugins: [react()],
-  resolve: {
-    alias: [{
-      find: /^three$/,
-      replacement: fileURLToPath(new URL("../node_modules/three/build/three.webgpu.js", import.meta.url))
-    }]
-  },
   server: {
     host: "127.0.0.1",
     port: 5173,

@@ -34,7 +34,6 @@ export function ActivityView(props: ActivityViewProps): React.JSX.Element {
 
       {output && (
         <article className="final-story-card">
-          <span>任务结果</span>
           <h3>{output}</h3>
         </article>
       )}

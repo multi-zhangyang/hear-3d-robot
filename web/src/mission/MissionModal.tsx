@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import type { Bootstrap, Goal, HumanoidRunMode } from "../types";
 import { UiButton } from "../ui/Button";
 import { DeferredBoundary } from "../ui/DeferredBoundary";
+import { CloseIcon } from "../ui/Icons";
 import { LoadingView } from "../ui/LoadingView";
 import { goalSummaryLabel, predicateLabel, scenarioLabel } from "../ui-text";
 import { validGoal } from "./goal-form";
@@ -127,7 +128,7 @@ export function MissionModal(props: MissionModalProps): React.JSX.Element | null
             disabled={props.submitting}
             onClick={cancel}
           >
-            ×
+            <CloseIcon />
           </button>
         </header>
 

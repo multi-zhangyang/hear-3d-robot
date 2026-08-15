@@ -44,18 +44,16 @@ export class HumanoidWorldScene {
   #scenarioChunksIdentity: string;
 
   static async create(
-    scene: THREE.Scene,
     scenario: ScenarioDefinition,
     scenarioChunks: ScenarioChunkDeltaState,
     signal?: AbortSignal
   ): Promise<HumanoidWorldScene> {
     const rig = await G1Rig.create(signal);
     signal?.throwIfAborted();
-    return new HumanoidWorldScene(scene, scenario, scenarioChunks, rig);
+    return new HumanoidWorldScene(scenario, scenarioChunks, rig);
   }
 
   private constructor(
-    scene: THREE.Scene,
     scenario: ScenarioDefinition,
     scenarioChunks: ScenarioChunkDeltaState,
     rig: G1Rig
@@ -65,16 +63,15 @@ export class HumanoidWorldScene {
     this.#scenarioChunksIdentity = scenarioChunksIdentity(scenarioChunks);
     this.rig = rig;
     this.root.name = "humanoid-world";
-    scene.add(this.root);
     this.#terrain = new HumanoidTerrain(scenario.bounds, scenario.seed);
     this.root.add(this.#terrain.root, rig.root);
     this.#createChunkGroups();
     this.#centerOfMass = new THREE.Mesh(
       new THREE.SphereGeometry(0.035, 18, 12),
       new THREE.MeshStandardMaterial({
-        color: 0xf5c86b,
-        emissive: 0xd99a32,
-        emissiveIntensity: 1.4,
+        color: 0xffffff,
+        emissive: 0xa1a1a1,
+        emissiveIntensity: 0.9,
         roughness: 0.3
       })
     );
@@ -83,7 +80,7 @@ export class HumanoidWorldScene {
     for (let index = 0; index < 32; index += 1) {
       const marker = new THREE.Mesh(
         new THREE.SphereGeometry(0.018, 12, 8),
-        new THREE.MeshBasicMaterial({ color: 0x5aebce, transparent: true, opacity: 0.9 })
+        new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.82 })
       );
       marker.visible = false;
       marker.renderOrder = 3;
@@ -292,7 +289,7 @@ export class HumanoidWorldScene {
       new THREE.BufferGeometry().setFromPoints(
         points.map((point) => new THREE.Vector3(point.x, Math.max(0.035, point.y + 0.035), point.z))
       ),
-      new THREE.LineBasicMaterial({ color: 0x5aebce, transparent: true, opacity: 0.78 })
+      new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.72 })
     );
     this.#path.name = "authoritative-navigation-plan";
     this.root.add(this.#path);
@@ -300,17 +297,17 @@ export class HumanoidWorldScene {
 }
 
 function contactColor(kind: HumanoidContactVisualKind): number {
-  if (kind === "solid") return 0xffd166;
-  if (kind === "hand") return 0xf5c86b;
+  if (kind === "solid") return 0xa1a1a1;
+  if (kind === "hand") return 0xffffff;
   if (kind === "body") return 0xff746d;
-  return 0x5aebce;
+  return 0xd4d4d4;
 }
 
 function obstacleMesh(obstacle: ScenarioVisualBlock): THREE.Mesh {
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(obstacle.size.x, obstacle.size.y, obstacle.size.z),
     new THREE.MeshStandardMaterial({
-      color: obstacle.id.startsWith("world_boundary") ? 0x31463c : blockColor(obstacle.id),
+      color: obstacle.id.startsWith("world_boundary") ? 0x242424 : blockColor(obstacle.id),
       roughness: 0.9,
       metalness: 0.02
     })
@@ -321,25 +318,25 @@ function obstacleMesh(obstacle: ScenarioVisualBlock): THREE.Mesh {
   mesh.name = obstacle.id;
   mesh.add(new THREE.LineSegments(
     new THREE.EdgesGeometry(mesh.geometry),
-    new THREE.LineBasicMaterial({ color: 0x9ab7a5, transparent: true, opacity: 0.38 })
+    new THREE.LineBasicMaterial({ color: 0x8a8a8a, transparent: true, opacity: 0.34 })
   ));
   return mesh;
 }
 
 function zoneMesh(zone: ScenarioVisualZone): THREE.Mesh {
   const mesh = new THREE.Mesh(
-    new THREE.BoxGeometry(zone.size.x, 0.018, zone.size.z),
+    new THREE.BoxGeometry(zone.size.x, 0.012, zone.size.z),
     new THREE.MeshStandardMaterial({
-      color: zone.color,
-      emissive: zone.color,
-      emissiveIntensity: 0.85,
+      color: 0xffffff,
+      emissive: 0x7a7a7a,
+      emissiveIntensity: 0.22,
       transparent: true,
-      opacity: 0.34,
-      roughness: 0.5,
+      opacity: 0.24,
+      roughness: 0.72,
       depthWrite: false
     })
   );
-  mesh.position.set(zone.center.x, 0.012, zone.center.z);
+  mesh.position.set(zone.center.x, 0.01, zone.center.z);
   mesh.add(zoneOutline(zone.size));
   mesh.name = zone.id;
   return mesh;
@@ -349,7 +346,7 @@ function objectMesh(object: ScenarioVisualObject): THREE.Mesh {
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(object.size.x, object.size.y, object.size.z, 2, 2, 2),
     new THREE.MeshStandardMaterial({
-      color: object.color,
+      color: blockColor(object.id),
       roughness: 0.48,
       metalness: 0.12
     })
@@ -367,7 +364,7 @@ function objectMesh(object: ScenarioVisualObject): THREE.Mesh {
   mesh.add(new THREE.LineSegments(
     new THREE.EdgesGeometry(mesh.geometry),
     new THREE.LineBasicMaterial({
-      color: object.color,
+      color: 0xa1a1a1,
       transparent: true,
       opacity: 0.72
     })
@@ -397,13 +394,13 @@ function updateObjectInteractionMaterial(
   const material = mesh.material;
   if (!(material instanceof THREE.MeshStandardMaterial)) return;
   if (state === "verified") {
-    material.emissive.setHex(0x42d9b8);
-    material.emissiveIntensity = 0.8;
+    material.emissive.setHex(0xffffff);
+    material.emissiveIntensity = 0.65;
     return;
   }
   if (state === "contact") {
-    material.emissive.setHex(0xd9ad50);
-    material.emissiveIntensity = 0.55;
+    material.emissive.setHex(0xa1a1a1);
+    material.emissiveIntensity = 0.4;
     return;
   }
   material.emissive.setHex(0x000000);
@@ -416,7 +413,7 @@ function blockColor(id: string): number {
     hash ^= character.codePointAt(0) ?? 0;
     hash = Math.imul(hash, 16777619);
   }
-  const palette = [0x66786a, 0x806e55, 0x586f77, 0x71805f, 0x69627b];
+  const palette = [0x3a3a3a, 0x474747, 0x555555, 0x626262, 0x707070];
   return palette[Math.abs(hash) % palette.length]!;
 }
 

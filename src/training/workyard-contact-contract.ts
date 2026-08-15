@@ -22,12 +22,12 @@ const HandSynergyNames = [
 ] as const;
 
 const WorkyardContactTrainingContractSchema = z.object({
-  protocol: z.literal("hear-workyard-contact-training-contract-v1"),
+  protocol: z.literal("hear-workyard-contact-training-contract-v2"),
   scenario_id: z.literal("humanoid_workyard"),
   parent_contract: z.literal("training/workyard-task-v4.json"),
   environment: z.object({
     framework: z.literal("mjlab"),
-    task_id: z.literal("Hear-Workyard-Frozen-Reach-Hand-Synergy-G1-v1"),
+    task_id: z.literal("Hear-Workyard-Whole-Body-Reach-Hand-Synergy-G1-v2"),
     module: z.literal("training/workyard_contact_mjlab_env.py"),
     implementation_status: z.literal("implemented"),
     terminal_stage: z.literal("grasp"),
@@ -47,18 +47,18 @@ const WorkyardContactTrainingContractSchema = z.object({
       jit: z.literal("g1_velocity_teacher.jit.pt"),
       report: z.literal("training-report.json"),
       gradient_parameter_count: z.literal(0),
-      authority: z.tuple([z.literal("lower_body"), z.literal("waist")])
+      authority: z.literal("whole_body_reference_only")
     }).strict(),
     reach_policy: z.object({
-      protocol: z.literal("hear-frozen-reach-policy-export-v1"),
+      protocol: z.literal("hear-whole-body-reach-policy-deployment-v3"),
       root: z.string().min(1),
-      jit: z.literal("workyard_reach_selected.jit.pt"),
+      jit: z.literal("workyard_reach.jit.pt"),
       report: z.literal("reach-policy-report.json"),
-      jit_sha256: z.string().regex(/^[a-f0-9]{64}$/u),
-      source_checkpoint_sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+      jit_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+      source_checkpoint_sha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
       gradient_parameter_count: z.literal(0),
-      action_size: z.literal(14),
-      authority: z.literal("frozen_active_arm_reach")
+      action_size: z.literal(29),
+      authority: z.literal("frozen_whole_body_reach")
     }).strict(),
     analytic_teacher_preflight: z.object({
       protocol: z.literal("hear-workyard-contact-analytic-teacher-preflight-v1"),
@@ -92,6 +92,10 @@ const WorkyardContactTrainingContractSchema = z.object({
       "episode_local_after_first_geometry_gate"
     ),
     pose_hold: z.literal("closure_gate_then_measured_contact_pose"),
+    terminal_pocket_max_joint_target_slew_rad_per_control_step: z.literal(
+      0.001
+    ),
+    hand_contact_solref_time_constant_s: z.literal(0.04),
     force_release_threshold_n: z.number().finite().positive(),
     emergency_force_release_threshold_n: z.number().finite().positive(),
     maximum_closing_joint_lead_rad: z.literal(0.25),
@@ -101,8 +105,8 @@ const WorkyardContactTrainingContractSchema = z.object({
     phase: z.literal("hand_synergy_contact_grasp"),
     role: z.literal("contact_conditioned_8d_hand_policy"),
     observation: z.object({
-      protocol: z.literal("hear-workyard-contact-observation-v1"),
-      size: z.literal(247),
+      protocol: z.literal("hear-workyard-contact-observation-v2"),
+      size: z.literal(262),
       terms: z.array(SizedTermSchema).length(3),
       forbidden_terms: z.tuple([
         z.literal("teacher_stage"),
@@ -139,12 +143,14 @@ const WorkyardContactTrainingContractSchema = z.object({
     }).strict()
   }).strict(),
   composition: z.object({
-    protocol: z.literal("hear-frozen-reach-hand-synergy-composition-v1"),
+    protocol: z.literal(
+      "hear-frozen-whole-body-reach-hand-synergy-composition-v2"
+    ),
     learned_action_size: z.literal(8),
-    frozen_reach_action_size: z.literal(14),
-    logical_composed_action_size: z.literal(22),
+    frozen_reach_action_size: z.literal(29),
+    logical_composed_action_size: z.literal(37),
     body_joint_command: z.literal(
-      "frozen_locomotion_plus_frozen_reach_or_harness_terminal_executor"
+      "frozen_whole_body_reach_plus_harness_terminal_active_arm_executor"
     ),
     hand_joint_command: z.literal("authorized_active_hand_synergy_only")
   }).strict(),
@@ -236,7 +242,7 @@ const WorkyardContactTrainingContractSchema = z.object({
     context.addIssue({
       code: "custom",
       path: ["learner", "observation", "terms"],
-      message: "Contact observation terms do not sum to 247"
+      message: "Contact observation terms do not sum to 262"
     });
   }
   if (contract.training.dagger.teacher_beta_final
@@ -289,13 +295,13 @@ export interface WorkyardContactArtifactEvidence {
 }
 
 export interface WorkyardContactDryRunReport {
-  protocol: "hear-workyard-contact-training-dry-run-v1";
+  protocol: "hear-workyard-contact-training-dry-run-v2";
   contract_sha256: string;
   scenario_id: "humanoid_workyard";
   learner: {
-    observation_size: 247;
+    observation_size: 262;
     action_size: 8;
-    logical_composed_action_size: 22;
+    logical_composed_action_size: 37;
     active_hand_only: true;
   };
   terminal_stage: "grasp";
@@ -361,28 +367,54 @@ export async function inspectWorkyardContactArtifacts(
     }
     const reachReport = JSON.parse(reachReportBytes.toString("utf8")) as {
       protocol?: string;
+      deployment?: { protocol?: string; accepted?: boolean;
+        controller_mode?: string; terminal_assistance_step_count?: number;
+        minimum_support_margin_m?: number;
+        maximum_foot_planar_displacement_m?: number;
+        maximum_foot_slip_speed_m_s?: number;
+        double_support_loss_rate_maximum?: number;
+        no_foot_contact_rate_maximum?: number };
       source?: { checkpoint_sha256?: string; phase_one_accepted?: boolean;
-        hand_checkpoint_expansion_authorized?: boolean;
-        waist_checkpoint_expansion_authorized?: boolean };
+        hand_checkpoint_expansion_authorized?: boolean };
       policy?: { file?: string; bytes?: number; sha256?: string;
-        input_size?: number; output_size?: number; batch_dynamic?: boolean;
+        input?: string; input_size?: number; output?: string;
+        output_size?: number; batch_dynamic?: boolean;
         gradient_parameter_count?: number };
     };
-    if (reachReport.protocol !== contract.qualified_inputs.reach_policy.protocol
+    if (contract.qualified_inputs.reach_policy.source_checkpoint_sha256 === null
+      || contract.qualified_inputs.reach_policy.jit_sha256 === null
+      || reachReport.protocol !== contract.qualified_inputs.reach_policy.protocol
+      || reachReport.deployment?.protocol
+        !== "hear-typescript-mujoco-reach-deployment-gate-v1"
+      || reachReport.deployment?.accepted !== true
+      || reachReport.deployment?.controller_mode !== "learned_policy_only"
+      || reachReport.deployment?.terminal_assistance_step_count !== 0
+      || !((reachReport.deployment?.minimum_support_margin_m
+        ?? Number.NEGATIVE_INFINITY) >= -0.04)
+      || !((reachReport.deployment?.maximum_foot_planar_displacement_m
+        ?? Number.POSITIVE_INFINITY) <= 0.08)
+      || !((reachReport.deployment?.maximum_foot_slip_speed_m_s
+        ?? Number.POSITIVE_INFINITY) <= 0.20)
+      || !((reachReport.deployment?.double_support_loss_rate_maximum
+        ?? Number.POSITIVE_INFINITY) <= 0.10)
+      || !((reachReport.deployment?.no_foot_contact_rate_maximum
+        ?? Number.POSITIVE_INFINITY) <= 0.01)
       || reachReport.source?.checkpoint_sha256
         !== contract.qualified_inputs.reach_policy.source_checkpoint_sha256
       || reachReport.source?.phase_one_accepted !== true
       || reachReport.source?.hand_checkpoint_expansion_authorized !== true
-      || reachReport.source?.waist_checkpoint_expansion_authorized !== false
       || reachReport.policy?.file !== contract.qualified_inputs.reach_policy.jit
       || reachReport.policy?.bytes !== reachJit.byteLength
       || reachReport.policy?.sha256 !== sha256(reachJit)
       || reachReport.policy.sha256 !== contract.qualified_inputs.reach_policy.jit_sha256
-      || reachReport.policy.input_size !== 231
-      || reachReport.policy.output_size !== 14
+      || reachReport.policy.input
+        !== "hear-workyard-whole-body-reach-observation-v5"
+      || reachReport.policy.input_size !== 246
+      || reachReport.policy.output !== "bounded-whole-body-reach-mean"
+      || reachReport.policy.output_size !== 29
       || reachReport.policy.batch_dynamic !== true
       || reachReport.policy.gradient_parameter_count !== 0) {
-      blockers.push("Frozen v15 reach policy identity is invalid");
+      blockers.push("Qualified whole-body reach policy identity is invalid or unpinned");
     }
     const preflight = JSON.parse(teacherGateBytes.toString("utf8")) as {
       gate?: { protocol?: string; passed?: boolean; checks?: Record<string, boolean> };
@@ -458,7 +490,7 @@ export function dryRunWorkyardContactTrainingContract(
     throw new Error("Contact Workyard pickup stand drifted from the trained MuJoCo plant");
   }
   const expectedTerms = [
-    ["frozen_reach_observation", 231],
+    ["frozen_reach_observation", 246],
     ["hand_coordination", 8],
     ["previous_authorized_hand_action", 8]
   ] as const;
@@ -474,13 +506,13 @@ export function dryRunWorkyardContactTrainingContract(
   }
   const blockers = [...artifacts.blockers];
   return {
-    protocol: "hear-workyard-contact-training-dry-run-v1",
+    protocol: "hear-workyard-contact-training-dry-run-v2",
     contract_sha256: sha256(Buffer.from(JSON.stringify(contract))),
     scenario_id: contract.scenario_id,
     learner: {
-      observation_size: 247,
+      observation_size: 262,
       action_size: 8,
-      logical_composed_action_size: 22,
+      logical_composed_action_size: 37,
       active_hand_only: true
     },
     terminal_stage: "grasp",

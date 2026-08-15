@@ -18,6 +18,7 @@ import {
   type HumanoidLearnedPolicyCapability
 } from "../../domain/humanoid-policy.js";
 import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
+import type { NeuralSafetyInterrupt } from "../../domain/neural-hierarchy.js";
 import type { HumanoidWorldObservation } from "../../world/humanoid/world.js";
 import {
   HumanoidEmbodiedSkillIdentitySchema,
@@ -31,6 +32,9 @@ import {
   type HumanoidArticulationGoal
 } from "./articulation-control.js";
 import { alignHumanoidSkillToGoal } from "./goal-skill-alignment.js";
+import {
+  humanoidRecoverySafetyInterruptIsCurrent
+} from "./recovery-safety-authority.js";
 
 const GRASP_REACH_PRECONDITION_DISTANCE_METERS = 0.12;
 
@@ -55,6 +59,10 @@ export interface ActiveHumanoidSkillBinding {
   skill_catalog_sha256: string;
   active_goal_sha256?: string;
   recovery_authorized?: boolean;
+  recovery_interrupt_id?: string;
+  /** Physical evidence used to prove that the semantic target has not moved. */
+  target_evidence_position: Vec3 | null;
+  /** Planner destination. For approach/carry this is a robot-base target, not object evidence. */
   target_position: Vec3 | null;
   target_solid: Omit<HumanoidSolidToken, "currentContacts"> | null;
   target_articulation: HumanoidObjectWorldModelEntry["articulation"];
@@ -62,7 +70,7 @@ export interface ActiveHumanoidSkillBinding {
   eligible_interaction_point_ids: string[];
   learned_policy_required_capabilities: HumanoidLearnedPolicyCapability[];
   learned_policy_missing_capabilities: HumanoidLearnedPolicyCapability[];
-  control_mode: "learned_policy" | "reference_control_fallback";
+  control_mode: "learned_policy";
 }
 
 export function manipulationBasePlacementNavigationBlockerIds(
@@ -146,6 +154,8 @@ export const ActiveHumanoidSkillBindingSchema = z.object({
     skill_catalog_sha256: z.string().regex(/^[a-f0-9]{64}$/),
     active_goal_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     recovery_authorized: z.boolean().optional(),
+    recovery_interrupt_id: z.string().uuid().optional(),
+    target_evidence_position: Vec3Schema.nullable().default(null),
     target_position: Vec3Schema.nullable(),
     target_solid: PersistedSolidSchema.nullable().default(null),
     target_articulation: PersistedArticulationSchema.nullable(),
@@ -157,16 +167,23 @@ export const ActiveHumanoidSkillBindingSchema = z.object({
     learned_policy_missing_capabilities: z.array(
       z.enum(HUMANOID_LEARNED_POLICY_CAPABILITIES)
     ).default([]),
-    control_mode: z.enum([
-      "learned_policy",
-      "reference_control_fallback"
-    ]).default("reference_control_fallback")
+    control_mode: z.literal("learned_policy")
   }).strict().superRefine((binding, context) => {
     if (binding.invocation_sha256 !== modelPayloadSha256(binding.invocation)) {
       context.addIssue({
         code: "custom",
         path: ["invocation_sha256"],
         message: "Active Skill invocation identity is invalid"
+      });
+    }
+    if (binding.recovery_interrupt_id !== undefined
+      && (binding.recovery_authorized !== true
+        || binding.invocation.skill !== "stabilize"
+        || binding.phase !== "recover_support")) {
+      context.addIssue({
+        code: "custom",
+        path: ["recovery_interrupt_id"],
+        message: "A recovery interrupt may authorize only stabilize.recover_support"
       });
     }
     const pointIds = binding.eligible_interaction_points.map(({ id }) => id).sort();
@@ -230,6 +247,7 @@ export function bindHumanoidSkill(input: {
   articulationGoal?: HumanoidArticulationGoal;
   activeGoal?: Goal;
   recoveryAuthorized?: boolean;
+  recoveryInterrupt?: NeuralSafetyInterrupt;
 }): HumanoidSkillBindingResult {
   const request = BeginHumanoidSkillSchema.parse(input.request);
   const invocation = request.invocation;
@@ -256,6 +274,37 @@ export function bindHumanoidSkill(input: {
         ? "The current observation already supplies sensor authority"
         : "Checker authority must be expressed by a physical Motion Option terminal"
     });
+  }
+  const fallenRecovery = invocation.skill === "stabilize"
+    && request.phase === "recover_support";
+  if (input.recoveryInterrupt && !fallenRecovery) {
+    return rejection("skill_recovery_interrupt_requires_stabilize", {
+      requested_skill: invocation.skill,
+      requested_phase: request.phase,
+      recovery_interrupt_id: input.recoveryInterrupt.interrupt_id
+    });
+  }
+  if (input.observation.robot.fallen && !fallenRecovery) {
+    return rejection("skill_fallen_recovery_required", {
+      requested_skill: invocation.skill,
+      requested_phase: request.phase,
+      required_skill: "stabilize",
+      required_phase: "recover_support"
+    });
+  }
+  if (input.observation.robot.fallen || input.recoveryInterrupt !== undefined) {
+    const interrupt = input.recoveryInterrupt;
+    if (input.recoveryAuthorized !== true
+      || !humanoidRecoverySafetyInterruptIsCurrent(interrupt, {
+        worldRevision: input.observation.worldRevision
+      })) {
+      return rejection("skill_recovery_interrupt_required", {
+        skill: invocation.skill,
+        phase: request.phase,
+        world_revision: input.observation.worldRevision,
+        recovery_interrupt_id: interrupt?.interrupt_id ?? null
+      });
+    }
   }
   const worldModel = input.observation.interaction.object_world_model;
   if (worldModel.frame !== input.observation.frame
@@ -388,6 +437,16 @@ export function bindHumanoidSkill(input: {
   const learnedPolicyMissingCapabilities = learnedPolicyRequiredCapabilities.filter(
     (capability) => !learnedPolicyCapabilities.has(capability)
   );
+  if (learnedPolicyMissingCapabilities.length > 0) {
+    return rejection("skill_learned_policy_capability_missing", {
+      skill: invocation.skill,
+      phase: request.phase,
+      required_capabilities: learnedPolicyRequiredCapabilities,
+      installed_capabilities: [...learnedPolicyCapabilities],
+      missing_capabilities: learnedPolicyMissingCapabilities,
+      recovery: "Choose a Skill phase fully covered by the installed trained controller"
+    });
+  }
   const planningAction: SkillPlanningAction = "plan_humanoid_skill";
   return {
     accepted: true,
@@ -410,6 +469,15 @@ export function bindHumanoidSkill(input: {
         ? { active_goal_sha256: modelPayloadSha256(input.activeGoal) }
         : {}),
       ...(input.recoveryAuthorized ? { recovery_authorized: true } : {}),
+      ...(input.recoveryInterrupt
+        ? { recovery_interrupt_id: input.recoveryInterrupt.interrupt_id }
+        : {}),
+      target_evidence_position: target
+        ? { ...target.pose.position }
+        : targetZone ? { ...targetZone.center }
+        : explorationFrontier ? { ...explorationFrontier.target }
+        : targetSolid ? { ...targetSolid.center }
+        : null,
       target_position: approachPlacement
         ? { ...approachPlacement.rootWorldTarget }
         : invocation.skill === "carry_to_zone" && target && targetZone
@@ -439,9 +507,7 @@ export function bindHumanoidSkill(input: {
       eligible_interaction_point_ids: interaction.eligiblePointIds,
       learned_policy_required_capabilities: learnedPolicyRequiredCapabilities,
       learned_policy_missing_capabilities: learnedPolicyMissingCapabilities,
-      control_mode: learnedPolicyMissingCapabilities.length === 0
-        ? "learned_policy"
-        : "reference_control_fallback"
+      control_mode: "learned_policy"
     }
   };
 }

@@ -691,13 +691,16 @@ describe("humanoid skill binding", () => {
           skill: "approach",
           object_id: "cabinet-door",
           interaction_point_id: "door-handle",
+          hand: "right",
           standoff_m: 0.45
         },
         phase: "route"
       },
       observation: observation()
     });
-    if (!result.accepted) throw new Error("Expected approach binding");
+    if (!result.accepted) throw new Error(
+      `Expected approach binding: ${JSON.stringify(result)}`
+    );
 
     expect(validateSkillPlanningReference({
       binding: result.binding,
@@ -720,6 +723,62 @@ describe("humanoid skill binding", () => {
       accepted: false,
       code: "skill_phase_authority_mismatch"
     });
+  });
+
+  it("keeps approach planner placement separate from target-object evidence", () => {
+    const current = observation();
+    current.manipulationBasePlacements = [{
+      objectId: "cabinet-door",
+      interactionPointId: "door-handle",
+      handSurface: "right_hand_palm_link",
+      rootWorldTarget: { x: 1.75, y: 0.76, z: 3.4 },
+      rootTranslationWorld: { x: 0.75, y: 0, z: 2.4 },
+      rootYawRadians: 0,
+      wristWorldTarget: { x: 2.35, y: 1, z: 3 },
+      ikResidualMeters: 0.01
+    }];
+    const result = bindHumanoidSkill({
+      transactionId: "approach-placement-grounding",
+      agentId: "humanoid-motion-reference",
+      request: {
+        invocation: {
+          skill: "approach",
+          object_id: "cabinet-door",
+          interaction_point_id: "door-handle",
+          hand: "right",
+          standoff_m: 0.45
+        },
+        phase: "route"
+      },
+      observation: current
+    });
+    if (!result.accepted) throw new Error(
+      `Expected approach binding: ${JSON.stringify(result)}`
+    );
+    expect(result.binding).toMatchObject({
+      target_position: { x: 1.75, y: 0.76, z: 3.4 },
+      target_evidence_position: { x: 2, y: 1, z: 3 }
+    });
+
+    const receipt = groundHumanoidPhysicalExecution({
+      planningReceipt: {
+        transactionId: "planning-approach",
+        accepted: true,
+        worldAfterRevision: current.worldRevision,
+        detail: {
+          plan_id: "route-approach",
+          skill_binding: result.binding
+        }
+      },
+      intent: {
+        transactionId: "execute-approach",
+        planningTransactionId: "planning-approach",
+        planId: "route-approach"
+      },
+      observation: current,
+      authorityStateSha256: "c".repeat(64)
+    });
+    expect(receipt).toMatchObject({ accepted: true, failed_obligation_ids: [] });
   });
 
   it("routes articulated pull through the generic solver", () => {

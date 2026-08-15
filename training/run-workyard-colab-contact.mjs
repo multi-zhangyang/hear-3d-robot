@@ -6,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   rmdirSync,
+  statSync,
   writeFileSync
 } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
@@ -51,6 +52,7 @@ const executionProfile = options.profile ?? (
 const workspace = process.cwd();
 const contractPath = resolve("training/workyard-contact-task-v1.json");
 const defaultContract = JSON.parse(readFileSync(contractPath, "utf8"));
+const requiresQualifiedPreflight = mode === "pilot" || mode === "train";
 const session = options.session
   ?? `hear-workyard-contact-${backend}-${mode}-${randomUUID().slice(0, 8)}`;
 const distro = options.distro ?? "HEAR-Linux";
@@ -60,7 +62,7 @@ const locomotionRoot = resolve(
   options.locomotionRoot ?? "artifacts/training/g1-residual-teacher"
 );
 const reachRoot = resolve(
-  options.reachRoot ?? "artifacts/training/workyard-reach-frozen-v15"
+  options.reachRoot ?? "artifacts/training/workyard-reach-deployment-v3"
 );
 const preflightReport = resolve(
   options.preflightReport
@@ -68,11 +70,24 @@ const preflightReport = resolve(
     ?? "artifacts/training/workyard-contact-teacher/local-v59.json"
 );
 const output = resolve(options.output ?? (
-  mode === "train" || mode === "pilot"
+  mode === "teacher"
+    ? preflightReport
+    : mode === "train" || mode === "pilot"
     ? `artifacts/training/workyard-contact-${mode}/${session}`
     : `artifacts/training/workyard-contact-${mode}/${session}.json`
 ));
 const producesTrainingArtifacts = mode === "train" || mode === "pilot";
+const persistCheckpointsToDrive = producesTrainingArtifacts
+  && backend === "colab"
+  && options.driveCheckpoints === "mount";
+const streamTrainingArtifacts = backend === "colab"
+  && (producesTrainingArtifacts || options.artifactStream === "on");
+const driveDirectory = options.driveDirectory
+  ?? `HEAR/workyard-contact/${mode}/${session}`;
+const driveLocalRoot = options.driveLocalRoot
+  ? resolve(options.driveLocalRoot)
+  : null;
+const remoteDriveOutputRoot = `/content/drive/MyDrive/${driveDirectory}`;
 const localReport = producesTrainingArtifacts ? `${output}-remote-report.json` : output;
 const localArchive = producesTrainingArtifacts ? `${output}.tar.gz` : null;
 const temporaryDirectory = resolve(`.tmp/workyard-contact-${backend}`);
@@ -87,6 +102,7 @@ const localExecutionArchive = resolve(localRuntimeDirectory, "artifacts.tar.gz")
 const localPidFile = resolve(localRuntimeDirectory, "runner.pid");
 const bundleAssemblyScript = resolve(temporaryDirectory, `${session}-assemble-bundle.py`);
 const bundleChunkPrefix = resolve(temporaryDirectory, `${session}-bundle-part`);
+const driveFinalizer = resolve(temporaryDirectory, `${session}-drive-finalize.py`);
 
 let activeSession = null;
 let activeLocalPidFile = null;
@@ -126,13 +142,19 @@ async function main() {
     requireSuccess(await colab([
       "new", "--session", session, "--gpu", options.gpu ?? "L4"
     ]), "create Colab contact session");
+    if (persistCheckpointsToDrive) {
+      requireSuccess(await colab([
+        "drivemount", "--session", session, "/content/drive"
+      ], false, 300_000), "mount Google Drive for durable contact checkpoints");
+      writeDriveFinalizer();
+    }
     await uploadBundleInVerifiedChunks();
     requireSuccess(await retryColab([
       "upload", "--session", session, toWslPath(config), REMOTE_CONFIG
     ], "upload contact configuration", null, 5), "upload contact configuration");
     const remoteTimeoutSeconds = options.timeoutSeconds
       ?? (mode === "train" ? 21_600 : mode === "pilot" ? 3_600 : 1_800);
-    const execution = await colab([
+    const executionArgs = [
       "exec",
       "--session",
       session,
@@ -140,20 +162,57 @@ async function main() {
       toWslPath(bootstrap),
       "--timeout",
       String(remoteTimeoutSeconds)
-    ], false, (remoteTimeoutSeconds + 300) * 1_000);
-    requireSuccess(await retryColab([
-      "download", "--session", session, REMOTE_REPORT, toWslPath(localReport)
-    ], "download contact report", localReport), "download contact report");
-    const report = validateReport(localReport);
-    requireSuccess(execution, `execute contact Workyard ${mode}`);
-    if (producesTrainingArtifacts) {
+    ];
+    const execution = streamTrainingArtifacts
+      ? await colabArtifactStream(
+          executionArgs,
+          (remoteTimeoutSeconds + 300) * 1_000,
+          new Map([
+            ["training-report.json", { path: localReport, required: true }],
+            ...(localArchive
+              ? [["training-artifacts.tar.gz", { path: localArchive, required: false }]]
+              : [])
+          ])
+        )
+      : await colab(
+          executionArgs, false, (remoteTimeoutSeconds + 300) * 1_000
+        );
+    if (streamTrainingArtifacts) {
+      if (!existsSync(localReport)) {
+        throw new Error("Contact execution returned no streamed report");
+      }
+    } else {
       requireSuccess(await retryColab([
-        "download", "--session", session, REMOTE_ARCHIVE, toWslPath(localArchive)
-      ], "download contact artifacts", localArchive), "download contact artifacts");
+        "download", "--session", session, REMOTE_REPORT, toWslPath(localReport)
+      ], "download contact report", localReport), "download contact report");
+    }
+    if (producesTrainingArtifacts) {
+      if (streamTrainingArtifacts) {
+        if (!existsSync(localArchive)) {
+          throw new Error("Contact execution returned no streamed training archive");
+        }
+      } else {
+        requireSuccess(await retryColab([
+          "download", "--session", session, REMOTE_ARCHIVE, toWslPath(localArchive)
+        ], "download contact artifacts", localArchive), "download contact artifacts");
+      }
       await extractArtifacts(localArchive, output);
       copyFileSync(localReport, resolve(output, "training-report.json"));
+    }
+    const report = validateReport(localReport);
+    requireSuccess(execution, `execute contact Workyard ${mode}`);
+    if (persistCheckpointsToDrive) {
+      requireSuccess(await retryColab([
+        "exec", "--session", session, "--file", toWslPath(driveFinalizer),
+        "--timeout", "1200"
+      ], "finalize contact artifacts in Google Drive", null, 3, 1_260_000),
+      "finalize contact artifacts in Google Drive");
+    } else if (driveLocalRoot && producesTrainingArtifacts) {
+      backupToLocalDrive();
+    }
+    if (producesTrainingArtifacts) {
       console.log(
-        `Contact ${mode}: ${output} (independent gate: ${report.acceptance.final_gate.passed})`
+        `Contact ${mode}: ${output} (independent gate: ${report.acceptance.final_gate.passed}; verified artifact stream; ${persistCheckpointsToDrive ? "periodic Drive checkpoints enabled" : "periodic Drive checkpoints disabled"}${driveLocalRoot ? "; desktop Drive mirror configured" : ""})`
       );
     } else {
       console.log(`Contact Workyard ${mode}: ${output}`);
@@ -218,7 +277,14 @@ function buildConfiguration(contract) {
     final_eval_envs: options.finalEvalEnvs ?? (pilot ? 16 : evaluation.episodes),
     final_eval_steps: options.finalEvalSteps ?? evaluation.control_steps_per_episode,
     seed: options.seed ?? 42,
+    ...(options.episodeSeeds === undefined
+      ? {}
+      : { episode_seeds: options.episodeSeeds }),
     execution_profile: executionProfile,
+    artifact_stream: streamTrainingArtifacts,
+    ...(persistCheckpointsToDrive
+      ? { output_root: remoteDriveOutputRoot }
+      : {}),
     archive: backend === "local" ? toWslPath(localExecutionArchive) : REMOTE_ARCHIVE
   };
   if (mode === "train") {
@@ -277,14 +343,27 @@ async function runLocal() {
 
 function assertInputs() {
   const contract = JSON.parse(readFileSync(contractPath, "utf8"));
-  if (contract.protocol !== "hear-workyard-contact-training-contract-v1"
-    || contract.learner?.observation?.size !== 247
+  if (contract.protocol !== "hear-workyard-contact-training-contract-v2"
+    || contract.learner?.observation?.size !== 262
     || contract.learner?.action?.size !== 8
-    || contract.composition?.logical_composed_action_size !== 22) {
+    || contract.composition?.logical_composed_action_size !== 37) {
     throw new Error("Contact training contract is invalid");
   }
   if (!/^[A-Za-z0-9._-]+$/.test(session)) {
     throw new Error(`Unsafe contact run identity: ${session}`);
+  }
+  if (persistCheckpointsToDrive || driveLocalRoot) {
+    const segments = driveDirectory.split("/");
+    if (segments.length === 0 || segments.some((segment) => (
+      !segment || segment === "." || segment === ".." || !/^[A-Za-z0-9._-]+$/.test(segment)
+    ))) {
+      throw new Error(`Unsafe contact Drive directory: ${driveDirectory}`);
+    }
+  }
+  if (driveLocalRoot && (
+    !existsSync(driveLocalRoot) || !statSync(driveLocalRoot).isDirectory()
+  )) {
+    throw new Error(`Contact local Drive root is unavailable: ${driveLocalRoot}`);
   }
   const runnerInputs = [
     ...FIXED_BUNDLE_PATHS,
@@ -299,7 +378,7 @@ function assertInputs() {
   const roots = [
     ["locomotion", locomotionRoot],
     ["reach", reachRoot],
-    ["preflight", preflightReport]
+    ...(requiresQualifiedPreflight ? [["preflight", preflightReport]] : [])
   ];
   const relatives = {};
   for (const [name, path] of roots) {
@@ -308,10 +387,11 @@ function assertInputs() {
   }
   const locomotionJit = resolve(locomotionRoot, "g1_velocity_teacher.jit.pt");
   const locomotionReport = resolve(locomotionRoot, "training-report.json");
-  const reachJit = resolve(reachRoot, "workyard_reach_selected.jit.pt");
+  const reachJit = resolve(reachRoot, "workyard_reach.jit.pt");
   const reachReport = resolve(reachRoot, "reach-policy-report.json");
   for (const path of [
-    locomotionJit, locomotionReport, reachJit, reachReport, preflightReport
+    locomotionJit, locomotionReport, reachJit, reachReport,
+    ...(requiresQualifiedPreflight ? [preflightReport] : [])
   ]) {
     if (!existsSync(path)) throw new Error(`Qualified contact artifact is missing: ${path}`);
   }
@@ -325,20 +405,47 @@ function assertInputs() {
     throw new Error("Frozen locomotion JIT does not match its report");
   }
   const reachReportValue = JSON.parse(readFileSync(reachReport, "utf8"));
-  if (reachReportValue.policy?.sha256 !== sha256(reachJit)
+  if (contract.qualified_inputs.reach_policy.jit_sha256 === null
+    || contract.qualified_inputs.reach_policy.source_checkpoint_sha256 === null
+    || reachReportValue.protocol
+      !== "hear-whole-body-reach-policy-deployment-v3"
+    || reachReportValue.deployment?.protocol
+      !== "hear-typescript-mujoco-reach-deployment-gate-v1"
+    || reachReportValue.deployment?.accepted !== true
+    || reachReportValue.deployment?.controller_mode !== "learned_policy_only"
+    || reachReportValue.deployment?.terminal_assistance_step_count !== 0
+    || !(reachReportValue.deployment?.minimum_support_margin_m >= -0.04)
+    || !(reachReportValue.deployment?.maximum_foot_planar_displacement_m <= 0.08)
+    || !(reachReportValue.deployment?.maximum_foot_slip_speed_m_s <= 0.20)
+    || !(reachReportValue.deployment?.double_support_loss_rate_maximum <= 0.10)
+    || !(reachReportValue.deployment?.no_foot_contact_rate_maximum <= 0.01)
+    || reachReportValue.source?.checkpoint_sha256
+      !== contract.qualified_inputs.reach_policy.source_checkpoint_sha256
+    || reachReportValue.policy?.sha256 !== sha256(reachJit)
     || reachReportValue.policy?.sha256 !== contract.qualified_inputs.reach_policy.jit_sha256
     || reachReportValue.policy?.bytes !== readFileSync(reachJit).byteLength
-    || reachReportValue.policy?.input_size !== 231
-    || reachReportValue.policy?.output_size !== 14
+    || reachReportValue.policy?.input
+      !== "hear-workyard-whole-body-reach-observation-v5"
+    || reachReportValue.policy?.input_size !== 246
+    || reachReportValue.policy?.output !== "bounded-whole-body-reach-mean"
+    || reachReportValue.policy?.output_size !== 29
     || reachReportValue.policy?.gradient_parameter_count !== 0) {
-    throw new Error("Frozen v15 reach JIT does not match its report");
+    throw new Error("Qualified whole-body reach JIT does not match its report");
   }
-  const preflight = JSON.parse(readFileSync(preflightReport, "utf8"));
-  if (preflight.gate?.protocol
-      !== "hear-workyard-contact-analytic-teacher-preflight-v1"
-    || preflight.gate?.passed !== true
-    || !Object.values(preflight.gate?.checks ?? {}).every(Boolean)) {
-    throw new Error("Analytic contact preflight is not qualified");
+  if (requiresQualifiedPreflight) {
+    const preflight = JSON.parse(readFileSync(preflightReport, "utf8"));
+    const frozenReach = preflight.evaluation?.frozen_reach
+      ?? preflight.contract?.frozen_reach;
+    if (preflight.gate?.protocol
+        !== "hear-workyard-contact-analytic-teacher-preflight-v1"
+      || preflight.gate?.passed !== true
+      || !Object.values(preflight.gate?.checks ?? {}).every(Boolean)
+      || frozenReach?.gradient_parameter_count !== 0
+      || frozenReach?.jit_sha256 !== sha256(reachJit)) {
+      throw new Error(
+        "Analytic contact preflight is not qualified for the pinned Reach policy"
+      );
+    }
   }
   return {
     contract,
@@ -346,7 +453,7 @@ function assertInputs() {
       ...FIXED_BUNDLE_PATHS,
       relatives.locomotion,
       relatives.reach,
-      relatives.preflight
+      ...(requiresQualifiedPreflight ? [relatives.preflight] : [])
     ]
   };
 }
@@ -357,6 +464,71 @@ function workspaceRelative(path) {
     throw new Error(`Contact input must remain inside the workspace: ${path}`);
   }
   return value;
+}
+
+function backupToLocalDrive() {
+  if (!driveLocalRoot || !localArchive) {
+    throw new Error("Contact local Drive backup is not configured");
+  }
+  const target = resolve(driveLocalRoot, ...driveDirectory.split("/"));
+  const child = relative(driveLocalRoot, target);
+  if (!child || child === ".." || child.startsWith("..\\") || child.startsWith("../")) {
+    throw new Error(`Unsafe contact local Drive target: ${target}`);
+  }
+  if (existsSync(target)) {
+    throw new Error(`Contact local Drive target already exists: ${target}`);
+  }
+  mkdirSync(target, { recursive: true });
+  try {
+    const archiveDestination = resolve(
+      target, "hear-workyard-contact-artifacts.tar.gz"
+    );
+    const reportDestination = resolve(
+      target, "hear-workyard-contact-report.json"
+    );
+    copyFileSync(localArchive, archiveDestination);
+    copyFileSync(localReport, reportDestination);
+    if (sha256(localArchive) !== sha256(archiveDestination)
+      || sha256(localReport) !== sha256(reportDestination)) {
+      throw new Error("Contact local Drive backup failed SHA256 verification");
+    }
+  } catch (error) {
+    rmSync(target, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function writeDriveFinalizer() {
+  writeFileSync(driveFinalizer, [
+    "import shutil",
+    "from hashlib import sha256",
+    "from pathlib import Path",
+    "drive_root = Path('/content/drive/MyDrive').resolve()",
+    `target = (drive_root / ${JSON.stringify(driveDirectory)}).resolve()`,
+    "if drive_root not in target.parents: raise RuntimeError(f'unsafe Drive target: {target}')",
+    "target.mkdir(parents=True, exist_ok=True)",
+    "sources = [",
+    `  Path(${JSON.stringify(REMOTE_ARCHIVE)}),`,
+    `  Path(${JSON.stringify(REMOTE_REPORT)}),`,
+    "]",
+    "temporaries = []",
+    "try:",
+    "  for source in sources:",
+    "    if not source.is_file(): raise RuntimeError(f'missing training artifact: {source}')",
+    "    destination = target / source.name",
+    "    temporary = target / (source.name + '.partial')",
+    "    temporary.unlink(missing_ok=True)",
+    "    temporaries.append(temporary)",
+    "    shutil.copy2(source, temporary)",
+    "    if temporary.stat().st_size != source.stat().st_size: raise RuntimeError('Drive byte count mismatch')",
+    "    if sha256(temporary.read_bytes()).hexdigest() != sha256(source.read_bytes()).hexdigest(): raise RuntimeError('Drive sha256 mismatch')",
+    "    temporary.replace(destination)",
+    "except Exception:",
+    "  for temporary in temporaries: temporary.unlink(missing_ok=True)",
+    "  raise",
+    "print(f'[hear] contact training finalized in {target}')",
+    ""
+  ].join("\n"), "utf8");
 }
 
 async function createBundle(inputs) {
@@ -472,6 +644,147 @@ function colab(args, tolerateFailure = false, watchdogMs = 600_000) {
   );
 }
 
+function colabArtifactStream(args, watchdogMs, destinations) {
+  console.log(`[${session}] colab ${args.join(" ")} (artifact stream)`);
+  const prefix = "@@HEAR_ARTIFACT_V1@@";
+  return new Promise((resolveStatus, reject) => {
+    let settled = false;
+    let timedOut = false;
+    let parseFailure = null;
+    let lineBuffer = "";
+    let activeArtifact = null;
+    const received = new Set();
+    const child = spawn(
+      "wsl.exe",
+      ["-d", distro, "--", colabPath, ...args],
+      {
+        cwd: workspace,
+        shell: false,
+        stdio: ["inherit", "pipe", "pipe"],
+        windowsHide: true
+      }
+    );
+
+    const failParsing = (error) => {
+      if (parseFailure) return;
+      parseFailure = error instanceof Error ? error : new Error(String(error));
+      terminateProcessTree(child.pid);
+    };
+    const handleLine = (rawLine) => {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (!line.startsWith(prefix)) {
+        process.stdout.write(`${line}\n`);
+        return;
+      }
+      try {
+        const frame = JSON.parse(line.slice(prefix.length));
+        const destination = destinations.get(frame.name);
+        if (!destination || typeof frame.name !== "string") {
+          throw new Error(`Unexpected streamed artifact: ${frame.name ?? "unknown"}`);
+        }
+        if (frame.kind === "begin") {
+          if (activeArtifact || received.has(frame.name)
+            || !Number.isSafeInteger(frame.bytes) || frame.bytes <= 0
+            || !/^[a-f0-9]{64}$/.test(frame.sha256)) {
+            throw new Error(`Invalid artifact begin frame: ${frame.name}`);
+          }
+          activeArtifact = {
+            name: frame.name,
+            bytes: frame.bytes,
+            sha256: frame.sha256,
+            nextIndex: 0,
+            chunks: []
+          };
+          return;
+        }
+        if (!activeArtifact || activeArtifact.name !== frame.name) {
+          throw new Error(`Artifact stream ordering violation: ${frame.name}`);
+        }
+        if (frame.kind === "chunk") {
+          if (frame.index !== activeArtifact.nextIndex
+            || typeof frame.data !== "string") {
+            throw new Error(`Invalid artifact chunk frame: ${frame.name}`);
+          }
+          const chunk = Buffer.from(frame.data, "base64");
+          if (chunk.toString("base64") !== frame.data) {
+            throw new Error(`Corrupt artifact base64 frame: ${frame.name}`);
+          }
+          activeArtifact.chunks.push(chunk);
+          activeArtifact.nextIndex += 1;
+          return;
+        }
+        if (frame.kind !== "end"
+          || frame.chunks !== activeArtifact.nextIndex) {
+          throw new Error(`Invalid artifact end frame: ${frame.name}`);
+        }
+        const value = Buffer.concat(activeArtifact.chunks);
+        if (value.byteLength !== activeArtifact.bytes
+          || createHash("sha256").update(value).digest("hex")
+            !== activeArtifact.sha256) {
+          throw new Error(`Artifact stream verification failed: ${frame.name}`);
+        }
+        if (existsSync(destination.path)) {
+          throw new Error(`Artifact stream target already exists: ${destination.path}`);
+        }
+        writeFileSync(destination.path, value);
+        received.add(frame.name);
+        activeArtifact = null;
+      } catch (error) {
+        failParsing(error);
+      }
+    };
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      lineBuffer += chunk;
+      for (;;) {
+        const newline = lineBuffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = lineBuffer.slice(0, newline);
+        lineBuffer = lineBuffer.slice(newline + 1);
+        handleLine(line);
+      }
+    });
+    child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+
+    const watchdog = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      terminateProcessTree(child.pid);
+    }, watchdogMs);
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      if (lineBuffer) handleLine(lineBuffer);
+      if (parseFailure) return reject(parseFailure);
+      if (timedOut) {
+        return reject(new Error("Colab artifact stream exceeded its watchdog"));
+      }
+      if (activeArtifact) {
+        return reject(new Error(
+          `Colab artifact stream ended inside ${activeArtifact.name}`
+        ));
+      }
+      for (const [name, destination] of destinations) {
+        if (destination.required && !received.has(name)) {
+          return reject(new Error(`Colab artifact stream omitted ${name}`));
+        }
+      }
+      if (signal) {
+        return reject(new Error(`wsl.exe terminated by ${signal}`));
+      }
+      resolveStatus(code ?? 0);
+    });
+  });
+}
+
 async function retryColab(
   args,
   operation,
@@ -530,7 +843,7 @@ function spawnPromise(command, args, watchdogMs, beforeKill, timeoutMessage, tol
 
 function validateReport(path) {
   const report = JSON.parse(readFileSync(path, "utf8"));
-  if (report.protocol !== "hear-workyard-contact-run-v1") {
+  if (report.protocol !== "hear-workyard-contact-run-v2") {
     throw new Error("Downloaded file is not a contact Workyard report");
   }
   if (report.ready !== true) {
@@ -539,15 +852,16 @@ function validateReport(path) {
   const evaluation = report.evaluation;
   if (report.mode !== mode
     || report.execution?.profile !== executionProfile
-    || report.contract?.observation_size !== 247
+    || report.contract?.observation_size !== 262
     || report.contract?.action_size !== 8
-    || report.contract?.logical_composed_action_size !== 22
+    || report.contract?.logical_composed_action_size !== 37
     || report.contract?.terminal_stage !== "grasp"
     || JSON.stringify(report.contract?.excluded_stages) !== JSON.stringify(["lift", "carry", "place"])
     || report.contract?.teacher_state_directly_exposed !== false
     || report.contract?.cpu_round_trip_per_control_step !== false
     || report.contract?.hand_max_closing_joint_lead_rad !== 0.25
     || report.contract?.opposing_support_coordination !== 0.4
+    || report.contract?.hand_contact_solref_time_constant_s !== 0.04
     || evaluation?.frozen_locomotion?.gradient_parameter_count !== 0
     || evaluation?.frozen_reach?.gradient_parameter_count !== 0
     || evaluation?.maximum_unauthorized_hand_action !== 0
@@ -608,6 +922,7 @@ function cleanupTemporaryInputs() {
   rmSync(bundle, { force: true });
   rmSync(config, { force: true });
   rmSync(bundleAssemblyScript, { force: true });
+  rmSync(driveFinalizer, { force: true });
   for (let index = 0; index < 10_000; index += 1) {
     const path = `${bundleChunkPrefix}-${String(index).padStart(3, "0")}`;
     if (!existsSync(path)) break;
@@ -706,6 +1021,10 @@ function parseOptions(args) {
     ["--reach-root", ["reachRoot", String]],
     ["--preflight-report", ["preflightReport", String]],
     ["--output", ["output", String]],
+    ["--drive-directory", ["driveDirectory", nonEmptyString]],
+    ["--drive-local-root", ["driveLocalRoot", nonEmptyString]],
+    ["--artifact-stream", ["artifactStream", onOffMode]],
+    ["--drive-checkpoints", ["driveCheckpoints", driveCheckpointMode]],
     ["--iterations", ["iterations", positiveInteger]],
     ["--dagger-steps", ["daggerSteps", positiveInteger]],
     ["--dagger-learning-rate", ["daggerLearningRate", positiveNumber]],
@@ -724,6 +1043,7 @@ function parseOptions(args) {
     ["--final-eval-envs", ["finalEvalEnvs", positiveInteger]],
     ["--final-eval-steps", ["finalEvalSteps", positiveInteger]],
     ["--seed", ["seed", nonNegativeInteger]],
+    ["--episode-seeds", ["episodeSeeds", episodeSeedList]],
     ["--timeout-seconds", ["timeoutSeconds", positiveInteger]]
   ]);
   for (let index = 0; index < args.length; index += 2) {
@@ -752,9 +1072,31 @@ function executionBackend(value) {
   return value;
 }
 
+function driveCheckpointMode(value) {
+  if (value !== "mount" && value !== "off") {
+    throw new Error(`Expected mount or off, received: ${value}`);
+  }
+  return value;
+}
+
+function onOffMode(value) {
+  if (value !== "on" && value !== "off") {
+    throw new Error(`Expected on or off, received: ${value}`);
+  }
+  return value;
+}
+
 function nonEmptyString(value) {
   if (!String(value).trim()) throw new Error("Expected a non-empty value");
   return String(value);
+}
+
+function episodeSeedList(value) {
+  const seeds = String(value).split(",").map((item) => nonNegativeInteger(item.trim()));
+  if (seeds.length === 0 || new Set(seeds).size !== seeds.length) {
+    throw new Error("Expected a comma-separated list of unique episode seeds");
+  }
+  return seeds;
 }
 
 function positiveNumber(value) {

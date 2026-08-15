@@ -881,7 +881,7 @@ const HumanoidRunCheckpointV6Schema = z.object({
       context.addIssue({
         code: "custom",
         path: ["action_execution_ledger", "active", transactionId, "admission"],
-        message: "Active physical execution requires durable Coordinator delegation"
+        message: "Active physical execution requires durable Action Selection admission"
       });
     }
     const neuralAdmission = execution.admission.neural_rollout_certificate;

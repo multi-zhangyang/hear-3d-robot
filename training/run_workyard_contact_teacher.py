@@ -47,12 +47,12 @@ def main() -> None:
   reach_policy_root = (
     args.reach_policy_root
     if args.reach_policy_root is not None
-    else repository_root / "artifacts" / "training" / "workyard-reach-frozen-v15"
+    else repository_root / "artifacts" / "training" / "workyard-reach-deployment-v3"
   ).resolve()
   artifact_paths = {
     "locomotion teacher JIT": locomotion_teacher_root / "g1_velocity_teacher.jit.pt",
     "locomotion teacher report": locomotion_teacher_root / "training-report.json",
-    "reach policy JIT": reach_policy_root / "workyard_reach_selected.jit.pt",
+    "reach policy JIT": reach_policy_root / "workyard_reach.jit.pt",
     "reach policy report": reach_policy_root / "reach-policy-report.json",
   }
   missing = [label for label, path in artifact_paths.items() if not path.is_file()]

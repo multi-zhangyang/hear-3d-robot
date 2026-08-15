@@ -13,6 +13,9 @@ import {
 } from "../../domain/schema.js";
 import { HumanoidContactConstraintSchema } from "./motion-plan-schema.js";
 import { HumanoidMotionOptionContractSchema } from "./motion-option-contract.js";
+import {
+  HumanoidRecoveryExecutionContractSchema
+} from "./recovery-execution-contract.js";
 
 const NonEmptyIdSchema = z.string().trim().min(1);
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
@@ -128,12 +131,31 @@ const HumanoidEmbodiedNavigationContractSchema = z.object({
 
 export const HumanoidEmbodiedSkillContractSchema = z.discriminatedUnion(
   "protocol",
-  [HumanoidEmbodiedMotionContractSchema, HumanoidEmbodiedNavigationContractSchema]
+  [
+    HumanoidEmbodiedMotionContractSchema,
+    HumanoidEmbodiedNavigationContractSchema,
+    HumanoidRecoveryExecutionContractSchema
+  ]
 );
 
 export type HumanoidEmbodiedSkillContract = z.infer<
   typeof HumanoidEmbodiedSkillContractSchema
 >;
+
+const HumanoidRegularSkillSafetySchema = z.object({
+  authorizedContacts: z.array(HumanoidContactConstraintSchema),
+  stopOnFall: z.literal(true),
+  stopOnUnauthorizedContact: z.literal(true),
+  stopOnContractViolation: z.literal(true)
+}).strict();
+
+const HumanoidRecoverySkillSafetySchema = z.object({
+  authorizedContacts: z.array(HumanoidContactConstraintSchema),
+  stopOnFall: z.literal(false),
+  stopOnUnauthorizedContact: z.literal(true),
+  stopOnContractViolation: z.literal(true),
+  recoveryTerrainContact: z.literal(true)
+}).strict();
 
 export const HumanoidEmbodiedSkillCallSchema = z.object({
   protocol: z.literal("humanoid-embodied-skill-call-v2"),
@@ -167,12 +189,10 @@ export const HumanoidEmbodiedSkillCallSchema = z.object({
     grasps: z.array(HumanoidEmbodiedGraspCommandSchema)
   }).strict(),
   contract: HumanoidEmbodiedSkillContractSchema.nullable(),
-  safety: z.object({
-    authorizedContacts: z.array(HumanoidContactConstraintSchema),
-    stopOnFall: z.literal(true),
-    stopOnUnauthorizedContact: z.literal(true),
-    stopOnContractViolation: z.literal(true)
-  }).strict(),
+  safety: z.union([
+    HumanoidRegularSkillSafetySchema,
+    HumanoidRecoverySkillSafetySchema
+  ]),
   feedback: z.object({
     mode: z.literal("event_driven"),
     progressDelta: z.number().finite().positive().max(1),
@@ -186,6 +206,26 @@ export const HumanoidEmbodiedSkillCallSchema = z.object({
     ])).min(1)
   }).strict()
 }).strict().superRefine((call, context) => {
+  const recoveryContract = call.contract?.protocol
+    === "humanoid-embodied-recovery-contract-v1";
+  const recoverySafety = "recoveryTerrainContact" in call.safety;
+  if (recoveryContract !== recoverySafety) {
+    context.addIssue({
+      code: "custom",
+      path: [recoveryContract ? "safety" : "contract"],
+      message: "Recovery contract and terrain-contact safety authority must be paired"
+    });
+  }
+  if (recoveryContract && (call.identity.runtimeKind !== "semantic_skill"
+    || call.identity.skillId !== "stabilize"
+    || call.identity.phase !== "recover_support"
+    || call.identity.invocation?.skill !== "stabilize")) {
+    context.addIssue({
+      code: "custom",
+      path: ["identity"],
+      message: "Only stabilize.recover_support may carry a recovery contract"
+    });
+  }
   if (call.window.stepIndex > call.window.maximumSteps
     || call.window.remainingSteps
       !== Math.max(0, call.window.maximumSteps - call.window.stepIndex)) {

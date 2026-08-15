@@ -230,14 +230,20 @@ export const humanoidControllerAssets = [
     );
   });
 
-  it("loads the bundled learned controller when no module is configured", async () => {
+  it("loads the bundled Workyard whole-body controller when no module is configured", async () => {
     const source = await loadConfiguredHumanoidControllerSource({});
     expect(source.sourceSha256).toMatch(/^[a-f0-9]{64}$/);
     const controller = await source.controllerFactory();
     expect(controller.descriptor).toMatchObject({
-      implementation: "mjlab_g1_velocity_onnx",
+      implementation:
+        "workyard_whole_body_reach_onnx+workyard_contact_8d_onnx",
       learnedPolicy: {
-        capabilities: ["balance", "locomotion"]
+        capabilities: [
+          "balance",
+          "locomotion",
+          "joint_reference_tracking",
+          "contact_rich_manipulation"
+        ]
       }
     });
     await controller.dispose();

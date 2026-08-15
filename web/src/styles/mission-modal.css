@@ -81,6 +81,15 @@
   line-height: 1;
 }
 
+.mission-dialog-close svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-width: 1.7;
+}
+
 .mission-dialog-close:hover:not(:disabled) {
   border-color: rgb(116 225 180 / 42%);
   color: #eef7f3;

@@ -67,6 +67,13 @@ textarea:focus-visible {
   transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
 }
 
+.ui-button > span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
 .ui-button:hover:not(:disabled) {
   border-color: rgb(131 218 179 / 54%);
   background: linear-gradient(180deg, #333c39, #252c2a);
@@ -161,6 +168,14 @@ textarea:focus-visible {
   background: transparent;
   cursor: pointer;
   font-size: 18px;
+}
+.failure-close svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-width: 1.8;
 }
 
 .centered-spin {

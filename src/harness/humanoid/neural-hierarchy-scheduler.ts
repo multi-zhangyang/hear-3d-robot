@@ -13,7 +13,8 @@ const NeuralSchedulerEventBaseSchema = z.object({
   event_id: z.string().uuid(),
   at: z.string().datetime(),
   world_revision: z.number().int().nonnegative(),
-  causal_signal_ids: z.array(z.string().uuid()).max(64).default([])
+  causal_signal_ids: z.array(z.string().uuid()).max(64).default([]),
+  causal_interrupt_ids: z.array(z.string().uuid()).max(64).optional()
 });
 
 export const NeuralSchedulerEventSchema = z.discriminatedUnion("kind", [

@@ -464,7 +464,7 @@ function learnedPolicyCapabilities(
       ? ["locomotion", "contact_rich_manipulation"]
       : ["locomotion"];
   }
-  if (skill === "stabilize") return ["balance"];
+  if (skill === "stabilize") return ["balance", "whole_body_recovery"];
   if (skill === "regrasp" || skill === "bimanual_support"
     || skill === "bimanual_carry") {
     return ["joint_reference_tracking", "contact_rich_manipulation", "bimanual_manipulation"];

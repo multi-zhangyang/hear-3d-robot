@@ -6,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   rmdirSync,
+  statSync,
   writeFileSync
 } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
@@ -70,6 +71,7 @@ const localArchive = mode === "train" ? `${output}.tar.gz` : null;
 const temporaryDirectory = resolve(`.tmp/workyard-${backend}`);
 const bundle = resolve(temporaryDirectory, `${session}.tar.gz`);
 const config = resolve(temporaryDirectory, `${session}.json`);
+const driveBackup = resolve(temporaryDirectory, `${session}-drive-backup.py`);
 const bootstrap = resolve("training/colab_workyard_residual.py");
 const localLauncher = resolve("training/run-workyard-local-residual.sh");
 const localRuntimeDirectory = resolve(temporaryDirectory, `${session}-runtime`);
@@ -77,6 +79,13 @@ const localSourceRoot = resolve(localRuntimeDirectory, "source");
 const localExecutionReport = resolve(localRuntimeDirectory, "report.json");
 const localExecutionArchive = resolve(localRuntimeDirectory, "artifacts.tar.gz");
 const localPidFile = resolve(localRuntimeDirectory, "runner.pid");
+const driveDirectory = options.driveDirectory
+  ?? `HEAR/workyard-residual/${session}`;
+const driveLocalRoot = options.driveLocalRoot
+  ? resolve(options.driveLocalRoot)
+  : null;
+const persistCheckpointsToDrive = backend === "colab" && mode === "train";
+const remoteDriveOutputRoot = `/content/drive/MyDrive/${driveDirectory}`;
 
 let activeSession = null;
 let activeLocalPidFile = null;
@@ -102,6 +111,7 @@ async function main() {
   }
   mkdirSync(dirname(output), { recursive: true });
   mkdirSync(temporaryDirectory, { recursive: true });
+  assertDriveDirectory();
   writeFileSync(config, JSON.stringify({
     mode,
     iterations: options.iterations ?? (mode === "train" ? 1000 : 1),
@@ -122,11 +132,16 @@ async function main() {
     rollout_steps: options.rolloutSteps ?? (
       backend === "local" && mode === "teacher" ? 200 : 64
     ),
-    eval_envs: options.evalEnvs ?? (backend === "local" ? 16 : 128),
+    eval_envs: options.evalEnvs ?? (
+      backend === "local" ? 16 : mode === "train" ? 500 : 128
+    ),
     eval_steps: options.evalSteps ?? 600,
     seed: options.seed ?? 42,
     execution_profile: executionProfile,
-    archive: backend === "local" ? toWslPath(localExecutionArchive) : REMOTE_ARCHIVE
+    archive: backend === "local" ? toWslPath(localExecutionArchive) : REMOTE_ARCHIVE,
+    ...(persistCheckpointsToDrive
+      ? { output_root: remoteDriveOutputRoot }
+      : {})
   }), "utf8");
   await createBundle(teacherPaths);
   if (backend === "local") {
@@ -146,6 +161,12 @@ async function main() {
     requireSuccess(await colab([
       "upload", "--session", session, toWslPath(config), REMOTE_CONFIG
     ]), "upload residual Workyard configuration");
+    if (persistCheckpointsToDrive) {
+      requireSuccess(await colab([
+        "drivemount", "--session", session, "/content/drive"
+      ], false, 300_000), "mount Google Drive for residual checkpoints");
+      writeDriveBackup();
+    }
     const remoteTimeoutSeconds = options.timeoutSeconds
       ?? (mode === "train" ? 14_400 : 1_800);
     const execution = await colab([
@@ -160,8 +181,6 @@ async function main() {
     requireSuccess(await colab([
       "download", "--session", session, REMOTE_REPORT, toWslPath(localReport)
     ]), "download residual Workyard report");
-    const report = validateReport(localReport);
-    requireSuccess(execution, `execute residual Workyard ${mode}`);
     if (mode === "train") {
       requireSuccess(await colab([
         "download",
@@ -172,7 +191,23 @@ async function main() {
       ]), "download residual Workyard artifacts");
       await extractArtifacts(localArchive, output);
       copyFileSync(localReport, resolve(output, "training-report.json"));
+      if (persistCheckpointsToDrive) {
+        requireSuccess(await colab([
+          "exec", "--session", session, "--file", toWslPath(driveBackup),
+          "--timeout", "1200"
+        ], false, 1_260_000), "persist residual training artifacts to Google Drive");
+      }
+    }
+    const report = validateReport(localReport);
+    requireSuccess(execution, `execute residual Workyard ${mode}`);
+    if (mode === "train") {
       console.log(`Residual Workyard training: ${output}`);
+      console.log(`Residual Workyard Drive backup: ${
+        `MyDrive/${driveDirectory}`
+      }${driveLocalRoot
+        ? ` (desktop mirror: ${resolve(driveLocalRoot, ...driveDirectory.split("/"))})`
+        : ""
+      }`);
     } else {
       console.log(`Residual Workyard ${mode}: ${output}`);
     }
@@ -188,6 +223,7 @@ async function main() {
     activeSession = null;
     rmSync(bundle, { force: true });
     rmSync(config, { force: true });
+    rmSync(driveBackup, { force: true });
     try {
       rmdirSync(temporaryDirectory);
     } catch {
@@ -291,6 +327,53 @@ function assertInputs() {
   };
 }
 
+function assertDriveDirectory() {
+  const segments = driveDirectory.split("/");
+  if (segments.length === 0 || segments.some((segment) => (
+    !segment || segment === "." || segment === ".." || !/^[\w.-]+$/.test(segment)
+  ))) {
+    throw new Error(`Unsafe residual Drive directory: ${driveDirectory}`);
+  }
+  if (driveLocalRoot && (
+    !existsSync(driveLocalRoot) || !statSync(driveLocalRoot).isDirectory()
+  )) {
+    throw new Error(`Residual local Drive root is unavailable: ${driveLocalRoot}`);
+  }
+}
+
+function writeDriveBackup() {
+  writeFileSync(driveBackup, [
+    "import shutil",
+    "from hashlib import sha256",
+    "from pathlib import Path",
+    "drive_root = Path('/content/drive/MyDrive').resolve()",
+    `target = (drive_root / ${JSON.stringify(driveDirectory)}).resolve()`,
+    "if drive_root not in target.parents: raise RuntimeError(f'unsafe Drive target: {target}')",
+    "target.mkdir(parents=True, exist_ok=True)",
+    "sources = [",
+    `  Path(${JSON.stringify(REMOTE_ARCHIVE)}),`,
+    `  Path(${JSON.stringify(REMOTE_REPORT)}),`,
+    "]",
+    "temporaries = []",
+    "try:",
+    "  for source in sources:",
+    "    if not source.is_file(): raise RuntimeError(f'missing training artifact: {source}')",
+    "    destination = target / source.name",
+    "    temporary = target / (source.name + '.partial')",
+    "    temporary.unlink(missing_ok=True)",
+    "    temporaries.append(temporary)",
+    "    shutil.copy2(source, temporary)",
+    "    if temporary.stat().st_size != source.stat().st_size: raise RuntimeError('Drive byte count mismatch')",
+    "    if sha256(temporary.read_bytes()).hexdigest() != sha256(source.read_bytes()).hexdigest(): raise RuntimeError('Drive sha256 mismatch')",
+    "    temporary.replace(destination)",
+    "except Exception:",
+    "  for temporary in temporaries: temporary.unlink(missing_ok=True)",
+    "  raise",
+    "print(f'[hear] residual training persisted to {target}')",
+    ""
+  ].join("\n"), "utf8");
+}
+
 function local(timeoutSeconds) {
   const pidFile = toWslPath(localPidFile);
   const command = [
@@ -370,10 +453,6 @@ async function createBundle(teacherPaths) {
     gzip: true,
     portable: true,
     onWriteEntry(entry) {
-      entry.path = entry.path.replace(
-        /^assets\/humanoid\/g1\/meshes(?=\/|$)/,
-        "assets/humanoid/g1/assets"
-      );
       if (entry.path === teacherPaths.jit) {
         entry.path = "assets/humanoid/controllers/mjlab-g1-velocity/"
           + "g1_velocity_teacher.jit.pt";
@@ -465,13 +544,13 @@ function validateReport(path) {
   const evaluation = report.evaluation;
   if (report.mode !== mode
     || report.execution?.profile !== executionProfile
-    || report.contract?.observation_size !== 231
-    || report.contract?.action_size !== 14
+    || report.contract?.observation_size !== 246
+    || report.contract?.action_size !== 29
     || report.contract?.teacher_state_directly_exposed !== false
     || report.contract?.cpu_round_trip_per_control_step !== false
     || evaluation?.teacher?.gradient_parameter_count !== 0
     || !String(evaluation?.teacher?.device ?? "").startsWith("cuda")
-    || evaluation?.composition?.maximum_frozen_joint_command_error > 1e-6
+    || evaluation?.composition?.maximum_balance_composition_error > 1e-6
     || evaluation?.composition?.maximum_upper_body_command_error > 1e-6
     || evaluation?.composition?.maximum_fixed_open_hand_target_error_rad > 1e-6
     || evaluation?.reach_teacher?.label_coverage !== 1
@@ -494,6 +573,9 @@ function validateReport(path) {
     || report.training?.ppo_retention?.rollout_teacher_label_coverage !== 1
     || report.training?.checkpoint_selection?.selected_checkpoint?.file
       !== "workyard_reach_selected.pt"
+    || report.evaluation?.wrist_position_error_m?.initial_maximum < 0.35
+    || report.acceptance?.deployment_distribution_covered !== true
+    || report.acceptance?.phase_one_accepted !== true
     || (retentionMode === "critic_warmup_rollout_teacher" && (
       report.training?.ppo_retention?.rollout_teacher_loss_coefficient
         !== retentionCoefficient
@@ -592,6 +674,8 @@ function parseOptions(args) {
     ["--session", ["session", String]],
     ["--teacher-root", ["teacherRoot", String]],
     ["--output", ["output", String]],
+    ["--drive-directory", ["driveDirectory", nonEmptyString]],
+    ["--drive-local-root", ["driveLocalRoot", nonEmptyString]],
     ["--iterations", ["iterations", positiveInteger]],
     ["--dagger-steps", ["daggerSteps", positiveInteger]],
     ["--dagger-learning-rate", ["daggerLearningRate", positiveNumber]],

@@ -154,9 +154,10 @@ function assertInputs() {
   const report = JSON.parse(readFileSync(trainingReport, "utf8"));
   const finalGate = report.acceptance?.final_gate;
   const selected = report.training?.checkpoint_selection?.selected_checkpoint;
+  const frozenReach = report.training?.frozen_reach;
   const reportedLead = report.contract?.hand_max_closing_joint_lead_rad;
   const reportedSupport = report.contract?.opposing_support_coordination;
-  if (report.protocol !== "hear-workyard-contact-run-v1"
+  if (report.protocol !== "hear-workyard-contact-run-v2"
     || report.mode !== "train"
     || report.ready !== true
     || report.acceptance?.verified_grasp_policy_accepted !== true
@@ -169,6 +170,11 @@ function assertInputs() {
     || selected?.sha256 !== sha256(checkpoint)
     || report.bundle?.contract_sha256 !== sha256(trainingContract)
     || report.bundle?.environment_sha256 !== sha256(trainingEnvironment)
+    || frozenReach?.protocol
+      !== "hear-frozen-qualified-whole-body-reach-runtime-v2"
+    || frozenReach?.gradient_parameter_count !== 0
+    || frozenReach?.execution_authority !== "frozen_29d_whole_body_reach"
+    || frozenReach?.jit_sha256 !== report.bundle?.reach_jit_sha256
     || (reportedLead !== undefined && reportedLead !== 0.25)
     || (reportedSupport !== undefined && reportedSupport !== 0.4)) {
     throw new Error(
@@ -259,7 +265,10 @@ async function uploadBundle() {
 
 function validateOutputs() {
   const report = JSON.parse(readFileSync(outputs.report, "utf8"));
-  if (report.protocol !== "hear-frozen-contact-policy-export-v1"
+  const frozenReach = JSON.parse(
+    readFileSync(trainingReport, "utf8")
+  ).training?.frozen_reach;
+  if (report.protocol !== "hear-frozen-contact-policy-export-v2"
     || report.source?.checkpoint_sha256 !== sha256(checkpoint)
     || report.source?.training_contract_sha256 !== sha256(trainingContract)
     || report.source?.training_environment_sha256 !== sha256(trainingEnvironment)
@@ -267,9 +276,21 @@ function validateOutputs() {
     || report.source?.held_out_episode_count !== 500
     || report.source?.held_out_success_rate < 0.75
     || report.source?.maximum_active_hand_force_n > 30
+    || report.source?.frozen_reach?.protocol
+      !== "hear-frozen-contact-reach-binding-v1"
+    || report.source?.frozen_reach?.runtime_protocol !== frozenReach?.protocol
+    || report.source?.frozen_reach?.source_checkpoint_sha256
+      !== frozenReach?.source_checkpoint_sha256
+    || report.source?.frozen_reach?.jit_sha256 !== frozenReach?.jit_sha256
+    || report.source?.frozen_reach?.report_sha256
+      !== frozenReach?.report_sha256
     || report.plant?.protocol !== "hear-workyard-contact-deployment-plant-v1"
     || report.plant?.g1_xml?.sha256 !== sha256(plantXml)
     || report.plant?.g1_xml?.bytes !== readFileSync(plantXml).byteLength
+    || report.plant?.g1_xml?.hand_contact_collision_count !== 14
+    || report.plant?.g1_xml?.hand_contact_priority !== 2
+    || report.plant?.g1_xml?.hand_contact_solref_time_constant_s !== 0.04
+    || report.plant?.g1_xml?.hand_contact_solref_damping_ratio !== 1
     || report.plant?.hand_joint_count !== 14
     || report.plant?.hand_position_kp !== 2.5
     || report.plant?.hand_velocity_damping !== 0.3
@@ -282,7 +303,8 @@ function validateOutputs() {
     || report.policy?.onnx?.file !== "workyard_contact.onnx"
     || report.policy?.onnx?.sha256 !== sha256(outputs.onnx)
     || report.policy?.onnx?.opset !== 17
-    || report.policy?.input_size !== 247
+    || report.policy?.input_protocol !== "hear-workyard-contact-observation-v2"
+    || report.policy?.input_size !== 262
     || report.policy?.output_size !== 8
     || report.harness?.maximum_closing_joint_lead_rad !== 0.25
     || report.validation?.finite !== true

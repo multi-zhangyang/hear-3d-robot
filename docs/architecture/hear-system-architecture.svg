@@ -1,0 +1,238 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040" viewBox="0 0 1600 1040" role="img" aria-labelledby="title desc">
+  <title id="title">HEAR hierarchical embodied agent architecture</title>
+  <desc id="desc">A layered architecture diagram showing the OpenAI Agents SDK semantic hierarchy, causal authority harness, deterministic embodied control, offline policy training, and read-only operator projections.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071015"/>
+      <stop offset="0.55" stop-color="#0b1518"/>
+      <stop offset="1" stop-color="#101713"/>
+    </linearGradient>
+    <linearGradient id="agentFill" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#173c35"/>
+      <stop offset="1" stop-color="#102923"/>
+    </linearGradient>
+    <linearGradient id="harnessFill" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#182d3b"/>
+      <stop offset="1" stop-color="#111e29"/>
+    </linearGradient>
+    <linearGradient id="plantFill" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#3b3020"/>
+      <stop offset="1" stop-color="#251e16"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-30%" width="140%" height="170%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#000" flood-opacity=".34"/>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#86b7aa" stroke-opacity=".035"/>
+    </pattern>
+    <marker id="arrowControl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#6ee7bd"/>
+    </marker>
+    <marker id="arrowFeedback" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#e7bd70"/>
+    </marker>
+    <marker id="arrowDeploy" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#77bce5"/>
+    </marker>
+    <marker id="arrowRead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#9aa9a5"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "Segoe UI", "Microsoft YaHei UI", sans-serif; }
+      .eyebrow { fill:#75d9b8; font-size:13px; font-weight:700; letter-spacing:2.2px; }
+      .title { fill:#f2f7f4; font-size:34px; font-weight:760; letter-spacing:-.5px; }
+      .subtitle { fill:#91a49e; font-size:15px; }
+      .section { fill:#8fa49e; font-size:12px; font-weight:700; letter-spacing:1.9px; }
+      .sectionNote { fill:#60736d; font-size:12px; }
+      .boxTitle { fill:#eff8f4; font-size:14px; font-weight:700; }
+      .boxSub { fill:#8ca39b; font-size:11px; }
+      .tiny { fill:#748881; font-size:10px; }
+      .agentBox { fill:url(#agentFill); stroke:#4cae8e; stroke-opacity:.62; }
+      .managerBox { fill:#15322d; stroke:#69dab5; stroke-opacity:.8; }
+      .harnessBox { fill:url(#harnessFill); stroke:#639bc2; stroke-opacity:.7; }
+      .plantBox { fill:url(#plantFill); stroke:#c9a15f; stroke-opacity:.72; }
+      .viewBox { fill:#17211f; stroke:#758e86; stroke-opacity:.55; }
+      .trainBox { fill:#20263a; stroke:#7b83bd; stroke-opacity:.7; }
+      .writerBox { fill:#17483b; stroke:#9bf1d1; stroke-width:2.2; }
+      .card { rx:12; filter:url(#shadow); }
+      .control { fill:none; stroke:#6ee7bd; stroke-width:2; marker-end:url(#arrowControl); }
+      .feedback { fill:none; stroke:#e7bd70; stroke-width:1.8; stroke-dasharray:7 6; marker-end:url(#arrowFeedback); }
+      .deploy { fill:none; stroke:#77bce5; stroke-width:1.8; stroke-dasharray:4 5; marker-end:url(#arrowDeploy); }
+      .read { fill:none; stroke:#9aa9a5; stroke-width:1.6; stroke-dasharray:3 6; marker-end:url(#arrowRead); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1040" fill="url(#bg)"/>
+  <rect width="1600" height="1040" fill="url(#grid)"/>
+  <text class="eyebrow" x="64" y="54">HEAR · HIERARCHICAL EMBODIED AGENT RUNTIME</text>
+  <text class="title" x="64" y="94">模仿神经控制链的层级闭环</text>
+  <text class="subtitle" x="64" y="123">模型决定语义目标与技能 · Harness 决定因果与权限 · 控制器闭合高速物理环</text>
+
+  <g transform="translate(64 156)">
+    <rect width="1110" height="354" rx="22" fill="#0d1818" stroke="#5ca98f" stroke-opacity=".23"/>
+    <text class="section" x="24" y="31">SEMANTIC CORTEX · OPENAI AGENTS SDK</text>
+    <text class="sectionNote" x="1084" y="31" text-anchor="end">13 个独立 Session · 严格单父树 · 并行叶节点</text>
+
+    <rect class="card managerBox" x="442" y="52" width="226" height="62" rx="12"/>
+    <text class="boxTitle" x="555" y="78" text-anchor="middle">Executive</text>
+    <text class="boxSub" x="555" y="98" text-anchor="middle">唯一语义控制根 · Goal epoch</text>
+
+    <rect class="card agentBox" x="164" y="146" width="212" height="62" rx="12"/>
+    <text class="boxTitle" x="270" y="172" text-anchor="middle">Goal Valuation</text>
+    <text class="boxSub" x="270" y="192" text-anchor="middle">目标估值、继续或退休</text>
+    <rect class="card managerBox" x="449" y="146" width="212" height="62" rx="12"/>
+    <text class="boxTitle" x="555" y="172" text-anchor="middle">Action Selection</text>
+    <text class="boxSub" x="555" y="192" text-anchor="middle">唯一 Skill 承诺所有者</text>
+
+    <rect class="card managerBox" x="56" y="248" width="224" height="74" rx="12"/>
+    <text class="boxTitle" x="168" y="276" text-anchor="middle">Perception Manager</text>
+    <text class="boxSub" x="168" y="296" text-anchor="middle">并行汇合：场景 + 相关记忆</text>
+    <text class="tiny" x="168" y="312" text-anchor="middle">Scene Interpreter · Memory Retriever</text>
+
+    <rect class="card managerBox" x="318" y="248" width="474" height="74" rx="12"/>
+    <text class="boxTitle" x="555" y="276" text-anchor="middle">Sensorimotor Manager</text>
+    <text class="boxSub" x="555" y="296" text-anchor="middle">并行汇合：可供性 · 风险 · 预测 · 运动规划</text>
+    <text class="tiny" x="555" y="312" text-anchor="middle">Affordance · Risk/Interoception · Predictive Critic · Premotor → Motor Intent</text>
+
+    <rect class="card agentBox" x="830" y="248" width="224" height="74" rx="12"/>
+    <text class="boxTitle" x="942" y="276" text-anchor="middle">Recovery</text>
+    <text class="boxSub" x="942" y="296" text-anchor="middle">Sensorimotor 子级 · 独占有界 lease</text>
+    <text class="tiny" x="942" y="312" text-anchor="middle">不是默认 fallback 链</text>
+
+    <path class="control" d="M555 114V146"/>
+    <path class="control" d="M520 114V130H270V146"/>
+    <path class="control" d="M510 208V229H168V248"/>
+    <path class="control" d="M555 208V248"/>
+    <path class="control" d="M792 285H830"/>
+  </g>
+
+  <g transform="translate(64 530)">
+    <rect width="1110" height="196" rx="22" fill="#0d151b" stroke="#648fb0" stroke-opacity=".27"/>
+    <text class="section" x="24" y="31">CAUSAL AUTHORITY HARNESS</text>
+    <text class="sectionNote" x="1084" y="31" text-anchor="end">类型化 · 世界版本化 · 可恢复 · 原子写入</text>
+
+    <rect class="card harnessBox" x="30" y="58" width="208" height="92" rx="12"/>
+    <text class="boxTitle" x="134" y="84" text-anchor="middle">Neural Signals</text>
+    <text class="boxSub" x="134" y="105" text-anchor="middle">invocation · parent episode</text>
+    <text class="tiny" x="134" y="125" text-anchor="middle">独立上下文，不共享聊天记忆</text>
+
+    <rect class="card harnessBox" x="260" y="58" width="208" height="92" rx="12"/>
+    <text class="boxTitle" x="364" y="84" text-anchor="middle">Commitment + Scheduler</text>
+    <text class="boxSub" x="364" y="105" text-anchor="middle">Goal epoch · Skill commitment</text>
+    <text class="tiny" x="364" y="125" text-anchor="middle">唤醒最近责任祖先</text>
+
+    <rect class="card harnessBox" x="490" y="58" width="208" height="92" rx="12"/>
+    <text class="boxTitle" x="594" y="84" text-anchor="middle">Isolated Rollout Gate</text>
+    <text class="boxSub" x="594" y="105" text-anchor="middle">复制状态 · 预测后果</text>
+    <text class="tiny" x="594" y="125" text-anchor="middle">签发一次性 rollout certificate</text>
+
+    <rect class="card harnessBox" x="720" y="58" width="170" height="92" rx="12"/>
+    <text class="boxTitle" x="805" y="84" text-anchor="middle">Execution Ledger</text>
+    <text class="boxSub" x="805" y="105" text-anchor="middle">原子 admission</text>
+    <text class="tiny" x="805" y="125" text-anchor="middle">防重放 · 绑定 world revision</text>
+
+    <rect class="card writerBox" x="912" y="58" width="170" height="92" rx="12"/>
+    <text class="boxTitle" x="997" y="84" text-anchor="middle">Serial Executor</text>
+    <text class="boxSub" x="997" y="105" text-anchor="middle">唯一物理写入者</text>
+    <text class="tiny" x="997" y="125" text-anchor="middle">串行事务 · 真实回执</text>
+
+    <path class="control" d="M238 104H260"/>
+    <path class="control" d="M468 104H490"/>
+    <path class="control" d="M698 104H720"/>
+    <path class="control" d="M890 104H912"/>
+  </g>
+
+  <path class="control" d="M619 510V520H198V588"/>
+  <text class="tiny" x="211" y="548" fill="#6ee7bd">类型化语义信号</text>
+
+  <g transform="translate(64 746)">
+    <rect width="1110" height="224" rx="22" fill="#18150f" stroke="#c29a59" stroke-opacity=".28"/>
+    <text class="section" x="24" y="31" fill="#d1ae72">EMBODIED CONTROL</text>
+    <text class="sectionNote" x="1084" y="31" text-anchor="end">LLM 不输出关节值，不逐帧遥控</text>
+
+    <rect class="card plantBox" x="30" y="62" width="224" height="104" rx="12"/>
+    <text class="boxTitle" x="142" y="89" text-anchor="middle">Sensor Fusion</text>
+    <text class="boxSub" x="142" y="110" text-anchor="middle">确定性感觉融合</text>
+    <text class="tiny" x="142" y="131" text-anchor="middle">本体 · 接触 · 视觉语义</text>
+    <text class="tiny" x="142" y="148" text-anchor="middle">只产生 evidence</text>
+
+    <rect class="card plantBox" x="292" y="62" width="300" height="104" rx="12"/>
+    <text class="boxTitle" x="442" y="89" text-anchor="middle">Controller Cascade · 50 Hz</text>
+    <text class="boxSub" x="442" y="110" text-anchor="middle">29D whole-body reach + 8D hand = 37D</text>
+    <text class="tiny" x="442" y="131" text-anchor="middle">学习策略 + 确定性力反射</text>
+    <text class="tiny" x="442" y="148" text-anchor="middle">低延迟闭环，不调用模型</text>
+
+    <rect class="card plantBox" x="630" y="62" width="232" height="104" rx="12"/>
+    <text class="boxTitle" x="746" y="89" text-anchor="middle">MuJoCo Plant · 200 Hz</text>
+    <text class="boxSub" x="746" y="110" text-anchor="middle">G1 + articulated hands</text>
+    <text class="tiny" x="746" y="131" text-anchor="middle">碰撞 · 重力 · 接触 · 动力学</text>
+    <text class="tiny" x="746" y="148" text-anchor="middle">唯一权威世界状态</text>
+
+    <rect class="card plantBox" x="900" y="62" width="182" height="104" rx="12"/>
+    <text class="boxTitle" x="991" y="89" text-anchor="middle">Physical Receipt</text>
+    <text class="boxSub" x="991" y="110" text-anchor="middle">真实结果验收</text>
+    <text class="tiny" x="991" y="131" text-anchor="middle">成功 / 偏差 / 接触 / 失败</text>
+    <text class="tiny" x="991" y="148" text-anchor="middle">驱动下一层级事件</text>
+
+    <path class="control" d="M592 114H630"/>
+    <path class="control" d="M862 114H900"/>
+    <path class="feedback" d="M900 150C780 204 310 204 142 166"/>
+  </g>
+
+  <path class="control" d="M1061 680V778H506V808"/>
+  <path class="feedback" d="M205 746V716C205 700 185 700 185 680"/>
+  <path class="feedback" d="M1055 746C1170 722 1200 612 1135 584"/>
+  <text class="tiny" x="1083" y="738" text-anchor="end" fill="#e7bd70">物理回执 / 感觉反馈</text>
+
+  <g transform="translate(1202 156)">
+    <rect width="334" height="322" rx="22" fill="#121525" stroke="#7780b7" stroke-opacity=".28"/>
+    <text class="section" x="22" y="31">OFFLINE POLICY FACTORY</text>
+    <text class="sectionNote" x="22" y="51">Colab GPU · 不在运行时训练</text>
+    <rect class="card trainBox" x="22" y="72" width="290" height="52" rx="11"/>
+    <text class="boxTitle" x="167" y="94" text-anchor="middle">Versioned Task Contract</text>
+    <text class="boxSub" x="167" y="112" text-anchor="middle">观察、动作、权限、物理参数</text>
+    <rect class="card trainBox" x="22" y="139" width="290" height="52" rx="11"/>
+    <text class="boxTitle" x="167" y="161" text-anchor="middle">mjlab / RSL-RL Training</text>
+    <text class="boxSub" x="167" y="179" text-anchor="middle">locomotion · reach · contact</text>
+    <rect class="card trainBox" x="22" y="206" width="290" height="52" rx="11"/>
+    <text class="boxTitle" x="167" y="228" text-anchor="middle">Independent Physical Gate</text>
+    <text class="boxSub" x="167" y="246" text-anchor="middle">500 seeds · force &lt; 30 N</text>
+    <rect class="card trainBox" x="22" y="273" width="290" height="34" rx="11"/>
+    <text class="boxTitle" x="167" y="296" text-anchor="middle">Qualified ONNX + signed report</text>
+    <path class="deploy" d="M167 124V139M167 191V206M167 258V273"/>
+  </g>
+  <path class="deploy" d="M1369 478V722H560V808"/>
+  <text class="tiny" x="1383" y="606" fill="#77bce5">gate 后才安装到控制器</text>
+
+  <g transform="translate(1202 514)">
+    <rect width="334" height="456" rx="22" fill="#101715" stroke="#778e87" stroke-opacity=".28"/>
+    <text class="section" x="22" y="31">READ-ONLY PROJECTIONS</text>
+    <text class="sectionNote" x="22" y="51">没有 Skill、轨迹或关节写入口</text>
+    <rect class="card viewBox" x="22" y="76" width="290" height="82" rx="12"/>
+    <text class="boxTitle" x="167" y="101" text-anchor="middle">HEAR Operator</text>
+    <text class="boxSub" x="167" y="122" text-anchor="middle">R3F 世界 + React Flow 层级</text>
+    <text class="tiny" x="167" y="142" text-anchor="middle">任务、权限、回执在同一驾驶舱</text>
+    <rect class="card viewBox" x="22" y="184" width="290" height="82" rx="12"/>
+    <text class="boxTitle" x="167" y="209" text-anchor="middle">Foxglove · MCAP</text>
+    <text class="boxSub" x="167" y="230" text-anchor="middle">TF · 43 joints · contacts · timeline</text>
+    <text class="tiny" x="167" y="250" text-anchor="middle">专业遥测、曲线与三维诊断</text>
+    <rect class="card viewBox" x="22" y="292" width="290" height="64" rx="12"/>
+    <text class="boxTitle" x="167" y="317" text-anchor="middle">Rerun · optional</text>
+    <text class="boxSub" x="167" y="338" text-anchor="middle">固定版本的记录 / 回放视图</text>
+    <path class="read" d="M167 158V184M167 266V292"/>
+    <g transform="translate(22 388)">
+      <path class="control" d="M0 0H32"/>
+      <text class="tiny" x="42" y="4">层级控制 / 物理写入</text>
+      <path class="feedback" d="M0 23H32"/>
+      <text class="tiny" x="42" y="27">感觉与回执反馈</text>
+      <path class="deploy" d="M154 0H186"/>
+      <text class="tiny" x="196" y="4">离线部署</text>
+      <path class="read" d="M154 23H186"/>
+      <text class="tiny" x="196" y="27">只读投影</text>
+    </g>
+  </g>
+  <path class="read" d="M1174 654H1202"/>
+  <path class="read" d="M1174 864C1190 864 1190 739 1202 739"/>
+
+  <text class="tiny" x="64" y="1015">Invariant: Serial Executor is the sole writer of authoritative MuJoCo state. Visualization never becomes control authority.</text>
+</svg>

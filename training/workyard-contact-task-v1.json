@@ -1,10 +1,10 @@
 {
-  "protocol": "hear-workyard-contact-training-contract-v1",
+  "protocol": "hear-workyard-contact-training-contract-v2",
   "scenario_id": "humanoid_workyard",
   "parent_contract": "training/workyard-task-v4.json",
   "environment": {
     "framework": "mjlab",
-    "task_id": "Hear-Workyard-Frozen-Reach-Hand-Synergy-G1-v1",
+    "task_id": "Hear-Workyard-Whole-Body-Reach-Hand-Synergy-G1-v2",
     "module": "training/workyard_contact_mjlab_env.py",
     "implementation_status": "implemented",
     "terminal_stage": "grasp",
@@ -22,18 +22,18 @@
       "jit": "g1_velocity_teacher.jit.pt",
       "report": "training-report.json",
       "gradient_parameter_count": 0,
-      "authority": ["lower_body", "waist"]
+      "authority": "whole_body_reference_only"
     },
     "reach_policy": {
-      "protocol": "hear-frozen-reach-policy-export-v1",
-      "root": "artifacts/training/workyard-reach-frozen-v15",
-      "jit": "workyard_reach_selected.jit.pt",
+      "protocol": "hear-whole-body-reach-policy-deployment-v3",
+      "root": "artifacts/training/workyard-reach-deployment-v3",
+      "jit": "workyard_reach.jit.pt",
       "report": "reach-policy-report.json",
-      "jit_sha256": "c90cdf1c5ee6090b03a1fa48d584d09fd66de27e8e7e77eab9ac42ede3d27bfc",
-      "source_checkpoint_sha256": "a39169baa2ae2514165dc76a1b862ec6dd398c9cace81d3754867e82c99539e4",
+      "jit_sha256": null,
+      "source_checkpoint_sha256": null,
       "gradient_parameter_count": 0,
-      "action_size": 14,
-      "authority": "frozen_active_arm_reach"
+      "action_size": 29,
+      "authority": "frozen_whole_body_reach"
     },
     "analytic_teacher_preflight": {
       "protocol": "hear-workyard-contact-analytic-teacher-preflight-v1",
@@ -66,6 +66,7 @@
     "closure_authority_latch": "episode_local_after_first_geometry_gate",
     "pose_hold": "closure_gate_then_measured_contact_pose",
     "terminal_pocket_max_joint_target_slew_rad_per_control_step": 0.001,
+    "hand_contact_solref_time_constant_s": 0.04,
     "force_release_threshold_n": 6,
     "emergency_force_release_threshold_n": 12,
     "maximum_closing_joint_lead_rad": 0.25,
@@ -75,10 +76,10 @@
     "phase": "hand_synergy_contact_grasp",
     "role": "contact_conditioned_8d_hand_policy",
     "observation": {
-      "protocol": "hear-workyard-contact-observation-v1",
-      "size": 247,
+      "protocol": "hear-workyard-contact-observation-v2",
+      "size": 262,
       "terms": [
-        { "name": "frozen_reach_observation", "size": 231 },
+        { "name": "frozen_reach_observation", "size": 246 },
         { "name": "hand_coordination", "size": 8 },
         { "name": "previous_authorized_hand_action", "size": 8 }
       ],
@@ -117,11 +118,11 @@
     }
   },
   "composition": {
-    "protocol": "hear-frozen-reach-hand-synergy-composition-v1",
+    "protocol": "hear-frozen-whole-body-reach-hand-synergy-composition-v2",
     "learned_action_size": 8,
-    "frozen_reach_action_size": 14,
-    "logical_composed_action_size": 22,
-    "body_joint_command": "frozen_locomotion_plus_frozen_reach_or_harness_terminal_executor",
+    "frozen_reach_action_size": 29,
+    "logical_composed_action_size": 37,
+    "body_joint_command": "frozen_whole_body_reach_plus_harness_terminal_active_arm_executor",
     "hand_joint_command": "authorized_active_hand_synergy_only"
   },
   "training": {

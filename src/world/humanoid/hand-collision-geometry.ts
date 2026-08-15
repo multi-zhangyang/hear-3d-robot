@@ -29,7 +29,7 @@ export function g1PhysicsModelXml(source: string): string {
   );
   let replacementCount = 0;
   transformed = transformed.replace(/<geom\b([^>]*)\/>/g, (element, attributes: string) => {
-    if (attribute(attributes, "class") !== "collision") return element;
+    if (!isG1HandColliderClass(attribute(attributes, "class"))) return element;
     const mesh = attribute(attributes, "mesh");
     if (!mesh || !isG1HandCollisionMeshName(mesh)) return element;
     const generatedName = g1HandContactGeomName(mesh);
@@ -54,6 +54,10 @@ export function g1PhysicsModelXml(source: string): string {
   transformed = transformed.replace(/\s*<geom\b(?=[^>]*\bclass="visual")[^>]*\/>/g, "");
   assertUniqueGeomNames(transformed);
   return transformed;
+}
+
+function isG1HandColliderClass(value: string | null): boolean {
+  return value === "collision" || value === "hand_collision";
 }
 
 function isG1HandCollisionMeshName(value: string): value is G1HandCollisionMeshName {

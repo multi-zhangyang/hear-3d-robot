@@ -2,6 +2,7 @@
 // identically offline and in CI, where no external request will resolve.
 import "@fontsource-variable/space-grotesk";
 import "@fontsource-variable/jetbrains-mono";
+import "@xyflow/react/dist/style.css";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
@@ -13,6 +14,7 @@ import "./styles/game-world.css";
 import "./styles/humanoid-world.css";
 import "./styles/journey.css";
 import "./styles/mission-modal.css";
+import "./styles/operator-console.css";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing application root");

@@ -103,7 +103,10 @@ import {
   type HumanoidRunCheckpoint
 } from "../../domain/humanoid-run.js";
 import type { RunStore } from "../../persistence/run-store.js";
-import type { HumanoidPolicyFrameSink } from "../../world/humanoid/simulation.js";
+import type {
+  HumanoidPolicyControlFrame,
+  HumanoidPolicyFrameSink
+} from "../../world/humanoid/simulation.js";
 import {
   createLifecycleEvent,
   reconcileLifecycleOutbox
@@ -200,6 +203,7 @@ import {
   currentAgentHarnessInvocationChain
 } from "../agent-scope.js";
 import {
+  acknowledgeNeuralSafetyInterrupt,
   activeNeuralAuthorityLease,
   appendNeuralPredictionError,
   closeNeuralAuthorityLease,
@@ -211,7 +215,11 @@ import {
   markNeuralPathwayDispatch,
   neuralPathwayDue,
   pendingNeuralSignals,
+  pendingNeuralSafetyInterrupts,
   publishNeuralSignal,
+  recordNeuralSafetyInterrupt,
+  recordNeuralReflexArcFrame,
+  resolveNeuralSafetyInterrupts,
   transitionNeuralHarnessPhase,
   transitionNeuralSkillCommitment,
   type NeuralAuthorityLease,
@@ -221,6 +229,7 @@ import {
   type NeuralPlanningAction,
   type NeuralPredictionError,
   type NeuralRolloutCertificate,
+  type NeuralSafetyInterrupt,
   type NeuralSignal,
   type NeuralSignalKind,
   type NeuralSkillCommitment
@@ -232,7 +241,14 @@ import {
   HUMANOID_NEURAL_SIGNAL_CONTRACTS,
   type HumanoidNeuralAgentId
 } from "./neural-hierarchy-contract.js";
+import {
+  humanoidRecoverySafetyInterruptIsCurrent
+} from "./recovery-safety-authority.js";
+import {
+  recoverCommittedNeuralPhysicalExecutionFeedback
+} from "./neural-agents.js";
 import type {
+  NeuralSchedulerEvent,
   NeuralWakeAuthority
 } from "./neural-hierarchy-scheduler.js";
 import {
@@ -249,7 +265,14 @@ import {
   requiredModelCallIds
 } from "./autonomy-history-loader.js";
 
-export type HumanoidCoordinatorPhase =
+/**
+ * Deterministic readiness derived from durable Goal, action, and physics state.
+ *
+ * This is a Harness safety gate, not an Agent or a routing authority. Neural
+ * control remains owned by `neural_hierarchy_state.harness_phase` and the
+ * invocation-scoped parent-child lease chain.
+ */
+export type HumanoidAutonomyReadiness =
   | "goal_selection"
   | "goal_transition"
   | "complete_satisfied_goal"
@@ -331,6 +354,8 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     ReturnType<typeof stageActionCommit>["pending"][string]
   > = [];
   #continuousPhysicsEnabled = false;
+  #stationarySafetySuspended = false;
+  #neuralSchedulerEventSink: ((event: NeuralSchedulerEvent) => void) | undefined;
   #modelAuthority: HumanoidModelAuthority | undefined;
   #goalEvidence = new Map<string, GoalEvidenceArtifact>();
   #persistedGoalEvidenceRefs = new Set<string>();
@@ -389,9 +414,10 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       replayHistoricalCognitiveState: input.freshNeuralHierarchyEpoch !== true,
       neuralHierarchyEpochId: this.#checkpoint.neural_hierarchy_state.epoch_id,
       frameSink: (frame) => this.#physicalExecution.recordFrame(frame, "execution"),
-      ...(input.policyFrameSink
-        ? { policyFrameSink: input.policyFrameSink }
-        : {}),
+      policyFrameSink: async (frame) => {
+        await this.#recordNeuralReflexArcFrame(frame);
+        await input.policyFrameSink?.(frame);
+      },
       physicalFrameSink: (cut) => this.#physicalExecution.recordPhysicalCut(cut),
       physicalExecutionFrameOffset: (transactionId) => (
         this.#physicalExecution.executionFrameOffset(transactionId)
@@ -417,11 +443,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       activeNeuralSkillCommitment: () => (
         this.#activeNeuralSkillCommitmentAuthority()
       ),
+      activeRecoverySafetyInterrupt: () => (
+        this.#activeRecoverySafetyInterruptAuthority()
+      ),
       ...(this.#signal ? { signal: this.#signal } : {})
     });
     this.#physicsClock = new HumanoidPhysicsClock({
       world: this.#world,
       frameSink: (frame) => this.#physicalExecution.recordFrame(frame, "stationary"),
+      onSafetyEvent: (error) => this.#handleStationarySafetyInterruption(error),
       onError: async (error) => {
         await this.recordProvider({
           status: "continuous_physics_stopped",
@@ -446,6 +476,23 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   get signal(): AbortSignal | undefined {
     return this.#signal;
+  }
+
+  attachNeuralSchedulerEventSink(
+    sink: (event: NeuralSchedulerEvent) => void
+  ): () => void {
+    if (this.#neuralSchedulerEventSink) {
+      throw new Error("Humanoid runtime already has a neural scheduler event sink");
+    }
+    this.#neuralSchedulerEventSink = sink;
+    let attached = true;
+    return () => {
+      if (!attached) return;
+      attached = false;
+      if (this.#neuralSchedulerEventSink === sink) {
+        this.#neuralSchedulerEventSink = undefined;
+      }
+    };
   }
 
   get checkpoint(): HumanoidRunCheckpoint {
@@ -580,11 +627,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       phase = "goal_valuation";
       reason = "no_active_goal_epoch";
     } else {
-      const coordinator = this.coordinatorPhase();
-      if (coordinator === "complete_satisfied_goal") {
+      const safetyInterrupt = pendingNeuralSafetyInterrupts(state)[0];
+      if (safetyInterrupt?.status === "pending") {
+        phase = "safety_interrupt";
+        reason = "body_reflex_safety_interrupt_requires_supervisory_acknowledgement";
+      } else {
+      const readiness = this.autonomyReadiness();
+      if (readiness === "complete_satisfied_goal") {
         phase = "cycle_completion";
         reason = "runtime_completion_barrier_ready";
-      } else if (coordinator === "complete_cycle") {
+      } else if (readiness === "complete_cycle") {
         const completion = this.cycleCompletionReadiness();
         const execution = this.validateCycleEvidence(
           completion.evidence_transaction_ids
@@ -604,22 +656,27 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           phase = "perception";
           reason = "fresh_epoch_completion_perception_required";
         }
-      } else if (coordinator === "post_execution") {
+      } else if (readiness === "post_execution") {
         // A fresh Agent/hierarchy epoch deliberately has no inherited neural
         // commitment or signal graph. Resume from the durable physical receipt
         // by obtaining a new observation; normal live epochs still close their
         // executing commitment through feedback first.
-        if (state.active_skill_commitment === null) {
+        if (state.active_skill_commitment === null
+          || ["completed", "failed", "released"].includes(
+            state.active_skill_commitment.state
+          )) {
           phase = "perception";
-          reason = "fresh_epoch_post_execution_observation_required";
+          reason = state.active_skill_commitment === null
+            ? "fresh_epoch_post_execution_observation_required"
+            : "closed_commitment_post_execution_observation_required";
         } else {
           phase = "feedback";
           reason = "post_execution_observation_required";
         }
-      } else if (coordinator === "post_failure_observation") {
+      } else if (readiness === "post_failure_observation") {
         phase = "perception";
         reason = "physical_failure_requires_current_perception";
-      } else if (coordinator === "replan_or_retire") {
+      } else if (readiness === "replan_or_retire") {
         if (activeRecoveryReplacementCommitment(state)) {
           phase = "motor_assessment";
           reason = "recovery_replacement_commitment_requires_assessment";
@@ -640,7 +697,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
           kinds: ["perceptual_belief"]
         }).some((signal) => signal.status === "pending")) {
-          // The durable Coordinator phase proves that a rejected plan or
+          // Durable action/physics readiness proves that a rejected plan or
           // failed execution was followed by Sensor Fusion.  A fresh neural
           // epoch still needs its own Perception edge before Recovery can act.
           phase = "perception";
@@ -649,7 +706,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           phase = "recovery";
           reason = "runtime_failure_feedback_required";
         }
-      } else if (coordinator === "execute_plan") {
+      } else if (readiness === "execute_plan") {
         const storedCommitment = state.active_skill_commitment;
         const activeCommitment = storedCommitment
           && !["completed", "failed", "released"].includes(storedCommitment.state)
@@ -696,6 +753,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       } else {
         return structuredClone(current);
       }
+      }
     }
     if (phase === current.phase) return structuredClone(current);
     return this.transitionNeuralHarnessPhase({
@@ -732,6 +790,68 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }).filter((signal) => (
       (input.invocationId === undefined || signal.invocation_id === input.invocationId)
     ));
+  }
+
+  pendingNeuralSafetyInterrupts(): NeuralSafetyInterrupt[] {
+    return pendingNeuralSafetyInterrupts(
+      this.#checkpoint.neural_hierarchy_state
+    );
+  }
+
+  async acknowledgeNeuralSafetyInterrupt(input: {
+    interruptId: string;
+    acknowledgedByNodeId: string;
+  }): Promise<{
+    interrupt: NeuralSafetyInterrupt;
+    commitment: NeuralSkillCommitment | null;
+  }> {
+    if (input.acknowledgedByNodeId !== HUMANOID_NEURAL_AGENT_IDS.actionSelection) {
+      throw new Error("Only Action Selection may acknowledge a supervisory safety interrupt");
+    }
+    return this.#neuralStateMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
+      const world = this.#world.snapshot();
+      if (!world.robot.fallen) {
+        throw new Error("Stationary fall interrupt is no longer physically active");
+      }
+      const acknowledged = acknowledgeNeuralSafetyInterrupt(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          interruptId: input.interruptId,
+          acknowledgedByNodeId: input.acknowledgedByNodeId,
+          worldRevision: world.worldRevision
+        }
+      );
+      const phase = acknowledged.state.harness_phase;
+      if (phase.phase !== "safety_interrupt") {
+        throw new Error(
+          `Safety acknowledgement requires safety_interrupt phase, found ${phase.phase}`
+        );
+      }
+      this.#checkpoint.neural_hierarchy_state = transitionNeuralHarnessPhase(
+        acknowledged.state,
+        {
+          phase: "perception",
+          goalEpochId: phase.goal_epoch_id,
+          commitmentId: null,
+          worldRevision: world.worldRevision,
+          enteredByNodeId: input.acknowledgedByNodeId,
+          reason: "stationary_safety_interrupt_acknowledged_observation_required",
+          liveInvocationIds: this.#liveNeuralInvocationIds()
+        }
+      );
+      await this.#persistNeuralState();
+      await this.emit("neural_safety_interrupt_acknowledged", json({
+        interrupt: acknowledged.interrupt,
+        failed_commitment: acknowledged.commitment,
+        next_phase: "perception",
+        automatic_actuation: false
+      }));
+      return {
+        interrupt: acknowledged.interrupt,
+        commitment: acknowledged.commitment
+      };
+    });
   }
 
   currentWorldRevision(): number {
@@ -1137,6 +1257,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   neuralSkillProposalAdmission(signal: NeuralSignal): {
     accepted: boolean;
     reason?: string;
+    detail?: JsonValue;
     invocation?: JsonValue;
     relation?: "direct" | "prerequisite" | "recovery" | "safety";
     predicate_index?: number | null;
@@ -1186,6 +1307,9 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       signal,
       HUMANOID_NEURAL_AGENT_IDS.recovery
     );
+    const recoveryInterrupt = recoveryAuthorized
+      ? this.#activeRecoverySafetyInterruptAuthority()
+      : undefined;
     const alignment = alignHumanoidSkillToGoal({
       goal: activeGoal,
       invocation: invocation.data,
@@ -1223,13 +1347,18 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       },
       observation,
       activeGoal,
-      ...(recoveryAuthorized ? { recoveryAuthorized: true } : {})
+      ...(recoveryAuthorized ? { recoveryAuthorized: true } : {}),
+      ...(recoveryInterrupt ? { recoveryInterrupt } : {})
     });
     if (!readiness.accepted) {
       return {
         accepted: false,
         invocation: json(invocation.data),
-        reason: `The proposed Skill is not ready for a bounded physical commitment: ${readiness.code}; ${JSON.stringify(readiness.detail)}`
+        reason: `The proposed Skill is not ready for a bounded physical commitment: ${readiness.code}; ${JSON.stringify(readiness.detail)}`,
+        detail: json({
+          admission_code: readiness.code,
+          readiness: readiness.detail
+        })
       };
     }
     return {
@@ -1629,6 +1758,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         const before = new Set(Object.keys(next.candidates));
         try {
           assertGoalSupported(candidate.goal, this.#scenario);
+          await this.#assertGoalNavigationGrounding(candidate.goal);
           next = proposeGoalCandidate(next, {
             proposal_id: candidate.proposal_id,
             source,
@@ -1666,6 +1796,67 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         goal_dag_state_sha256: next.state_sha256
       });
     });
+  }
+
+  async #assertGoalNavigationGrounding(goal: Goal): Promise<void> {
+    const targets = goal.predicates.filter((predicate) => (
+      predicate.type === "robot_at"
+    ));
+    for (let leftIndex = 0; leftIndex < targets.length; leftIndex += 1) {
+      const left = targets[leftIndex]!;
+      for (let rightIndex = leftIndex + 1; rightIndex < targets.length; rightIndex += 1) {
+        const right = targets[rightIndex]!;
+        const separation = Math.hypot(
+          left.target.x - right.target.x,
+          left.target.z - right.target.z
+        );
+        if (separation > left.tolerance + right.tolerance) {
+          throw new Error(
+            "Goal contains mutually exclusive robot_at predicates: "
+            + `separation=${separation.toFixed(6)}m, `
+            + `combined_tolerance=${(left.tolerance + right.tolerance).toFixed(6)}m`
+          );
+        }
+      }
+    }
+    for (const predicate of targets) {
+      const assessment = await this.#world.assessNavigationTarget(predicate.target);
+      if (!assessment.accepted || !assessment.resolvedTarget) {
+        throw new Error(
+          "Goal robot_at target has no current complete navigation path: "
+          + (assessment.reason ?? "navigation_target_rejected")
+        );
+      }
+      const goalError = Math.hypot(
+        assessment.resolvedTarget.x - predicate.target.x,
+        assessment.resolvedTarget.z - predicate.target.z
+      );
+      if (goalError > predicate.tolerance) {
+        throw new Error(
+          "Goal robot_at target projects outside its completion tolerance: "
+          + `projection_error=${goalError.toFixed(6)}m, `
+          + `goal_tolerance=${predicate.tolerance.toFixed(6)}m`
+        );
+      }
+    }
+    const zonePredicates = goal.predicates.filter((predicate) => (
+      predicate.type === "robot_in_zone"
+    ));
+    for (const predicate of zonePredicates) {
+      const zone = this.#scenario.zones.find(({ id }) => id === predicate.zone_id);
+      if (!zone) continue;
+      const assessment = await this.#world.assessNavigationTarget(zone.center);
+      const resolved = assessment.resolvedTarget;
+      const resolvedInsideZone = resolved !== null
+        && Math.abs(resolved.x - zone.center.x) <= zone.size.x / 2 + predicate.tolerance
+        && Math.abs(resolved.z - zone.center.z) <= zone.size.z / 2 + predicate.tolerance;
+      if (!assessment.accepted || !resolvedInsideZone) {
+        throw new Error(
+          `Goal robot_in_zone target ${predicate.zone_id} has no current complete `
+          + `navigation path into the zone: ${assessment.reason ?? "zone_center_rejected"}`
+        );
+      }
+    }
   }
 
   async selectGoalCandidate(
@@ -1808,7 +1999,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   ): Promise<JsonValue> {
     return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
       this.#assertRunAcceptsDecisions();
-      if (this.coordinatorPhase() !== "replan_or_retire") {
+      if (this.autonomyReadiness() !== "replan_or_retire") {
         throw new Error("The active Goal is not awaiting recovery re-evaluation");
       }
       const activeCycle = this.#checkpoint.active_cycle;
@@ -1855,7 +2046,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         evidence_ref: evidence.ref,
         world_revision: captured.world.worldRevision
       });
-      // Continuing an active Goal transfers control back to the Coordinator,
+      // Continuing an active Goal transfers control back to Executive and
       // so publish the successor Cycle in the same locked checkpoint cut. A
       // specialist result must never expose `active Goal + no active Cycle` as
       // if the Goal Manager should select the already-active Goal again.
@@ -1884,7 +2075,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   validateSatisfiedGoal(): JsonValue {
-    if (this.coordinatorPhase() !== "complete_satisfied_goal") {
+    if (this.autonomyReadiness() !== "complete_satisfied_goal") {
       throw new Error("The active Goal is not ready for execution-free completion");
     }
     const activeGoal = this.#requiredActiveGoal();
@@ -2014,7 +2205,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         if (resumeClock
           && this.#checkpoint.status === "running"
           && activeActionExecutions(this.#checkpoint.action_execution_ledger).length === 0) {
-          this.#physicsClock.start();
+          await this.#resumeContinuousPhysicsIfSafe();
         }
       }
     });
@@ -2022,6 +2213,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   async stopContinuousPhysics(): Promise<void> {
     this.#continuousPhysicsEnabled = false;
+    this.#stationarySafetySuspended = false;
     await this.#physicsClock.stop();
   }
 
@@ -2067,12 +2259,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     });
   }
 
-  coordinatorPhase(): HumanoidCoordinatorPhase {
+  autonomyReadiness(): HumanoidAutonomyReadiness {
     if (this.#checkpoint.goal_dag.status !== "active") return "goal_selection";
     const activeCycle = this.#checkpoint.active_cycle;
     if (!activeCycle) {
       throw new Error(
-        "An active Goal must enter an autonomous Cycle before Coordinator dispatch"
+        "An active Goal must enter an autonomous Cycle before autonomy dispatch"
       );
     }
     const receipts = humanoidActionReceiptsInCommitOrder(
@@ -2081,6 +2273,33 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const cycleReceipts = receipts.filter((receipt) => (
       sameAutonomousCycle(receipt.cycle, activeCycle)
     ));
+    const world = this.#world.snapshot();
+    const safetyInterrupt = pendingNeuralSafetyInterrupts(
+      this.#checkpoint.neural_hierarchy_state
+    )[0];
+    if (world.robot.fallen || safetyInterrupt) {
+      const latestFailedSafetyExecutionIndex = cycleReceipts.findLastIndex(
+        (receipt) => physicalExecutionReceipt(receipt)
+          && !completedPhysicalExecution(receipt)
+          && receipt.worldAfterRevision >= (safetyInterrupt?.world_revision ?? 0)
+      );
+      const latestFailedSafetyExecution = cycleReceipts[
+        latestFailedSafetyExecutionIndex
+      ];
+      const failureRevision = Math.max(
+        safetyInterrupt?.world_revision ?? world.worldRevision,
+        latestFailedSafetyExecution?.worldAfterRevision ?? 0
+      );
+      const failureObserved = cycleReceipts.slice(
+        Math.max(0, latestFailedSafetyExecutionIndex + 1)
+      ).some((receipt) => (
+        isHumanoidSensorFusionActor(receipt.agentId)
+          && receipt.accepted
+          && receipt.action === "observe_humanoid"
+          && receipt.worldAfterRevision >= failureRevision
+      ));
+      return failureObserved ? "replan_or_retire" : "post_failure_observation";
+    }
     const completion = this.cycleCompletionReadiness();
     if (completion.status === "ready") {
       if (this.#pendingBlockRemoval()) {
@@ -2156,7 +2375,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   executorDelegationAvailable(): boolean {
-    const phase = this.coordinatorPhase();
+    const phase = this.autonomyReadiness();
     if (phase === "execute_plan") return true;
     if (phase !== "post_execution") return false;
     return this.#pendingBlockRemoval();
@@ -2179,7 +2398,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   goalRetirementDelegationAvailable(): boolean {
-    const phase = this.coordinatorPhase();
+    const phase = this.autonomyReadiness();
     if (phase === "goal_transition") return true;
     if (phase !== "replan_or_retire") return false;
     const activeCycleState = this.#checkpoint.active_cycle;
@@ -2220,7 +2439,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   sentryDelegationAvailable(): boolean {
-    const phase = this.coordinatorPhase();
+    const phase = this.autonomyReadiness();
     if (phase === "observe_or_plan" || phase === "post_failure_observation") {
       return true;
     }
@@ -2254,7 +2473,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
   }
 
   motionDelegationAvailable(): boolean {
-    const phase = this.coordinatorPhase();
+    const phase = this.autonomyReadiness();
     if (phase === "observe_or_plan" || phase === "plan") return true;
     if (phase !== "replan_or_retire") return false;
     const budget = this.#checkpoint.active_cycle?.replan_budget;
@@ -2326,7 +2545,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       observation,
       world,
       cycleCompletion: this.cycleCompletionReadiness(),
-      coordinatorPhase: this.coordinatorPhase()
+      autonomyReadiness: this.autonomyReadiness()
     });
     this.#rememberGoalEvidence(result.worldEvidence);
     this.#contextGoalEvidenceRefs.set(agentId, result.worldEvidence.evidence.ref);
@@ -2369,6 +2588,15 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       owned_skill_commitment: activeCommitment?.owner_node_id === agentId
         ? activeCommitment
         : null,
+      pending_safety_interrupts: (
+        agentId === HUMANOID_NEURAL_AGENT_IDS.executive
+          || agentId === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+          || agentId === HUMANOID_NEURAL_AGENT_IDS.reflex
+      )
+        ? pendingNeuralSafetyInterrupts(
+            this.#checkpoint.neural_hierarchy_state
+          )
+        : [],
       active_rollout_certificates: Object.values(
         this.#checkpoint.neural_hierarchy_state.rollout_certificates
       ).filter((certificate) => (
@@ -2494,7 +2722,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       const episodeId = invocation?.agentId === agentId
         ? invocation.invocationId
         : undefined;
-      const rawBudgetRole = this.coordinatorPhase() === "replan_or_retire"
+      const rawBudgetRole = this.autonomyReadiness() === "replan_or_retire"
         ? replanBudgetRole(agentId)
         : undefined;
       const budgetRole = rawBudgetRole === "coordinator"
@@ -2828,12 +3056,20 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         automatic_actuation: false
       }));
     }
-    await this.recoverPendingPhysicalExecution();
+    const recoveredPhysicalReceipt = await this.recoverPendingPhysicalExecution();
+    const neuralFeedbackReceipt = recoveredPhysicalReceipt
+      ?? this.#committedPhysicalReceiptAwaitingNeuralFeedback();
+    if (neuralFeedbackReceipt) {
+      await recoverCommittedNeuralPhysicalExecutionFeedback(
+        this,
+        neuralFeedbackReceipt
+      );
+    }
     this.#continuousPhysicsEnabled = true;
     const pendingExecution = activeActionExecutions(
       this.#checkpoint.action_execution_ledger
     )[0];
-    if (!pendingExecution) this.#physicsClock.start();
+    if (!pendingExecution) await this.#resumeContinuousPhysicsIfSafe();
     const controller = this.#world.snapshot().robot.controller;
     await this.emit(
       pendingExecution ? "continuous_physics_deferred" : "continuous_physics_started",
@@ -2887,7 +3123,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     const authority = execution.admission.tool_call_authority;
     if (!execution.admission.decision || !authority) {
       throw new Error(
-        `Durable physical execution has no Coordinator delegation: ${execution.transaction_id}`
+        `Durable physical execution has no Action Selection admission: ${execution.transaction_id}`
       );
     }
     const receipt = await this.invoke(
@@ -2915,6 +3151,21 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       world_revision: receipt.worldAfterRevision
     }));
     return receipt;
+  }
+
+  #committedPhysicalReceiptAwaitingNeuralFeedback():
+    HumanoidActionReceipt | undefined {
+    const hierarchy = this.#checkpoint.neural_hierarchy_state;
+    const commitment = hierarchy.active_skill_commitment;
+    const transactionId = hierarchy.reflex_arc.execution_transaction_id;
+    if (!commitment
+      || commitment.state !== "executing"
+      || hierarchy.reflex_arc.commitment_id !== commitment.commitment_id
+      || hierarchy.reflex_arc.status === "idle"
+      || hierarchy.reflex_arc.status === "active"
+      || !transactionId) return undefined;
+    const receipt = this.#checkpoint.committed_actions[transactionId];
+    return receipt ? structuredClone(receipt) : undefined;
   }
 
   async completeCycle(output: string): Promise<boolean> {
@@ -3068,7 +3319,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   async completeSatisfiedGoal(output: string): Promise<boolean> {
     return this.#goalStateMutex.runExclusive(() => this.#withPhysicsPaused(async () => {
-      if (this.coordinatorPhase() !== "complete_satisfied_goal") {
+      if (this.autonomyReadiness() !== "complete_satisfied_goal") {
         throw new Error("The active Goal is not ready for execution-free completion");
       }
       let cycleOutput: JsonValue;
@@ -3999,6 +4250,22 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     return undefined;
   }
 
+  #activeRecoverySafetyInterruptAuthority(): NeuralSafetyInterrupt | undefined {
+    const worldRevision = this.#world.snapshot().worldRevision;
+    const interrupt = Object.values(
+      this.#checkpoint.neural_hierarchy_state.safety_interrupts
+    )
+      .filter((candidate) => humanoidRecoverySafetyInterruptIsCurrent(
+        candidate,
+        { worldRevision }
+      ))
+      .sort((left, right) => (
+        right.world_revision - left.world_revision
+        || right.created_at.localeCompare(left.created_at)
+      ))[0];
+    return interrupt ? structuredClone(interrupt) : undefined;
+  }
+
   #neuralSignalHasSourceNode(signal: NeuralSignal, sourceNodeId: string): boolean {
     const hierarchy = this.#checkpoint.neural_hierarchy_state;
     const pending = [signal.signal_id];
@@ -4116,7 +4383,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       || action !== humanoidExecutionActionForPlan(referencedReceipt.action)) {
       return;
     }
-    const phase = this.coordinatorPhase();
+    const phase = this.autonomyReadiness();
     if (phase !== "execute_plan") {
       throw new Error(
         `Humanoid physical action has no current execution authority in phase ${phase}`
@@ -4334,10 +4601,152 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         if (resumeClock
           && this.#checkpoint.status === "running"
           && activeActionExecutions(this.#checkpoint.action_execution_ledger).length === 0) {
-          this.#physicsClock.start();
+          await this.#resumeContinuousPhysicsIfSafe();
         }
       }
     });
+  }
+
+  async #handleStationarySafetyInterruption(
+    error: import("../../world/humanoid/physics-clock.js").HumanoidStationarySafetyError
+  ): Promise<void> {
+    this.#stationarySafetySuspended = true;
+    await this.#persist(true);
+    const snapshot = this.#world.snapshot();
+    const interrupt = await this.#neuralStateMutex.runExclusive(async () => {
+      const activeCommitment = this.#checkpoint.neural_hierarchy_state
+        .active_skill_commitment;
+      const recorded = recordNeuralSafetyInterrupt(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          kind: "stationary_fall",
+          sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.body,
+          relayNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
+          targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+          worldFrame: snapshot.frame,
+          worldRevision: snapshot.worldRevision,
+          commitmentId: activeCommitment
+            && !["completed", "failed", "released"].includes(activeCommitment.state)
+            ? activeCommitment.commitment_id
+            : null,
+          detail: json({
+            reason: "robot_fallen",
+            root_position: snapshot.robot.rootPosition,
+            balance: snapshot.robot.balance,
+            continuous_physics_suspended: true
+          })
+        }
+      );
+      this.#checkpoint.neural_hierarchy_state = recorded.state;
+      await this.#persistNeuralState();
+      return recorded.interrupt;
+    });
+    await this.recordProvider({
+      status: "stationary_safety_interruption",
+      reason: "robot_fallen",
+      frame: snapshot.frame,
+      world_revision: snapshot.worldRevision,
+      root_position: snapshot.robot.rootPosition,
+      balance: json(snapshot.robot.balance),
+      safety_interrupt_id: interrupt.interrupt_id,
+      error: error.message,
+      automatic_actuation: false
+    }, HUMANOID_NEURAL_AGENT_IDS.reflex);
+    await this.emit("humanoid_stationary_safety_interrupted", json({
+      source_node_id: HUMANOID_NEURAL_AGENT_IDS.body,
+      routed_through_node_id: HUMANOID_NEURAL_AGENT_IDS.reflex,
+      target_control_domain: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      correction_scope: "supervisory",
+      reason: "robot_fallen",
+      safety_interrupt_id: interrupt.interrupt_id,
+      frame: snapshot.frame,
+      world_revision: snapshot.worldRevision,
+      continuous_physics_suspended: true
+    }));
+    this.#neuralSchedulerEventSink?.({
+      event_id: randomUUID(),
+      at: new Date().toISOString(),
+      world_revision: snapshot.worldRevision,
+      causal_signal_ids: [],
+      causal_interrupt_ids: [interrupt.interrupt_id],
+      kind: "prediction_error",
+      correction_scope: "supervisory"
+    });
+  }
+
+  async #resumeContinuousPhysicsIfSafe(): Promise<void> {
+    if (!this.#continuousPhysicsEnabled
+      || this.#checkpoint.status !== "running"
+      || activeActionExecutions(this.#checkpoint.action_execution_ledger).length > 0) {
+      return;
+    }
+    const snapshot = this.#world.snapshot();
+    if (snapshot.robot.fallen) {
+      this.#stationarySafetySuspended = true;
+      return;
+    }
+    const pendingInterrupts = pendingNeuralSafetyInterrupts(
+      this.#checkpoint.neural_hierarchy_state
+    );
+    const completedRecoveryInterruptIds = this.#completedRecoveryInterruptIds(
+      snapshot.worldRevision
+    );
+    if (pendingInterrupts.some((interrupt) => (
+      interrupt.status !== "acknowledged"
+      || !completedRecoveryInterruptIds.has(interrupt.interrupt_id)
+    ))) {
+      this.#stationarySafetySuspended = true;
+      return;
+    }
+    const recovered = this.#stationarySafetySuspended;
+    this.#stationarySafetySuspended = false;
+    const resolvedInterrupts = await this.#neuralStateMutex.runExclusive(async () => {
+      const resolution = resolveNeuralSafetyInterrupts(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          worldRevision: snapshot.worldRevision,
+          interruptIds: [...completedRecoveryInterruptIds]
+        }
+      );
+      if (resolution.resolved.length === 0) return [];
+      this.#checkpoint.neural_hierarchy_state = resolution.state;
+      await this.#persistNeuralState();
+      return resolution.resolved;
+    });
+    this.#physicsClock.start();
+    if (!recovered) return;
+    await this.recordProvider({
+      status: "stationary_safety_recovered",
+      frame: snapshot.frame,
+      world_revision: snapshot.worldRevision,
+      resolved_safety_interrupt_ids: resolvedInterrupts.map(
+        (interrupt) => interrupt.interrupt_id
+      ),
+      automatic_actuation: true
+    }, HUMANOID_NEURAL_AGENT_IDS.reflex);
+    await this.emit("humanoid_stationary_safety_recovered", json({
+      frame: snapshot.frame,
+      world_revision: snapshot.worldRevision,
+      resolved_safety_interrupt_ids: resolvedInterrupts.map(
+        (interrupt) => interrupt.interrupt_id
+      ),
+      continuous_physics_resumed: true
+    }));
+  }
+
+  #completedRecoveryInterruptIds(worldRevision: number): Set<string> {
+    const completed = new Set<string>();
+    for (const receipt of Object.values(this.#checkpoint.committed_actions)) {
+      if (receipt.action !== "execute_humanoid_skill"
+        || !receipt.accepted
+        || receipt.code !== "recovery_completed"
+        || receipt.worldAfterRevision > worldRevision) continue;
+      const recovery = object(receipt.detail).recovery;
+      if (recovery === undefined) continue;
+      const interruptId = object(recovery).safety_interrupt_id;
+      if (typeof interruptId === "string") completed.add(interruptId);
+    }
+    return completed;
   }
 
   #node(agentId: string): TaskNode {
@@ -4370,6 +4779,30 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
     this.#checkpoint.world = captured.world;
     this.#checkpoint.world_checkpoint = captured.worldCheckpoint;
+  }
+
+  async #recordNeuralReflexArcFrame(
+    frame: HumanoidPolicyControlFrame
+  ): Promise<void> {
+    await this.#neuralStateMutex.runExclusive(() => {
+      const executions = activeActionExecutions(
+        this.#checkpoint.action_execution_ledger
+      );
+      if (executions.length > 1) {
+        throw new Error("A reflex frame cannot have multiple physical owners");
+      }
+      const execution = executions[0];
+      const certificate = execution?.admission.neural_rollout_certificate;
+      if (!execution || !certificate) return;
+      this.#checkpoint.neural_hierarchy_state = recordNeuralReflexArcFrame(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          executionTransactionId: execution.transaction_id,
+          commitmentId: certificate.commitment_id,
+          ...neuralReflexFrameMetrics(frame)
+        }
+      );
+    });
   }
 
   async #persistNeuralState(): Promise<void> {
@@ -5866,6 +6299,76 @@ function findLatestProviderModelUsage(
     return ModelUsageStateSchema.parse(record.model_usage);
   }
   return undefined;
+}
+
+function neuralReflexFrameMetrics(frame: HumanoidPolicyControlFrame): {
+  simulatedTimeSeconds: number;
+  controllerMode: "learned_policy" | "reference_control" | "hybrid_control";
+  controllerRoute: "direct" | "primary" | "fallback" | "upper_body_overlay";
+  controllerImplementation: string;
+  physicsSubsteps: number;
+  weightedJointTrackingError: number;
+  controllerReferenceDelta: number;
+  maximumJointVelocity: number;
+  localCorrection: boolean;
+  nonFootContact: boolean;
+  supportState: "none" | "left" | "right" | "double";
+  fallen: boolean;
+} {
+  const jointCount = frame.reference.jointPositions.length;
+  if (frame.postState.jointPositions.length !== jointCount
+    || frame.postState.jointVelocities.length !== jointCount
+    || frame.reference.jointTrackingWeights.length !== jointCount
+    || frame.actuation.positions.length !== jointCount) {
+    throw new Error("Reflex controller frame joint dimensions do not align");
+  }
+  let weightedSquaredError = 0;
+  let trackingWeight = 0;
+  let controllerReferenceSquaredDelta = 0;
+  let maximumJointVelocity = 0;
+  for (let index = 0; index < jointCount; index += 1) {
+    const weight = frame.reference.jointTrackingWeights[index]!;
+    const trackingDelta = frame.postState.jointPositions[index]!
+      - frame.reference.jointPositions[index]!;
+    weightedSquaredError += weight * trackingDelta * trackingDelta;
+    trackingWeight += weight;
+    const controllerDelta = frame.actuation.positions[index]!
+      - frame.reference.jointPositions[index]!;
+    controllerReferenceSquaredDelta += controllerDelta * controllerDelta;
+    maximumJointVelocity = Math.max(
+      maximumJointVelocity,
+      Math.abs(frame.postState.jointVelocities[index]!)
+    );
+  }
+  const controllerReferenceDelta = Math.sqrt(
+    controllerReferenceSquaredDelta / Math.max(1, jointCount)
+  );
+  const execution = frame.controllerExecution;
+  const controllerMode = execution?.mode
+    ?? (frame.controller.learnedPolicy ? "learned_policy" : "reference_control");
+  const controllerRoute = frame.controllerInference?.route
+    ?? execution?.routing?.route
+    ?? "direct";
+  const physicsSubsteps = Math.round(
+    frame.controller.controlStepSeconds / frame.controller.physicsStepSeconds
+  );
+  return {
+    simulatedTimeSeconds: frame.postSnapshot.simulatedTime,
+    controllerMode,
+    controllerRoute,
+    controllerImplementation: execution?.activeImplementation
+      ?? frame.controller.implementation,
+    physicsSubsteps,
+    weightedJointTrackingError: trackingWeight === 0
+      ? 0
+      : Math.sqrt(weightedSquaredError / trackingWeight),
+    controllerReferenceDelta,
+    maximumJointVelocity,
+    localCorrection: controllerReferenceDelta > 1e-6,
+    nonFootContact: frame.postSnapshot.nonFootEnvironmentContacts.length > 0,
+    supportState: frame.postSnapshot.balance.support,
+    fallen: frame.postSnapshot.fallen
+  };
 }
 
 function neuralBoundSkillLifecycleOutcome(input: {

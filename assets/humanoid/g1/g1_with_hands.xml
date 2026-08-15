@@ -13,6 +13,9 @@
       </default>
       <default class="collision">
         <geom group="3" type="mesh"/>
+        <default class="hand_collision">
+          <geom priority="2" solref="0.04 1"/>
+        </default>
         <default class="foot">
           <geom type="sphere" size="0.005" priority="1" friction="0.6" condim="3"/>
         </default>
@@ -254,7 +257,7 @@
                             <joint name="left_hand_thumb_0_joint" axis="0 1 0" range="-1.0472 1.0472"
                               actuatorfrcrange="-2.45 2.45"/>
                             <geom class="visual" mesh="left_hand_thumb_0_link"/>
-                            <geom class="collision" mesh="left_hand_thumb_0_link"/>
+                            <geom class="hand_collision" mesh="left_hand_thumb_0_link"/>
                             <body name="left_hand_thumb_1_link" pos="-0.0025 -0.0193 0">
                               <inertial pos="-0.000827888 -0.0354744 -0.0003809"
                                 quat="0.685598 0.705471 -0.15207 0.0956069" mass="0.0588507"
@@ -262,7 +265,7 @@
                               <joint name="left_hand_thumb_1_joint" axis="0 0 1" range="-0.724312 1.0472"
                                 actuatorfrcrange="-1.4 1.4"/>
                               <geom class="visual" mesh="left_hand_thumb_1_link"/>
-                              <geom size="0.01 0.015 0.01" pos="-0.001 -0.032 0" type="box" class="collision"/>
+                              <geom size="0.01 0.015 0.01" pos="-0.001 -0.032 0" type="box" class="hand_collision"/>
                               <body name="left_hand_thumb_2_link" pos="0 -0.0458 0">
                                 <inertial pos="-0.00171735 -0.0262819 0.000107789"
                                   quat="0.703174 0.710977 -0.00017564 -0.00766553" mass="0.0203063"
@@ -270,7 +273,7 @@
                                 <joint name="left_hand_thumb_2_joint" axis="0 0 1" range="0 1.74533"
                                   actuatorfrcrange="-1.4 1.4"/>
                                 <geom class="visual" mesh="left_hand_thumb_2_link"/>
-                                <geom class="collision" mesh="left_hand_thumb_2_link"/>
+                                <geom class="hand_collision" mesh="left_hand_thumb_2_link"/>
                               </body>
                             </body>
                           </body>
@@ -280,7 +283,7 @@
                             <joint name="left_hand_middle_0_joint" axis="0 0 1" range="-1.5708 0"
                               actuatorfrcrange="-1.4 1.4"/>
                             <geom class="visual" mesh="left_hand_middle_0_link"/>
-                            <geom class="collision" mesh="left_hand_middle_0_link"/>
+                            <geom class="hand_collision" mesh="left_hand_middle_0_link"/>
                             <body name="left_hand_middle_1_link" pos="0.0458 0 0">
                               <inertial pos="0.0262819 0.00171735 -0.000107789"
                                 quat="0.502612 0.491799 0.502639 0.502861" mass="0.0203063"
@@ -288,7 +291,7 @@
                               <joint name="left_hand_middle_1_joint" axis="0 0 1" range="-1.74533 0"
                                 actuatorfrcrange="-1.4 1.4"/>
                               <geom class="visual" mesh="left_hand_middle_1_link"/>
-                              <geom class="collision" mesh="left_hand_middle_1_link"/>
+                              <geom class="hand_collision" mesh="left_hand_middle_1_link"/>
                             </body>
                           </body>
                           <body name="left_hand_index_0_link" pos="0.1192 0.0046 0.0285">
@@ -297,7 +300,7 @@
                             <joint name="left_hand_index_0_joint" axis="0 0 1" range="-1.5708 0"
                               actuatorfrcrange="-1.4 1.4"/>
                             <geom class="visual" mesh="left_hand_index_0_link"/>
-                            <geom class="collision" mesh="left_hand_index_0_link"/>
+                            <geom class="hand_collision" mesh="left_hand_index_0_link"/>
                             <body name="left_hand_index_1_link" pos="0.0458 0 0">
                               <inertial pos="0.0262819 0.00171735 -0.000107789"
                                 quat="0.502612 0.491799 0.502639 0.502861" mass="0.0203063"
@@ -305,7 +308,7 @@
                               <joint name="left_hand_index_1_joint" axis="0 0 1" range="-1.74533 0"
                                 actuatorfrcrange="-1.4 1.4"/>
                               <geom class="visual" mesh="left_hand_index_1_link"/>
-                              <geom class="collision" mesh="left_hand_index_1_link"/>
+                              <geom class="hand_collision" mesh="left_hand_index_1_link"/>
                             </body>
                           </body>
                         </body>
@@ -371,7 +374,7 @@
                             <joint name="right_hand_thumb_0_joint" axis="0 1 0" range="-1.0472 1.0472"
                               actuatorfrcrange="-2.45 2.45"/>
                             <geom class="visual" mesh="right_hand_thumb_0_link"/>
-                            <geom class="collision" mesh="right_hand_thumb_0_link"/>
+                            <geom class="hand_collision" mesh="right_hand_thumb_0_link"/>
                             <body name="right_hand_thumb_1_link" pos="-0.0025 0.0193 0">
                               <inertial pos="-0.000827888 0.0354744 -0.0003809"
                                 quat="0.705471 0.685598 -0.0956069 0.15207" mass="0.0588507"
@@ -379,7 +382,7 @@
                               <joint name="right_hand_thumb_1_joint" axis="0 0 1" range="-1.0472 0.724312"
                                 actuatorfrcrange="-1.4 1.4"/>
                               <geom class="visual" mesh="right_hand_thumb_1_link"/>
-                              <geom size="0.01 0.015 0.01" pos="-0.001 0.032 0" type="box" class="collision"/>
+                              <geom size="0.01 0.015 0.01" pos="-0.001 0.032 0" type="box" class="hand_collision"/>
                               <body name="right_hand_thumb_2_link" pos="0 0.0458 0">
                                 <inertial pos="-0.00171735 0.0262819 0.000107789"
                                   quat="0.710977 0.703174 0.00766553 0.00017564" mass="0.0203063"
@@ -387,7 +390,7 @@
                                 <joint name="right_hand_thumb_2_joint" axis="0 0 1" range="-1.74533 0"
                                   actuatorfrcrange="-1.4 1.4"/>
                                 <geom class="visual" mesh="right_hand_thumb_2_link"/>
-                                <geom class="collision" mesh="right_hand_thumb_2_link"/>
+                                <geom class="hand_collision" mesh="right_hand_thumb_2_link"/>
                               </body>
                             </body>
                           </body>
@@ -397,7 +400,7 @@
                             <joint name="right_hand_middle_0_joint" axis="0 0 1" range="0 1.5708"
                               actuatorfrcrange="-1.4 1.4"/>
                             <geom class="visual" mesh="right_hand_middle_0_link"/>
-                            <geom class="collision" mesh="right_hand_middle_0_link"/>
+                            <geom class="hand_collision" mesh="right_hand_middle_0_link"/>
                             <body name="right_hand_middle_1_link" pos="0.0458 0 0">
                               <inertial pos="0.0262819 -0.00171735 -0.000107789"
                                 quat="0.502861 0.502639 0.491799 0.502612" mass="0.0203063"
@@ -405,7 +408,7 @@
                               <joint name="right_hand_middle_1_joint" axis="0 0 1" range="0 1.74533"
                                 actuatorfrcrange="-1.4 1.4"/>
                               <geom class="visual" mesh="right_hand_middle_1_link"/>
-                              <geom class="collision" mesh="right_hand_middle_1_link"/>
+                              <geom class="hand_collision" mesh="right_hand_middle_1_link"/>
                             </body>
                           </body>
                           <body name="right_hand_index_0_link" pos="0.1192 -0.0046 0.0285">
@@ -414,7 +417,7 @@
                             <joint name="right_hand_index_0_joint" axis="0 0 1" range="0 1.5708"
                               actuatorfrcrange="-1.4 1.4"/>
                             <geom class="visual" mesh="right_hand_index_0_link"/>
-                            <geom class="collision" mesh="right_hand_index_0_link"/>
+                            <geom class="hand_collision" mesh="right_hand_index_0_link"/>
                             <body name="right_hand_index_1_link" pos="0.0458 0 0">
                               <inertial pos="0.0262819 -0.00171735 -0.000107789"
                                 quat="0.502861 0.502639 0.491799 0.502612" mass="0.0203063"
@@ -422,7 +425,7 @@
                               <joint name="right_hand_index_1_joint" axis="0 0 1" range="0 1.74533"
                                 actuatorfrcrange="-1.4 1.4"/>
                               <geom class="visual" mesh="right_hand_index_1_link"/>
-                              <geom class="collision" mesh="right_hand_index_1_link"/>
+                              <geom class="hand_collision" mesh="right_hand_index_1_link"/>
                             </body>
                           </body>
                         </body>

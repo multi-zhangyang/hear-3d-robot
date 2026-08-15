@@ -17,6 +17,7 @@ import {
 } from "../config/load.js";
 import type { Goal } from "../domain/schema.js";
 import { modelPayloadSha256 } from "../domain/model-call-authority.js";
+import type { NeuralHierarchyState } from "../domain/neural-hierarchy.js";
 import { humanoidActionReceiptsInCommitOrder } from "../domain/humanoid-run.js";
 import {
   humanoidRunShouldFinish,
@@ -36,7 +37,7 @@ import {
 import {
   AgentManifestIncompatibleError,
   assertAgentManifestCompatible
-} from "../harness/agent-manifest.js";
+} from "../harness/agent-manifest-compatibility.js";
 import { withAgentInvocation } from "../harness/agent-scope.js";
 import {
   createHumanoidNeuralAgentHierarchy,
@@ -47,6 +48,7 @@ import { HUMANOID_NEURAL_AGENT_IDS } from
   "../harness/humanoid/neural-hierarchy-contract.js";
 import {
   NeuralHierarchyScheduler,
+  neuralWakeTarget,
   type NeuralSchedulerDispatch,
   type NeuralSchedulerEvent
 } from "../harness/humanoid/neural-hierarchy-scheduler.js";
@@ -81,6 +83,9 @@ import { isRunPauseRequested } from "./run-pause.js";
 import { assertGoalSupported } from "./goal-validation.js";
 import { assertHumanoidGoalSupported } from "./humanoid-checker.js";
 import {
+  assertHumanoidGoalControllerAdmission
+} from "./humanoid-goal-controller-admission.js";
+import {
   captureHumanoidSessionBaseline,
   captureHumanoidSessionStateIdentity,
   humanoidAgentStateFingerprint,
@@ -102,9 +107,6 @@ import { drawSeed } from "../world/world-generator.js";
 
 setTracingDisabled(true);
 
-// The SDK owns retries for one model request. This smaller outer window only
-// resumes a durable mission boundary after the SDK could not safely finish it.
-const MAX_MISSION_CONTINUITY_RECOVERIES = 2;
 const SERVER_ERROR_CONTEXT_RECOVERY_ATTEMPT = 2;
 const HUMANOID_PROMPT_CACHE_NAMESPACE = "hear-humanoid-agent-profile-v1";
 
@@ -204,6 +206,15 @@ export async function startHumanoidMission(input: {
       ...(input.eventSink ? { eventSink: input.eventSink } : {}),
       ...(input.signal ? { signal: input.signal } : {})
     });
+    try {
+      assertHumanoidGoalControllerAdmission(
+        input.goal,
+        world.snapshot().robot.controller
+      );
+    } catch (error) {
+      await runtime.fail(errorMessage(error));
+      throw error;
+    }
     return await executeHumanoidMission({
       runtime,
       provider: input.provider,
@@ -282,6 +293,15 @@ export async function resumeHumanoidMission(input: {
       ...(input.eventSink ? { eventSink: input.eventSink } : {}),
       ...(input.signal ? { signal: input.signal } : {})
     });
+    try {
+      assertHumanoidGoalControllerAdmission(
+        store.definition.goal,
+        world.snapshot().robot.controller
+      );
+    } catch (error) {
+      await runtime.fail(errorMessage(error));
+      throw error;
+    }
     if (input.freshAgentEpoch) {
       // RunStore intentionally clears the old per-Agent context together with
       // the neural epoch. Anchor that new empty context cut before autonomy
@@ -309,12 +329,17 @@ async function executeHumanoidMission(input: {
   resumed: boolean;
   signal?: AbortSignal;
 }): Promise<HumanoidMissionRunResult> {
-  const transportRecovery = new PerAgentTransportRecovery(
-    MAX_MISSION_CONTINUITY_RECOVERIES
-  );
+  // A continuous embodied run is stopped only by an explicit abort or a
+  // non-transient provider/configuration error. Transient connections may be
+  // unavailable for hours; the durable SDK/session boundary lets the same run
+  // wait and resume without an operator starting a replacement mission.
+  const transportRecovery = new PerAgentTransportRecovery(null);
+  const decisionRecovery = new PerAgentTransportRecovery(null);
+  const decisionRecoveryAgents = new Set<string>();
   let modelProgressRecoveryEpoch = 0;
   let initialized = false;
   let neuralScheduler: NeuralHierarchyScheduler | undefined;
+  let detachNeuralSchedulerEventSink: (() => void) | undefined;
   try {
     const persistedManifest = await persistedManifestForMission(input);
     const manifestEpochId = persistedManifest?.epoch_id ?? randomUUID();
@@ -497,11 +522,11 @@ async function executeHumanoidMission(input: {
       toolNotFoundBehavior: "return_error_to_model",
       // Provider reasoning ids are response-local on OpenAI-compatible chat
       // transports. Omitting them from durable history preserves exact
-      // append-only prefixes across coordinator turns and SDK Session replay.
+      // append-only prefixes across Executive episodes and SDK Session replay.
       reasoningItemIdPolicy: "omit",
       workflowName: "HEAR humanoid autonomy"
     });
-    let scheduledWake: NeuralSchedulerDispatch | undefined;
+    const scheduledWakes: NeuralSchedulerDispatch[] = [];
     neuralScheduler = new NeuralHierarchyScheduler({
       resolveAuthority: ({ requestedTargetNodeId }) => (
         input.runtime.resolveNeuralWakeAuthority(requestedTargetNodeId)
@@ -509,9 +534,15 @@ async function executeHumanoidMission(input: {
       dispatch: async (wake) => {
         // The scheduler delivers an interrupt plan to the one Executive root.
         // It never starts the requested child as a new root episode.
-        scheduledWake = wake;
+        if (scheduledWakes.length >= 256) {
+          throw new Error("Neural Executive wake queue exceeded 256 plans");
+        }
+        scheduledWakes.push(wake);
       }
     });
+    detachNeuralSchedulerEventSink = input.runtime.attachNeuralSchedulerEventSink(
+      (event) => neuralScheduler!.publish(event)
+    );
     const executiveSession = hierarchy.session(
       HUMANOID_NEURAL_AGENT_IDS.executive
     ) as FileSession;
@@ -604,7 +635,7 @@ async function executeHumanoidMission(input: {
     const acceptVerifiedTransition = async (
       output: string
     ): Promise<HumanoidMissionRunResult | undefined> => {
-      const completion = assertCoordinatorStepOutput(output);
+      const completion = assertExecutiveStepOutput(output);
       if (completion.status === "step_completed") return undefined;
       const transitionOutput = completion.payloadOutput;
       await contextManager.commitPendingSessionRewrites(sessionForAgent);
@@ -664,11 +695,38 @@ async function executeHumanoidMission(input: {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
       await input.runtime.reconcileNeuralHarnessPhase();
-      neuralScheduler.publish(neuralSchedulerEventForRuntime(input.runtime));
+      // Scheduler callbacks may arrive while the previous Executive episode is
+      // still running.  They are wake hints, not durable authority: after that
+      // episode the Harness phase, Goal epoch, commitment, leases, or world may
+      // already have changed.  Reconcile from durable state, discard delivered
+      // plans from the old cut, and publish one current event.  The scheduler
+      // still coalesces concurrent events, but a stale plan can never drive the
+      // next model episode merely because it was queued first.
+      scheduledWakes.length = 0;
+      const expectedWakeEvent = neuralSchedulerEventForRuntime(input.runtime);
+      neuralScheduler.publish(expectedWakeEvent);
       await neuralScheduler.waitForIdle();
-      const wake = scheduledWake;
-      scheduledWake = undefined;
-      if (!wake) throw new Error("Neural scheduler produced no Executive wake plan");
+      const scheduledWake = selectCurrentNeuralWake(
+        expectedWakeEvent,
+        scheduledWakes
+      );
+      scheduledWakes.length = 0;
+      if (!scheduledWake) {
+        throw new Error("Neural scheduler produced no current Executive wake plan");
+      }
+      // Leases are invocation-scoped and may expire or be replaced between
+      // scheduler dispatch and consumption.  Resolve the structural path at
+      // the exact point where Executive receives the wake.
+      const currentWakeAuthority = input.runtime.resolveNeuralWakeAuthority(
+        scheduledWake.requestedTargetNodeId
+      );
+      const wake: NeuralSchedulerDispatch = {
+        ...scheduledWake,
+        authorizedTargetNodeId: currentWakeAuthority.targetNodeId,
+        parentNodeId: currentWakeAuthority.parentNodeId,
+        authorityLeaseId: currentWakeAuthority.authorityLeaseId,
+        authorityPath: currentWakeAuthority.authorityPath
+      };
       const sessionBaseline = await captureHumanoidSessionBaseline(sessions);
       modelRequestSessionBaseline = sessionBaseline;
       try {
@@ -738,6 +796,17 @@ async function executeHumanoidMission(input: {
           ? stream.finalOutput
           : JSON.stringify(stream.finalOutput);
         const result = await acceptVerifiedTransition(output);
+        for (const agentId of decisionRecoveryAgents) {
+          const recovered = decisionRecovery.responseCompleted(agentId);
+          if (recovered === 0) continue;
+          await input.runtime.recordProvider({
+            status: "model_decision_recovered",
+            consecutive_restarts: recovered,
+            recovery_window_reset: true,
+            automatic_actuation: false
+          }, agentId);
+        }
+        decisionRecoveryAgents.clear();
         if (result) return result;
         await input.runtime.store.clearAgentState();
         await input.runtime.setActiveAgent(input.runtime.rootAgentId);
@@ -773,6 +842,40 @@ async function executeHumanoidMission(input: {
             automatic_actuation: false
           }, receipt.agentId);
           await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+          continue;
+        }
+        if (decisionStall) {
+          const interruptedAgentId = decisionStall.agentId;
+          const decisionBaseline = modelRequestSessionBaseline ?? sessionBaseline;
+          const restoredAgentIds = await restoreHumanoidSessionBaseline(
+            sessions,
+            decisionBaseline
+          );
+          acceptRestoredSessions(restoredAgentIds, decisionBaseline);
+          await input.runtime.store.clearAgentState();
+          serializedState = undefined;
+          modelProgressRecoveryEpoch += 1;
+          const recoveryAttempt = decisionRecovery.nextAttempt(interruptedAgentId);
+          if (recoveryAttempt === null) {
+            throw new Error("Autonomous model-decision recovery counter exhausted", {
+              cause: error
+            });
+          }
+          decisionRecoveryAgents.add(interruptedAgentId);
+          const retry = transportRetryPlan(decisionStall, recoveryAttempt);
+          await input.runtime.recordProvider({
+            status: "model_decision_recovery_scheduled",
+            recovery_attempt: recoveryAttempt,
+            recovery_policy: "until_progress_or_abort",
+            retry_after_ms: retry.waitMs,
+            session_branch_rolled_back: restoredAgentIds.length > 0,
+            sdk_state_rebased: true,
+            evidence: decisionStall.evidence ?? null,
+            error: decisionStall.message,
+            automatic_actuation: false
+          }, interruptedAgentId);
+          await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+          await delay(retry.waitMs, input.signal);
           continue;
         }
         if (isRetryableContextCompactionInterruption(error)
@@ -860,7 +963,7 @@ async function executeHumanoidMission(input: {
         await input.runtime.recordProvider({
           status: "transport_interrupted",
           recovery_attempt: recoveryAttempt,
-          maximum_recoveries: MAX_MISSION_CONTINUITY_RECOVERIES,
+          recovery_policy: "until_response_or_abort",
           retry_after_ms: retry.waitMs,
           exponential_backoff_ms: retry.backoffMs,
           ...(retry.retryAfterMs === null
@@ -905,6 +1008,7 @@ async function executeHumanoidMission(input: {
     }
     throw error;
   } finally {
+    detachNeuralSchedulerEventSink?.();
     await neuralScheduler?.shutdown("mission_runner_closed");
   }
 }
@@ -989,11 +1093,11 @@ async function persistedManifestForMission(input: {
 }
 
 async function hasPersistedAgentRuntimeState(store: RunStore): Promise<boolean> {
-  const [agentStateExists, coordinatorSessionExists] = await Promise.all([
+  const [agentStateExists, rootSessionExists] = await Promise.all([
     pathExists(resolve(store.runDir, "agent-state.json")),
     pathExists(store.sessionPath())
   ]);
-  if (agentStateExists || coordinatorSessionExists) return true;
+  if (agentStateExists || rootSessionExists) return true;
   try {
     return (await readdir(resolve(store.runDir, "sessions"))).length > 0;
   } catch (error) {
@@ -1121,6 +1225,7 @@ function neuralCycleInput(
       : []),
     `Harness phase：${neural.harness_phase.phase}`,
     `Scheduler requested responsibility：${wake.requestedTargetNodeId}`,
+    `Scheduler event：${JSON.stringify(wake.event)}`,
     `Nearest lease-authorized responsibility：${wake.authorizedTargetNodeId}`,
     `Authorized structural parent：${wake.parentNodeId ?? "none; Executive root"}`,
     `Authority lease：${wake.authorityLeaseId ?? "none; Executive root authority"}`,
@@ -1131,7 +1236,6 @@ function neuralCycleInput(
           ...wake.authorityPath.map((hop) => hop.childNodeId)
         ].join(" -> ")}`,
     `Hierarchy epoch：${neural.epoch_id}`,
-    `Active commitment：${JSON.stringify(neural.active_skill_commitment)}`,
     `Cycle completion：${JSON.stringify(runtime.cycleCompletionReadiness())}`,
     "Sensorimotor 先提出 skill_proposal；Action Selection 独占建立 commitment；只有真实 rollout_result 被批准后才能转 executing 并进入 Serial Executor。",
     "若物理执行失败，必须先由 Action Selection 关闭旧 commitment，再经 Perception Manager→Sensor Fusion 获取与失败因果绑定的当前世界状态，然后才可沿 Action Selection→Sensorimotor→Recovery 生成替代 Skill 或逐级升级。",
@@ -1166,49 +1270,132 @@ function neuralSchedulerEventForRuntime(
     event_id: randomUUID(),
     at: new Date().toISOString(),
     world_revision: runtime.currentWorldRevision(),
-    causal_signal_ids: runtime.pendingNeuralSignals().slice(0, 64).map(
-      (signal) => signal.signal_id
-    )
+    causal_signal_ids: [] as string[]
   };
+  let event: NeuralSchedulerEvent;
   if (checkpoint.goal_dag.status !== "active") {
-    return { ...base, kind: "no_active_goal" };
+    event = { ...base, kind: "no_active_goal" };
+  } else {
+    switch (state.harness_phase.phase) {
+      case "bootstrapping":
+      case "goal_valuation":
+        event = { ...base, kind: "run_started" };
+        break;
+      case "perception":
+        event = { ...base, kind: "world_revision_changed" };
+        break;
+      case "feedback": {
+        const outcome = activeCommitmentFeedbackKind(state);
+        event = outcome
+          ? { ...base, kind: outcome }
+          : { ...base, kind: "world_revision_changed" };
+        break;
+      }
+      case "skill_proposal":
+      case "commitment_authorization":
+        event = { ...base, kind: "commitment_absent" };
+        break;
+      case "motor_assessment":
+      case "motor_planning":
+        event = { ...base, kind: "goal_selected" };
+        break;
+      case "rollout_review":
+        event = { ...base, kind: "rollout_completed" };
+        break;
+      case "execution":
+        event = { ...base, kind: "goal_selected" };
+        break;
+      case "safety_interrupt":
+        event = {
+          ...base,
+          kind: "prediction_error",
+          correction_scope: "supervisory",
+          causal_interrupt_ids: runtime.pendingNeuralSafetyInterrupts().map(
+            (interrupt) => interrupt.interrupt_id
+          ).slice(0, 64)
+        };
+        break;
+      case "recovery":
+        event = {
+          ...base,
+          kind: "prediction_error",
+          correction_scope: "pathway"
+        };
+        break;
+      case "cycle_completion":
+        event = { ...base, kind: "cycle_ready" };
+        break;
+      case "terminal":
+        event = { ...base, kind: "run_started" };
+        break;
+    }
   }
-  switch (state.harness_phase.phase) {
-    case "bootstrapping":
-    case "goal_valuation":
-      return { ...base, kind: "run_started" };
-    case "perception":
-      return { ...base, kind: "world_revision_changed" };
-    case "feedback":
-      return state.active_skill_commitment?.state === "executing"
-        ? { ...base, kind: "skill_completed" }
-        : { ...base, kind: "world_revision_changed" };
-    case "skill_proposal":
-    case "commitment_authorization":
-      return { ...base, kind: "commitment_absent" };
-    case "motor_assessment":
-    case "motor_planning":
-      return { ...base, kind: "goal_selected" };
-    case "rollout_review":
-      return { ...base, kind: "rollout_completed" };
-    case "execution":
-      return { ...base, kind: "goal_selected" };
-    case "recovery":
-      return {
-        ...base,
-        kind: "prediction_error",
-        correction_scope: "pathway"
-      };
-    case "cycle_completion":
-      return { ...base, kind: "cycle_ready" };
-    case "terminal":
-      return { ...base, kind: "run_started" };
+  const targetNodeId = neuralWakeTarget(event);
+  return {
+    ...event,
+    causal_signal_ids: targetNodeId === null
+      ? []
+      : runtime.pendingNeuralSignals({ targetNodeId }).slice(0, 64).map(
+          (signal) => signal.signal_id
+        )
+  };
+}
+
+function selectCurrentNeuralWake(
+  expectedEvent: NeuralSchedulerEvent,
+  wakes: readonly NeuralSchedulerDispatch[]
+): NeuralSchedulerDispatch | undefined {
+  const expectedTarget = neuralWakeTarget(expectedEvent);
+  if (expectedTarget === null) return undefined;
+  const compatible = wakes.filter((wake) => (
+    wake.requestedTargetNodeId === expectedTarget
+      && neuralWakeEventsShareControlMeaning(wake.event, expectedEvent)
+  ));
+  return compatible.sort((left, right) => (
+    left.event.world_revision - right.event.world_revision
+      || left.event.at.localeCompare(right.event.at)
+  )).at(-1);
+}
+
+function neuralWakeEventsShareControlMeaning(
+  left: NeuralSchedulerEvent,
+  right: NeuralSchedulerEvent
+): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "prediction_error" && right.kind === "prediction_error") {
+    return left.correction_scope === right.correction_scope;
   }
+  if (left.kind === "escalation" && right.kind === "escalation") {
+    return left.source_node_id === right.source_node_id;
+  }
+  return true;
+}
+
+function activeCommitmentFeedbackKind(
+  state: NeuralHierarchyState
+): "skill_completed" | "skill_failed" | undefined {
+  const commitment = state.active_skill_commitment;
+  if (!commitment) return undefined;
+  const outcome = Object.values(state.signals)
+    .filter((signal) => {
+      if (signal.status !== "pending"
+        || (signal.kind !== "skill_completed" && signal.kind !== "skill_failed")
+        || signal.world_revision < commitment.established_world_revision) {
+        return false;
+      }
+      const leaseId = signal.authority_lease_id ?? signal.source_authority_lease_id;
+      return leaseId !== null && state.authority_leases[leaseId]?.commitment_id
+        === commitment.commitment_id;
+    })
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  return outcome?.kind === "skill_completed" || outcome?.kind === "skill_failed"
+    ? outcome.kind
+    : undefined;
 }
 
 class CompletedResponseDecisionStallError extends ModelDecisionStallError {}
 
-function assertCoordinatorStepOutput(output: string | undefined): {
+function assertExecutiveStepOutput(output: string | undefined): {
   status: "step_completed";
 } | {
   status: "cycle_completed" | "satisfied_goal_completed";

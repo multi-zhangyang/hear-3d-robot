@@ -5,6 +5,7 @@ import {
   type HumanoidGroundingReceipt
 } from "../../domain/humanoid-grounding.js";
 import { modelPayloadSha256 } from "../../domain/model-call-authority.js";
+import type { NeuralSafetyInterrupt } from "../../domain/neural-hierarchy.js";
 import type { Goal, JsonValue, Vec3 } from "../../domain/schema.js";
 import type { HumanoidWorldObservation } from
   "../../world/humanoid/world.js";
@@ -14,6 +15,9 @@ import {
   humanoidEmbodiedSkillIdentity,
   type ActiveHumanoidSkillBinding
 } from "./skill-binding.js";
+import {
+  humanoidRecoverySafetyInterruptIsCurrent
+} from "./recovery-safety-authority.js";
 
 const TARGET_POSITION_TOLERANCE_METERS = 0.015;
 const ARTICULATION_POSITION_TOLERANCE = 0.015;
@@ -37,6 +41,7 @@ export function groundHumanoidPhysicalExecution(input: {
   observation: HumanoidWorldObservation;
   authorityStateSha256: string;
   activeGoal?: Goal;
+  recoveryInterrupts?: readonly NeuralSafetyInterrupt[];
 }): HumanoidGroundingReceipt {
   const detail = record(input.planningReceipt.detail);
   const parsedBinding = ActiveHumanoidSkillBindingSchema.safeParse(
@@ -47,6 +52,11 @@ export function groundHumanoidPhysicalExecution(input: {
   const currentGoalSha256 = input.activeGoal
     ? modelPayloadSha256(input.activeGoal)
     : null;
+  const recoveryInterrupt = binding?.recovery_interrupt_id
+    ? input.recoveryInterrupts?.find((interrupt) => (
+        interrupt.interrupt_id === binding.recovery_interrupt_id
+      ))
+    : undefined;
   const rebound = binding
     ? bindHumanoidSkill({
         transactionId: binding.transaction_id,
@@ -59,7 +69,8 @@ export function groundHumanoidPhysicalExecution(input: {
         },
         observation: input.observation,
         ...(input.activeGoal ? { activeGoal: input.activeGoal } : {}),
-        ...(binding.recovery_authorized ? { recoveryAuthorized: true } : {})
+        ...(binding.recovery_authorized ? { recoveryAuthorized: true } : {}),
+        ...(recoveryInterrupt ? { recoveryInterrupt } : {})
       })
     : null;
   const reboundBinding = rebound?.accepted ? rebound.binding : null;
@@ -109,6 +120,11 @@ export function groundHumanoidPhysicalExecution(input: {
       observation: input.observation,
       semanticRegrounded: rebound?.accepted === true
     }),
+    recoveryInterruptObligation(
+      binding,
+      recoveryInterrupt,
+      input.observation
+    ),
     activeGoalObligation(binding, currentGoalSha256),
     semanticPreconditionsObligation(bindingPresent, rebound),
     targetEvidenceObligation(binding, reboundBinding),
@@ -129,6 +145,46 @@ export function groundHumanoidPhysicalExecution(input: {
     world_revision: input.observation.worldRevision,
     authority_state_sha256: input.authorityStateSha256,
     obligations
+  });
+}
+
+function recoveryInterruptObligation(
+  binding: ActiveHumanoidSkillBinding | null,
+  interrupt: NeuralSafetyInterrupt | undefined,
+  observation: HumanoidWorldObservation
+): HumanoidGroundingObligation {
+  const expectedId = binding?.recovery_interrupt_id;
+  if (!expectedId) {
+    return createHumanoidGroundingObligation({
+      id: "recovery_interrupt",
+      scope: "skill",
+      required: false,
+      status: "not_applicable",
+      code: "recovery_interrupt_not_required",
+      detail: null
+    });
+  }
+  const satisfied = binding?.recovery_authorized === true
+    && binding.invocation.skill === "stabilize"
+    && binding.phase === "recover_support"
+    && humanoidRecoverySafetyInterruptIsCurrent(interrupt, {
+      worldRevision: observation.worldRevision,
+      interruptId: expectedId
+    });
+  return obligation({
+    id: "recovery_interrupt",
+    scope: "skill",
+    required: true,
+    satisfied,
+    successCode: "recovery_interrupt_current",
+    failureCode: "recovery_interrupt_invalid",
+    detail: {
+      expected_interrupt_id: expectedId,
+      current_interrupt_id: interrupt?.interrupt_id ?? null,
+      interrupt_status: interrupt?.status ?? null,
+      fallen: observation.robot.fallen,
+      current_world_revision: observation.worldRevision
+    }
   });
 }
 
@@ -260,7 +316,7 @@ function targetEvidenceObligation(
   binding: ActiveHumanoidSkillBinding | null,
   rebound: ActiveHumanoidSkillBinding | null
 ): HumanoidGroundingObligation {
-  if (!binding || (binding.target_position === null
+  if (!binding || (binding.target_evidence_position === null
     && binding.target_solid === null
     && binding.target_articulation === null)) {
     return createHumanoidGroundingObligation({
@@ -273,8 +329,8 @@ function targetEvidenceObligation(
     });
   }
   const positionDrift = distanceNullable(
-    binding.target_position,
-    rebound?.target_position ?? null
+    binding.target_evidence_position,
+    rebound?.target_evidence_position ?? null
   );
   const solidMatches = sameSolid(binding.target_solid, rebound?.target_solid ?? null);
   const articulationMatches = sameArticulation(
@@ -296,8 +352,8 @@ function targetEvidenceObligation(
       maximum_position_drift_m: TARGET_POSITION_TOLERANCE_METERS,
       solid_matches: solidMatches,
       articulation_matches: articulationMatches,
-      bound_target_position: binding.target_position,
-      current_target_position: rebound?.target_position ?? null
+      bound_target_position: binding.target_evidence_position,
+      current_target_position: rebound?.target_evidence_position ?? null
     }
   });
 }

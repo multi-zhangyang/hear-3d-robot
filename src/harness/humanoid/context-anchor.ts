@@ -25,7 +25,7 @@ import {
   type GoalEvidenceArtifact
 } from "./goal-evidence.js";
 import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.js";
-import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
+import type { HumanoidAutonomyReadiness } from "./run-runtime.js";
 import { humanoidReplanBudgetAuthority } from "../../domain/humanoid-replan-budget.js";
 import { createHumanoidAutonomyContext } from "./autonomy-context.js";
 import { goalDAGContextView } from "./goal-dag-context.js";
@@ -48,7 +48,7 @@ export function createHumanoidContextAnchor(input: {
   observation: HumanoidWorldObservation;
   world: HumanoidWorldSnapshot;
   cycleCompletion: HumanoidCycleCompletionReadiness;
-  coordinatorPhase: HumanoidCoordinatorPhase;
+  autonomyReadiness: HumanoidAutonomyReadiness;
 }): HumanoidContextAnchorResult {
   const checker = input.activeGoal && input.checkpoint.goal_progress
     ? inspectHumanoidGoal(
@@ -89,7 +89,7 @@ export function createHumanoidContextAnchor(input: {
           }
         : null,
       cycle_completion: input.cycleCompletion,
-      coordinator_phase: input.coordinatorPhase,
+      autonomy_readiness: input.autonomyReadiness,
       execution_authority: executionAuthority,
       recovery_authority: recoveryAuthority,
       goal_context: {
@@ -168,10 +168,10 @@ export function createHumanoidContextAnchor(input: {
 function pendingExecutionAuthority(input: {
   checkpoint: HumanoidRunCheckpoint;
   world: HumanoidWorldSnapshot;
-  coordinatorPhase: HumanoidCoordinatorPhase;
+  autonomyReadiness: HumanoidAutonomyReadiness;
 }): JsonValue {
   const cycle = input.checkpoint.active_cycle;
-  if (input.coordinatorPhase !== "execute_plan" || !cycle) return null;
+  if (input.autonomyReadiness !== "execute_plan" || !cycle) return null;
   const receipt = humanoidActionReceiptsInCommitOrder(
     input.checkpoint.committed_actions
   ).findLast((candidate) => (

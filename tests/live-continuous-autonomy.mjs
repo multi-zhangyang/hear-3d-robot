@@ -16,8 +16,10 @@ import { inspectLiveRunEvidence } from "./live-run-evidence.mjs";
 
 loadEnvironment();
 
-const scenarioId = optionalText("HEAR_LIVE_SCENARIO") ?? "humanoid_courtyard";
-const seed = optionalSeed("HEAR_LIVE_SEED") ?? drawSeed();
+const requestedScenarioId = optionalText("HEAR_LIVE_SCENARIO")
+  ?? "humanoid_courtyard";
+const requestedSeed = optionalSeed("HEAR_LIVE_SEED") ?? drawSeed();
+const resumeRunId = optionalText("HEAR_LIVE_RESUME_RUN_ID");
 const observationMs = optionalPositiveInteger("HEAR_LIVE_OBSERVATION_MS")
   ?? (optionalPositiveInteger("HEAR_LIVE_TIMEOUT_MINUTES") ?? 30) * 60_000;
 const runsDir = resolve(optionalText("HEAR_RUNS_DIR") ?? "runs");
@@ -29,7 +31,6 @@ const [catalog, provider, controllerSource] = await Promise.all([
   Promise.resolve(loadProviderConfig()),
   loadConfiguredHumanoidControllerSource()
 ]);
-const scenario = catalog.materialize(scenarioId, seed);
 const manager = new RunManager({
   runsDir,
   catalog,
@@ -37,22 +38,39 @@ const manager = new RunManager({
   ...(controllerSource ? { controllerSource } : {})
 });
 let runId;
+let store;
+let scenario;
 
 try {
-  runId = await manager.start({
-    mission: "在当前世界持续自主观察、选择目标并通过真实物理执行自由活动。",
-    scenarioId,
-    goal: scenario.default_goal,
-    runMode: "continuous",
-    seed
-  });
-  const store = await RunStore.open(resolveRunDirectory(runsDir, runId));
+  if (resumeRunId) {
+    store = await RunStore.open(resolveRunDirectory(runsDir, resumeRunId));
+    assert.equal(store.definition.run_mode, "continuous",
+      "Only a continuous run can be resumed by the continuous observer");
+    scenario = structuredClone(store.definition.scenario);
+    runId = await manager.resume(resumeRunId);
+  } else {
+    scenario = catalog.materialize(requestedScenarioId, requestedSeed);
+    runId = await manager.start({
+      mission: "在当前世界持续自主观察、选择目标并通过真实物理执行自由活动。",
+      scenarioId: requestedScenarioId,
+      goal: scenario.default_goal,
+      runMode: "continuous",
+      seed: requestedSeed
+    });
+    store = await RunStore.open(resolveRunDirectory(runsDir, runId));
+  }
   assert.equal(
     store.definition.controller_source_sha256,
     controllerSource?.sourceSha256,
     "Continuous run did not retain the configured humanoid controller source"
   );
-  await observeContinuousRun(manager, store, runId, observationMs);
+  await observeContinuousRun(
+    manager,
+    store,
+    runId,
+    observationMs,
+    resumeRunId !== undefined
+  );
 
   manager.stop(runId, "Continuous observation window ended");
   await waitUntil(() => !manager.isActive(runId), 10 * 60_000,
@@ -74,19 +92,45 @@ try {
   await manager.drain("Continuous observer finished");
 }
 
-async function observeContinuousRun(manager, store, runId, durationMs) {
+async function observeContinuousRun(
+  manager,
+  store,
+  runId,
+  durationMs,
+  resumed
+) {
   const deadline = Date.now() + durationMs;
+  const startupDeadline = Math.min(deadline, Date.now() + 2 * 60_000);
+  let enteredRunning = false;
   while (Date.now() < deadline) {
     const checkpoint = await store.readHumanoidCheckpoint();
+    const awaitingStartup = !enteredRunning && (
+      checkpoint.status === "starting"
+        || resumed && (
+          checkpoint.status === "paused"
+            || checkpoint.status === "interrupted"
+        )
+    );
+    if (awaitingStartup) {
+      if (Date.now() >= startupDeadline) {
+        throw new Error("Continuous run did not leave starting state within 2 minutes");
+      }
+      await delay(Math.min(250, Math.max(1, deadline - Date.now())));
+      continue;
+    }
     if (checkpoint.status !== "running") {
       throw new Error(
         `Continuous run stopped without an operator request: ${checkpoint.error ?? checkpoint.status}`
       );
     }
+    enteredRunning = true;
     if (!manager.isActive(runId)) {
       throw new Error("Continuous runtime exited while its checkpoint remained nonterminal");
     }
     await delay(Math.min(1_000, Math.max(1, deadline - Date.now())));
+  }
+  if (!enteredRunning) {
+    throw new Error("Continuous run never entered running state");
   }
 }
 

@@ -169,7 +169,7 @@ def tensorboard_curves(log_dir: Path) -> dict[str, list[dict[str, float | int]]]
 def validate_contract(module: ModuleType) -> tuple[dict[str, object], Path, list[str]]:
   contract_path = REMOTE_ROOT / "training" / "workyard-task-v4.json"
   contract = json.loads(contract_path.read_text(encoding="utf-8"))
-  if contract.get("protocol") != "hear-workyard-residual-training-contract-v4":
+  if contract.get("protocol") != "hear-workyard-whole-body-reach-training-contract-v5":
     raise RuntimeError("Residual Workyard contract protocol is invalid")
   if contract["environment"]["task_id"] != module.TASK_ID:
     raise RuntimeError("Residual task registration disagrees with its contract")
@@ -179,8 +179,21 @@ def validate_contract(module: ModuleType) -> tuple[dict[str, object], Path, list
     raise RuntimeError("Residual action dimension disagrees with its contract")
   if contract["teacher"]["actuation"] != module.BODY_ACTUATION_CONTRACT:
     raise RuntimeError("Residual teacher actuation boundary is invalid")
-  if tuple(contract["student"]["entry_state"]["root_position_world"]) != (
-    module.RESIDUAL_ENTRY_ROOT_POSITION
+  entry = contract["student"]["entry_state"]
+  randomization = contract["randomization"]
+  if (
+    tuple(tuple(value) for value in entry["object_relative_placement_catalog"])
+      != module.REACH_ENTRY_OBJECT_RELATIVE_PLACEMENTS
+    or entry["correlation_protocol"] != module.REACH_ENTRY_CORRELATION_PROTOCOL
+    or entry["root_height_m"] != module.RESIDUAL_ENTRY_ROOT_POSITION[2]
+    or tuple(tuple(value) for value in (
+      randomization["reach_entry_object_relative_placement_catalog"]
+    )) != module.REACH_ENTRY_OBJECT_RELATIVE_PLACEMENTS
+    or randomization["reach_entry_correlation_protocol"]
+      != module.REACH_ENTRY_CORRELATION_PROTOCOL
+    or tuple(tuple(value) for value in (
+      randomization["runtime_geometry_top_wrist_offsets_m"]
+    )) != module.RUNTIME_GEOMETRY_TOP_WRIST_OFFSET_M
   ):
     raise RuntimeError("Residual reach entry state disagrees with its contract")
   if contract["reach_teacher"] != module.REACH_TEACHER_CONTRACT:
@@ -377,7 +390,7 @@ def rollout(
 
     append_wrist_error_trace(0, initial_wrist_error, active)
     reach_teacher_active_joint_samples = torch.zeros(
-      module.ACTION_SIZE, dtype=torch.long, device="cuda:0"
+      module.UPPER_BODY_ACTION_SIZE, dtype=torch.long, device="cuda:0"
     )
     reach_teacher_authority_saturation_count = torch.zeros_like(
       reach_teacher_active_joint_samples
@@ -389,16 +402,16 @@ def rollout(
       reach_teacher_active_joint_samples
     )
     reach_teacher_absolute_action_sum = torch.zeros(
-      module.ACTION_SIZE, dtype=torch.float64, device="cuda:0"
+      module.UPPER_BODY_ACTION_SIZE, dtype=torch.float64, device="cuda:0"
     )
     reach_teacher_maximum_unclamped_action_by_joint = torch.zeros(
-      module.ACTION_SIZE, device="cuda:0"
+      module.UPPER_BODY_ACTION_SIZE, device="cuda:0"
     )
     reach_teacher_maximum_joint_target_step_by_joint = torch.zeros(
-      module.ACTION_SIZE, device="cuda:0"
+      module.UPPER_BODY_ACTION_SIZE, device="cuda:0"
     )
     reach_teacher_maximum_solver_target_slew_by_joint = torch.zeros(
-      module.ACTION_SIZE, device="cuda:0"
+      module.UPPER_BODY_ACTION_SIZE, device="cuda:0"
     )
     maximum_absolute_unclamped_reach_teacher_action = 0.0
     reach_teacher_active_arm_samples = 0
@@ -461,7 +474,7 @@ def rollout(
         ).sum(dim=0)
         reach_teacher_absolute_action_sum += torch.where(
           active_joint_mask,
-          teacher_label_before_step.abs().to(torch.float64),
+          teacher_label_before_step[:, module.UPPER_BODY_SLICE].abs().to(torch.float64),
           0.0,
         ).sum(dim=0)
         active_unclamped_action = torch.where(
@@ -708,6 +721,7 @@ def rollout(
         frozen_error = (
           action_term.body_targets[:, :15]
           - action_term.teacher_body_targets[:, :15]
+          - action_term.balance_residual
         ).abs()
         upper_error = (
           action_term.body_targets[:, 15:]
@@ -1089,7 +1103,7 @@ def rollout(
         frozen_tracking_squared_error_sum / frozen_tracking_sample_count
       ) ** 0.5,
       "composition": {
-        "maximum_frozen_joint_command_error": maximum_frozen_composition_error,
+        "maximum_balance_composition_error": maximum_frozen_composition_error,
         "maximum_upper_body_command_error": maximum_upper_composition_error,
         "frozen_joint_count": 15,
         "upper_body_residual_joint_count": 14,
@@ -1424,6 +1438,7 @@ def ppo_with_retention(
     teacher_coefficient,
     args.teacher_maximum_action_std,
     args.teacher_dispersion_coefficient,
+    torch.arange(module.ACTION_SIZE, device="cuda:0") >= module.BALANCE_ACTION_SIZE,
   )
   actor_normalizer = getattr(actor, "obs_normalizer", None)
   normalizer_count = getattr(actor_normalizer, "count", None)
@@ -1573,7 +1588,7 @@ def ppo_with_retention(
     "actor_normalizer_sample_count_after": normalizer_count_after,
     "teacher_supervision": "every_stored_learner_rollout_state",
     "loss_coupling": "same_ppo_minibatch",
-    "teacher_action_scope": "authorized_14d_actor_action",
+    "teacher_action_scope": "authorized_14d_upper_body_slice_of_29d_actor_action",
     "rollout_teacher_loss": "smooth_l1_plus_excess_std_penalty",
     "rollout_teacher_loss_coefficient": args.rollout_teacher_coefficient,
     "teacher_maximum_action_std": args.teacher_maximum_action_std,
@@ -1616,7 +1631,7 @@ def train(
   agent_cfg.save_interval = max(1, args.iterations // 4)
   agent_cfg.seed = args.seed
   agent_cfg.logger = "tensorboard"
-  agent_cfg.run_name = "task_space_reach_dagger_then_ppo"
+  agent_cfg.run_name = "whole_body_reach_dagger_then_ppo"
   agent_cfg.upload_model = False
   if args.ppo_retention_mode == "critic_warmup_rollout_teacher":
     agent_cfg.algorithm.learning_rate = args.ppo_critic_learning_rate
@@ -1880,7 +1895,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
     and evaluation["reach_teacher"]["actor_observation_exposure"] is False
     and evaluation["reach_teacher"]["execution_authority"] == "none"
     and evaluation["reach_teacher"]["label_coverage"] == 1.0
-    and evaluation["composition"]["maximum_frozen_joint_command_error"] <= 1e-6
+    and evaluation["composition"]["maximum_balance_composition_error"] <= 1e-6
     and evaluation["composition"]["maximum_upper_body_command_error"] <= 1e-6
     and evaluation["composition"]["maximum_fixed_open_hand_target_error_rad"] <= 1e-6
   )
@@ -1925,9 +1940,18 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         and selection["rollback_applied"] is True
       )
     )
+  deployment_distribution_covered = (
+    evaluation["wrist_position_error_m"]["initial_maximum"]
+      >= threshold["deployment_initial_wrist_error_coverage_minimum_m"]
+    and contract["reach_teacher"]["target_protocol"]
+      == module.RUNTIME_GEOMETRY_TOP_TARGET_PROTOCOL
+    and contract["student"]["entry_state"]["protocol"]
+      == "hear-workyard-reach-entry-v3"
+  )
   phase_one_accepted = (
     args.mode == "train"
     and held_out_episode_requirement_met
+    and deployment_distribution_covered
     and evaluation["success_rate"] >= threshold["wrist_target_success_rate_minimum"]
     and evaluation["fall_rate"] <= threshold["fall_rate_maximum"]
     and evaluation["frozen_teacher_joint_rms_error_rad"]
@@ -1997,6 +2021,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
       "cpu_round_trip_per_control_step": False,
       "teacher_actuation_protocol": module.TEACHER_ACTUATION_PROTOCOL,
       "reach_teacher_protocol": module.REACH_TEACHER_PROTOCOL,
+      "reach_target_protocol": module.RUNTIME_GEOMETRY_TOP_TARGET_PROTOCOL,
       "dynamic_com_protocol": module.DYNAMIC_COM_PROTOCOL,
       "entry_state_protocol": contract["student"]["entry_state"]["protocol"],
     },
@@ -2018,6 +2043,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
       "selected_checkpoint_safety_gate_passed": (
         selected_checkpoint_safety_gate_passed
       ),
+      "deployment_distribution_covered": deployment_distribution_covered,
       "phase_one_accepted": phase_one_accepted,
       "hand_checkpoint_expansion_authorized": phase_one_accepted,
       "waist_checkpoint_expansion_authorized": False,

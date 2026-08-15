@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Goal, HumanoidActionReceipt, HumanoidRunCheckpoint, TaskNode } from "../types";
+import type {
+  HumanoidActionReceipt,
+  HumanoidRunCheckpoint,
+  NeuralHarnessPhase,
+  TaskNode
+} from "../types";
 import { activeContextUsage } from "../context-memory";
 import { activeCheckpointGoal, goalSelectionLabel } from "../goal-state";
 import {
@@ -13,7 +18,8 @@ import {
   nodeOutput,
   shortTime
 } from "./presenter";
-import { buildAgentTree, type AgentTreeEntry } from "./agent-tree";
+import { buildAgentTree } from "./agent-tree";
+import { HierarchyGraph } from "./HierarchyGraph";
 import {
   presentAutonomousCycles,
   type CycleStageKind,
@@ -49,11 +55,7 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
   const selectedUsage = selected ? checkpoint.model_usage?.by_agent[selected.id] : undefined;
   const goal = activeCheckpointGoal(checkpoint);
   const selectionLabel = goalSelectionLabel(checkpoint);
-  const inactiveGoalLabel = checkpoint.status === "succeeded"
-    ? "任务已完成"
-    : checkpoint.status === "failed"
-      ? "运行已结束"
-      : selectionLabel ?? "等待本轮目标";
+  const inactiveGoalLabel = selectionLabel ?? "等待本轮目标";
   const cycles = useMemo(() => presentAutonomousCycles({
     checkpoint,
     actions: props.actions,
@@ -71,6 +73,7 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
   const contextMemory = checkpoint.context_memory;
   const contextUsage = activeContextUsage(contextMemory);
   const activeCount = checkpoint.active_agent_ids.length;
+  const harnessPhase = checkpoint.neural_hierarchy_state?.harness_phase;
 
   return (
     <section className="agent-flow-view" aria-label="实时层级智能体流">
@@ -79,9 +82,17 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
           <span className={`flow-live ${isLive(checkpoint.status) ? "active" : ""}`}>
             <i /> {isLive(checkpoint.status) ? "实时运行中" : runStatusLabel(checkpoint.status)}
           </span>
-          <p>{goal ? goalSummaryLabel(goal) : inactiveGoalLabel}</p>
+          {(goal || isLive(checkpoint.status)) && (
+            <p>{goal ? goalSummaryLabel(goal) : inactiveGoalLabel}</p>
+          )}
         </div>
         <div className="flow-hero-metrics">
+          {harnessPhase && isLive(checkpoint.status) && (
+            <div className="harness-phase-card">
+              <span>阶段</span>
+              <strong>{harnessPhaseLabel(harnessPhase.phase)}</strong>
+            </div>
+          )}
           <div
             className="context-memory-card"
             style={{ "--context-load": `${Math.round(contextUsage.loadFraction * 100)}%` } as React.CSSProperties}
@@ -92,17 +103,11 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
               {compactTokens(contextUsage.activeEstimatedTokens)}
               <em> / {compactTokens(contextUsage.contextWindowTokens)}</em>
             </strong>
-            <small>
-              压缩线 {compactTokens(contextUsage.compactTriggerTokens)}
-              {contextMemory.total_compactions > 0
-                ? ` · ${contextMemory.total_compactions} 次`
-                : ""}
-            </small>
             <i />
           </div>
           <div className="flow-progress" style={{ "--flow-progress": `${Math.min(100, progress * 100)}%` } as React.CSSProperties}>
             <strong>{goal ? formatPercent(progress) : checkpoint.status === "succeeded" ? "完成" : "—"}</strong>
-            <span>{goal ? "目标进度" : checkpoint.status === "succeeded" ? "任务状态" : "目标选择"}</span>
+            <span>{goal ? "目标" : "状态"}</span>
           </div>
         </div>
       </header>
@@ -110,27 +115,29 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
       <div className="flow-columns">
         <section className="agent-constellation" aria-label="智能体团队">
           <header className="flow-section-heading">
-            <div><span>层级结构</span><b>{activeCount > 0 ? `${activeCount} 个执行中 · ` : ""}{nodes.length} 个智能体</b></div>
+            <div><span>控制层级</span><b>{nodes.length} 节点{activeCount > 0 ? ` · ${activeCount} 活跃` : ""}</b></div>
+            {selected ? (
+              <small className="flow-selection-summary">
+                <b>{agentNameLabel(selected.name)}</b>
+              </small>
+            ) : null}
           </header>
-          <div className="agent-branch-list">
-            {tree.map((entry) => (
-              <AgentCard
-                key={entry.node.id}
-                entry={entry}
-                goal={goal}
-                selected={entry.node.id === selected?.id}
-                onSelect={() => {
-                  selectionLockedRef.current = true;
-                  setSelectedId(entry.node.id);
-                }}
-              />
-            ))}
-          </div>
+          <HierarchyGraph
+            nodes={checkpoint.nodes}
+            rootId={checkpoint.root_id}
+            activeIds={checkpoint.active_agent_ids}
+            selectedId={selected?.id ?? null}
+            goal={goal}
+            onSelect={(nodeId) => {
+              selectionLockedRef.current = true;
+              setSelectedId(nodeId);
+            }}
+          />
           {selected && (
             <article className="agent-output-card">
               <div className="agent-output-title">
                 <span className={`agent-avatar ${selected.status}`}>{initials(agentNameLabel(selected.name))}</span>
-                <div><small>{nodeOutput(selected) ? "最新结果" : "当前目标"}</small><b>{agentNameLabel(selected.name)}</b></div>
+                <div><b>{agentNameLabel(selected.name)}</b></div>
                 <StatusPill status={selected.status} />
               </div>
               <p>{nodeOutput(selected) ?? nodePurposeLabel(selected, goal)}</p>
@@ -147,7 +154,6 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
                   </span>
                 )}
                 <span>{selected.steps_used} 次工具决策</span>
-                <span>{selected.child_ids.length} 个下级角色</span>
               </div>
             </article>
           )}
@@ -155,7 +161,7 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
 
         <section className="execution-feed" aria-label="智能体执行流">
           <header className="flow-section-heading">
-            <div><span>自主循环</span><b>感知到记忆的真实因果链</b></div>
+            <div><span>执行</span><b>自主闭环</b></div>
             <span className={`stream-signal ${isLive(checkpoint.status) ? "active" : ""}`}>
               <i /> {isLive(checkpoint.status) ? "实时" : "已完成"}
             </span>
@@ -173,48 +179,6 @@ export function AgentFlowView(props: AgentFlowViewProps): React.JSX.Element {
   );
 }
 
-function AgentCard(props: {
-  entry: AgentTreeEntry;
-  goal: Goal | null;
-  selected: boolean;
-  onSelect: () => void;
-}): React.JSX.Element {
-  const { node } = props.entry;
-  return (
-    <button
-      type="button"
-      className={`agent-branch-card ${node.status} ${props.selected ? "selected" : ""}`}
-      style={{ "--agent-depth": Math.min(props.entry.depth, 6) } as React.CSSProperties}
-      aria-pressed={props.selected}
-      onClick={props.onSelect}
-    >
-      <TreeGuides entry={props.entry} />
-      <span className={`agent-avatar ${node.status}`}>{initials(agentNameLabel(node.name))}</span>
-      <span className="agent-card-copy">
-        <b>{agentNameLabel(node.name)}</b>
-        <small>{nodePurposeLabel(node, props.goal)}</small>
-      </span>
-      <StatusPill status={node.status} />
-    </button>
-  );
-}
-
-function TreeGuides({ entry }: { entry: AgentTreeEntry }): React.JSX.Element | null {
-  if (entry.depth === 0) return null;
-  return (
-    <span className="agent-tree-guides" aria-hidden="true">
-      {entry.ancestorContinuations.slice(0, -1).map((continues, index) => (
-        <i
-          className={continues ? "continues" : ""}
-          key={index}
-          style={{ "--tree-guide": index } as React.CSSProperties}
-        />
-      ))}
-      <i className={`agent-tree-elbow ${entry.isLastSibling ? "last" : ""}`} />
-    </span>
-  );
-}
-
 function CycleCard(props: { cycle: PresentedCycle; expanded: boolean }): React.JSX.Element {
   const { cycle } = props;
   const [open, setOpen] = useState(props.expanded);
@@ -227,7 +191,7 @@ function CycleCard(props: { cycle: PresentedCycle; expanded: boolean }): React.J
       <summary>
         <span className="cycle-index">{cycle.index}</span>
         <span className="cycle-summary-copy">
-          <b>自主 Cycle {cycle.index}</b>
+          <b>闭环 {cycle.index}</b>
           <small>{cycleStateLabel(cycle)}</small>
         </span>
         {cycle.at && <time>{shortTime(cycle.at)}</time>}
@@ -303,4 +267,20 @@ function compactTokens(tokens: number): string {
     notation: "compact",
     maximumFractionDigits: 1
   }).format(tokens);
+}
+
+function harnessPhaseLabel(phase: NeuralHarnessPhase): string {
+  if (phase === "bootstrapping") return "初始化";
+  if (phase === "goal_valuation") return "目标估值";
+  if (phase === "perception") return "感知";
+  if (phase === "skill_proposal") return "技能提案";
+  if (phase === "commitment_authorization") return "承诺授权";
+  if (phase === "motor_assessment") return "动作评估";
+  if (phase === "motor_planning") return "运动规划";
+  if (phase === "rollout_review") return "预演评估";
+  if (phase === "execution") return "物理执行";
+  if (phase === "feedback") return "闭环反馈";
+  if (phase === "recovery") return "自主恢复";
+  if (phase === "cycle_completion") return "周期验收";
+  return "已终止";
 }

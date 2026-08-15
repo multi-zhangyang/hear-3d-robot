@@ -9,6 +9,7 @@ const HumanoidGroundingObligationSchema = z.object({
     "planning_plan",
     "world_authority",
     "skill_binding",
+    "recovery_interrupt",
     "active_goal",
     "semantic_preconditions",
     "target_evidence",

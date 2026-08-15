@@ -384,7 +384,8 @@ function collisionFact(detail: Record<string, unknown> | null): string | null {
 
 function presentedModelOutput(value: unknown): string | null {
   const raw = typeof value === "string" ? value : JSON.stringify(value);
-  if (/coordinator_phase/iu.test(raw) && /cycle_completion/iu.test(raw)) {
+  if (/(?:autonomy_readiness|coordinator_phase)/iu.test(raw)
+    && /cycle_completion/iu.test(raw)) {
     return "当前物理执行、执行后感知与目标验收证据已经齐备。";
   }
   if (/goal_dag(?:_status|\.status)/iu.test(raw) && /current_goal_epoch_id/iu.test(raw)) {

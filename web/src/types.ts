@@ -192,6 +192,13 @@ export interface HumanoidWorldSnapshot {
       actuation: "joint_position_pd";
       controlStepSeconds: number;
       physicsStepSeconds: number;
+      learnedPolicy?: {
+        protocol: "humanoid-learned-policy-v1";
+        runtime: string;
+        observationSpace: { protocol: string; size: number };
+        actionSpace: { protocol: string; size: number };
+        capabilities: string[];
+      };
     };
     controllerExecution?: {
       protocol: "humanoid-controller-execution-v1";
@@ -617,6 +624,21 @@ type RunStatus = "starting" | "running" | "paused" | "succeeded" | "failed" | "i
 
 export type HumanoidRunMode = "mission" | "continuous";
 
+export type NeuralHarnessPhase =
+  | "bootstrapping"
+  | "goal_valuation"
+  | "perception"
+  | "skill_proposal"
+  | "commitment_authorization"
+  | "motor_assessment"
+  | "motor_planning"
+  | "rollout_review"
+  | "execution"
+  | "feedback"
+  | "recovery"
+  | "cycle_completion"
+  | "terminal";
+
 export interface HumanoidRunCheckpoint {
   version: 4 | 5 | 6;
   runtime: "humanoid_g1";
@@ -636,6 +658,19 @@ export interface HumanoidRunCheckpoint {
   committed_actions: Record<string, HumanoidActionReceipt>;
   context_memory: ContextMemoryState;
   embodied_memory: HumanoidEmbodiedMemoryState;
+  neural_hierarchy_state?: {
+    version: 3;
+    harness_phase: {
+      phase: NeuralHarnessPhase;
+      sequence: number;
+      goal_epoch_id: string | null;
+      commitment_id: string | null;
+      world_revision: number;
+      entered_by_node_id: string;
+      reason: string;
+      entered_at: string;
+    };
+  };
   pending_lifecycle_events: unknown[];
   cycle_index: number;
   total_model_calls: number;

@@ -26,10 +26,16 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 - 头部视场感知与角色化 3D 对象状态，当前 MuJoCo 精确状态和历史观察严格分离
 - 追加式事件日志、可寻址具身历史、物理检查点、独立会话和结构化上下文压缩
 - 中文实时界面，展示 3D 世界、层级执行流、动作回执、模型活动与物理状态
-- Three.js 优先使用 WebGPU，并兼容 WebGL2
-- Linux、Windows 和 macOS 持续集成
+- React Three Fiber + Drei 声明式管理 Three.js 舞台，优先使用 WebGPU 并自动回落 WebGL2
+- React Flow + d3-hierarchy 显示可缩放的 18 节点严格单父控制权树
+- 一键导出 Foxglove MCAP：包含运行事件、权威世界、43 关节、坐标变换、接触/质心和导航线，且没有命令通道
+- Windows 与 Linux/WSL 开发运行；训练任务通过 Colab GPU 执行
 
 ## 运行链路
+
+![HEAR 模仿神经控制链的层级闭环架构](docs/architecture/hear-system-architecture.svg)
+
+图中的绿色实线是层级控制和物理写入，黄色虚线是感觉与回执反馈，蓝色虚线是通过独立 gate 后的离线策略部署，灰色虚线是只读可视化。只有 Serial Executor 能够写入权威 MuJoCo 状态；Foxglove、Rerun 和 Operator 都不是控制节点。完整说明见 [System Architecture](docs/architecture/system-overview.md)。
 
 ```text
 Executive
@@ -53,29 +59,72 @@ Executive
 ```
 
 ```mermaid
-flowchart TD
-    E["Executive<br/>唯一根"] --> G["Goal Valuation"]
-    E --> AS["Action Selection<br/>唯一 Skill commitment 权限"]
-    AS --> P["Perception Manager"]
-    P --> SF["Sensor Fusion<br/>确定性"]
-    P --> SI["Scene Interpreter"]
-    P --> MR["Memory Retriever"]
-    AS --> SM["Sensorimotor Manager"]
-    SM --> AF["Affordance"]
-    SM --> RI["Risk / Interoception"]
-    SM --> PC["Predictive Critic"]
-    SM --> PM["Premotor"]
-    SM --> RC["Recovery<br/>独占 lease episode"]
-    PM --> MI["Motor Intent<br/>最低 LLM 边界"]
-    MI --> RG["MuJoCo Rollout Gate<br/>确定性"]
-    SM --> EX["Serial Executor<br/>唯一物理写入者"]
-    EX --> CR["Controller / Reflex<br/>训练策略 + 快速闭环"]
-    CR --> B["MuJoCo Body"]
+flowchart TB
+    subgraph COG["认知控制层 · 13 个 OpenAI Agents SDK 模型 Agent"]
+        E["Executive<br/>唯一根"]
+        G["Goal Valuation"]
+        AS["Action Selection<br/>唯一 Skill commitment 权限"]
+        P["Perception Manager"]
+        SI["Scene Interpreter"]
+        MR["Memory Retriever"]
+        SM["Sensorimotor Manager"]
+        AF["Affordance"]
+        RI["Risk / Interoception"]
+        PC["Predictive Critic"]
+        PM["Premotor"]
+        MI["Motor Intent<br/>最低 LLM 边界"]
+        RC["Recovery<br/>独占 lease episode"]
+    end
+
+    subgraph RT["运行时与身体层 · 5 个非模型节点"]
+        SF["Sensor Fusion<br/>确定性"]
+        RG["MuJoCo Rollout Gate<br/>确定性预演"]
+        EX["Serial Executor<br/>唯一物理写入者"]
+        CR["Controller / Reflex<br/>训练策略 + 50 Hz 快速闭环"]
+        B["MuJoCo Body<br/>200 Hz 物理本体"]
+    end
+
+    E --> G
+    E --> AS
+    AS --> P
+    P --> SF
+    P --> SI
+    P --> MR
+    AS --> SM
+    SM --> AF
+    SM --> RI
+    SM --> PC
+    SM --> PM
+    SM --> RC
+    PM --> MI
+    MI --> RG
+    SM --> EX
+    EX --> CR
+    CR --> B
+
+    RG -. "rollout_result · 反馈无控制权" .-> PC
+    CR -. "执行回执 / 预测误差 · 反馈无控制权" .-> SM
+    B -. "身体感知 · 反馈无控制权" .-> P
+
+    classDef model fill:#173a31,stroke:#65e6bb,color:#e9fff6,stroke-width:1.4px
+    classDef runtime fill:#182a35,stroke:#5aa0d1,color:#edf8ff,stroke-width:1.4px
+    classDef writer fill:#214c3e,stroke:#9bf3d4,color:#ffffff,stroke-width:2.6px
+    classDef controller fill:#41331f,stroke:#d8ad67,color:#fff7e8,stroke-width:1.8px
+    classDef plant fill:#302e3b,stroke:#9a95b5,color:#f4f1ff,stroke-width:1.8px
+    class E,G,AS,P,SI,MR,SM,AF,RI,PC,PM,MI,RC model
+    class SF,RG runtime
+    class EX writer
+    class CR controller
+    class B plant
 ```
 
-上图只画**控制权所有权**。Rollout、身体感知、预测误差和执行回执是带因果来源的反馈信号，不是第二父级，也不会把树改成平级 Agent 网络。
+上图的 **17 条实线**只表示控制权所有权；三条虚线只概括带因果来源的闭环反馈。Rollout、身体感知、预测误差和执行回执都不是第二父级，也不会把树改成平级 Agent 网络。
 
-这是控制权树，不是平级多 Agent 网络。除 Executive 外，每个节点只有一个直接父级；父级通常通过 `Agent.asTool()` 调用模型子级并保留控制权。兄弟节点不互相通信、不共享 Session，只允许由共同父级发起并汇合两组只读并行：Scene + Memory、Affordance + Risk。每次直接子级调用都有独立 `invocation_id`，并绑定共同父级的 `parent_episode_id`；共同父级只能汇合属于自己本次 episode 的返回，禁止依靠队列顺序、payload 相等或“第一个 pending 信号”猜测配对。父子委派没有自由文本 `intent` 通道：父级只能选择自己拥有的子边、合同允许的信号类型，以及当前父 episode 真正拥有的 pending `source_signal_ids`；旧 episode、兄弟、其他父级、已消费或过期信号即使 UUID 仍在历史中也会被代码拒绝。反馈信号可以沿白名单回路唤醒最近责任层，但不会生成第二父级。
+![HEAR 18 节点严格单父层级](docs/screenshots/hierarchy.png)
+
+这是控制权树，不是平级多 Agent 网络。除 Executive 外，每个节点只有一个直接父级；父级通常通过 `Agent.asTool()` 调用模型子级并保留控制权。兄弟节点不互相通信、不共享 Session，只允许由共同父级发起并汇合两组只读并行：Scene + Memory、Affordance + Risk。每次直接子级调用都有独立 `invocation_id`，并绑定共同父级的 `parent_episode_id`；共同父级只能汇合属于自己本次 episode 的返回，禁止依靠队列顺序、payload 相等或“第一个 pending 信号”猜测配对。父子委派没有自由文本 `intent` 通道：父级只能选择自己拥有的子边和当前父 episode 真正拥有的 pending `source_signal_ids`；允许多种信号的边仍受合同约束，而当前相位只有一种合法输入的边会把 `signal_kind` 收窄为单一 schema 字面值。旧 episode、兄弟、其他父级、已消费或过期信号即使 UUID 仍在历史中也会被代码拒绝。反馈信号可以沿白名单回路唤醒最近责任层，但不会生成第二父级。
+
+Perception Manager 不再把整份 Sensor Fusion、Scene 和 Memory 文档重新生成一遍；它只提交有界的 `compact_perceptual_belief_v1`。Harness 在校验后依据本次 Manager episode 的三个直接子信号物化完整知觉证据，再沿唯一父边上送。这让模型负责状态估计、Harness 负责无损证据运输，避免长几何数组把函数调用 JSON 截断，同时不会替模型选择 Skill、手、交互点、路线或姿态。
 
 Action Selection 使用两阶段技能协议：Sensorimotor 第一次只能返回
 `skill_proposal`；Action Selection 独占建立一个与 Goal epoch、世界版本和
@@ -96,7 +145,15 @@ Recovery 也没有第二父级，更不是 SDK handoff。Sensorimotor Manager �
 普通分支后，以独占 lease 启动一个上下文隔离的 Recovery episode；它只能返回
 恢复提案或升级，lease 关闭后控制仍回到同一个 Sensorimotor 父级。
 
+Motor Intent 的局部恢复按控制模态封顶，而不是靠增加重试次数：同一
+`transit_clearance` episode 可自主尝试 whole-body clearance 和 alternate
+navigation；两种模态都被真实 Rollout Gate 拒绝后，Harness 将两条因果信号合并为
+typed escalation，沿 Premotor 逐级上送。Action Selection 随后关闭已被证伪的
+commitment，再让独占 Recovery 选择新 Skill，避免在旧承诺内无限改坐标。
+
 控制树、反馈图和执行状态机的完整定义见 [`docs/architecture/neural-hierarchy-v3.md`](docs/architecture/neural-hierarchy-v3.md)。模型认知在 Motor Intent 截止；规划求解、MuJoCo 预演、唯一串行执行、训练策略和控制器闭环都位于其下。Harness 按事件唤醒路径，并在代码层强制“感知 → 父级并行汇合 → 技能 → rollout → 预测评估 → 串行执行 → 反馈”，不依赖模型按提示词自行维持安全顺序。
+
+认知层、权限 Harness、离线训练、快速控制闭环与可视化之间的完整边界见 [`docs/architecture/system-overview.md`](docs/architecture/system-overview.md)。
 
 层级协议升级不会静默复用旧 Agent Session。普通 resume 会明确拒绝旧 neural contract；显式 `hear resume --run RUN_ID --fresh-agent-epoch --confirm` 会在没有未完成物理事务或 action commit 时归档旧 Manifest、RunState 与各节点 Session，重建 neural hierarchy/context epoch，同时原样保留物理世界、Goal DAG、已提交动作账本和 embodied memory。若机器人仍处于 admitted/executing transaction，该切换会拒绝执行，必须先恢复同一物理事务。
 
@@ -136,9 +193,11 @@ Recovery 也没有第二父级，更不是 SDK handoff。Sensorimotor Manager �
 
 层级智能体不直接输出电机值或关节动作。它负责语义目标、Skill DAG、交互对象和终止条件；低层运动由 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 执行。`HumanoidWorld.create` 的 `controllerFactory` 会分别为权威 MuJoCo 世界和独立预演池创建控制器实例，场景资源重建时继续使用同一工厂。控制器状态必须支持捕获与恢复，策略的观察空间、动作空间和真实能力随世界快照公开。
 
-不设置 `HEAR_HUMANOID_CONTROLLER_MODULE` 时，正式 CLI 和 Operator 默认加载仓库随附的 mjlab G1 学习策略，并在缺少关节参考跟踪能力的控制步切换到 YAHMP。设置该变量可以用自己的训练产物覆盖默认主策略；值可以是相对路径、绝对路径或已安装包名。模块必须导出 `createHumanoidWholeBodyController(context)`，并在每次调用时创建独立的 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 实例。模块可以通过 `humanoidControllerAssets` 声明 ONNX、训练报告等本地策略文件，运行来源身份会同时覆盖入口与全部资产内容。运行定义不保存本机路径；恢复时入口或任一策略资产发生变化都会在创建世界前被拒绝。未记录来源身份的历史运行仍使用创建时的 YAHMP，不会被新的默认策略静默迁移。
+不设置 `HEAR_HUMANOID_CONTROLLER_MODULE` 时，正式 CLI 和 Operator 默认加载仓库随附的 Workyard 全身 reach 控制器：mjlab G1 策略提供运动参考，29D reach 策略联合修正平衡关节并控制双臂。只有通过新 reach 合同重新训练和资格验证的 contact 策略，才可通过 `hear/controllers/workyard-contact` 显式叠加 8D 手部协同并声明接触式操作能力；系统不会把旧 contact 模型接到不兼容的观测空间。设置该变量可以覆盖默认控制器；值可以是相对路径、绝对路径或已安装包名。模块必须导出 `createHumanoidWholeBodyController(context)`，并在每次调用时创建独立的 [`HumanoidWholeBodyController`](src/world/humanoid/whole-body-controller.ts) 实例。模块可以通过 `humanoidControllerAssets` 声明 ONNX、训练报告等本地策略文件，运行来源身份会同时覆盖入口与全部资产内容。运行定义不保存本机路径；恢复时入口或任一策略资产发生变化都会在创建世界前被拒绝。未记录来源身份的历史运行仍使用创建时的 YAHMP，不会被新的默认策略静默迁移。
 
 YAHMP 参考控制器声明 `balance`、`locomotion` 和 `joint_reference_tracking`。任务空间 IK、接触柔顺和抓取检查器是参考生成与物理验收组件，不代表策略已经学会接触式操作或双手操作。后续可以接入强化学习、模仿学习或其他已训练策略；新控制器只有在真实支持时才应声明 `contact_rich_manipulation` 或 `bimanual_manipulation`，Harness 仍会用同一 MuJoCo 预演和执行回执验证结果。只运行参考控制器时可设置 `HEAR_HUMANOID_CONTROLLER_MODULE=hear/controllers/yahmp`。
+
+运行创建和恢复会在首个模型调用前检查 Goal 与控制器的永久能力边界。抓取、搬运、稳放、容器和关节操作目标若没有已安装且明确声明 `contact_rich_manipulation` 的训练策略，会立即拒绝启动；系统不会让 Agent 在物理上不可能的 Goal 上循环，也不会用参考控制或扩大容差冒充接触策略。
 
 外接学习策略缺少平衡、移动或关节参考跟踪中的任一基础能力时，模拟器会把它作为主控制器，并创建独立 YAHMP 参考控制器组成能力路由。声明能力只是第一层筛选；路由还按控制器实现与语义 Skill 家族保存真实成功后验、近期结果、成功入口状态分布、命令分布和策略切换结果。冷启动允许有界探索，积累足够真实终态后，低置信成功后验、入口状态 OOD 或命令 OOD 都会拒绝学习策略并使用参考回退。预演不会写入能力经验，未完成准入与能力证据会随物理检查点精确恢复。
 
@@ -166,7 +225,7 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 
 十三个模型节点分别拥有独立的 Agents SDK Session 和 Model facade；Sensor Fusion、Rollout Gate、Serial Executor、Controller / Reflex 与 MuJoCo Body 不创建模型 Session。稳定指令和各节点自己的历史位于请求前缀，实时世界权限与定向神经信号位于末尾；缓存亲和键按凭证、协议、模型和结构 Agent ID 保持稳定。亲和键只影响供应商缓存路由，不承载对话内容；不同 Agent、不同 Run 的 Session 和物理状态始终隔离，父子间只交换有世界版本、TTL 和因果来源的类型化信号。
 
-每个 Agent 的上下文只压缩自己的历史，不接收兄弟或父子 Agent 的压缩摘要。完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。Goal DAG 与可寻址具身记忆仍是长期事实来源；历史召回只能作为带来源的旧证据，不能替代当前 Sensor Fusion。结构 Agent、其 Session、工具 Schema、输出 Schema、控制边、反馈合同和运行时服务身份全部写入 V2 Agent Manifest，恢复时不允许旧 Coordinator epoch 静默复用新层级 Session。
+每个 Agent 的上下文只压缩自己的历史，不接收兄弟或父子 Agent 的压缩摘要。完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。Goal DAG 与可寻址具身记忆仍是长期事实来源；历史召回只能由 Memory Retriever 进行有界查询，再经 Perception Manager 汇合为上行证据，不能作为跨 Agent 共享上下文或替代当前 Sensor Fusion。结构 Agent、其 Session、工具 Schema、输出 Schema、控制边、反馈合同和运行时服务身份全部写入 V3 Agent Manifest，恢复时不允许旧 Coordinator epoch 静默复用新层级 Session。
 
 上下文压缩本身由独立模型完成。无效输出可以在同一压缩回合内重新生成；网络中断会立即交还原业务 Agent 的标准传输恢复流程，原始历史和 Session 不会被替代摘要覆盖。只有通过 schema、来源引用和当前世界权限校验的压缩记录才会成为新基线；基线提交后的业务请求若中断，恢复只保留该基线和真实热历史，不会重新灌入已经裁剪的旧前缀。配置窗口不足属于明确的容量错误，不会无限重试。
 
@@ -200,6 +259,8 @@ Operator 异常退出后，未完成任务会转为可恢复状态。恢复操�
 - 规划、执行和拒绝回执
 - 碰撞部位、场景实体与实时恢复状态
 - 经过整理的模型活动与输出
+
+产品主舞台采用 React Three Fiber + Drei，层级图采用 React Flow。每个运行现可从顶栏导出自包含的 Foxglove MCAP，用现成的 3D、时间轴和曲线面板分析权威世界与物理状态；后续实时 WebSocket 仍只会是只读投影。Rerun 被定位为版本固定的记录/回放面；二者都不会替代 HEAR 的任务与 Harness 权限界面。完整选型和集成边界见 [Visualization Stack](docs/architecture/visualization-stack.md)。
 
 | 行动历程 | 智能体输出 |
 |---|---|
@@ -285,9 +346,9 @@ HEAR_WORKYARD_CONTACT_TARGET_ZONE_ID=assembly_bay
 
 `AI_REQUEST_TIMEOUT_MS` 默认是 `300000`，表示 HTTP 建连或相邻响应数据之间允许的最长静默时间。`AI_STREAM_EVENT_IDLE_TIMEOUT_MS` 默认同为 `300000`，约束相邻 Agents SDK 模型事件之间的静默时间；只有真实模型事件会续期。两者均可按端点能力在 5 秒至 10 分钟之间调整，任务总时限、人工停止和进程恢复仍独立生效。
 
-模型节点按四个可独立配置的结构 profile 选择供应商参数；未设置的 profile 变量继承同名 `AI_*` 默认值。旧 `GOAL_MANAGER`、`COORDINATOR`、`MOTION`、`SENTRY` 与 `EXECUTOR` 键只用于读取 V1 运行或兼容旧部署，不再表示 V2 的结构身份：
+模型节点按四个可独立配置的结构 profile 选择供应商参数；未设置的 profile 变量继承同名 `AI_*` 默认值。旧 `GOAL_MANAGER`、`COORDINATOR`、`MOTION`、`SENTRY` 与 `EXECUTOR` 键只用于读取 V1 运行或兼容旧部署，不再表示 V3 的结构身份：
 
-| `PROFILE` | V2 结构职责 |
+| `PROFILE` | V3 结构职责 |
 |---|---|
 | `EXECUTIVE` | Executive、Goal Valuation、Action Selection |
 | `ASSOCIATIVE` | Perception、Scene、Memory、Affordance、Risk |
@@ -342,7 +403,7 @@ pnpm validate:workyard-training
 
 验证会将 29 个 G1 身体关节、14 个手部关节、221 维 observation、37 维动作（29 个身体参考残差与 8 个手部协同增量）、`reach → contact → grasp → lift → carry → place` teacher 课程、奖励证据来源、训练/验证/留出种子和最终验收阈值，与真实 `humanoid_workyard` 场景交叉核对。部署 student 不读取 teacher 阶段，而是消费 capability multi-hot、Skill 窗口进度以及 base、wrist、grasp 命令。报告只有在 Python 环境与 v2 合约同时完整时才返回 `colab_smoke_ready: true`；否则不会启动 Colab 训练。
 
-v2 保留为 whole-body cold-start 基线，不再作为主要训练路线。v4 使用经身份校验的 G1 velocity policy 作为同 GPU、动态 batch、零梯度 locomotion teacher；第一阶段 student 只有 14 维 arm/wrist residual，双手固定为 neutral open pose，12 个下肢关节与 3 个腰部关节逐帧保持 teacher authority。GPU batched DLS 教师根据 pelvis-relative wrist target 产生在线 DAgger 标签，但不进入 231 维 actor observation、没有执行权，也不能扩张 Harness Skill 窗口。actor observation 新增 4 维 support-relative Dynamic-CoM；奖励与报告分别记录 wrist signed progress、capture point、support margin、脚底位移、接触丢失和 slip。正式创建 Colab 会话前可验证合约和两条教师边界：
+当前 reach v5 是 29D 全身闭环策略：冻结 G1 velocity policy 只提供同 GPU、动态 batch、零梯度的运动参考，student 用前 15D 修正下肢与腰部平衡，并用后 14D 控制双臂。GPU batched DLS 只提供上肢 DAgger 标签，不进入 246D actor observation，也没有执行权。策略可利用 support-relative Dynamic-CoM、真实关节与末端状态、接触、物体和 typed Skill 命令，学习补偿到达动作引起的全身耦合；奖励与报告同时约束 wrist progress、capture point、support margin、脚底位移、接触丢失和 slip。正式创建 Colab 会话前可验证合同和教师边界：
 
 ```sh
 pnpm validate:workyard-residual-training
@@ -351,21 +412,40 @@ pnpm teacher:workyard:residual:colab
 pnpm train:workyard:residual:colab -- --iterations 1000 --num-envs 2048
 ```
 
-smoke 报告会检查两条 teacher 路径是否始终在 CUDA 上批量执行、是否存在梯度参数或逐控制步 CPU round-trip，以及 frozen joint、upper-body residual 和固定 open hand 三条组合恒等式。`teacher` 模式先验证解析 IK 能否真实缩短 wrist error；正式训练先把同一个 deployable actor 用在线 DAgger/Smooth-L1 warm-start，再原位交给 PPO。Dynamic-CoM 报告同时保留 reset-inclusive 原始证据、前 16 步瞬态轨迹和固定 10 步 settling 后的门控指标，门槛不会为了通过而放宽。smoke、teacher 和短训练都不会自行声明 deployment acceptance。只有独立 held-out seeds 同时达到 reach 与 Dynamic-CoM 阈值后，才允许把 action head 从 14 维扩展为带 8 维 hand synergy 的 22 维 contact/grasp phase；腰部 residual 必须再通过 contact/grasp 与 Dynamic-CoM gate，不能由 phase one 直接授权。训练 checkpoint、曲线和报告均写入 `artifacts/training/`，不会进入 Git。
+smoke 报告会检查 locomotion reference 与 DLS labeler 是否始终在 CUDA 上批量执行、是否存在梯度参数或逐控制步 CPU round-trip，以及 15D balance residual、14D upper-body target 和固定 open hand 的组合恒等式。`teacher` 模式只验证解析标签生成；正式训练先用在线 DAgger/Smooth-L1 warm-start 同一个 deployable actor，再原位交给 retention PPO。只有 500 个独立 held-out seeds 同时达到 reach 与 Dynamic-CoM 阈值后，checkpoint 才能导出并通过 TypeScript MuJoCo 部署门。该部署门关闭终端 DLS 辅助，以纯 ONNX 策略验收腕部误差、支撑裕量、双脚位移、脚底滑移、双支撑丢失和离地率；生产终端反射不能替策略取得资格。训练 checkpoint、曲线和报告均写入 `artifacts/training/`，不会进入 Git。
 
-contact/grasp 阶段继续冻结 locomotion、腰部和 14 维 reach actor，只训练经过 typed contact authority 与 closure geometry latch 授权的 8 维主动手协同策略。解析式 pocket/DLS executor 只承担 terminal alignment teacher、提前接触回撤和 6 N/12 N 力反射，不把 teacher 私有阶段暴露给 student，也不让模型逐控制帧操作关节。正式流水线为：
+contact/grasp 阶段冻结完整 29D whole-body reach actor，只训练经过 typed contact authority 与 closure geometry latch 授权的 8D 主动手协同策略；整体是 37D 组合，hand actor 消费 246D reach observation 加 16D 手部历史。解析式 pocket/DLS executor 只在终端口袋内接管获授权的主动臂，并处理提前接触回撤和 6 N/12 N 力反射；它不能改动平衡残差、另一只手或任何 checkpoint，也不让模型逐控制帧操作关节。正式流水线为：
 
 ```sh
 pnpm validate:workyard-contact-training
 pnpm teacher:workyard:contact:colab
 pnpm pilot:workyard:contact:colab
-pnpm train:workyard:contact:colab -- --output artifacts/training/workyard-contact/formal-v2 --timeout-seconds 21600
 pnpm export:workyard:reach:colab
+pnpm qualify:workyard:reach:deployment
+pnpm train:workyard:contact:colab -- --output artifacts/training/workyard-contact/formal-v2 --timeout-seconds 21600
 pnpm export:workyard:contact:colab
 pnpm install:workyard:policies
 ```
 
-`teacher` 必须先通过左右手独立成功率、30 N 峰值接触力、对向接触、零丢物、零跌倒、零数值恢复和零越权门禁。`pilot` 实际运行在线 DAgger、PPO retention、checkpoint 回滚选择与短规模独立评估；正式 `formal-v2` 的规模由合同锁死，不能通过命令行缩小，并用 500 个 held-out seeds 作最终验收。只有最终门禁通过的 checkpoint 才能导出；安装命令再次校验报告、文件大小和 SHA-256，再把 reach/contact ONNX 复制为仓库运行资产。使用完整 Workyard 组合控制器时设置 `HEAR_HUMANOID_CONTROLLER_MODULE=hear/controllers/workyard-contact`；三个 `*_POLICY_DIRECTORY` 变量只用于显式替换随附资产。
+`teacher` 必须先通过左右手独立成功率、30 N 峰值接触力、对向接触、零丢物、零跌倒、零数值恢复和零越权门禁。`pilot` 实际运行在线 DAgger、PPO retention、checkpoint 回滚选择与短规模独立评估；正式训练的规模由合同锁死，不能通过命令行缩小，并用 500 个 held-out seeds 作最终验收。只有最终门禁通过的 checkpoint 才能导出；安装命令再次校验报告、文件大小和 SHA-256，再把 reach/contact ONNX 复制为仓库运行资产。使用完整 Workyard 组合控制器时设置 `HEAR_HUMANOID_CONTROLLER_MODULE=hear/controllers/workyard-contact`；三个 `*_POLICY_DIRECTORY` 变量只用于显式替换随附资产。
+
+旧 formal-v7 contact 是建立在 14D reach/247D observation 上的历史结果，不能接入 v5 whole-body reach，也不会被默认控制器加载。新 contact 必须在 29D reach 通过部署资格后重新完成左右手 preflight、DAgger/PPO 和独立 500-seed gate；在此之前默认控制器只声明平衡、移动与全身到达能力，抓取类 Goal 会在模型调用前被拒绝。
+
+reach 正式训练可用 `--drive-local-root` 把 Colab 下载并校验后的归档复制到已经登录的桌面 Google Drive，不需要每个临时 runtime 再做一次交互式全盘 OAuth。contact 的长训练同样先通过已认证的 Colab CLI 流式取回报告与归档；需要周期 checkpoint 时再显式启用 Drive mount。
+
+正式训练的报告与 checkpoint 归档通过同一个 Colab `exec` WebSocket 分块返回，宿主端逐帧重组并校验字节数与 SHA-256。这避免长训练超过 Colab runtime proxy 一小时令牌后，后续 `download` 错把仍存在的 `/content` 文件报告为 404。敏感授权信息不会进入训练 bundle、终端日志或仓库。
+
+需要同时备份训练目录和已安装部署目录时，仍可使用完整 Drive 挂载流程。该命令创建短时 CPU 会话、分块上传并校验归档、写入 `MyDrive/HEAR/`，结束后主动释放会话；目标目录已存在时拒绝覆盖：
+
+```sh
+pnpm backup:workyard:contact:drive -- \
+  --source-root artifacts/training/workyard-contact/formal-v2 \
+  --deployment-root artifacts/training/workyard-contact-deployment/formal-v2 \
+  --drive-directory HEAR/workyard-contact/formal-v2
+```
+
+以上三项也是当前默认值，因此备份正式 v2 产物时可直接运行
+`pnpm backup:workyard:contact:drive`。
 
 恢复默认要求原 Agent 配置、指令、工具与 SDK 身份完全一致。明确升级这些边界后，可使用 `--fresh-agent-epoch` 将旧 Manifest、RunState 和各节点 Session 原样归档，再从同一物理检查点、Goal DAG、动作账本和长期记忆创建新的 Agent epoch；该选项不会重置世界或回放动作。
 

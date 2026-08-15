@@ -1,7 +1,7 @@
 # HEAR Neural Hierarchy
 
 Status: implementation contract, verified against the OpenAI Agents SDK and
-robot-control literature on 2026-08-13.
+robot-control literature on 2026-08-15.
 
 ## Non-negotiable thesis
 
@@ -31,9 +31,12 @@ The hierarchy is a recursive control system rather than a long prompt chain:
 
 Every model-to-model delegation has the same wire law:
 
-- the parent chooses only one owned child edge, an allowed typed `signal_kind`,
-  exact causal `source_signal_ids`, priority, and horizon; there is no
-  parent-authored free-text intent channel;
+- the parent chooses only one owned child edge and exact causal
+  `source_signal_ids`; when an edge admits more than one current contract kind,
+  its typed `signal_kind` remains constrained to that set, while a phase-bound
+  edge such as rollout review exposes one literal kind instead of asking the
+  model to select protocol state; there is no parent-authored free-text intent
+  channel;
 - every cited signal must be pending, current, directed to that parent, and
   bound to that exact parent episode; a UUID from an earlier episode, sibling,
   foreign parent, consumed signal, or expired signal is rejected even if it
@@ -42,6 +45,10 @@ Every model-to-model delegation has the same wire law:
   `(parent, child, harness_phase, signal_kind)` from the structural contract;
 - the Harness constructs the child's own context anchor and injects the cited
   world-versioned signals;
+- at a parallel Manager join, the Harness—not the model—derives and binds the
+  exact Sensor Fusion/Scene/Memory or Belief/Affordance/Risk child-result IDs
+  from the current invocation and parent episode; the model owns semantic
+  synthesis, not provenance UUID bookkeeping;
 - parent context, sibling output, Sessions, and JSON-encoded copies of an
   anchor are never transferred;
 - the child returns one typed ascending signal to its direct parent.
@@ -118,6 +125,18 @@ owns deterministic planning and rollout. The resulting `rollout_result` is a
 typed reentrant signal to the predictive Critic, which compares expected and
 observed outcomes without becoming a second actuator. This preserves a strict
 tree while retaining a cerebellar parallel pathway.
+
+Motor Intent recovery is bounded by control modality rather than an arbitrary
+retry count. When transit clearance blocks a committed Skill, the same SDK
+episode may try whole-body clearance and alternate navigation. Each attempt
+is explicitly labelled by the Harness at the tool boundary while clearance is
+already active, so the original blocked navigation cannot be miscounted as an
+alternate-route attempt. Each attempt must produce a real Rollout Gate signal.
+If both modalities are deterministically rejected, the Harness emits one causally joined
+`motor_intent_local_recovery_exhausted_v1` escalation through Premotor. It does
+not keep inventing coordinates inside the disproved commitment; Action Selection
+releases that commitment before the exclusive Recovery episode chooses a new
+bounded Skill.
 
 Feedback provenance is deliberately separate from control authority. Every
 direct-child SDK call creates a durable `invocation_id`; its lease and every
@@ -303,6 +322,22 @@ The control tree answers *who owns whom*. The phase machine answers *what is
 legal now*. These are separate contracts. Prompts may explain order, but only
 the Harness may enforce order or enable tools.
 
+`autonomyReadiness` is a separate deterministic projection of durable Goal,
+action-receipt, and MuJoCo state. It may veto an illegal completion or physical
+write, but it is not an Agent, scheduler, delegation surface, or model-visible
+control phase. Model Agents receive only the neural Harness phase plus signals
+addressed to their own node and invocation. This prevents the old central
+`coordinator_phase` vocabulary from becoming a second, hidden orchestration
+system alongside the parent-child tree.
+
+Embodied history likewise has one structural retrieval owner: Memory Retriever.
+Goal Valuation, Action Selection, and Recovery do not receive a shared memory
+snapshot or a second recall tool. Recovery acts on the post-failure perceptual
+belief, whose evidence can include the bounded Memory Retriever result joined
+by Perception Manager. The Executive also does not read Action Selection's
+active commitment directly; commitment state reaches it only through typed
+direct-child returns and the current Harness phase.
+
 ```mermaid
 stateDiagram-v2
     [*] --> GoalValuation: run started / no active Goal
@@ -347,10 +382,18 @@ stateDiagram-v2
 ```
 
 Only two states admit concurrent Agent calls: `PerceptionFork` and
-`AssessmentFork`. The Harness dynamically exposes exactly the tools valid for
-the current state. It never exposes Premotor alongside unfinished critics or
-Executor before a real Predictive result. Thus model tool ordering is a
-choice only among currently legal alternatives, not a safety mechanism.
+`AssessmentFork`. Each persistent Agent Session has one stable capability table;
+the Harness admits a call only when the current state, directed signals, and
+commitment authorize it. Premotor therefore cannot execute alongside unfinished
+critics and Executor cannot execute before a real Predictive result even though
+those capabilities remain discoverable. Model tool ordering is never a safety
+mechanism.
+
+Scheduler events are wake-up metadata, not a global signal bus. Their causal
+IDs are drawn only from signals addressed to the event's requested node; they
+never contain the tree-wide pending set. During feedback, the event kind is
+derived from the latest commitment-bound `skill_completed` or `skill_failed`
+signal, not inferred merely from an `executing` commitment state.
 
 ## Neural-to-embodied Skill bridge
 
@@ -359,6 +402,13 @@ different authorities. Action Selection owns the former; Motor Intent must
 materialize the latter through the existing semantic Skill APIs before any
 planner can run. No Harness layer fabricates a transaction identifier and a
 neural UUID is never reused as an embodied Skill transaction.
+
+The embodied binding also keeps spatial authority explicit. Its
+`target_evidence_position` is the observed object, zone, frontier, or solid
+position used by dispatch-time grounding; `target_position` is the planner
+destination. For an `approach` Skill the latter may be an IK-derived robot-base
+placement several decimetres from the object. These fields must never be
+compared as if they represented the same physical entity.
 
 ```mermaid
 sequenceDiagram
@@ -411,6 +461,16 @@ new Sensorimotor episode, and only then may Sensorimotor open its exclusive
 Recovery lease. Causal ancestry distinguishes this lower-pathway failure from an
 `escalation` actually authored by Recovery: only the latter may continue upward
 to Executive and Goal Valuation.
+
+The controller capability boundary is checked before the first model episode
+and again on resume. A Goal containing grasp, carry, placement, container,
+articulation, or contact-mediated block predicates cannot enter the hierarchy
+unless the installed learned controller explicitly declares
+`contact_rich_manipulation`. Reference tracking, inverse kinematics, contact
+checking, and a deterministic terminal solver are not allowed to impersonate a
+trained contact policy. Per-Skill capability admission remains in force after
+this mission-level check; the early check only removes controller/Goal pairs
+that are permanently impossible and would otherwise waste entire Agent cycles.
 
 ## Authority leases and event wake-up
 
@@ -515,22 +575,27 @@ Session, raw transcript, or compacted transcript. A parent constructs a new,
 typed, bounded neural input from durable state for each invocation. SDK
 Sessions preserve each Agent's own continuity only.
 
-Read-only retrieval is also episode-bounded. Relevant Memory and Recovery may
-call `recall_embodied_history` once per invocation; after a successful recall
-the Harness removes that capability and leaves typed submission as the only
-next step. Empty history is a valid result, not a reason to poll the same store.
+Read-only retrieval is also episode-bounded. Relevant Memory is the only model
+node allowed to call `recall_embodied_history`, at most once per invocation;
+after a successful recall the Harness rejects another recall and admits the
+typed result as the next step. Recovery has no retrieval tool and receives only
+the post-failure belief routed back through Perception Manager. Empty history
+is a valid result, not a reason to poll the same store.
 
 `Agent.asTool()` provides the nested Agent loop and Manager-owned return, but
 it does not replace HEAR's embodied phase, revision, causality, or actuation
-authority. SDK dynamic tool availability is used to expose only the phase-safe
-surface. Harness leases and typed signals remain the source of robot authority.
+authority. The SDK surface remains stable across a persistent Session while
+invoke-time Harness admission enforces the phase-safe executable subset.
+Harness leases and typed signals remain the source of robot authority.
 
-Every formal neural control turn uses `tool_choice=required`; prose cannot
-replace a typed control edge or state transition. DeepSeek's OpenAI-compatible
-thinking endpoint rejects that combination, so HEAR disables provider thinking
-only for these formal control turns while retaining the same model and tool
-surface. Harness validation, Goal mutations, commitment transitions, rollout
-certificates, and physical admission remain authoritative.
+Every authority-changing neural turn uses `tool_choice=required`; prose cannot
+replace a child-control edge, Goal mutation, commitment transition, plan, or
+physical admission. The configured DeepSeek-compatible endpoint rejects
+provider thinking together with `required`, so those authority turns disable
+extended thinking. Read-only and proposal specialists (Scene, Memory,
+Affordance, Risk, Predictive, and Recovery) use thinking-enabled `auto` turns;
+their typed outputs still pass the same Harness schemas, causal routing, and
+parent-owned publication before they affect control.
 
 ## Node and implementation audit
 
@@ -706,10 +771,10 @@ OpenAI-compatible endpoints are not assumed to implement `json_schema`
 response formatting. Every model node submits its final typed neural signal
 through an SDK function tool whose parameter schema is that node's output
 schema. Assistant prose is never accepted as a control signal.
-Manager submission tools are capability-gated by the same invocation-local
+Manager submission tools are execution-gated by the same invocation-local
 fork/join and state-mutation barriers. A Manager cannot merely assert that a
-child ran, a commitment exists, or a rollout was accepted: the submission tool
-is absent until the corresponding Harness signal or durable state transition
+child ran, a commitment exists, or a rollout was accepted: an early submission
+is rejected until the corresponding Harness signal or durable state transition
 exists, and submitted source IDs must cite that exact result.
 Signal freshness follows invocation identity plus the signal TTL, not the
 revision at which a later phase transition was recorded. This matters in the
@@ -755,6 +820,18 @@ a native JSON value. The Harness validates and canonicalizes it into the
 internal `payload_json` envelope before routing. This avoids asking a model to
 correctly escape a second JSON wire format inside the function arguments while
 preserving the existing durable signal representation.
+
+Perception aggregation uses a stricter split between neural coding and evidence
+transport. Perception Manager emits only `compact_perceptual_belief_v1`: a
+bounded list of observations, uncertainty, changed entities, safety facts, Goal
+state, and world revision. It never serializes the Sensor Fusion, Scene, or
+Memory payload a second time. After the model submission is schema-valid, the
+Harness materializes `materialized_perceptual_belief_v1` by attaching those
+three exact joined child signals from durable causal state. Higher layers
+therefore receive verbatim geometry and memory evidence without making an LLM
+copy a potentially output-token-sized sensor document. The Harness transports
+evidence; it does not choose a Skill, hand, interaction point, route, posture,
+or motor parameter.
 
 At the parent-facing `Agent.asTool()` boundary, `source_signal_ids` is rebound
 to the single ascending signal created for that direct ownership edge. The

@@ -1,7 +1,7 @@
 """Export an accepted HEAR reach checkpoint for deployment.
 
 The contact/grasp phase must not reopen gradient authority over the accepted
-14D reach primitive.  This exporter validates the qualification report and
+29D whole-body reach primitive.  This exporter validates the qualification report and
 selected checkpoint identity, reconstructs the deterministic bounded actor,
 and emits batch-dynamic TorchScript and ONNX modules plus a cryptographic
 identity report for the next Harness skill layer.  TorchScript remains the
@@ -25,10 +25,10 @@ from torch import nn
 from torch.nn import functional as torch_f
 
 
-PROTOCOL = "hear-frozen-reach-policy-export-v1"
+PROTOCOL = "hear-whole-body-reach-policy-candidate-v3"
 SOURCE_REPORT_PROTOCOL = "hear-workyard-residual-run-v4"
-OBSERVATION_SIZE = 231
-ACTION_SIZE = 14
+OBSERVATION_SIZE = 246
+ACTION_SIZE = 29
 NORMALIZER_EPS = 1.0e-2
 
 
@@ -112,6 +112,13 @@ def validate_source(
     or acceptance.get("hand_checkpoint_expansion_authorized") is not True
     or acceptance.get("waist_checkpoint_expansion_authorized") is not False
     or acceptance.get("selected_checkpoint_safety_gate_passed") is not True
+    or acceptance.get("deployment_distribution_covered") is not True
+    or acceptance.get("deployment_accepted") is not False
+    or report.get("contract", {}).get("reach_target_protocol")
+      != "typescript-pregrasp-geometry-top-wrist-target-v1"
+    or report.get("evaluation", {}).get("wrist_position_error_m", {}).get(
+      "initial_maximum", 0.0
+    ) < 0.35
     or not isinstance(selection, dict)
     or selection.get("selected_source") not in ("dagger", "ppo")
     or not isinstance(selected, dict)
@@ -241,6 +248,14 @@ def main() -> None:
       "waist_checkpoint_expansion_authorized": source_acceptance[
         "waist_checkpoint_expansion_authorized"
       ],
+      "deployment_distribution_covered": source_acceptance[
+        "deployment_distribution_covered"
+      ],
+      "training_deployment_accepted": source_acceptance["deployment_accepted"],
+      "initial_wrist_error_maximum_m": source_evaluation[
+        "wrist_position_error_m"
+      ]["initial_maximum"],
+      "target_protocol": source_report["contract"]["reach_target_protocol"],
       "held_out_environment_count": source_evaluation["environment_count"],
       "held_out_success_rate": source_evaluation["success_rate"],
     },
@@ -249,9 +264,9 @@ def main() -> None:
       "bytes": output_path.stat().st_size,
       "sha256": sha256(output_path),
       "runtime": "torchscript_cuda",
-      "input": "hear-workyard-residual-observation-v4",
+      "input": "hear-workyard-whole-body-reach-observation-v5",
       "input_size": OBSERVATION_SIZE,
-      "output": "bounded-upper-body-residual-mean",
+      "output": "bounded-whole-body-reach-mean",
       "output_size": ACTION_SIZE,
       "distribution": "beta_bounded_minus_one_one",
       "deterministic_statistic": "mean",
@@ -269,10 +284,10 @@ def main() -> None:
       "runtime": "onnxruntime",
       "opset": 17,
       "input": "observation",
-      "input_protocol": "hear-workyard-residual-observation-v4",
+      "input_protocol": "hear-workyard-whole-body-reach-observation-v5",
       "input_size": OBSERVATION_SIZE,
       "output": "reach_action",
-      "output_protocol": "bounded-upper-body-residual-mean",
+      "output_protocol": "bounded-whole-body-reach-mean",
       "output_size": ACTION_SIZE,
       "batch_dynamic": True,
     },

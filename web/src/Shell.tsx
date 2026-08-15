@@ -2,6 +2,7 @@ import { useState } from "react";
 import { summarizeFailure } from "./failure-summary";
 import type { RunListItem } from "./types";
 import { UiButton } from "./ui/Button";
+import { CloseIcon } from "./ui/Icons";
 import { runStatusLabel } from "./ui-text";
 
 export function Login(props: {
@@ -83,7 +84,9 @@ export function FailureAlert(props: {
         <p className="failure-headline">{headline}</p>
       </div>
       {props.onClose && (
-        <button type="button" className="failure-close" aria-label="关闭" onClick={props.onClose}>×</button>
+        <button type="button" className="failure-close" aria-label="关闭" onClick={props.onClose}>
+          <CloseIcon />
+        </button>
       )}
     </aside>
   );

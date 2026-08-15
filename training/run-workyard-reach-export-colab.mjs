@@ -13,12 +13,12 @@ import { create } from "tar";
 const options = parseOptions(process.argv.slice(2));
 const workspace = process.cwd();
 const sourceRoot = resolve(options.sourceRoot
-  ?? "artifacts/training/workyard-residual/hear-colab-reach-v15-qualification-20260811");
+  ?? "artifacts/training/workyard-residual/whole-body-v5-formal-20260815");
 const checkpoint = resolve(sourceRoot, "workyard_reach_selected.pt");
 const trainingReport = resolve(sourceRoot, "training-report.json");
 const exporter = resolve("training/export_workyard_reach_policy.py");
 const output = resolve(options.output
-  ?? "artifacts/training/workyard-reach-deployment-v15");
+  ?? "artifacts/training/workyard-reach-candidate-v3");
 const session = options.session
   ?? `hear-workyard-reach-export-${randomUUID().slice(0, 8)}`;
 const distro = options.distro ?? "HEAR-Linux";
@@ -71,11 +71,11 @@ async function main() {
     writeDriver();
     activeSession = session;
     requireSuccess(await colab(["new", "--session", session, "--gpu", "L4"]),
-      "create Colab reach export session");
+      "create Colab whole-body reach export session");
     await uploadBundle();
     requireSuccess(await colab([
       "exec", "--session", session, "--file", toWslPath(driver), "--timeout", "1200"
-    ], false, 1_260_000), "export accepted reach policy");
+    ], false, 1_260_000), "export qualified whole-body reach policy");
     mkdirSync(output, { recursive: true });
     outputCreated = true;
     for (const [name, local] of Object.entries(outputs)) {
@@ -126,11 +126,20 @@ function assertInputs() {
   const selected = report.training?.checkpoint_selection?.selected_checkpoint;
   if (report.protocol !== "hear-workyard-residual-run-v4"
     || report.mode !== "train"
+    || report.contract?.protocol
+      !== "hear-workyard-whole-body-reach-training-contract-v5"
+    || report.contract?.observation_size !== 246
+    || report.contract?.action_size !== 29
     || report.acceptance?.phase_one_accepted !== true
+    || report.acceptance?.deployment_distribution_covered !== true
+    || report.acceptance?.deployment_accepted !== false
+    || report.contract?.reach_target_protocol
+      !== "typescript-pregrasp-geometry-top-wrist-target-v1"
+    || report.evaluation?.wrist_position_error_m?.initial_maximum < 0.35
     || selected?.file !== "workyard_reach_selected.pt"
     || selected?.bytes !== readFileSync(checkpoint).byteLength
     || selected?.sha256 !== sha256(checkpoint)) {
-    throw new Error("Reach export source is not the accepted v15 checkpoint");
+    throw new Error("Reach export source is not a qualified whole-body checkpoint");
   }
 }
 
@@ -209,15 +218,27 @@ async function uploadBundle() {
 
 function validateOutputs() {
   const report = JSON.parse(readFileSync(outputs.report, "utf8"));
-  if (report.protocol !== "hear-frozen-reach-policy-export-v1"
+  if (report.protocol !== "hear-whole-body-reach-policy-candidate-v3"
     || report.source?.checkpoint_sha256 !== sha256(checkpoint)
+    || report.source?.deployment_distribution_covered !== true
+    || report.source?.training_deployment_accepted !== false
+    || report.source?.initial_wrist_error_maximum_m < 0.35
     || report.source?.held_out_environment_count !== 500
-    || report.source?.held_out_success_rate < 0.99
+    || report.source?.held_out_success_rate < 0.85
     || report.policy?.file !== "workyard_reach.jit.pt"
     || report.policy?.sha256 !== sha256(outputs.jit)
+    || report.policy?.input !== "hear-workyard-whole-body-reach-observation-v5"
+    || report.policy?.input_size !== 246
+    || report.policy?.output !== "bounded-whole-body-reach-mean"
+    || report.policy?.output_size !== 29
     || report.onnx?.file !== "workyard_reach.onnx"
     || report.onnx?.sha256 !== sha256(outputs.onnx)
     || report.onnx?.opset !== 17
+    || report.onnx?.input_protocol
+      !== "hear-workyard-whole-body-reach-observation-v5"
+    || report.onnx?.input_size !== 246
+    || report.onnx?.output_protocol !== "bounded-whole-body-reach-mean"
+    || report.onnx?.output_size !== 29
     || report.validation?.onnx_checker_full !== true
     || report.validation?.maximum_onnx_error > 1e-5) {
     throw new Error("Downloaded reach deployment export failed validation");

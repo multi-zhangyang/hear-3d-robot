@@ -93,6 +93,7 @@ export function completedPhysicalExecution(receipt: HumanoidActionReceipt): bool
   return receipt.accepted && (receipt.action === "execute_humanoid_skill"
     ? receipt.code === "motion_option_succeeded"
       || receipt.code === "navigation_completed"
+      || receipt.code === "recovery_completed"
     : (
     receipt.action === "execute_whole_body_motion"
       ? receipt.code === "motion_option_succeeded"

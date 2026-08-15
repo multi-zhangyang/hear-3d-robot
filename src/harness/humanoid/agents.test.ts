@@ -166,7 +166,7 @@ describe("humanoid agent hierarchy", () => {
   it("gives Motion only active Goal authority instead of Coordinator parameters", () => {
     const rendered = motionInvocationInput({
       run_mode: "mission",
-      coordinator_phase: "plan",
+      autonomy_readiness: "plan",
       active_cycle: { cycle_id: "cycle-7" },
       active_goal: {
         summary: "抓取可见工件",
@@ -235,7 +235,7 @@ describe("humanoid agent hierarchy", () => {
       observed_after_execution: false,
       reason: "no execution" as string | null
     };
-    let coordinatorPhase = "observe_or_plan" as
+    let autonomyReadiness = "observe_or_plan" as
       | "goal_selection"
       | "goal_transition"
       | "complete_satisfied_goal"
@@ -260,7 +260,7 @@ describe("humanoid agent hierarchy", () => {
     });
     const runtime = {
       contextAnchor: () => ({
-        coordinator_phase: coordinatorPhase,
+        autonomy_readiness: autonomyReadiness,
         world_frame: 20,
         world_revision: 20
       }),
@@ -288,7 +288,7 @@ describe("humanoid agent hierarchy", () => {
         return structuredClone(execution);
       },
       cycleCompletionReadiness: () => structuredClone(cycleCompletion),
-      coordinatorPhase: () => coordinatorPhase,
+      autonomyReadiness: () => autonomyReadiness,
       executorDelegationAvailable: () => executorDelegationAvailable,
       goalRetirementDelegationAvailable: () => goalRetirementDelegationAvailable,
       goalTransitionCompletionAvailable: () => goalTransitionCompletionAvailable,
@@ -388,10 +388,10 @@ describe("humanoid agent hierarchy", () => {
       (entry) => entry.name
     );
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
-    coordinatorPhase = "plan";
+    autonomyReadiness = "plan";
     sentryDelegationAvailable = false;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
-    coordinatorPhase = "observe_or_plan";
+    autonomyReadiness = "observe_or_plan";
     sentryDelegationAvailable = true;
     const smuggledMotionParameters = await coordinatorTool(
       "delegate_motion_reference"
@@ -444,11 +444,11 @@ describe("humanoid agent hierarchy", () => {
       tool: "delegate_physics_executor",
       result: {
         accepted: false,
-        code: "coordinator_phase_rejected",
+        code: "autonomy_readiness_rejected",
         automatic_actuation: false
       }
     });
-    coordinatorPhase = "replan_or_retire";
+    autonomyReadiness = "replan_or_retire";
     goalRetirementDelegationAvailable = false;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     const recoverableGoalRetirement = await coordinatorTool(
@@ -470,22 +470,22 @@ describe("humanoid agent hierarchy", () => {
       tool: "delegate_goal_manager",
       result: {
         accepted: false,
-        code: "coordinator_phase_rejected",
+        code: "autonomy_readiness_rejected",
         automatic_actuation: false
       },
-      coordinator_state: { coordinator_phase: "replan_or_retire" }
+      coordinator_state: { autonomy_readiness: "replan_or_retire" }
     });
     goalRetirementDelegationAvailable = true;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
-    coordinatorPhase = "goal_transition";
+    autonomyReadiness = "goal_transition";
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
-    coordinatorPhase = "goal_selection";
+    autonomyReadiness = "goal_selection";
     goalRetirementDelegationAvailable = false;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     goalTransitionCompletionAvailable = true;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     goalTransitionCompletionAvailable = false;
-    coordinatorPhase = "complete_satisfied_goal";
+    autonomyReadiness = "complete_satisfied_goal";
     goalRetirementDelegationAvailable = false;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     const satisfiedGoalCompletion = await coordinatorTool(
@@ -500,7 +500,7 @@ describe("humanoid agent hierarchy", () => {
         physical_execution_required: false
       }
     });
-    coordinatorPhase = "observe_or_plan";
+    autonomyReadiness = "observe_or_plan";
     goalRetirementDelegationAvailable = false;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     executorDelegationAvailable = true;
@@ -536,7 +536,7 @@ describe("humanoid agent hierarchy", () => {
         })]
       }
     });
-    coordinatorPhase = "execute_plan";
+    autonomyReadiness = "execute_plan";
     const validExecutorDelegation = await coordinatorTool(
       "delegate_physics_executor"
     ).invoke(
@@ -569,7 +569,7 @@ describe("humanoid agent hierarchy", () => {
       observed_after_execution: false,
       reason: null
     };
-    coordinatorPhase = "post_execution";
+    autonomyReadiness = "post_execution";
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     const prematureCompletionInput = JSON.stringify({
       summary: "不能跳过执行后感知",
@@ -584,10 +584,10 @@ describe("humanoid agent hierarchy", () => {
       tool: "complete_autonomous_cycle",
       result: {
         accepted: false,
-        code: "coordinator_phase_rejected",
+        code: "autonomy_readiness_rejected",
         automatic_actuation: false
       },
-      coordinator_state: { coordinator_phase: "post_execution" }
+      coordinator_state: { autonomy_readiness: "post_execution" }
     });
     cycleCompletion.observed_after_execution = true;
     expect(JSON.parse(String(await coordinatorTool(
@@ -598,11 +598,11 @@ describe("humanoid agent hierarchy", () => {
     )))).toMatchObject({
       result: {
         accepted: false,
-        code: "coordinator_phase_rejected"
+        code: "autonomy_readiness_rejected"
       },
-      coordinator_state: { coordinator_phase: "post_execution" }
+      coordinator_state: { autonomy_readiness: "post_execution" }
     });
-    coordinatorPhase = "complete_cycle";
+    autonomyReadiness = "complete_cycle";
     executorDelegationAvailable = false;
     expect(await visibleCoordinatorTools()).toEqual(stableCoordinatorToolNames);
     expect(hierarchy.motionPlanner.instructions).toEqual(expect.stringContaining(
@@ -735,7 +735,7 @@ describe("humanoid agent hierarchy", () => {
       finalOutput: JSON.stringify({ status: "satisfied_goal_completed" })
     });
 
-    coordinatorPhase = "observe_or_plan";
+    autonomyReadiness = "observe_or_plan";
     const recall = hierarchy.coordinator.tools.find(
       (entry) => entry.name === "recall_embodied_history"
     );
@@ -794,7 +794,7 @@ describe("humanoid agent hierarchy", () => {
     if (!complete || complete.type !== "function") {
       throw new Error("Cycle completion tool is missing");
     }
-    coordinatorPhase = "complete_cycle";
+    autonomyReadiness = "complete_cycle";
     const output = await complete.invoke(
       new RunContext({ runId: "humanoid-hierarchy-test" }),
       JSON.stringify({
@@ -830,7 +830,7 @@ describe("humanoid agent hierarchy", () => {
     const hierarchy = createHumanoidAgentHierarchy({
       provider,
       runtime: {
-        contextAnchor: () => ({ coordinator_phase: "replan_or_retire" }),
+        contextAnchor: () => ({ autonomy_readiness: "replan_or_retire" }),
         invoke: async (name: string, input: unknown, transactionId: string, agentId: string) => (
           receipt({
             transactionId,
@@ -849,7 +849,7 @@ describe("humanoid agent hierarchy", () => {
           observed_after_execution: false,
           reason: "no execution"
         }),
-        coordinatorPhase: () => "replan_or_retire"
+        autonomyReadiness: () => "replan_or_retire"
       } as never,
       createModel: () => modelStub(),
       createSession: (agentId) => new MemorySession({ sessionId: agentId }),
@@ -887,7 +887,7 @@ describe("humanoid agent hierarchy", () => {
         accepted: true
       },
       coordinator_state: {
-        coordinator_phase: "replan_or_retire"
+        autonomy_readiness: "replan_or_retire"
       }
     });
     expect(filteredAgents).toEqual([]);
@@ -902,7 +902,7 @@ describe("humanoid agent hierarchy", () => {
       provider,
       runtime: delegatedMotionRuntime({
         contextAnchor: () => ({
-          coordinator_phase: "plan",
+          autonomy_readiness: "plan",
           active_cycle: { cycle_id: `cycle-${worldRevision}` },
           planning_tool_state: { world_revision: worldRevision }
         }),
@@ -1188,7 +1188,7 @@ function delegatedMotionRuntime(overrides: Record<string, unknown> = {}) {
       observed_after_execution: false,
       reason: "no execution"
     }),
-    coordinatorPhase: () => "observe_or_plan",
+    autonomyReadiness: () => "observe_or_plan",
     executorDelegationAvailable: () => false,
     goalRetirementDelegationAvailable: () => false,
     sentryDelegationAvailable: () => true,

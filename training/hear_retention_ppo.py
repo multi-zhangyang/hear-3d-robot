@@ -1,7 +1,7 @@
 """HEAR PPO with rollout-aligned analytic-teacher retention.
 
 The Harness grants a policy exactly one bounded Skill action window (currently
-14D reach or 8D hand synergy).  Every learner-visited state in an on-policy
+29D whole-body reach or 8D hand synergy).  Every learner-visited state in an on-policy
 rollout receives its analytic teacher label before the environment is stepped.
 The label is carried inside
 the rollout observation TensorDict under private keys, so RSL-RL's own
@@ -39,6 +39,7 @@ class HearRetentionPPO(PPO):
   teacher_loss_coefficient: float = 0.0
   teacher_maximum_action_std: float = 0.15
   teacher_dispersion_coefficient: float = 1.0
+  teacher_action_mask: torch.Tensor | None = None
 
   @staticmethod
   def construct_algorithm(
@@ -83,6 +84,7 @@ class HearRetentionPPO(PPO):
     loss_coefficient: float,
     maximum_action_std: float,
     dispersion_coefficient: float,
+    action_mask: torch.Tensor | None = None,
   ) -> None:
     """Bind the environment-local analytic teacher after runner construction."""
     if not callable(provider):
@@ -99,10 +101,19 @@ class HearRetentionPPO(PPO):
       or dispersion_coefficient < 0.0
     ):
       raise ValueError("Teacher dispersion coefficient must be finite and non-negative")
+    if action_mask is None:
+      action_mask = torch.ones(
+        self.storage.actions_shape[-1], dtype=torch.bool, device=self.device
+      )
+    else:
+      action_mask = action_mask.to(device=self.device, dtype=torch.bool)
+    if action_mask.shape != (self.storage.actions_shape[-1],) or not action_mask.any():
+      raise ValueError("Rollout teacher action mask must select an actor action slice")
     self.teacher_action_provider = provider
     self.teacher_loss_coefficient = float(loss_coefficient)
     self.teacher_maximum_action_std = float(maximum_action_std)
     self.teacher_dispersion_coefficient = float(dispersion_coefficient)
+    self.teacher_action_mask = action_mask
 
   def act(self, obs: TensorDict) -> torch.Tensor:
     """Sample the learner action and label the same pre-step state."""
@@ -165,6 +176,8 @@ class HearRetentionPPO(PPO):
 
     if self.teacher_action_provider is None:
       raise RuntimeError("Retention PPO has no rollout teacher provider")
+    if self.teacher_action_mask is None:
+      raise RuntimeError("Retention PPO has no rollout teacher action mask")
     if self.actor.is_recurrent or self.critic.is_recurrent:
       raise RuntimeError("HEAR retention PPO does not yet authorize recurrent models")
     if self.rnd is not None or self.symmetry is not None:
@@ -227,8 +240,13 @@ class HearRetentionPPO(PPO):
         teacher_action[teacher_valid],
         reduction="none",
       )
-      teacher_imitation_loss = element_teacher_imitation_loss.mean()
-      policy_action_std = self.actor.output_std[teacher_valid]
+      selected_teacher_loss = element_teacher_imitation_loss[
+        :, self.teacher_action_mask
+      ]
+      teacher_imitation_loss = selected_teacher_loss.mean()
+      policy_action_std = self.actor.output_std[
+        teacher_valid
+      ][:, self.teacher_action_mask]
       teacher_dispersion_penalty = torch.relu(
         policy_action_std - self.teacher_maximum_action_std
       ).square().mean()
@@ -260,6 +278,7 @@ class HearRetentionPPO(PPO):
       mean_policy_action_std += policy_action_std.detach().mean().item()
       mean_teacher_loss_by_action += (
         element_teacher_imitation_loss.detach().mean(dim=0)
+        * self.teacher_action_mask.to(dtype=torch.float32)
       )
 
     num_updates = self.num_learning_epochs * self.num_mini_batches

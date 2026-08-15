@@ -1,0 +1,122 @@
+{
+  "protocol": "hear-g1-getup-training-contract-v1",
+  "task_id": "Hear-G1-Getup-v1",
+  "plant": {
+    "morphology": "unitree-g1-29dof-with-hands",
+    "model": "assets/humanoid/g1/g1_with_hands.xml",
+    "physics_step_seconds": 0.005,
+    "control_step_seconds": 0.02,
+    "actuation": "whole-body-joint-position-pd",
+    "body_joint_count": 29,
+    "hand_behavior": "fixed-open",
+    "source_actuation": "mjlab-unitree-g1-velocity-policy-matched"
+  },
+  "actor": {
+    "observation": {
+      "protocol": "hear-g1-getup-proprioception-v1",
+      "size": 99,
+      "ordered_terms": [
+        ["projected_gravity", 3],
+        ["root_angular_velocity_pelvis", 3],
+        ["root_linear_velocity_pelvis", 3],
+        ["root_height", 1],
+        ["joint_position_relative_neutral", 29],
+        ["joint_velocity", 29],
+        ["previous_normalized_action", 29],
+        ["binary_foot_contact", 2]
+      ],
+      "forbidden_terms": [
+        "reference_motion_id",
+        "reference_pose",
+        "reference_phase",
+        "scripted_trajectory",
+        "reset_pose_category",
+        "curriculum_progress",
+        "agent_state",
+        "skill_plan"
+      ]
+    },
+    "action": {
+      "protocol": "hear-g1-getup-joint-target-v1",
+      "size": 29,
+      "range": [-1.0, 1.0],
+      "mapping": "neutral_piecewise_soft_joint_limits",
+      "distribution": "beta_bounded_minus_one_one"
+    }
+  },
+  "reset_distribution": {
+    "states": [
+      "standing",
+      "crouched",
+      "prone",
+      "supine",
+      "left_side",
+      "right_side",
+      "intermediate_ground_contact"
+    ],
+    "randomization": [
+      "root_yaw",
+      "root_pose_noise",
+      "joint_pose_noise",
+      "initial_root_velocity",
+      "initial_joint_velocity",
+      "friction",
+      "actuator_strength",
+      "interval_push"
+    ]
+  },
+  "curriculum": {
+    "protocol": "humanup-inspired-two-stage-v1",
+    "feasibility": {
+      "state_initialization": "crouched-to-full-ground-distribution",
+      "vertical_assistance_newtons_initial": 120.0,
+      "vertical_assistance_newtons_final": 0.0,
+      "dense_rewards": [
+        "root_height_progress",
+        "torso_height_progress",
+        "upright",
+        "foot_support",
+        "stable_standing"
+      ]
+    },
+    "robustness": {
+      "begins_at_progress": 0.35,
+      "regularizers": [
+        "action_rate",
+        "joint_velocity",
+        "actuator_effort",
+        "impact",
+        "bilateral_symmetry",
+        "joint_limits"
+      ]
+    },
+    "deployment_assistance": 0.0
+  },
+  "success": {
+    "continuous_control_steps": 20,
+    "root_height_minimum_m": 0.7,
+    "projected_upright_minimum": 0.9,
+    "requires_both_feet": true,
+    "root_linear_speed_maximum_m_s": 0.35,
+    "root_angular_speed_maximum_rad_s": 0.5,
+    "joint_speed_maximum_rad_s": 1.5
+  },
+  "deployment_gate": {
+    "minimum_episode_count": 500,
+    "minimum_overall_success_rate": 0.8,
+    "minimum_prone_success_rate": 0.75,
+    "minimum_supine_success_rate": 0.75,
+    "minimum_side_success_rate": 0.75,
+    "maximum_median_recovery_seconds": 12.0,
+    "maximum_p95_recovery_seconds": 15.0,
+    "minimum_stable_exit_rate": 0.75,
+    "non_finite_action_count": 0
+  },
+  "harness_boundary": {
+    "entry": "fallen-and-stabilize-skill",
+    "authority": "recovery-expert-until-continuous-stable-standing",
+    "handoff_seconds": 0.4,
+    "llm_control_frequency_hz": 0,
+    "policy_control_frequency_hz": 50
+  }
+}

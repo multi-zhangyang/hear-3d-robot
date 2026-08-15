@@ -1,5 +1,10 @@
 # HEAR Agent Harness v2
 
+> Historical design only. This Coordinator-based runtime is retired and is
+> not imported by the production mission runner. The authoritative design is
+> [Neural Hierarchy V3](neural-hierarchy-v3.md); V2 remains solely to explain
+> legacy run/manifest migration and earlier training decisions.
+
 ## Product thesis
 
 HEAR is a hierarchical Agent Harness for an autonomous humanoid. The Harness

@@ -1,4 +1,8 @@
 import type { Scenario, Vec3 } from "../../domain/schema.js";
+import {
+  HUMANOID_RECOVERY_CONTROL_STEP_SECONDS,
+  HUMANOID_RECOVERY_WINDOW_SECONDS
+} from "../../domain/humanoid-policy.js";
 import type { ScenarioChunkDeltaState } from "../../domain/scenario-chunk-delta-schema.js";
 import {
   NavigationPlanningError,
@@ -65,6 +69,12 @@ import {
   type HumanoidAuthorityIdentity
 } from "./authority-state.js";
 import { HumanoidMotionExecution } from "./motion-execution.js";
+import { HumanoidRecoveryExecution } from "./recovery-execution.js";
+import {
+  HumanoidRecoveryPlanSchema,
+  humanoidRecoveryContractSha256,
+  type HumanoidRecoveryPlan
+} from "./recovery-execution-contract.js";
 import {
   HumanoidNavigationExecution,
   carryNavigationFailure,
@@ -117,6 +127,7 @@ import type {
   HumanoidWorldOptions,
   HumanoidWorldScenarioSynchronizationReceipt,
   HumanoidWorldSnapshot,
+  HumanoidRecoveryPlanReceipt,
   NavigationPlanReceipt,
   WholeBodyCandidatePlanReceipt,
   WholeBodyPlanReceipt
@@ -209,6 +220,7 @@ export type {
   HumanoidWorldOptions,
   HumanoidWorldScenarioSynchronizationReceipt,
   HumanoidWorldSnapshot,
+  HumanoidRecoveryPlanReceipt,
   NavigationPlanReceipt,
   WholeBodyCandidatePlanReceipt,
   WholeBodyPlanReceipt
@@ -871,6 +883,153 @@ export class HumanoidWorld {
     };
   }
 
+  async planHumanoidRecovery(
+    rawPlan: HumanoidRecoveryPlan,
+    options: WholeBodyMotionPlanningOptions = {}
+  ): Promise<HumanoidRecoveryPlanReceipt> {
+    const recovery = HumanoidRecoveryPlanSchema.parse(rawPlan);
+    const context = await this.#authority.capture(() => {
+      if (this.#motions.has(recovery.id)) {
+        throw new Error(`Duplicate humanoid recovery plan: ${recovery.id}`);
+      }
+      const identity = options.skillCallIdentity;
+      const recoveryIdentity = identity?.runtimeKind === "semantic_skill"
+        && identity.skillId === "stabilize"
+        && identity.invocation?.skill === "stabilize"
+        && identity.phase === "recover_support";
+      if (!recoveryIdentity) {
+        throw new Error(
+          "Humanoid recovery is only available to stabilize.recover_support"
+        );
+      }
+      const descriptor = this.#simulation.controllerDescriptor();
+      if (Math.abs(descriptor.controlStepSeconds
+        - HUMANOID_RECOVERY_CONTROL_STEP_SECONDS) > 1e-12) {
+        throw new Error(
+          "Humanoid recovery controller rate does not match its execution contract"
+        );
+      }
+      if (!descriptor.learnedPolicy?.capabilities.includes("whole_body_recovery")) {
+        throw new Error(
+          "Humanoid recovery requires an installed whole_body_recovery controller"
+        );
+      }
+      const interrupt = recovery.contract.safetyInterrupt;
+      if (interrupt.status !== "acknowledged"
+        || interrupt.world_revision > this.#worldRevision) {
+        throw new Error(
+          "Humanoid recovery requires an acknowledged safety interrupt from this world"
+        );
+      }
+      return {
+        planning: this.#captureMotionPlanningContext(),
+        controlStepSeconds: descriptor.controlStepSeconds
+      };
+    });
+    const createdRevision = context.planning.worldRevision;
+    const expiresRevision = this.#planExpiryRevision(createdRevision);
+    const durationSeconds = HUMANOID_RECOVERY_WINDOW_SECONDS;
+    const markerPlan = HumanoidMotionPlanSchema.parse({
+      id: recovery.id,
+      intent: "Recover upright support and return authority to the body controller",
+      duration_seconds: durationSeconds,
+      contact_constraints: recovery.contract.authorizedContacts,
+      keyframes: [
+        { at_seconds: 0 },
+        { at_seconds: durationSeconds }
+      ]
+    });
+    const intentSha256 = humanoidMotionIntentSha256(markerPlan);
+    const artifact = {
+      version: 1 as const,
+      protocol: "humanoid-motion-v1" as const,
+      generator: "humanoid-recovery-contract-marker-v1",
+      controlStepSeconds: context.controlStepSeconds,
+      durationSeconds,
+      frames: [{
+        atSeconds: durationSeconds,
+        reference: serializeHumanoidReference(context.planning.baseline)
+      }]
+    };
+    await this.#authority.capture(() => {
+      if (!humanoidPlanIntentIsActive(this.#worldRevision, expiresRevision)) {
+        throw new Error("Humanoid recovery planning exceeded its intent lease");
+      }
+      if (this.#worldRevision !== createdRevision) {
+        throw new Error("Humanoid recovery planning lost its physical admission state");
+      }
+      if (this.#motions.has(recovery.id)) {
+        throw new Error(`Duplicate humanoid recovery plan: ${recovery.id}`);
+      }
+      const stored: StoredHumanoidMotionPlan = {
+        plan: structuredClone(markerPlan),
+        recoveryContract: structuredClone(recovery.contract),
+        skillCallIdentity: structuredClone(options.skillCallIdentity!),
+        artifact: structuredClone(artifact),
+        rollout: null,
+        retainTerminalJointTracking: false,
+        createdRevision,
+        validatedRevision: createdRevision,
+        validatedStateSha256: context.planning.stateSha256,
+        expiresRevision,
+        intentSha256,
+        revalidationCount: 0,
+        terminal: null,
+        option: null,
+        carriedObjectBindings: structuredClone(
+          context.planning.carriedObjectBindings
+        ),
+        carriedObjectTaskSpaceTargets: structuredClone(
+          context.planning.carriedObjectTaskSpaceTargets
+        ),
+        carriedObjectContinuation: null,
+        carriedObjectUnauthorizedContacts: [],
+        progress: {
+          nextFrameIndex: 0,
+          satisfiedContactKeys: [],
+          satisfiedContactEvidenceSha256: humanoidMotionContactEvidenceSha256({
+            planId: recovery.id,
+            intentSha256,
+            artifactSha256: humanoidMotionArtifactSha256(artifact),
+            nextFrameIndex: 0,
+            satisfiedContactKeys: []
+          }),
+          driftStreak: 0,
+          lastDrift: null,
+          failure: null,
+          recovery: {
+            stableSteps: 0,
+            handoffSteps: 0,
+            recoveryImplementation: null,
+            handoffStarted: false,
+            handoffCompleted: false,
+            previousTotalContactForceN: null
+          }
+        }
+      };
+      this.#motions.set(recovery.id, stored);
+      this.#planRegistryEpoch += 1;
+      stored.validatedStateSha256 = this.#authorityStateSha256();
+    });
+    return {
+      accepted: true,
+      planId: recovery.id,
+      createdRevision,
+      expiresRevision,
+      intentSha256,
+      contractSha256: humanoidRecoveryContractSha256(recovery.contract),
+      channels: [
+        "locomotion",
+        "left_leg",
+        "right_leg",
+        "torso",
+        "left_arm",
+        "right_arm"
+      ],
+      contract: structuredClone(recovery.contract)
+    };
+  }
+
   async planWholeBodyMotionCandidates(
     rawBatch: HumanoidMotionCandidateBatch,
     options: WholeBodyMotionPlanningOptions = {}
@@ -1051,6 +1210,236 @@ export class HumanoidWorld {
         validation: candidate.result.validation
       }))
     };
+  }
+
+  async executeHumanoidRecovery(
+    planId: string,
+    frameSink?: HumanoidFrameSink,
+    options: HumanoidExecutionOptions = {}
+  ): Promise<HumanoidExecutionReceipt> {
+    const initial = await this.#authority.capture(() => {
+      const stored = this.#motions.get(planId);
+      return {
+        stored,
+        authority: this.#authorityIdentity(),
+        terminalReceipt: stored?.terminal
+          ? humanoidPlanTerminalReceipt(stored.terminal, this.snapshot())
+          : null
+      };
+    });
+    const stored = initial.stored;
+    if (!stored?.recoveryContract) {
+      throw new Error(`Unknown humanoid recovery plan: ${planId}`);
+    }
+    const recoveryContract = stored.recoveryContract;
+    if (initial.terminalReceipt) return initial.terminalReceipt;
+    const expectedRevision = stored.validatedRevision
+      + stored.progress.nextFrameIndex;
+    if (expectedRevision !== initial.authority.revision) {
+      return this.#authority.capture(() => this.#finalizeMotionPlan(
+        stored,
+        this.#receipt(false, "plan_stale", 0, {
+          reason: `Humanoid recovery is stale: expected_revision=${expectedRevision}, `
+            + `world_revision=${this.#worldRevision}`
+        }),
+        options.retainTerminal ?? false
+      ));
+    }
+    const admission: HumanoidAuthorityIdentity = {
+      revision: expectedRevision,
+      stateSha256: initial.authority.stateSha256
+    };
+    const skillEvents = stored.skillCallIdentity?.runtimeKind === "semantic_skill"
+      ? options.skillEventStream ?? new HumanoidSkillEventStream(
+          stored.skillCallIdentity,
+          options.skillEventSink
+        )
+      : null;
+    let execution: HumanoidRecoveryExecution | undefined;
+    let skillAcceptedEmitted = false;
+    let handle: HumanoidAuthorityCommandHandle<HumanoidExecutionReceipt>;
+    try {
+      handle = await this.#authority.submit({
+        id: `recovery:${planId}`,
+        source: "motion",
+        admission,
+        ...(frameSink ? { frameSink } : {}),
+        admit: () => {
+          if (this.#motions.get(planId) !== stored) {
+            throw new Error(`Humanoid recovery plan became unavailable: ${planId}`);
+          }
+          const expected = stored.validatedRevision
+            + stored.progress.nextFrameIndex;
+          if (expected !== this.#worldRevision) {
+            throw new Error(
+              `Humanoid recovery plan is stale: expected_revision=${expected}, `
+              + `world_revision=${this.#worldRevision}`
+            );
+          }
+          this.#stationKeepingAnchor = null;
+          execution = new HumanoidRecoveryExecution({
+            stored,
+            reference: this.#reference,
+            initialSnapshot: this.#simulation.snapshot(),
+            ...(options.policyFrameSink
+              ? { policyFrameSink: options.policyFrameSink }
+              : {}),
+            ...(options.skillWindow ? { skillWindow: options.skillWindow } : {})
+          });
+        },
+        step: async () => {
+          options.signal?.throwIfAborted();
+          if (!execution) throw new Error("Humanoid recovery was not admitted");
+          if (!skillAcceptedEmitted && skillEvents && stored.skillCallIdentity) {
+            await skillEvents.accepted(humanoidSkillStatus({
+              identity: stored.skillCallIdentity,
+              state: "accepted",
+              evidence: execution.skillProgressEvidence(),
+              snapshot: this.snapshot()
+            }));
+            skillAcceptedEmitted = true;
+          }
+          await this.#ensurePhysicalRegion();
+          const step = await execution.step(
+            this.#simulation,
+            {
+              worldFrame: this.#frame,
+              worldRevision: this.#worldRevision
+            },
+            (snapshot) => {
+              this.#commitFrameState({ motionPlanId: planId });
+              this.#observeGraspFrame(this.#frame, snapshot);
+              this.#observeCarriedObjectFrame(snapshot);
+            }
+          );
+          this.#reference = execution.reference;
+          if (step.snapshot) {
+            const physicalSafety = storedMotionPhysicalSafety(stored);
+            if (physicalSafety) {
+              this.#physicalSafety = { planId, evidence: physicalSafety };
+            }
+          }
+          if (!step.done) {
+            const snapshot = this.snapshot();
+            await options.persistenceSink?.(this.#capturePersistenceState(snapshot));
+            if (skillEvents && stored.skillCallIdentity
+              && !options.deferSkillProgress) {
+              await skillEvents.progress(humanoidSkillStatus({
+                identity: stored.skillCallIdentity,
+                state: "executing",
+                evidence: execution.skillProgressEvidence(),
+                snapshot
+              }));
+            }
+            return {
+              ...(frameSink && !options.persistenceSink ? { snapshot } : {}),
+              done: false
+            };
+          }
+          const result = execution.result();
+          this.#reference = releaseReferenceTracking(result.reference);
+          const physicalSafety = result.physicalSafety
+            ?? storedMotionPhysicalSafety(stored);
+          const evidence = execution.skillProgressEvidence();
+          const receipt = this.#receipt(
+            result.completed,
+            result.completed ? "recovery_completed" : "recovery_failed",
+            result.frames,
+            {
+              ...(physicalSafety ? { physical_safety: physicalSafety } : {}),
+              recovery: {
+                contract_sha256: humanoidRecoveryContractSha256(
+                  recoveryContract
+                ),
+                safety_interrupt_id:
+                  recoveryContract.safetyInterrupt.interrupt_id,
+                recovery_implementation: result.recoveryImplementation,
+                stable_steps: evidence.stableSteps,
+                required_stable_steps: recoveryContract.stableSteps,
+                handoff_steps: result.handoffSteps,
+                required_handoff_steps: recoveryContract.handoffSteps,
+                handoff_completed: result.completed,
+                failure: result.failure
+              }
+            }
+          );
+          if (stored.skillCallIdentity && !options.deferSkillControllerOutcome) {
+            this.#simulation.recordControllerSkillOutcome({
+              protocol: "humanoid-controller-skill-outcome-v1",
+              identity: stored.skillCallIdentity,
+              outcome: result.completed ? "succeeded" : "failed",
+              terminalReason: receipt.code
+            });
+            receipt.finalSnapshot = this.snapshot();
+            receipt.detail.controller_routing = {
+              execution: receipt.finalSnapshot.robot.controllerExecution?.routing
+                ? structuredClone(
+                    receipt.finalSnapshot.robot.controllerExecution.routing
+                  )
+                : null,
+              capability_evidence: [
+                ...this.#simulation.controllerCapabilityEvidence()
+              ]
+            };
+          }
+          const terminalStatus = stored.skillCallIdentity
+            ? humanoidTerminalSkillStatus({
+                identity: stored.skillCallIdentity,
+                receipt,
+                evidence,
+                snapshot: this.snapshot()
+              })
+            : null;
+          const finalized = this.#finalizeMotionPlan(
+            stored,
+            terminalStatus ? withHumanoidSkillStatus(receipt, terminalStatus) : receipt,
+            options.retainTerminal ?? false
+          );
+          if (step.snapshot) {
+            await options.persistenceSink?.(this.#capturePersistenceState());
+          }
+          if (skillEvents && terminalStatus && !options.deferSkillTerminal) {
+            await skillEvents.terminal(
+              terminalStatus.state === "succeeded" ? "succeeded" : "failed",
+              terminalStatus
+            );
+          }
+          return {
+            ...(step.snapshot && frameSink && !options.persistenceSink
+              ? { snapshot: finalized.finalSnapshot }
+              : {}),
+            done: true,
+            result: finalized
+          };
+        }
+      });
+    } catch (error) {
+      if (!(error instanceof HumanoidAuthorityAdmissionError)) throw error;
+      return this.#authority.capture(() => this.#finalizeMotionPlan(
+        stored,
+        this.#receipt(false, "plan_stale", 0, { reason: error.message }),
+        options.retainTerminal ?? false
+      ));
+    }
+    try {
+      return await this.#driveAuthorityCommand(handle, options);
+    } catch (error) {
+      if (skillEvents && stored.skillCallIdentity && skillAcceptedEmitted) {
+        await skillEvents.terminal("interrupted", humanoidSkillStatus({
+          identity: stored.skillCallIdentity,
+          state: "interrupted",
+          evidence: execution?.skillProgressEvidence()
+            ?? storedMotionSkillEvidence(stored),
+          snapshot: this.snapshot(),
+          failure: {
+            code: "execution_interrupted",
+            detail: error instanceof Error ? error.message : String(error)
+          },
+          recoverability: "retry_skill"
+        }));
+      }
+      throw error;
+    }
   }
 
   async executeWholeBodyMotion(
@@ -1930,6 +2319,56 @@ export class HumanoidWorld {
       remainingDistance: validation.remainingDistance,
       carry: navigationCarryReceipt(context.carriedObjectBindings)
     };
+  }
+
+  /**
+   * Read-only Goal grounding for a requested robot base destination. This
+   * checks the complete NavMesh route and current dynamic obstacles without
+   * registering a route or acquiring physical write authority.
+   */
+  async assessNavigationTarget(target: Vec3): Promise<{
+    accepted: boolean;
+    worldRevision: number;
+    requestedTarget: Vec3;
+    resolvedTarget: Vec3 | null;
+    projectionDistance: number | null;
+    pathDistance: number | null;
+    reason: string | null;
+  }> {
+    const context = await this.#authority.capture(() => (
+      this.#captureNavigationPlanningContext()
+    ));
+    try {
+      const plan = await this.#navigation.plan(
+        context.start,
+        target,
+        context.obstacles
+      );
+      return {
+        accepted: true,
+        worldRevision: context.worldRevision,
+        requestedTarget: { ...target },
+        resolvedTarget: { ...plan.resolvedTarget },
+        projectionDistance: plan.projectionDistance,
+        pathDistance: plan.distance,
+        reason: null
+      };
+    } catch (error) {
+      return {
+        accepted: false,
+        worldRevision: context.worldRevision,
+        requestedTarget: { ...target },
+        resolvedTarget: error instanceof NavigationPlanningError
+          && error.projectedTarget
+          ? { ...error.projectedTarget }
+          : null,
+        projectionDistance: error instanceof NavigationPlanningError
+          ? error.projectionDistance ?? null
+          : null,
+        pathDistance: null,
+        reason: error instanceof Error ? error.message : String(error)
+      };
+    }
   }
 
   async executeNavigation(
@@ -3302,6 +3741,23 @@ function humanoidSkillStatus(input: {
 function storedMotionSkillEvidence(
   stored: StoredHumanoidMotionPlan
 ): HumanoidSkillProgressEvidence {
+  if (stored.recoveryContract && stored.progress.recovery) {
+    const contract = stored.recoveryContract;
+    const recovery = stored.progress.recovery;
+    return {
+      elapsedRatio: unitRatio(
+        stored.progress.nextFrameIndex / contract.maximumSteps
+      ),
+      physicalCompletionRatio: unitRatio((
+        Math.min(recovery.stableSteps, contract.stableSteps)
+        + Math.min(recovery.handoffSteps, contract.handoffSteps)
+      ) / (contract.stableSteps + contract.handoffSteps)),
+      satisfiedPredicateRatio: recovery.handoffCompleted ? 1 : 0,
+      stableSteps: recovery.stableSteps,
+      requiredStableSteps: contract.stableSteps,
+      confidence: recovery.recoveryImplementation === null ? 0 : 1
+    };
+  }
   const frameLimit = stored.option
     ? stored.option.certificate.validated_frame_limit
     : stored.artifact.frames.length;
@@ -3396,6 +3852,9 @@ function terminalSkillFailureDetail(
   receipt: HumanoidExecutionReceipt
 ): string | null {
   if (receipt.detail.reason?.trim()) return receipt.detail.reason;
+  if (receipt.detail.recovery?.failure?.detail.trim()) {
+    return receipt.detail.recovery.failure.detail;
+  }
   const failure = receipt.detail.failures?.[0];
   if (!failure) return null;
   return "message" in failure && failure.message?.trim()
@@ -3407,9 +3866,16 @@ function humanoidSkillRecoverability(
   receipt: HumanoidExecutionReceipt
 ): HumanoidEmbodiedSkillStatus["recoverability"] {
   const failureCode = receipt.detail.failures?.[0]?.code;
+  const recoveryFailureCode = receipt.detail.recovery?.failure?.code;
   const reason = receipt.detail.reason ?? "";
   if (failureCode === "fallen"
     || failureCode === "environment_contact"
+    || recoveryFailureCode === "unauthorized_scene_contact"
+    || recoveryFailureCode === "contact_force_limit"
+    || recoveryFailureCode === "contact_impact_limit"
+    || recoveryFailureCode === "joint_velocity_limit"
+    || recoveryFailureCode === "joint_limit_violation"
+    || recoveryFailureCode === "numerical_instability"
     || reason.includes("carried_object_collision")
     || reason.includes("carried_grasp_lost")) {
     return "safety_stop";

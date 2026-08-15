@@ -15,6 +15,7 @@ import type { HumanoidGroundingReceipt } from
 import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
 import type { NeuralRolloutExecutionAdmission } from
   "../../domain/action-execution-ledger.js";
+import type { NeuralSafetyInterrupt } from "../../domain/neural-hierarchy.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
 import {
   HUMANOID_SKILL_CONTRACTS,
@@ -39,6 +40,9 @@ import {
 } from "./actions.js";
 import { MAX_CHECKPOINT_ACTION_RECEIPTS } from "./embodied-memory.js";
 import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
+import {
+  humanoidRecoverySafetyInterruptIsCurrent
+} from "./recovery-safety-authority.js";
 import { normalizeHumanoidMotionCandidateBatchInput } from "./motion-candidate-input.js";
 import { BlockRemovalAuthorityError } from "./block-removal-authority.js";
 import {
@@ -328,6 +332,7 @@ export interface HumanoidActionRuntimeOptions {
     goalEpochId: string;
     invocation: HumanoidSkillInvocation;
   } | undefined;
+  activeRecoverySafetyInterrupt?: () => NeuralSafetyInterrupt | undefined;
   signal?: AbortSignal;
 }
 
@@ -358,6 +363,9 @@ export class HumanoidActionRuntime {
   readonly #activeGoal: HumanoidActionRuntimeOptions["activeGoal"];
   readonly #activeNeuralSkillCommitment: HumanoidActionRuntimeOptions[
     "activeNeuralSkillCommitment"
+  ];
+  readonly #activeRecoverySafetyInterrupt: HumanoidActionRuntimeOptions[
+    "activeRecoverySafetyInterrupt"
   ];
   readonly #neuralHierarchyEpochId: string | undefined;
   readonly #signal: AbortSignal | undefined;
@@ -433,6 +441,7 @@ export class HumanoidActionRuntime {
     this.#requireSkillBinding = options.requireSkillBinding ?? false;
     this.#activeGoal = options.activeGoal;
     this.#activeNeuralSkillCommitment = options.activeNeuralSkillCommitment;
+    this.#activeRecoverySafetyInterrupt = options.activeRecoverySafetyInterrupt;
     this.#neuralHierarchyEpochId = options.neuralHierarchyEpochId;
     this.#signal = options.signal;
     if (options.state !== undefined && options.state !== null) {
@@ -1285,6 +1294,12 @@ export class HumanoidActionRuntime {
     }
     const activeGoal = this.#activeGoal?.();
     const recovery = this.#recoveryPolicyByAgent.get(agentId);
+    const recoveryInterrupt = this.#activeRecoverySafetyInterrupt?.();
+    const safetyRecoveryAuthorized = humanoidSafetyRecoveryAuthorized(
+      recoveryInterrupt,
+      observation,
+      previous.invocation
+    );
     const rebound = bindHumanoidSkill({
       transactionId: previous.transaction_id,
       agentId,
@@ -1296,9 +1311,13 @@ export class HumanoidActionRuntime {
       },
       observation,
       ...(activeGoal ? { activeGoal } : {}),
-      ...(recovery
-        && humanoidRecoverySelectionAccepted(recovery, previous.invocation)
+      ...((recovery
+        && humanoidRecoverySelectionAccepted(recovery, previous.invocation))
+        || safetyRecoveryAuthorized
         ? { recoveryAuthorized: true }
+        : {}),
+      ...(safetyRecoveryAuthorized && recoveryInterrupt
+        ? { recoveryInterrupt }
         : {})
     });
     if (!rebound.accepted) return rebound;
@@ -1576,14 +1595,20 @@ export class HumanoidActionRuntime {
       const activeGoal = this.#activeGoal?.();
       if (activeGoal) {
         const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
+        const recoveryInterrupt = this.#activeRecoverySafetyInterrupt?.();
         const admission = readyBindings.map((binding) => ({
           binding,
           alignment: alignHumanoidSkillToGoal({
             goal: activeGoal,
             invocation: binding.invocation,
             observation,
-            ...(recovery
-              && humanoidRecoverySelectionAccepted(recovery, binding.invocation)
+            ...((recovery
+              && humanoidRecoverySelectionAccepted(recovery, binding.invocation))
+              || humanoidSafetyRecoveryAuthorized(
+                recoveryInterrupt,
+                observation,
+                binding.invocation
+              )
               ? { recoveryAuthorized: true }
               : {})
           })
@@ -1693,6 +1718,12 @@ export class HumanoidActionRuntime {
         }
       }
       const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
+      const recoveryInterrupt = this.#activeRecoverySafetyInterrupt?.();
+      const safetyRecoveryAuthorized = humanoidSafetyRecoveryAuthorized(
+        recoveryInterrupt,
+        observation,
+        request.invocation
+      );
       const activeGoal = this.#activeGoal?.();
       const result = bindHumanoidSkill({
         transactionId: invocation.transactionId,
@@ -1700,9 +1731,13 @@ export class HumanoidActionRuntime {
         request,
         observation,
         ...(activeGoal ? { activeGoal } : {}),
-        ...(recovery
-          && humanoidRecoverySelectionAccepted(recovery, request.invocation)
+        ...((recovery
+          && humanoidRecoverySelectionAccepted(recovery, request.invocation))
+          || safetyRecoveryAuthorized
           ? { recoveryAuthorized: true }
+          : {}),
+        ...(safetyRecoveryAuthorized && recoveryInterrupt
+          ? { recoveryInterrupt }
           : {})
       });
       if (!result.accepted) {
@@ -1714,7 +1749,8 @@ export class HumanoidActionRuntime {
         };
       }
       if (recovery
-        && !humanoidRecoverySelectionAccepted(recovery, result.binding.invocation)) {
+        && !humanoidRecoverySelectionAccepted(recovery, result.binding.invocation)
+        && !safetyRecoveryAuthorized) {
         return {
           accepted: false,
           code: "recovery_skill_selection_required",
@@ -1764,13 +1800,23 @@ export class HumanoidActionRuntime {
       try {
         const activeGoal = this.#activeGoal?.();
         const recovery = this.#recoveryPolicyByAgent.get(invocation.agentId);
+        const recoveryInterrupt = this.#activeRecoverySafetyInterrupt?.();
+        const safetyRecoveryAuthorized = humanoidSafetyRecoveryAuthorized(
+          recoveryInterrupt,
+          observation,
+          binding.invocation
+        );
         plan = planAutonomousHumanoidSkill({
           binding,
           observation,
           ...(activeGoal ? { activeGoal } : {}),
-          ...(recovery
-            && humanoidRecoverySelectionAccepted(recovery, binding.invocation)
+          ...((recovery
+            && humanoidRecoverySelectionAccepted(recovery, binding.invocation))
+            || safetyRecoveryAuthorized
             ? { recoveryAuthorized: true }
+            : {}),
+          ...(safetyRecoveryAuthorized && recoveryInterrupt
+            ? { recoveryInterrupt }
             : {})
         });
       } catch (error) {
@@ -1821,6 +1867,31 @@ export class HumanoidActionRuntime {
                 evidence: candidate.validation.evidence
               }
             }))
+          }
+        };
+      }
+      if (plan.kind === "recovery") {
+        const result = await this.#world.planHumanoidRecovery(plan.plan, {
+          skillCallIdentity: humanoidEmbodiedSkillIdentity(binding)
+        });
+        if (result.accepted) this.#planChannels.set(result.planId, result.channels);
+        return {
+          accepted: result.accepted,
+          code: result.accepted
+            ? "autonomous_skill_recovery_admitted"
+            : "autonomous_skill_recovery_rejected",
+          channels: result.channels,
+          detail: {
+            ...this.#planningSkillDetail(invocation.agentId),
+            automatic_actuation: false,
+            autonomous_plan_kind: "recovery",
+            plan_id: result.planId,
+            created_revision: result.createdRevision,
+            expires_revision: result.expiresRevision,
+            intent_sha256: result.intentSha256,
+            recovery_contract_sha256: result.contractSha256,
+            safety_interrupt_id: plan.plan.contract.safetyInterrupt.interrupt_id,
+            reason: result.reason ?? null
           }
         };
       }
@@ -1901,7 +1972,8 @@ export class HumanoidActionRuntime {
       const planKind = planningReceipt
         ? jsonObject(planningReceipt.detail)?.autonomous_plan_kind
         : undefined;
-      if (planKind !== "motion" && planKind !== "navigation") {
+      if (planKind !== "motion" && planKind !== "navigation"
+        && planKind !== "recovery") {
         return {
           accepted: false,
           code: "autonomous_skill_plan_kind_invalid",
@@ -1912,8 +1984,39 @@ export class HumanoidActionRuntime {
           }
         };
       }
+      if (planKind === "recovery") {
+        const recoveryInterrupt = this.#activeRecoverySafetyInterrupt?.();
+        if (!skill || skill.invocation.skill !== "stabilize"
+          || skill.phase !== "recover_support"
+          || !skill.recovery_interrupt_id
+          || recoveryInterrupt?.interrupt_id !== skill.recovery_interrupt_id
+          || recoveryInterrupt.status !== "acknowledged") {
+          return {
+            accepted: false,
+            code: "recovery_execution_authority_missing",
+            channels: [],
+            detail: {
+              planning_transaction_id: input.planning_transaction_id,
+              plan_id: reference.planId,
+              automatic_actuation: false,
+              reason: "Recovery execution lost its acknowledged physical safety interrupt"
+            }
+          };
+        }
+      }
       const channels = this.#planChannels.get(reference.planId)
-        ?? (planKind === "navigation" ? ["locomotion"] : []);
+        ?? (planKind === "navigation"
+          ? ["locomotion"]
+          : planKind === "recovery"
+            ? [
+                "locomotion",
+                "left_leg",
+                "right_leg",
+                "torso",
+                "left_arm",
+                "right_arm"
+              ]
+            : []);
       if (!this.#world.consumablePlanIds().includes(reference.planId)) {
         this.#planChannels.delete(reference.planId);
         return {
@@ -2039,6 +2142,12 @@ export class HumanoidActionRuntime {
           }
         : planKind === "motion"
         ? await this.#world.executeWholeBodyMotion(
+            executionPlanId,
+            this.#frameSink,
+            options
+          )
+        : planKind === "recovery"
+        ? await this.#world.executeHumanoidRecovery(
             executionPlanId,
             this.#frameSink,
             options
@@ -3960,6 +4069,17 @@ function planningFailureKey(agentId: string, fingerprint: string): string {
   return `${agentId}\0${fingerprint}`;
 }
 
+function humanoidSafetyRecoveryAuthorized(
+  interrupt: NeuralSafetyInterrupt | undefined,
+  observation: HumanoidWorldObservation,
+  invocation: HumanoidSkillInvocation
+): boolean {
+  return invocation.skill === "stabilize"
+    && humanoidRecoverySafetyInterruptIsCurrent(interrupt, {
+      worldRevision: observation.worldRevision
+    });
+}
+
 function planningFailureFingerprint(
   action: HumanoidPlanningActionName,
   agentId: string,
@@ -4091,7 +4211,7 @@ function groundingRejection(input: {
   channels: HumanoidBodyChannel[];
   planningTransactionId: string;
   planId: string;
-  planKind?: "motion" | "navigation";
+  planKind?: "motion" | "navigation" | "recovery";
   planningAction?: HumanoidPlanningActionName;
 }): {
   accepted: false;

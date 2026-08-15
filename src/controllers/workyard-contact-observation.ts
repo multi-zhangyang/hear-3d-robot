@@ -16,11 +16,11 @@ import type {
 } from "../world/humanoid/whole-body-controller.js";
 
 export const WORKYARD_CONTACT_OBSERVATION_PROTOCOL =
-  "hear-workyard-contact-observation-v1";
-export const WORKYARD_CONTACT_OBSERVATION_SIZE = 247;
+  "hear-workyard-contact-observation-v2";
+export const WORKYARD_CONTACT_OBSERVATION_SIZE = 262;
 export const WORKYARD_REACH_OBSERVATION_PROTOCOL =
-  "hear-workyard-residual-observation-v4";
-export const WORKYARD_REACH_OBSERVATION_SIZE = 231;
+  "hear-workyard-whole-body-reach-observation-v5";
+export const WORKYARD_REACH_OBSERVATION_SIZE = 246;
 
 type PolicyVec3 = readonly [x: number, y: number, z: number];
 type PolicyQuaternion = readonly [w: number, x: number, y: number, z: number];
@@ -38,7 +38,7 @@ export interface WorkyardReachObservationInput {
   previousReachAction: ArrayLike<number>;
 }
 
-/** Builds the exact 231D observation shared by reach and contact actors. */
+/** Builds the exact 246D whole-body reach observation. */
 export function encodeWorkyardReachObservation(
   input: WorkyardReachObservationInput,
   metadata: WorkyardContactObservationMetadata
@@ -69,7 +69,7 @@ export function encodeWorkyardReachObservation(
   );
   const reachAction = finiteVector(
     input.previousReachAction,
-    14,
+    HUMANOID_JOINT_NAMES.length,
     "previous reach action"
   );
 
@@ -234,7 +234,7 @@ export function encodeWorkyardReachObservation(
   return reachObservation;
 }
 
-/** Appends the hand policy's two 8D recurrent state terms to frozen reach. */
+/** Appends the hand policy's two 8D recurrent state terms to whole-body reach. */
 export function encodeWorkyardContactObservation(
   input: HumanoidHandSynergyPolicyInput
 ): Float32Array {
@@ -250,8 +250,8 @@ export function encodeWorkyardContactObservation(
   }
   const coordination = input.coordination;
   // MJLab clips the public actor observation group after concatenation.  The
-  // frozen reach actor consumes the raw 231D builder, while the contact actor
-  // was trained on this clipped 247D tensor.
+  // Whole-body reach consumes the raw 246D builder; contact adds 16D hand
+  // coordination/action state and receives the same public observation clip.
   const observation = Float32Array.from([
     ...component.observation.values,
     coordination.left.thumb_opposition,

@@ -5,7 +5,7 @@ import { E2E_RUNS_DIR } from "./e2e-runs.js";
 import { openRecordedOperator } from "./open-recorded-operator.js";
 
 const UPDATE_README_SCREENSHOTS = process.env.HEAR_UPDATE_SCREENSHOTS === "1";
-const DEFERRED_CHUNK = /three~|create-humanoid-stage|WorkspaceView|HumanoidMissionWorkspace|AgentFlowView|ActivityView|RobotTrailView|MissionModal/;
+const DEFERRED_CHUNK = /three~|WorkspaceView|HumanoidMissionWorkspace|AgentFlowView|ActivityView|RobotTrailView|MissionModal/;
 
 test("渲染自主人形世界与实时层级智能体界面", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
@@ -45,23 +45,23 @@ async function assertHumanoidOperator(
     return element instanceof HTMLCanvasElement && element.width > 200 && element.height > 200;
   });
   await expect.poll(() => [...deferredChunks]).toEqual(expect.arrayContaining([
-    expect.stringMatching(/create-humanoid-stage/),
     expect.stringMatching(/HumanoidMissionWorkspace/),
     expect.stringMatching(/WorkspaceView/),
     expect.stringMatching(/three~/)
   ]));
   await expect.poll(() => meshes.size).toBeGreaterThan(20);
+  await expect.poll(() => canvas.getAttribute("data-robot-screen-bounds"))
+    .not.toBeNull();
 
   const hierarchy = page.getByLabel("层级智能体执行状态");
   await expect(hierarchy).toBeVisible();
   const agentChain = hierarchy.locator(".humanoid-agent-chain");
-  for (const name of ["自主协调智能体", "人形感知哨兵", "全身运动参考智能体", "人形物理执行智能体"]) {
-    await expect(agentChain.getByText(name, { exact: true })).toBeVisible();
-  }
+  await expect(agentChain.getByText("执行目标价值管理器", { exact: true })).toBeVisible();
+  await expect(agentChain.locator(":scope > div").first()).toBeVisible();
   await expect(page.getByLabel("人形身体通道")).toContainText("双足运动");
   const physics = page.getByLabel("人形物理状态");
   if (project === "desktop") await expect(physics).toBeVisible();
-  await expect(physics).toContainText("任务约束 · YAHMP · 学习控制 · MuJoCo");
+  await expect(physics).toContainText("ONNX · MuJoCo");
   await expect(page.getByText("左脚", { exact: true })).toBeAttached();
   await expect(page.getByText("右脚", { exact: true })).toBeAttached();
   await expect(page.getByText("直立", { exact: true })).toBeAttached();
@@ -87,7 +87,7 @@ async function assertHumanoidOperator(
 
   const hotbar = page.getByRole("navigation", { name: "工作区" });
   await expect(hotbar).toBeVisible();
-  for (const name of ["世界", "智能体流", "行动历程", "输出"]) {
+  for (const name of ["仿真", "层级", "动作", "日志"]) {
     await expect(hotbar.getByRole("button", { name, exact: true })).toBeVisible();
   }
   if (project === "mobile") {
@@ -113,9 +113,9 @@ async function assertHumanoidOperator(
   expect(hotbarLayout).not.toBeNull();
   expect(canvasLayout!.y + composition.bottom).toBeLessThan(hotbarLayout!.y - 6);
   const panels = [
-    ["2", "智能体流面板", /AgentFlowView/, "实时层级智能体流", "hierarchy.png"],
-    ["3", "行动历程面板", /RobotTrailView/, "机器人行动历程", "actions.png"],
-    ["4", "智能体输出面板", /ActivityView/, "模型输出", "logs.png"]
+    ["2", "层级面板", /AgentFlowView/, "实时层级智能体流", "hierarchy.png"],
+    ["3", "动作面板", /RobotTrailView/, "机器人行动历程", "actions.png"],
+    ["4", "日志面板", /ActivityView/, "模型输出", "logs.png"]
   ] as const;
   for (const [key, region, deferred, content, screenshot] of panels) {
     await page.keyboard.press(key);
@@ -124,10 +124,20 @@ async function assertHumanoidOperator(
     await expect.poll(() => [...deferredChunks]).toEqual(expect.arrayContaining([
       expect.stringMatching(deferred)
     ]));
-    if (project === "desktop") await captureReadmeScreenshot(page, screenshot);
+    if (project === "desktop") {
+      if (screenshot === "hierarchy.png") {
+        const executorNode = page.locator(
+          '.react-flow__node[data-id="humanoid-executor"]'
+        );
+        await executorNode.click();
+        await expect(executorNode.locator(".neural-graph-node"))
+          .toHaveClass(/selected/);
+      }
+      await captureReadmeScreenshot(page, screenshot);
+    }
     await page.keyboard.press("Escape");
   }
-  await expect(hotbar.getByRole("button", { name: "世界" })).toHaveAttribute("aria-current", "page");
+  await expect(hotbar.getByRole("button", { name: "仿真" })).toHaveAttribute("aria-current", "page");
   await captureReadmeScreenshot(page, project === "desktop" ? "mission.png" : "mobile.png");
 
   const graphics = await canvas.evaluate((element): {

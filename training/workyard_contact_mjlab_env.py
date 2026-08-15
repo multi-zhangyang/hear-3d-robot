@@ -1,10 +1,10 @@
 """HEAR phase-two contact/grasp environment.
 
-The accepted 14D reach policy is a frozen Harness child skill.  A separate 8D
-hand-synergy actor receives gradient authority only after the typed contact
-capability becomes active.  The resulting physical command is a 22D logical
-composition while the learner itself cannot alter reach, locomotion, waist, or
-the inactive hand.
+The qualified 29D whole-body reach policy is a frozen Harness child skill. A
+separate 8D hand-synergy actor receives gradient authority only after the typed
+contact capability becomes active. The resulting physical command is a 37D
+logical composition while the learner itself cannot alter reach, balance, the
+inactive hand, or either frozen checkpoint.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
 
-TASK_ID: Final = "Hear-Workyard-Frozen-Reach-Hand-Synergy-G1-v1"
+TASK_ID: Final = "Hear-Workyard-Whole-Body-Reach-Hand-Synergy-G1-v2"
 REACH_OBSERVATION_SIZE: Final = reach.OBSERVATION_SIZE
 HAND_OBSERVATION_SIZE: Final = REACH_OBSERVATION_SIZE + 16
 HAND_ACTION_SIZE: Final = 8
@@ -46,6 +46,7 @@ MAXIMUM_NUMERICALLY_STABLE_QVEL: Final = 250.0
 MAXIMUM_NUMERICALLY_STABLE_QACC: Final = 1.0e6
 CONTACT_STAGE_INDEX: Final = base.TEACHER_STAGES.index("contact")
 GRASP_STAGE_INDEX: Final = base.TEACHER_STAGES.index("grasp")
+HAND_CONTACT_SOLREF_TIME_CONSTANT_S: Final = 0.04
 HAND_SYNERGY_NAMES: Final = (
   "left_opposition",
   "left_thumb",
@@ -56,12 +57,12 @@ HAND_SYNERGY_NAMES: Final = (
   "right_index",
   "right_middle",
 )
-REACH_POLICY_PROTOCOL: Final = "hear-frozen-reach-policy-export-v1"
+REACH_POLICY_PROTOCOL: Final = "hear-whole-body-reach-policy-deployment-v3"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REACH_POLICY_ROOT = (
-  REPOSITORY_ROOT / "artifacts" / "training" / "workyard-reach-frozen-v15"
+  REPOSITORY_ROOT / "artifacts" / "training" / "workyard-reach-deployment-v3"
 )
-DEFAULT_REACH_POLICY_JIT = DEFAULT_REACH_POLICY_ROOT / "workyard_reach_selected.jit.pt"
+DEFAULT_REACH_POLICY_JIT = DEFAULT_REACH_POLICY_ROOT / "workyard_reach.jit.pt"
 DEFAULT_REACH_POLICY_REPORT = DEFAULT_REACH_POLICY_ROOT / "reach-policy-report.json"
 HAND_ENDPOINTS: Final = (
   base.HAND_JOINT_LIMITS[0][0],
@@ -113,12 +114,23 @@ class FrozenReachPolicy:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     source = report.get("source")
     policy = report.get("policy")
+    deployment = report.get("deployment")
     if (
       report.get("protocol") != REACH_POLICY_PROTOCOL
       or not isinstance(source, dict)
+      or not isinstance(deployment, dict)
+      or deployment.get("protocol")
+        != "hear-typescript-mujoco-reach-deployment-gate-v1"
+      or deployment.get("accepted") is not True
+      or deployment.get("controller_mode") != "learned_policy_only"
+      or deployment.get("terminal_assistance_step_count") != 0
+      or deployment.get("minimum_support_margin_m", float("-inf")) < -0.04
+      or deployment.get("maximum_foot_planar_displacement_m", float("inf")) > 0.08
+      or deployment.get("maximum_foot_slip_speed_m_s", float("inf")) > 0.20
+      or deployment.get("double_support_loss_rate_maximum", float("inf")) > 0.10
+      or deployment.get("no_foot_contact_rate_maximum", float("inf")) > 0.01
       or source.get("phase_one_accepted") is not True
       or source.get("hand_checkpoint_expansion_authorized") is not True
-      or source.get("waist_checkpoint_expansion_authorized") is not False
       or source.get("held_out_environment_count", 0) < 500
       or source.get("held_out_success_rate", 0.0) < 0.85
       or not isinstance(policy, dict)
@@ -126,7 +138,10 @@ class FrozenReachPolicy:
       or policy.get("bytes") != jit_path.stat().st_size
       or policy.get("sha256") != reach._sha256(jit_path)
       or policy.get("runtime") != "torchscript_cuda"
+      or policy.get("input")
+        != "hear-workyard-whole-body-reach-observation-v5"
       or policy.get("input_size") != REACH_OBSERVATION_SIZE
+      or policy.get("output") != "bounded-whole-body-reach-mean"
       or policy.get("output_size") != reach.ACTION_SIZE
       or policy.get("batch_dynamic") is not True
       or policy.get("gradient_parameter_count") != 0
@@ -148,7 +163,7 @@ class FrozenReachPolicy:
     if self.gradient_parameter_count != 0:
       raise RuntimeError("Frozen reach policy retained gradient authority")
     self.identity = {
-      "protocol": "hear-frozen-qualified-reach-runtime-v1",
+      "protocol": "hear-frozen-qualified-whole-body-reach-runtime-v2",
       "jit_sha256": policy["sha256"],
       "report_sha256": reach._sha256(report_path),
       "source_checkpoint_sha256": source["checkpoint_sha256"],
@@ -157,7 +172,7 @@ class FrozenReachPolicy:
       "gradient_parameter_count": self.gradient_parameter_count,
       "held_out_environment_count": source["held_out_environment_count"],
       "held_out_success_rate": source["held_out_success_rate"],
-      "execution_authority": "frozen_14d_upper_body_only",
+      "execution_authority": "frozen_29d_whole_body_reach",
     }
     with torch.inference_mode():
       probe = torch.zeros(
@@ -191,7 +206,7 @@ class FrozenReachPolicy:
 
 
 def _load_contact_actuated_g1_spec() -> mujoco.MjSpec:
-  """Keep the accepted body plant and use compliant position control for hands."""
+  """Keep the accepted body plant and model compliant fingertip contact."""
   spec = reach._load_hybrid_actuated_g1_spec()
   joints = {joint.name: joint for joint in spec.joints}
   actuators = {actuator.target: actuator for actuator in spec.actuators}
@@ -205,6 +220,26 @@ def _load_contact_actuated_g1_spec() -> mujoco.MjSpec:
     # update into a short force spike.  This compliant hand still clears the
     # 4 N verified-grasp floor while leaving margin below the 30 N hard gate.
     actuator.set_to_position(kp=2.5, kv=0.3, inheritrange=True)
+  compliant_collision_count = 0
+  for geom in spec.geoms:
+    parent_name = getattr(getattr(geom, "parent", None), "name", "")
+    if (
+      (parent_name.startswith("left_hand_")
+        or parent_name.startswith("right_hand_"))
+      and geom.contype != 0
+      and geom.conaffinity != 0
+    ):
+      # The source mesh is geometrically rigid, but a real gripper contact is
+      # mediated by fingertip skin/pads.  Give those collision geoms priority
+      # over the steel rod's default solver parameters so the first 5 ms
+      # impact is compliant before the 20 ms tactile reflex can react.
+      geom.priority = 2
+      geom.solref[:] = (HAND_CONTACT_SOLREF_TIME_CONSTANT_S, 1.0)
+      compliant_collision_count += 1
+  if compliant_collision_count != len(base.HAND_JOINT_NAMES):
+    raise ValueError(
+      "Contact G1 collision skin does not cover every articulated hand link"
+    )
   return spec
 
 
@@ -250,6 +285,7 @@ class WorkyardContactCommandCfg(base.WorkyardCommandCfg):
   contact_base_assist_min_speed_m_s: float = 0.10
   contact_base_assist_max_speed_m_s: float = 0.12
   evaluation_episode_seed_base: int | None = None
+  evaluation_episode_seeds: tuple[int, ...] | None = None
 
   def build(self, env: ManagerBasedRlEnv) -> "WorkyardContactCommand":
     return WorkyardContactCommand(self, env)
@@ -280,6 +316,15 @@ class WorkyardContactCommand(base.WorkyardCommand):
         cfg.evaluation_episode_seed_base is not None
         and cfg.evaluation_episode_seed_base < 0
       )
+      or (
+        cfg.evaluation_episode_seeds is not None
+        and (
+          cfg.evaluation_episode_seed_base is not None
+          or len(cfg.evaluation_episode_seeds) != self.num_envs
+          or len(set(cfg.evaluation_episode_seeds)) != self.num_envs
+          or any(seed < 0 for seed in cfg.evaluation_episode_seeds)
+        )
+      )
     ):
       raise ValueError("Contact alignment shell must enclose the grasp pocket")
     self.max_stage = GRASP_STAGE_INDEX
@@ -295,7 +340,13 @@ class WorkyardContactCommand(base.WorkyardCommand):
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     super()._resample_command(env_ids)
-    if self.cfg.evaluation_episode_seed_base is not None:
+    if self.cfg.evaluation_episode_seeds is not None:
+      episode_seeds = torch.tensor(
+        self.cfg.evaluation_episode_seeds,
+        dtype=torch.long,
+        device=self.device,
+      )[env_ids]
+    elif self.cfg.evaluation_episode_seed_base is not None:
       # One vectorized environment maps to one explicit held-out episode seed.
       # This replaces only contact-task reset randomness; formal evaluation
       # uses the play configuration, so no training randomization is active.
@@ -303,6 +354,9 @@ class WorkyardContactCommand(base.WorkyardCommand):
         env_ids.to(dtype=torch.long)
         + self.cfg.evaluation_episode_seed_base
       )
+    else:
+      episode_seeds = None
+    if episode_seeds is not None:
       origins = self._env.scene.env_origins[env_ids]
       object_jitter = torch.zeros(
         (len(env_ids), 3), dtype=torch.float32, device=self.device
@@ -440,8 +494,16 @@ class WorkyardContactActionCfg(reach.WorkyardResidualActionCfg):
   hand_max_closing_joint_lead_rad: float = 0.25
   contact_force_stop_n: float = 6.0
   contact_force_emergency_release_n: float = 12.0
+  # Start closure only after contact is physically established.  The mirrored
+  # hands have different passive first-touch basins: the left needs the 2 N
+  # grasp-gate threshold, while the right's opposing digits establish a stable
+  # in-pocket touch from 0.5 N before active closure builds grasp force.
   preclosure_pose_hold_force_n: float = 2.0
-  preclosure_pose_hold_planar_tolerance_m: float = 0.045
+  preclosure_pose_hold_right_force_n: float = 0.5
+  # The left hand's measured shallow opposing basin begins near 4.6 cm from the
+  # ideal wrist pocket.  Admit that gentle first-touch geometry so closure can
+  # start after the arm overload reflex has removed passive-thumb force.
+  preclosure_pose_hold_planar_tolerance_m: float = 0.065
   preclosure_pose_hold_right_planar_tolerance_m: float = 0.060
   preclosure_pose_hold_vertical_tolerance_m: float = 0.045
   finger_preshape_coordination: float = 0.88
@@ -461,8 +523,7 @@ class WorkyardContactActionCfg(reach.WorkyardResidualActionCfg):
   contact_pocket_max_solver_target_slew_rad: float = 0.0010
   contact_approach_max_command_lead_rad: float = 0.10
   # Bound stored position-servo energy in the final pocket independently of
-  # the outer reach/alignment lead.  A slow target can still build a large
-  # spring error before first contact unless this lag is capped explicitly.
+  # the outer reach/alignment lead while preserving the v30 convergence basin.
   contact_pocket_max_command_lead_rad: float = 0.04
   contact_approach_hold_enter_error_m: float = 0.010
   contact_approach_hold_release_error_m: float = 0.020
@@ -474,7 +535,7 @@ class WorkyardContactActionCfg(reach.WorkyardResidualActionCfg):
 
 
 class WorkyardContactAction(reach.WorkyardResidualAction):
-  """8D learned hand action composed with an immutable 14D reach action."""
+  """8D learned hand action composed with an immutable 29D reach action."""
 
   cfg: WorkyardContactActionCfg
 
@@ -488,6 +549,8 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
       or cfg.contact_force_emergency_release_n <= cfg.contact_force_stop_n
       or cfg.preclosure_pose_hold_force_n <= 0.0
       or cfg.preclosure_pose_hold_force_n >= cfg.contact_force_stop_n
+      or cfg.preclosure_pose_hold_right_force_n <= 0.0
+      or cfg.preclosure_pose_hold_right_force_n >= cfg.contact_force_stop_n
       or cfg.preclosure_pose_hold_planar_tolerance_m <= 0.0
       or cfg.preclosure_pose_hold_right_planar_tolerance_m <= 0.0
       or cfg.preclosure_pose_hold_vertical_tolerance_m <= 0.0
@@ -876,14 +939,19 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
     ).detach()
     rows = torch.arange(self.num_envs, device=self.device)
     active_arm = torch_f.one_hot(command.active_hand, num_classes=2).bool()
-    active_arm_action = active_arm.unsqueeze(-1).expand(-1, -1, 7).reshape(
-      self.num_envs, reach.ACTION_SIZE
+    active_arm_action = torch.zeros(
+      (self.num_envs, reach.ACTION_SIZE), dtype=torch.bool, device=self.device
     )
-    # The accepted v15 actor is immutable and remains the reach command source
+    active_arm_action[:, reach.UPPER_BODY_SLICE] = (
+      active_arm.unsqueeze(-1).expand(-1, -1, 7).reshape(
+        self.num_envs, reach.UPPER_BODY_ACTION_SIZE
+      )
+    )
+    # The qualified whole-body actor remains the immutable command source
     # everywhere except the typed contact pocket.  Its training distribution
     # stops at a collision-free pre-grasp shell, so a deterministic DLS Harness
     # executor owns the final target-space approach.  This mask cannot be
-    # influenced by the 8D hand action and grants no learner, waist, locomotion,
+    # influenced by the 8D hand action and grants no learner, balance,
     # inactive-arm, or checkpoint authority.
     self._contact_approach_correction_active[:] = (
       command.contact_retreat_active
@@ -909,9 +977,17 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
       self.teacher.default_joint_positions
       + self._teacher_action * self.teacher.action_scale
     )
-    self._upper_body_residual[:] = self._raw_action * self.cfg.upper_body_scale
+    self._balance_residual[:] = (
+      self._raw_action[:, :reach.BALANCE_ACTION_SIZE] * self.cfg.balance_scale
+    )
+    self._upper_body_residual[:] = (
+      self._raw_action[:, reach.UPPER_BODY_SLICE] * self.cfg.upper_body_scale
+    )
     self._body_targets[:] = self.teacher.default_joint_positions
-    self._body_targets[:, :15] = self._teacher_body_targets[:, :15]
+    self._body_targets[:, :reach.BALANCE_ACTION_SIZE] = (
+      self._teacher_body_targets[:, :reach.BALANCE_ACTION_SIZE]
+      + self._balance_residual
+    )
     proposed_upper_targets = (
       self._body_targets[:, reach.UPPER_BODY_SLICE]
       + self._upper_body_residual
@@ -947,9 +1023,10 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
       proposed_upper_targets,
       self._safe_precontact_upper_targets,
     )
-    found, force, _, _ = base._hand_contact_summary(self._env)
+    found, force, _, opposed = base._hand_contact_summary(self._env)
     active_found = found[rows, command.active_hand]
     active_force = force[rows, command.active_hand]
+    active_opposed = opposed[rows, command.active_hand]
     wrist_delta = reach.active_wrist_position_delta(self._env)
     contact_supported_planar_tolerance = torch.where(
       command.active_hand == 0,
@@ -967,11 +1044,32 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
       wrist_delta[:, 2].abs()
       <= self.cfg.preclosure_pose_hold_vertical_tolerance_m
     )
+    preclosure_force_threshold = torch.where(
+      command.active_hand == 0,
+      torch.full_like(active_force, self.cfg.preclosure_pose_hold_force_n),
+      torch.full_like(
+        active_force, self.cfg.preclosure_pose_hold_right_force_n
+      ),
+    )
     contact_supported_closure = (
       command.contact_pocket_active
       & active_found
-      & (active_force >= self.cfg.preclosure_pose_hold_force_n)
+      & (active_force >= preclosure_force_threshold)
       & contact_supported_geometry
+    )
+    active_thumb_latched = self._teacher_thumb_contact_latched[
+      rows, command.active_hand
+    ]
+    active_opposing_latched = self._teacher_opposing_contact_latched[
+      rows, command.active_hand
+    ]
+    unilateral_contact_overload = (
+      command.contact_pocket_active
+      & (command.active_hand == 0)
+      & active_thumb_latched
+      & ~active_opposing_latched
+      & ~active_opposed
+      & (active_force >= self.cfg.contact_force_stop_n)
     )
     # Guarded terminal motion: if the open hand meets the authorized object
     # before closure geometry is valid, command the most recent contact-free
@@ -989,10 +1087,17 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
     guarded_early_contact = (
       command.contact_pocket_active
       & active_found
-      & (active_force >= self.cfg.preclosure_pose_hold_force_n)
+      & (active_force >= preclosure_force_threshold)
       & ~contact_supported_geometry
     )
-    new_guarded_contact = guarded_early_contact & ~self._guarded_contact_active
+    # Hand-space release cannot unload an open, fixed thumb that strikes first:
+    # its coordination is already zero.  Route that unilateral overload through
+    # the arm's existing contact guard and rewind a few bounded pocket updates.
+    # This is the spinal/tactile reflex for the only actuator group that can
+    # actually remove the stored position-servo force; it grants no new learner
+    # dimensions and remains inside the serial physical executor.
+    guarded_contact = guarded_early_contact | unilateral_contact_overload
+    new_guarded_contact = guarded_contact & ~self._guarded_contact_active
     guarded_release_target = (
       self._last_contact_free_upper_targets
       - 4.0 * (
@@ -1005,10 +1110,10 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
       self._guarded_contact_release_upper_targets,
     )
     self._guarded_contact_active[:] = (
-      (self._guarded_contact_active | guarded_early_contact)
+      (self._guarded_contact_active | guarded_contact)
       & command.contact_pocket_active
       & active_found
-      & ~contact_supported_geometry
+      & (~contact_supported_geometry | unilateral_contact_overload)
     )
     self._body_targets[:, reach.UPPER_BODY_SLICE] = torch.where(
       self._guarded_contact_active.unsqueeze(-1),
@@ -1019,13 +1124,24 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
       self._guarded_contact_active,
       self._guarded_contact_release_upper_targets,
     )
+    # The left hand has a passive fixed thumb: any guarded arm release changes
+    # the only actuator state capable of unloading it, so an earlier pose latch
+    # is no longer physically valid. The mirrored right hand closes from its
+    # opposing digits and retains the stable geometric guard latch.
+    pose_latch_release_active = self._guarded_contact_active & (
+      command.active_hand == 0
+    )
+    self._closure_pose_hold_active &= ~pose_latch_release_active
+    self._contact_pose_hold_active &= ~pose_latch_release_active
     # The alignment latch has already validated bearing and rod-axis geometry.
     # Once the open hand meets the rod inside the typed pocket, contact is a
     # better terminal constraint than an exact Cartesian point.  Capture the
     # measured arm immediately so the position servo cannot turn a gentle
     # first touch into a one-frame force spike, then let the 8D hand policy
     # establish opposing contact around that physically grounded pose.
-    closure_ready = hand_closure_ready(self._env) | contact_supported_closure
+    closure_ready = (
+      hand_closure_ready(self._env) | contact_supported_closure
+    ) & ~pose_latch_release_active
     new_closure_pose_hold = (
       closure_ready & ~self._closure_pose_hold_active
     )
@@ -1045,6 +1161,7 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
       command.contact_pocket_active
       & active_found
       & (active_force >= 2.0)
+      & ~pose_latch_release_active
       & (
         self._closure_pose_hold_active
         | (active_coordination > self.cfg.hand_synergy_step)
@@ -1076,6 +1193,10 @@ class WorkyardContactAction(reach.WorkyardResidualAction):
       selected_upper_targets,
       self._contact_pose_hold_upper_targets,
     )
+    self._executed_teacher_equivalent_action[:] = (
+      (self._body_targets - self.teacher.default_joint_positions)
+      / self.teacher.action_scale
+    ).clamp(-1.0, 1.0)
 
     active_side = torch_f.one_hot(command.active_hand, num_classes=2).bool()
     active_synergy = active_side.unsqueeze(-1).expand(-1, -1, 4).reshape(

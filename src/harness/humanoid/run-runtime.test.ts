@@ -109,7 +109,7 @@ describe("HumanoidRunRuntime", () => {
       await runtime.start(false);
       await runtime.stopContinuousPhysics();
 
-      expect(runtime.coordinatorPhase()).toBe("observe_or_plan");
+      expect(runtime.autonomyReadiness()).toBe("observe_or_plan");
       expect(runtime.goalRetirementDelegationAvailable()).toBe(false);
       expect(runtime.checkpoint.goal_dag.status).toBe("active");
       expect(runtime.checkpoint.checker?.success).toBe(false);
@@ -166,7 +166,7 @@ describe("HumanoidRunRuntime", () => {
       await runtime.start(false);
       await runtime.stopContinuousPhysics();
 
-      expect(runtime.coordinatorPhase()).toBe("complete_satisfied_goal");
+      expect(runtime.autonomyReadiness()).toBe("complete_satisfied_goal");
       expect(runtime.validateSatisfiedGoal()).toMatchObject({
         physical_execution_required: false,
         checker: { success: true }
@@ -282,7 +282,7 @@ describe("HumanoidRunRuntime", () => {
       });
       await runtime.initializeGoalAutonomy(manifest);
       expect(runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator)).toMatchObject({
-        coordinator_phase: "execute_plan",
+        autonomy_readiness: "execute_plan",
         execution_authority: {
           planning_transaction_id: currentPlan.transactionId,
           executor_action: "execute_whole_body_motion"
@@ -800,7 +800,7 @@ describe("HumanoidRunRuntime", () => {
       );
       expect(plan.accepted, JSON.stringify(plan)).toBe(true);
       expect(runtime.contextAnchor(HUMANOID_AGENT_IDS.coordinator)).toMatchObject({
-        coordinator_phase: "execute_plan",
+        autonomy_readiness: "execute_plan",
         robot: {
           root_heading: {
             yaw_radians: expect.any(Number),
@@ -1697,7 +1697,7 @@ describe("HumanoidRunRuntime", () => {
         checkpoint: blocked
       });
       await runtime.initializeGoalAutonomy(manifest);
-      expect(runtime.coordinatorPhase()).toBe("replan_or_retire");
+      expect(runtime.autonomyReadiness()).toBe("replan_or_retire");
       vi.spyOn(store, "writeCheckpoint")
         .mockRejectedValueOnce(new Error("checkpoint lost after model start"));
       await expect(runtime.recordModelCallStarted(

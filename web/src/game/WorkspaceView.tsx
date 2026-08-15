@@ -34,7 +34,7 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
   const runId = props.details.definition.run_id;
   const panel = props.workspace === "world" ? null : props.workspace === "flow"
     ? {
-        title: "智能体流",
+        title: "层级",
         body: (
           <AgentFlowView
             checkpoint={props.details.checkpoint}
@@ -45,11 +45,11 @@ export function WorkspaceView(props: WorkspaceViewProps): React.JSX.Element {
       }
     : props.workspace === "journey"
       ? {
-          title: "行动历程",
+          title: "动作",
           body: <RobotTrailView actions={props.details.actions} />
         }
       : {
-          title: "智能体输出",
+          title: "日志",
           body: (
             <ActivityView
               checkpoint={props.details.checkpoint}

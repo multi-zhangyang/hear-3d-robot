@@ -44,7 +44,7 @@ async function smokeProductionOperator() {
     assert.notEqual(firstController, secondController);
     assert.deepEqual(
       firstController.descriptor.learnedPolicy?.capabilities,
-      ["balance", "locomotion"]
+      ["balance", "locomotion", "contact_rich_manipulation"]
     );
     await Promise.all([firstController.dispose(), secondController.dispose()]);
 

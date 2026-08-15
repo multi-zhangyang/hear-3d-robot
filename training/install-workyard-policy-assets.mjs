@@ -1,9 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync
 } from "node:fs";
 import { relative, resolve } from "node:path";
@@ -11,7 +12,7 @@ import { relative, resolve } from "node:path";
 const options = parseOptions(process.argv.slice(2));
 const workspace = process.cwd();
 const reachRoot = resolve(
-  options.reachRoot ?? "artifacts/training/workyard-reach-deployment-v15"
+  options.reachRoot ?? "artifacts/training/workyard-reach-deployment-v3"
 );
 const contactRoot = resolve(
   options.contactRoot ?? "artifacts/training/workyard-contact-deployment/formal-v2"
@@ -30,46 +31,59 @@ const contact = {
   onnx: resolve(contactRoot, "workyard_contact.onnx"),
   report: resolve(contactRoot, "contact-policy-report.json")
 };
+const contactPlant = resolve("assets/humanoid/g1/g1_with_hands.xml");
 
 main();
 
 function main() {
   assertWorkspaceChild(destinationRoot, "deployment asset root");
-  for (const path of [reach.onnx, reach.report, contact.onnx, contact.report]) {
+  for (const path of [
+    reach.onnx,
+    reach.report,
+    contact.onnx,
+    contact.report,
+    contactPlant
+  ]) {
     if (!existsSync(path)) throw new Error(`Policy deployment input is missing: ${path}`);
-  }
-  for (const path of [reachDestination, contactDestination]) {
-    if (existsSync(path)) throw new Error(`Policy asset destination already exists: ${path}`);
   }
   const reachReport = JSON.parse(readFileSync(reach.report, "utf8"));
   const contactReport = JSON.parse(readFileSync(contact.report, "utf8"));
   validateReach(reachReport);
   validateContact(contactReport);
 
-  const created = [];
+  mkdirSync(destinationRoot, { recursive: true });
+  const transactionRoot = resolve(
+    destinationRoot,
+    `.workyard-policy-install-${randomUUID()}`
+  );
+  const stagedReach = resolve(transactionRoot, "next-reach");
+  const stagedContact = resolve(transactionRoot, "next-contact");
+  const previousReach = resolve(transactionRoot, "previous-reach");
+  const previousContact = resolve(transactionRoot, "previous-contact");
+  assertWorkspaceChild(transactionRoot, "policy install transaction");
+  mkdirSync(stagedReach, { recursive: true });
+  mkdirSync(stagedContact, { recursive: true });
   try {
-    for (const path of [reachDestination, contactDestination]) {
-      mkdirSync(path, { recursive: true });
-      created.push(path);
-    }
-    copyFileSync(reach.onnx, resolve(reachDestination, "workyard_reach.onnx"));
-    copyFileSync(reach.report, resolve(reachDestination, "reach-policy-report.json"));
-    copyFileSync(contact.onnx, resolve(contactDestination, "workyard_contact.onnx"));
-    copyFileSync(
-      contact.report,
-      resolve(contactDestination, "contact-policy-report.json")
-    );
-    assertInstalled(reachDestination, reach, reachReport, "reach");
-    assertInstalled(contactDestination, contact, contactReport, "contact");
+    stagePolicyAssetSet(stagedReach, reach, reachReport, "reach");
+    stagePolicyAssetSet(stagedContact, contact, contactReport, "contact");
+    replacePolicyAssetPair({
+      stagedReach,
+      stagedContact,
+      previousReach,
+      previousContact,
+      reachReport,
+      contactReport,
+      transactionRoot
+    });
   } catch (error) {
-    for (const path of created.reverse()) {
-      assertWorkspaceChild(path, "partial deployment asset");
-      rmSync(path, { recursive: true, force: true });
+    if (!error?.preservePolicyInstallTransaction && existsSync(transactionRoot)) {
+      assertWorkspaceChild(transactionRoot, "failed policy install transaction");
+      rmSync(transactionRoot, { recursive: true, force: true });
     }
     throw error;
   }
   console.log(JSON.stringify({
-    protocol: "hear-workyard-policy-assets-install-v1",
+    protocol: "hear-workyard-policy-assets-install-v2",
     reach: {
       destination: relative(workspace, reachDestination).replaceAll("\\", "/"),
       onnx_sha256: sha256(reach.onnx)
@@ -81,35 +95,141 @@ function main() {
   }, null, 2));
 }
 
+function stagePolicyAssetSet(destination, source, report, kind) {
+  const onnxName = kind === "reach" ? "workyard_reach.onnx" : "workyard_contact.onnx";
+  const reportName = kind === "reach"
+    ? "reach-policy-report.json"
+    : "contact-policy-report.json";
+  copyFileSync(source.onnx, resolve(destination, onnxName));
+  copyFileSync(source.report, resolve(destination, reportName));
+  assertInstalled(destination, source, report, kind);
+}
+
+function replacePolicyAssetPair(input) {
+  let reachBackedUp = false;
+  let contactBackedUp = false;
+  let reachInstalled = false;
+  let contactInstalled = false;
+  try {
+    if (existsSync(reachDestination)) {
+      renameSync(reachDestination, input.previousReach);
+      reachBackedUp = true;
+    }
+    if (existsSync(contactDestination)) {
+      renameSync(contactDestination, input.previousContact);
+      contactBackedUp = true;
+    }
+    renameSync(input.stagedReach, reachDestination);
+    reachInstalled = true;
+    renameSync(input.stagedContact, contactDestination);
+    contactInstalled = true;
+    assertInstalled(reachDestination, reach, input.reachReport, "reach");
+    assertInstalled(contactDestination, contact, input.contactReport, "contact");
+  } catch (error) {
+    const rollbackErrors = [];
+    for (const [installed, destination, previous, backedUp] of [
+      [contactInstalled, contactDestination, input.previousContact, contactBackedUp],
+      [reachInstalled, reachDestination, input.previousReach, reachBackedUp]
+    ]) {
+      try {
+        if (installed && existsSync(destination)) {
+          assertWorkspaceChild(destination, "new policy asset during rollback");
+          rmSync(destination, { recursive: true, force: true });
+        }
+        if (backedUp && existsSync(previous)) renameSync(previous, destination);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      const rollbackFailure = new AggregateError(
+        [error, ...rollbackErrors],
+        `Policy install failed and rollback is incomplete; recovery assets remain at ${input.transactionRoot}`
+      );
+      rollbackFailure.preservePolicyInstallTransaction = true;
+      throw rollbackFailure;
+    }
+    throw error;
+  }
+  assertWorkspaceChild(input.transactionRoot, "completed policy install transaction");
+  rmSync(input.transactionRoot, { recursive: true, force: true });
+}
+
 function validateReach(report) {
-  if (report.protocol !== "hear-frozen-reach-policy-export-v1"
+  if (report.protocol !== "hear-whole-body-reach-policy-deployment-v3"
+    || report.source?.deployment_distribution_covered !== true
+    || report.source?.training_deployment_accepted !== false
+    || !(report.source?.initial_wrist_error_maximum_m >= 0.35)
+    || report.source?.target_protocol
+      !== "typescript-pregrasp-geometry-top-wrist-target-v1"
+    || report.deployment?.protocol
+      !== "hear-typescript-mujoco-reach-deployment-gate-v1"
+    || report.deployment?.accepted !== true
+    || report.deployment?.runtime !== "typescript-mujoco-onnxruntime-web"
+    || report.deployment?.scenario_id !== "humanoid_workyard"
+    || report.deployment?.controller_mode !== "learned_policy_only"
+    || report.deployment?.target_protocol
+      !== "typescript-pregrasp-geometry-top-wrist-target-v1"
+    || !(report.deployment?.case_count >= 12)
+    || !(report.deployment?.success_rate >= 0.9)
+    || !(report.deployment?.initial_wrist_error_maximum_m >= 0.35)
+    || !(report.deployment?.terminal_wrist_error_maximum_m <= 0.06)
+    || report.deployment?.fall_count !== 0
+    || report.deployment?.unauthorized_collision_count !== 0
+    || report.deployment?.terminal_assistance_step_count !== 0
+    || !(report.deployment?.minimum_support_margin_m >= -0.04)
+    || !(report.deployment?.maximum_foot_planar_displacement_m <= 0.08)
+    || !(report.deployment?.maximum_foot_slip_speed_m_s <= 0.20)
+    || !(report.deployment?.double_support_loss_rate_maximum <= 0.10)
+    || !(report.deployment?.no_foot_contact_rate_maximum <= 0.01)
     || report.source?.held_out_environment_count !== 500
-    || report.source?.held_out_success_rate < 0.99
+    || !(report.source?.held_out_success_rate >= 0.85)
     || report.onnx?.file !== "workyard_reach.onnx"
     || report.onnx?.bytes !== readFileSync(reach.onnx).byteLength
     || report.onnx?.sha256 !== sha256(reach.onnx)
     || report.onnx?.opset !== 17
-    || report.onnx?.input_size !== 231
-    || report.onnx?.output_size !== 14
+    || report.onnx?.input_protocol
+      !== "hear-workyard-whole-body-reach-observation-v5"
+    || report.onnx?.input_size !== 246
+    || report.onnx?.output_protocol !== "bounded-whole-body-reach-mean"
+    || report.onnx?.output_size !== 29
     || report.validation?.finite !== true
     || report.validation?.onnx_checker_full !== true
-    || report.validation?.maximum_onnx_error > 1e-5) {
+    || !(report.validation?.maximum_onnx_error <= 1e-5)) {
     throw new Error("Reach deployment export is not qualified for installation");
   }
 }
 
 function validateContact(report) {
   const onnx = report.policy?.onnx;
-  if (report.protocol !== "hear-frozen-contact-policy-export-v1"
+  const reachReport = JSON.parse(readFileSync(reach.report, "utf8"));
+  const frozenReach = report.source?.frozen_reach;
+  if (report.protocol !== "hear-frozen-contact-policy-export-v2"
     || report.source?.formal_gate_passed !== true
     || report.source?.held_out_episode_count !== 500
     || report.source?.held_out_success_rate < 0.75
     || report.source?.maximum_active_hand_force_n > 30
+    || frozenReach?.protocol !== "hear-frozen-contact-reach-binding-v1"
+    || frozenReach?.runtime_protocol
+      !== "hear-frozen-qualified-whole-body-reach-runtime-v2"
+    || frozenReach?.source_checkpoint_sha256
+      !== reachReport.source?.checkpoint_sha256
+    || frozenReach?.jit_sha256 !== reachReport.policy?.sha256
+    || frozenReach?.report_sha256 !== sha256(reach.report)
+    || report.plant?.protocol !== "hear-workyard-contact-deployment-plant-v1"
+    || report.plant?.g1_xml?.file !== "g1_with_hands.xml"
+    || report.plant?.g1_xml?.bytes !== readFileSync(contactPlant).byteLength
+    || report.plant?.g1_xml?.sha256 !== sha256(contactPlant)
+    || report.plant?.g1_xml?.hand_contact_collision_count !== 14
+    || report.plant?.g1_xml?.hand_contact_priority !== 2
+    || report.plant?.g1_xml?.hand_contact_solref_time_constant_s !== 0.04
+    || report.plant?.g1_xml?.hand_contact_solref_damping_ratio !== 1
     || onnx?.file !== "workyard_contact.onnx"
     || onnx?.bytes !== readFileSync(contact.onnx).byteLength
     || onnx?.sha256 !== sha256(contact.onnx)
     || onnx?.opset !== 17
-    || report.policy?.input_size !== 247
+    || report.policy?.input_protocol !== "hear-workyard-contact-observation-v2"
+    || report.policy?.input_size !== 262
     || report.policy?.output_size !== 8
     || report.policy?.gradient_parameter_count !== 0
     || report.harness?.coordination_step !== 0.0075

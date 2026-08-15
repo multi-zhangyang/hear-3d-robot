@@ -50,6 +50,10 @@ import type {
   HumanoidSkillEventSink,
   HumanoidSkillEventStream
 } from "./skill-event-stream.js";
+import type {
+  HumanoidRecoveryExecutionContract
+} from "./recovery-execution-contract.js";
+import type { HumanoidRecoveryFailure } from "./recovery-execution.js";
 
 export interface HumanoidWorldSnapshot {
   frame: number;
@@ -151,13 +155,25 @@ export interface WholeBodyCandidatePlanReceipt {
   candidates: WholeBodyCandidateEvaluation[];
 }
 
+export interface HumanoidRecoveryPlanReceipt {
+  accepted: boolean;
+  planId: string;
+  createdRevision: number;
+  expiresRevision: number;
+  intentSha256: string;
+  contractSha256: string;
+  channels: HumanoidBodyChannel[];
+  contract: HumanoidRecoveryExecutionContract;
+  reason?: string;
+}
+
 export interface HumanoidExecutionReceipt {
   accepted: boolean;
   code: "motion_completed" | "navigation_completed" | "plan_stale"
     | "motion_failed" | "navigation_blocked" | "motion_option_succeeded"
     | "motion_goal_unmet" | "motion_goal_uncertain"
     | "motion_execution_drifted" | "motion_constraint_violated"
-    | "plan_revalidation_failed";
+    | "plan_revalidation_failed" | "recovery_completed" | "recovery_failed";
   frames: number;
   finalSnapshot: HumanoidWorldSnapshot;
   terminalResultSha256?: string;
@@ -230,6 +246,17 @@ export interface HumanoidExecutionReceipt {
     controller_routing?: {
       execution: NonNullable<HumanoidControllerExecutionState["routing"]> | null;
       capability_evidence: HumanoidControllerCapabilityEvidenceSummary[];
+    };
+    recovery?: {
+      contract_sha256: string;
+      safety_interrupt_id: string;
+      recovery_implementation: string | null;
+      stable_steps: number;
+      required_stable_steps: number;
+      handoff_steps: number;
+      required_handoff_steps: number;
+      handoff_completed: boolean;
+      failure: HumanoidRecoveryFailure | null;
     };
   };
 }

@@ -57,6 +57,9 @@ import { HumanoidNavigationArrivalHeadingSchema } from "./navigation-arrival.js"
 import { HumanoidSpatialBeliefMapCheckpointSchema } from "./spatial-belief-map.js";
 import { HumanoidEmbodiedSkillIdentitySchema } from "./embodied-skill-call.js";
 import { HumanoidHandPolicyAuthorityStateSchema } from "./hand-policy-authority.js";
+import {
+  HumanoidRecoveryExecutionContractSchema
+} from "./recovery-execution-contract.js";
 
 const FiniteArraySchema = z.array(z.number().finite());
 
@@ -146,7 +149,15 @@ const HumanoidMotionExecutionProgressSchema = z.object({
   driftStreak: z.number().int().nonnegative().default(0),
   lastDrift: HumanoidMotionDriftEvidenceSchema.nullable().default(null),
   failure: HumanoidMotionExecutionFailureSchema.nullable(),
-  physicalSafety: HumanoidPhysicalSafetyAccumulatorSchema.optional()
+  physicalSafety: HumanoidPhysicalSafetyAccumulatorSchema.optional(),
+  recovery: z.object({
+    stableSteps: z.number().int().nonnegative(),
+    handoffSteps: z.number().int().nonnegative(),
+    recoveryImplementation: z.string().trim().min(1).nullable(),
+    handoffStarted: z.boolean(),
+    handoffCompleted: z.boolean(),
+    previousTotalContactForceN: z.number().finite().nonnegative().nullable()
+  }).strict().optional()
 }).strict();
 
 export type HumanoidMotionExecutionProgress = z.infer<
@@ -178,6 +189,7 @@ export type HumanoidMotionOptionExecutionState = z.infer<
 
 const StoredMotionSchema = z.object({
   plan: HumanoidMotionPlanSchema,
+  recoveryContract: HumanoidRecoveryExecutionContractSchema.optional(),
   skillCallIdentity: HumanoidEmbodiedSkillIdentitySchema.nullable().default(null),
   artifact: HumanoidMotionArtifactSchema,
   rollout: HumanoidMotionRolloutSchema.nullable().default(null),
@@ -232,11 +244,40 @@ const StoredMotionSchema = z.object({
       message: "Humanoid motion intent lease cannot expire before creation"
     });
   }
-  if (motion.progress.nextFrameIndex > motion.artifact.frames.length) {
+  if (motion.recoveryContract === undefined
+    && motion.progress.nextFrameIndex > motion.artifact.frames.length) {
     context.addIssue({
       code: "custom",
       path: ["progress", "nextFrameIndex"],
       message: "Humanoid motion progress exceeds its artifact frame count"
+    });
+  }
+  if (motion.recoveryContract !== undefined) {
+    if (motion.option !== null || motion.rollout !== null
+      || motion.skillCallIdentity?.runtimeKind !== "semantic_skill"
+      || motion.skillCallIdentity.skillId !== "stabilize"
+      || motion.skillCallIdentity.phase !== "recover_support"
+      || motion.skillCallIdentity.invocation?.skill !== "stabilize"
+      || motion.recoveryContract.minimumSupportMarginMeters
+        !== motion.skillCallIdentity.invocation.minimum_support_margin_m
+      || motion.progress.nextFrameIndex > motion.recoveryContract.maximumSteps
+      || motion.progress.recovery === undefined
+      || motion.progress.recovery.stableSteps > motion.progress.nextFrameIndex
+      || motion.progress.recovery.handoffSteps > motion.progress.nextFrameIndex
+      || motion.progress.recovery.handoffCompleted
+        && motion.progress.recovery.handoffSteps
+          < motion.recoveryContract.handoffSteps) {
+      context.addIssue({
+        code: "custom",
+        path: ["recoveryContract"],
+        message: "Stored recovery execution is inconsistent with its Skill authority"
+      });
+    }
+  } else if (motion.progress.recovery !== undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["progress", "recovery"],
+      message: "Only a recovery execution may persist recovery progress"
     });
   }
   if (motion.rollout && motion.rollout.version !== motion.artifact.version) {

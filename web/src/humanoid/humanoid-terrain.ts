@@ -2,9 +2,9 @@ import * as THREE from "three";
 import { disposeObject } from "../three-kit";
 
 const TILE_SIZE = 1;
-const TILE_HEIGHT = 0.18;
-const TILE_GAP = 0.035;
-const TILE_COLORS = [0x344b40, 0x3b5145, 0x30453d, 0x405548, 0x2f4140] as const;
+const TILE_HEIGHT = 0.1;
+const TILE_GAP = 0.012;
+const TILE_COLORS = [0x151515, 0x181818, 0x121212, 0x1b1b1b, 0x161616] as const;
 
 export interface HumanoidTerrainChunk {
   id: string;
@@ -32,7 +32,9 @@ export class HumanoidTerrain {
     this.root.add(
       terrainHorizon(bounds),
       terrainFoundation(bounds),
-      terrainBorder(bounds)
+      terrainBorder(bounds),
+      terrainMajorGrid(bounds),
+      terrainPerimeterBeacons(bounds)
     );
     this.#updateTileCount();
   }
@@ -130,7 +132,7 @@ function terrainChunkMesh(
 function terrainFoundation(bounds: { width: number; depth: number }): THREE.Mesh {
   const foundation = new THREE.Mesh(
     new THREE.BoxGeometry(bounds.width + 0.16, 0.28, bounds.depth + 0.16),
-    new THREE.MeshStandardMaterial({ color: 0x1c2a28, roughness: 0.96, metalness: 0 })
+    new THREE.MeshStandardMaterial({ color: 0x080808, roughness: 0.98, metalness: 0 })
   );
   foundation.name = "humanoid-terrain-foundation";
   foundation.position.set(bounds.width / 2, -TILE_HEIGHT - 0.14, bounds.depth / 2);
@@ -141,7 +143,7 @@ function terrainFoundation(bounds: { width: number; depth: number }): THREE.Mesh
 function terrainHorizon(bounds: { width: number; depth: number }): THREE.Mesh {
   const horizon = new THREE.Mesh(
     new THREE.CircleGeometry(Math.max(bounds.width, bounds.depth) * 2.4, 64),
-    new THREE.MeshBasicMaterial({ color: 0x111a20 })
+    new THREE.MeshBasicMaterial({ color: 0x020202 })
   );
   horizon.name = "humanoid-terrain-horizon";
   horizon.rotation.x = -Math.PI / 2;
@@ -156,11 +158,69 @@ function terrainBorder(bounds: { width: number; depth: number }): THREE.LineSegm
       TILE_HEIGHT,
       bounds.depth + 0.08
     )),
-    new THREE.LineBasicMaterial({ color: 0x68c7aa, transparent: true, opacity: 0.34 })
+    new THREE.LineBasicMaterial({ color: 0xd4d4d4, transparent: true, opacity: 0.36 })
   );
   border.name = "humanoid-terrain-border";
   border.position.set(bounds.width / 2, -TILE_HEIGHT / 2, bounds.depth / 2);
   return border;
+}
+
+function terrainMajorGrid(bounds: { width: number; depth: number }): THREE.LineSegments {
+  const points: THREE.Vector3[] = [];
+  for (let x = 0; x <= bounds.width; x += 5) {
+    points.push(new THREE.Vector3(x, 0.006, 0), new THREE.Vector3(x, 0.006, bounds.depth));
+  }
+  for (let z = 0; z <= bounds.depth; z += 5) {
+    points.push(new THREE.Vector3(0, 0.006, z), new THREE.Vector3(bounds.width, 0.006, z));
+  }
+  const grid = new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(points),
+    new THREE.LineBasicMaterial({
+      color: 0x8a8a8a,
+      transparent: true,
+      opacity: 0.13,
+      depthWrite: false
+    })
+  );
+  grid.name = "humanoid-terrain-five-meter-grid";
+  grid.renderOrder = 1;
+  return grid;
+}
+
+function terrainPerimeterBeacons(bounds: { width: number; depth: number }): THREE.Group {
+  const group = new THREE.Group();
+  group.name = "humanoid-visual-perimeter-beacons";
+  const poleGeometry = new THREE.CylinderGeometry(0.018, 0.025, 0.72, 8);
+  const poleMaterial = new THREE.MeshStandardMaterial({
+    color: 0x1c1c1c,
+    roughness: 0.76,
+    metalness: 0.34
+  });
+  const lightGeometry = new THREE.CylinderGeometry(0.045, 0.045, 0.055, 12);
+  const lightMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    emissive: 0xb8b8b8,
+    emissiveIntensity: 1.5,
+    roughness: 0.3,
+    metalness: 0.12
+  });
+  for (const [x, z] of [
+    [-0.16, -0.16],
+    [bounds.width + 0.16, -0.16],
+    [-0.16, bounds.depth + 0.16],
+    [bounds.width + 0.16, bounds.depth + 0.16]
+  ] as const) {
+    const marker = new THREE.Group();
+    const pole = new THREE.Mesh(poleGeometry, poleMaterial);
+    pole.position.y = 0.36;
+    pole.castShadow = true;
+    const light = new THREE.Mesh(lightGeometry, lightMaterial);
+    light.position.y = 0.735;
+    marker.position.set(x, 0, z);
+    marker.add(pole, light);
+    group.add(marker);
+  }
+  return group;
 }
 
 function finitePoint(point: { x: number; z: number }): boolean {

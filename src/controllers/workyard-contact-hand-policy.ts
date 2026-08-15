@@ -21,6 +21,8 @@ const ACTION_SIZE = 8;
 const POLICY_ASSET_ID = "contact_policy";
 const REPORT_ASSET_ID = "contact_policy_report";
 const PLANT_ASSET_ID = "contact_plant";
+const REACH_POLICY_ASSET_ID = "reach_policy";
+const REACH_REPORT_ASSET_ID = "reach_policy_report";
 
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const ArtifactSchema = z.object({
@@ -30,7 +32,7 @@ const ArtifactSchema = z.object({
 }).strict();
 
 const ContactPolicyReportSchema = z.object({
-  protocol: z.literal("hear-frozen-contact-policy-export-v1"),
+  protocol: z.literal("hear-frozen-contact-policy-export-v2"),
   created_at: z.iso.datetime({ offset: true }),
   source: z.object({
     training_report_file: z.string().trim().min(1),
@@ -47,12 +49,25 @@ const ContactPolicyReportSchema = z.object({
     formal_gate_passed: z.literal(true),
     held_out_episode_count: z.literal(500),
     held_out_success_rate: z.number().finite().min(0.75).max(1),
-    maximum_active_hand_force_n: z.number().finite().min(0).max(30)
+    maximum_active_hand_force_n: z.number().finite().min(0).max(30),
+    frozen_reach: z.object({
+      protocol: z.literal("hear-frozen-contact-reach-binding-v1"),
+      runtime_protocol: z.literal(
+        "hear-frozen-qualified-whole-body-reach-runtime-v2"
+      ),
+      source_checkpoint_sha256: Sha256Schema,
+      jit_sha256: Sha256Schema,
+      report_sha256: Sha256Schema
+    }).strict()
   }).strict(),
   plant: z.object({
     protocol: z.literal("hear-workyard-contact-deployment-plant-v1"),
     g1_xml: ArtifactSchema.extend({
-      file: z.literal("g1_with_hands.xml")
+      file: z.literal("g1_with_hands.xml"),
+      hand_contact_collision_count: z.literal(14),
+      hand_contact_priority: z.literal(2),
+      hand_contact_solref_time_constant_s: z.literal(0.04),
+      hand_contact_solref_damping_ratio: z.literal(1)
     }),
     hand_joint_count: z.literal(14),
     hand_position_kp: z.literal(2.5),
@@ -109,7 +124,15 @@ export async function createWorkyardContactHandPolicy(input: {
   const policyAsset = requiredAsset(input.assets, POLICY_ASSET_ID);
   const reportAsset = requiredAsset(input.assets, REPORT_ASSET_ID);
   const plantAsset = requiredAsset(input.assets, PLANT_ASSET_ID);
-  const report = parseReport(policyAsset, reportAsset, plantAsset);
+  const reachPolicyAsset = requiredAsset(input.assets, REACH_POLICY_ASSET_ID);
+  const reachReportAsset = requiredAsset(input.assets, REACH_REPORT_ASSET_ID);
+  const report = parseReport(
+    policyAsset,
+    reportAsset,
+    plantAsset,
+    reachPolicyAsset,
+    reachReportAsset
+  );
   ort.env.wasm.numThreads = 1;
   const session = await ort.InferenceSession.create(policyAsset.bytes, {
     executionProviders: ["wasm"]
@@ -296,7 +319,9 @@ function applyContactForceReflex(
 function parseReport(
   policyAsset: HumanoidControllerModuleAsset,
   reportAsset: HumanoidControllerModuleAsset,
-  plantAsset: HumanoidControllerModuleAsset
+  plantAsset: HumanoidControllerModuleAsset,
+  reachPolicyAsset: HumanoidControllerModuleAsset,
+  reachReportAsset: HumanoidControllerModuleAsset
 ): z.infer<typeof ContactPolicyReportSchema> {
   let value: unknown;
   try {
@@ -323,6 +348,40 @@ function parseReport(
     || parsed.data.plant.g1_xml.sha256 !== plantAsset.sha256
     || sha256(plantAsset.bytes) !== plantAsset.sha256) {
     throw new Error("Workyard contact policy plant does not match the runtime G1 XML");
+  }
+  let reachReport: unknown;
+  try {
+    reachReport = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(
+      reachReportAsset.bytes
+    ));
+  } catch (error) {
+    throw new Error("Workyard reach policy report is not valid UTF-8 JSON", {
+      cause: error
+    });
+  }
+  if (!isUnknownRecord(reachReport)
+    || reachReport.protocol !== "hear-whole-body-reach-policy-deployment-v3") {
+    throw new Error("Workyard contact policy requires a qualified reach deployment");
+  }
+  const reachSource = isUnknownRecord(reachReport.source)
+    ? reachReport.source
+    : undefined;
+  const reachPolicy = isUnknownRecord(reachReport.policy)
+    ? reachReport.policy
+    : undefined;
+  const reachOnnx = isUnknownRecord(reachReport.onnx)
+    ? reachReport.onnx
+    : undefined;
+  const frozenReach = parsed.data.source.frozen_reach;
+  if (frozenReach.source_checkpoint_sha256 !== reachSource?.checkpoint_sha256
+    || frozenReach.jit_sha256 !== reachPolicy?.sha256
+    || frozenReach.report_sha256 !== sha256(reachReportAsset.bytes)
+    || reachOnnx?.sha256 !== reachPolicyAsset.sha256
+    || reachOnnx?.bytes !== reachPolicyAsset.bytes.byteLength
+    || sha256(reachPolicyAsset.bytes) !== reachPolicyAsset.sha256) {
+    throw new Error(
+      "Workyard contact policy was not trained against this exact reach deployment"
+    );
   }
   return parsed.data;
 }
@@ -378,5 +437,9 @@ function arrayEqual(
 }
 
 function isRecord(value: JsonValue): value is Record<string, JsonValue> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }

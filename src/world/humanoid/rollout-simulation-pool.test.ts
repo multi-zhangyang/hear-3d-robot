@@ -16,10 +16,17 @@ describe("HumanoidRolloutSimulationPool", () => {
   it("clones authoritative state into independent simulation and controller ownership", async () => {
     const authorityController = new RolloutTestController();
     const rolloutControllers: RolloutTestController[] = [];
+    const zones = [{
+      id: "assembly_bay",
+      center: { x: 4.2, y: -0.025, z: 6.4 },
+      size: { x: 1.4, y: 0.05, z: 1.4 }
+    }];
     const authority = await HumanoidSimulation.create({
+      zones,
       controllerFactory: async () => authorityController
     });
     const pool = await HumanoidRolloutSimulationPool.create({
+      zones,
       controllerFactory: async () => {
         const controller = new RolloutTestController();
         rolloutControllers.push(controller);
@@ -41,12 +48,18 @@ describe("HumanoidRolloutSimulationPool", () => {
       });
 
       expect(rolledOut.time - authoritativeState.time).toBeCloseTo(0.02, 9);
-      expect(rolledOut.controller.payload).toEqual({ inference_count: 3 });
+      expect(rolledOut.controller.payload).toEqual(expect.objectContaining({
+        primary: expect.objectContaining({
+          payload: { inference_count: 3 }
+        })
+      }));
       expect(authority.captureState()).toEqual(authoritativeState);
       expect(authority.snapshot()).toEqual(authoritativeSnapshot);
       expect(authorityController.inferenceCount).toBe(2);
+      expect(authorityController.seenZoneIds).toEqual(["assembly_bay"]);
       expect(rolloutControllers).toHaveLength(1);
       expect(rolloutControllers[0]).not.toBe(authorityController);
+      expect(rolloutControllers[0]!.seenZoneIds).toEqual(["assembly_bay"]);
     } finally {
       await pool.dispose();
       await authority.dispose();
@@ -164,20 +177,36 @@ class RolloutTestController implements HumanoidWholeBodyController {
     implementation: "rollout_pool_test_pd",
     actuation: "joint_position_pd",
     controlStepSeconds: 0.02,
-    physicsStepSeconds: 0.005
+    physicsStepSeconds: 0.005,
+    learnedPolicy: {
+      protocol: "humanoid-learned-policy-v1",
+      runtime: "test",
+      observationSpace: {
+        protocol: "rollout-pool-environment-test-v1",
+        size: 1
+      },
+      actionSpace: {
+        protocol: "rollout-pool-joint-position-test-v1",
+        size: HUMANOID_JOINT_NAMES.length
+      },
+      observationFeatures: ["object_state"],
+      capabilities: ["joint_reference_tracking"]
+    }
   };
   inferenceCount = 0;
   disposed = false;
+  seenZoneIds: string[] = [];
 
   reset(_state: HumanoidPolicyState, _reference: HumanoidReference): void {
     this.inferenceCount = 0;
   }
 
   async infer(
-    _state: HumanoidPolicyState,
+    state: HumanoidPolicyState,
     reference: HumanoidReference
   ): Promise<HumanoidJointPositionCommand> {
     this.inferenceCount += 1;
+    this.seenZoneIds = state.environment?.zones?.map(({ id }) => id) ?? [];
     return {
       kind: "joint_position_pd",
       positions: Float64Array.from(reference.jointPositions),

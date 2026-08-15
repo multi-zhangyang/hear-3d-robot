@@ -5,9 +5,14 @@ import {
   type HumanoidLearnedPolicyCapability
 } from "../../domain/humanoid-policy.js";
 import {
+  g1HandCoordinationFromJointPositions,
   G1HandCoordinationSchema,
   type G1HandCoordination
 } from "./hand-coordination.js";
+import {
+  G1_HAND_JOINT_NAMES,
+  type G1HandJointName
+} from "./morphology.js";
 import {
   HumanoidHandPolicyAuthorityStateSchema,
   type HumanoidHandPolicyAuthorityAssessment,
@@ -170,7 +175,7 @@ implements HumanoidWholeBodyController {
       this.#resetHandState();
       return bodyCommand;
     }
-    this.#admitAuthority(assessment);
+    this.#admitAuthority(assessment, state);
     const authority = this.#authority!;
     const output = await this.#hand.infer({
       state,
@@ -259,12 +264,18 @@ implements HumanoidWholeBodyController {
     if (failure?.status === "rejected") throw failure.reason;
   }
 
-  #admitAuthority(assessment: HumanoidHandPolicyAuthorityAssessment): void {
+  #admitAuthority(
+    assessment: HumanoidHandPolicyAuthorityAssessment,
+    state: HumanoidPolicyState
+  ): void {
     const authority = HumanoidHandPolicyAuthorityStateSchema.parse(
       assessment.state
     );
     if (!sameAuthority(this.#authority, authority)) {
-      this.#coordination.fill(0);
+      this.#coordination.set(measuredActiveHandCoordination(
+        state,
+        authority.activeHand
+      ));
       this.#previousAuthorizedAction.fill(0);
       this.#hand.reset();
     }
@@ -414,6 +425,39 @@ function sameAuthority(
   return left?.callId === right.callId
     && left.activeHand === right.activeHand
     && left.objectId === right.objectId;
+}
+
+/**
+ * A new typed Skill phase owns a new call identity even when it continues the
+ * same physical grasp. Re-anchor the policy integrator to the authoritative
+ * MuJoCo hand pose so grasp -> lift -> carry cannot restart from an open-hand
+ * logical state while the actuator is still holding a closed grasp.
+ */
+function measuredActiveHandCoordination(
+  state: HumanoidPolicyState,
+  activeHand: "left" | "right"
+): Float64Array {
+  const hands = state.environment?.hands;
+  if (!hands) {
+    throw new Error("Hand synergy authority requires authoritative hand state");
+  }
+  const positions = Object.fromEntries(G1_HAND_JOINT_NAMES.map((name) => {
+    const position = hands[name]?.position;
+    if (typeof position !== "number" || !Number.isFinite(position)) {
+      throw new Error(`Hand synergy joint state is unavailable: ${name}`);
+    }
+    return [name, position];
+  })) as Record<G1HandJointName, number>;
+  const measured = g1HandCoordinationFromJointPositions(positions);
+  const selected = activeHand === "left" ? measured.left : measured.right;
+  const coordination = new Float64Array(HAND_ACTION_SIZE);
+  coordination.set([
+    selected.thumb_opposition,
+    selected.thumb_curl,
+    selected.index_curl,
+    selected.middle_curl
+  ], activeHand === "left" ? 0 : 4);
+  return coordination;
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

@@ -16,7 +16,9 @@ const HumanoidExecutionCodeSchema = z.enum([
   "motion_goal_uncertain",
   "motion_execution_drifted",
   "motion_constraint_violated",
-  "plan_revalidation_failed"
+  "plan_revalidation_failed",
+  "recovery_completed",
+  "recovery_failed"
 ]);
 
 export const HumanoidPlanTerminalSchema = z.object({

@@ -171,9 +171,9 @@ export function createHumanoidActionTools(
 }
 
 /**
- * Execute a physical/runtime action directly from a coordinator tool call.
+ * Execute a physical/runtime action from the owning hierarchical tool call.
  *
- * The outer coordinator call remains the model decision authority. The
+ * The owning parent episode remains the model decision authority. The
  * deterministic service is only the actor: it cannot invent a second model
  * response, rewrite the accepted plan, or manufacture a tool-call identity.
  */
@@ -368,7 +368,9 @@ function humanoidActionTool(
   return actionTool;
 }
 
-function humanoidActionReceiptModelOutput(receipt: HumanoidActionReceipt): string {
+export function humanoidActionReceiptModelOutput(
+  receipt: HumanoidActionReceipt
+): string {
   return JSON.stringify({
     transactionId: receipt.transactionId,
     agentId: receipt.agentId,

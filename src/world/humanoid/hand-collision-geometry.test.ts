@@ -13,7 +13,10 @@ describe("G1 hand collision identity", () => {
     const transformed = g1PhysicsModelXml(source);
     const sourceSurfaces = [...source.matchAll(/<geom\b([^>]*)\/>/g)]
       .map((match) => match[1] ?? "")
-      .filter((attributes) => attribute(attributes, "class") === "collision")
+      .filter((attributes) => {
+        const collisionClass = attribute(attributes, "class");
+        return collisionClass === "collision" || collisionClass === "hand_collision";
+      })
       .map((attributes) => attribute(attributes, "mesh"))
       .filter((mesh): mesh is G1HandCollisionMeshName => (
         mesh !== null

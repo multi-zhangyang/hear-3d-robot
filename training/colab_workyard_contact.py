@@ -1,7 +1,7 @@
 """Train and independently qualify the HEAR 8D contact hand policy.
 
-The 14D reach policy, locomotion teacher, waist, and terminal DLS executor are
-immutable Harness-owned components.  Online DAgger and retention PPO optimize
+The 29D whole-body reach policy, locomotion reference, and terminal DLS
+executor are immutable Harness-owned components. Online DAgger and retention PPO optimize
 only the bounded 8D hand actor.  Checkpoint selection uses a private comparison
 split; the selected checkpoint is then evaluated once on the independent
 500-seed gate declared by workyard-contact-task-v1.json.
@@ -10,6 +10,7 @@ split; the selected checkpoint is then evaluated once on the independent
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib.metadata
 import inspect
@@ -77,10 +78,16 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--final-eval-envs", type=int, default=500)
   parser.add_argument("--final-eval-steps", type=int, default=400)
   parser.add_argument("--seed", type=int, default=42)
+  parser.add_argument("--episode-seeds", type=int, nargs="+", default=None)
   parser.add_argument("--execution-profile", default="colab-pro-l4-formal-v1")
   parser.add_argument("--output-root", default="/content/hear-workyard-contact")
   parser.add_argument(
     "--archive", default="/content/hear-workyard-contact-artifacts.tar.gz"
+  )
+  parser.add_argument(
+    "--artifact-stream",
+    action=argparse.BooleanOptionalAction,
+    default=False,
   )
   if REMOTE_CONFIG.is_file():
     configured = json.loads(REMOTE_CONFIG.read_text(encoding="utf-8"))
@@ -181,10 +188,11 @@ def _read_json(path: Path) -> dict[str, object]:
 
 def validate_contract(
   module: ModuleType,
+  require_qualified_preflight: bool,
 ) -> tuple[dict[str, object], Path, dict[str, object]]:
   contract_path = REMOTE_ROOT / "training" / "workyard-contact-task-v1.json"
   contract = _read_json(contract_path)
-  if contract.get("protocol") != "hear-workyard-contact-training-contract-v1":
+  if contract.get("protocol") != "hear-workyard-contact-training-contract-v2":
     raise RuntimeError("Contact Workyard contract protocol is invalid")
   if contract["environment"]["task_id"] != module.TASK_ID:
     raise RuntimeError("Contact task registration disagrees with its contract")
@@ -199,6 +207,11 @@ def validate_contract(
     raise RuntimeError("Contact hand synergy order drifted")
   if contract["environment"]["excluded_stages"] != ["lift", "carry", "place"]:
     raise RuntimeError("Contact learner expanded beyond verified grasp")
+  if (
+    contract["harness_executor"]["hand_contact_solref_time_constant_s"]
+    != module.HAND_CONTACT_SOLREF_TIME_CONSTANT_S
+  ):
+    raise RuntimeError("Contact collision-skin compliance drifted")
 
   observation_source = inspect.getsource(module.WorkyardContactObservation.__call__)
   leaked = [
@@ -229,10 +242,12 @@ def validate_contract(
   reach_jit = reach_root / reach["jit"]
   reach_report_path = reach_root / reach["report"]
   preflight_path = REMOTE_ROOT / qualified["analytic_teacher_preflight"]["report"]
-  for path in (
+  required_paths = [
     locomotion_jit, locomotion_report_path, reach_jit, reach_report_path,
-    preflight_path,
-  ):
+  ]
+  if require_qualified_preflight:
+    required_paths.append(preflight_path)
+  for path in required_paths:
     if not path.is_file():
       raise FileNotFoundError(f"Qualified contact input is missing: {path}")
 
@@ -250,28 +265,58 @@ def validate_contract(
   reach_report = _read_json(reach_report_path)
   reach_source = reach_report.get("source")
   reach_identity = reach_report.get("policy")
+  reach_deployment = reach_report.get("deployment")
   if not isinstance(reach_source, dict) or not isinstance(reach_identity, dict) or (
     reach_report.get("protocol") != reach["protocol"]
+    or not isinstance(reach_deployment, dict)
+    or reach_deployment.get("protocol")
+      != "hear-typescript-mujoco-reach-deployment-gate-v1"
+    or reach_deployment.get("accepted") is not True
+    or reach_deployment.get("controller_mode") != "learned_policy_only"
+    or reach_deployment.get("terminal_assistance_step_count") != 0
+    or reach_deployment.get("minimum_support_margin_m", float("-inf")) < -0.04
+    or reach_deployment.get("maximum_foot_planar_displacement_m", float("inf")) > 0.08
+    or reach_deployment.get("maximum_foot_slip_speed_m_s", float("inf")) > 0.20
+    or reach_deployment.get("double_support_loss_rate_maximum", float("inf")) > 0.10
+    or reach_deployment.get("no_foot_contact_rate_maximum", float("inf")) > 0.01
+    or reach["source_checkpoint_sha256"] is None
+    or reach["jit_sha256"] is None
     or reach_source.get("checkpoint_sha256") != reach["source_checkpoint_sha256"]
     or reach_identity.get("file") != reach_jit.name
     or reach_identity.get("bytes") != reach_jit.stat().st_size
     or reach_identity.get("sha256") != sha256(reach_jit)
     or reach_identity.get("sha256") != reach["jit_sha256"]
+    or reach_identity.get("input")
+      != "hear-workyard-whole-body-reach-observation-v5"
     or reach_identity.get("input_size") != module.REACH_OBSERVATION_SIZE
+    or reach_identity.get("output") != "bounded-whole-body-reach-mean"
     or reach_identity.get("output_size") != module.reach.ACTION_SIZE
     or reach_identity.get("batch_dynamic") is not True
     or reach_identity.get("gradient_parameter_count") != 0
   ):
-    raise RuntimeError("Frozen v15 reach identity is invalid")
-  preflight = _read_json(preflight_path)
-  gate = preflight.get("gate")
-  if not isinstance(gate, dict) or (
-    gate.get("protocol") != qualified["analytic_teacher_preflight"]["protocol"]
-    or gate.get("passed") is not True
-    or not isinstance(gate.get("checks"), dict)
-    or not all(gate["checks"].values())
-  ):
-    raise RuntimeError("Bundled analytic contact preflight is not qualified")
+    raise RuntimeError("Qualified whole-body reach identity is invalid or unpinned")
+  if require_qualified_preflight:
+    preflight = _read_json(preflight_path)
+    gate = preflight.get("gate")
+    evaluation = preflight.get("evaluation")
+    preflight_contract = preflight.get("contract")
+    frozen_reach = None
+    if isinstance(evaluation, dict):
+      frozen_reach = evaluation.get("frozen_reach")
+    if not isinstance(frozen_reach, dict) and isinstance(preflight_contract, dict):
+      frozen_reach = preflight_contract.get("frozen_reach")
+    if not isinstance(gate, dict) or (
+      gate.get("protocol") != qualified["analytic_teacher_preflight"]["protocol"]
+      or gate.get("passed") is not True
+      or not isinstance(gate.get("checks"), dict)
+      or not all(gate["checks"].values())
+      or not isinstance(frozen_reach, dict)
+      or frozen_reach.get("gradient_parameter_count") != 0
+      or frozen_reach.get("jit_sha256") != sha256(reach_jit)
+    ):
+      raise RuntimeError(
+        "Bundled analytic contact preflight is not qualified for pinned Reach"
+      )
   # The inherited G1 spec factory resolves its qualified locomotion identity
   # before an environment action term exists, so it cannot see the per-run
   # action_cfg paths configured below.  Mirror only the already hash-validated
@@ -295,12 +340,14 @@ def validate_contract(
     "locomotion_report": locomotion_report_path,
     "reach_jit": reach_jit,
     "reach_report": reach_report_path,
-    "analytic_preflight": preflight_path,
+    "analytic_preflight": preflight_path if require_qualified_preflight else None,
   }
   evidence = {
     "locomotion_jit_sha256": sha256(locomotion_jit),
     "reach_jit_sha256": sha256(reach_jit),
-    "analytic_preflight_sha256": sha256(preflight_path),
+    "analytic_preflight_sha256": (
+      sha256(preflight_path) if require_qualified_preflight else None
+    ),
     "forbidden_observation_references": leaked,
     "cpu_round_trip_per_control_step": False,
     "paths": artifact_paths,
@@ -423,6 +470,7 @@ def contact_rollout(
   steps: int,
   episode_seed_first: int,
   *,
+  episode_seeds: list[int] | None = None,
   checkpoint: Path | None = None,
   analytic_teacher: bool = False,
 ) -> dict[str, object]:
@@ -434,11 +482,20 @@ def contact_rollout(
 
   if (checkpoint is None) == (not analytic_teacher):
     raise ValueError("Contact rollout requires exactly one action source")
-  torch.manual_seed(episode_seed_first)
+  if episode_seeds is not None:
+    if len(episode_seeds) != num_envs or len(set(episode_seeds)) != num_envs:
+      raise ValueError("Explicit episode seeds must be unique and match num_envs")
+    if any(seed < 0 for seed in episode_seeds):
+      raise ValueError("Explicit episode seeds must be non-negative")
+  evaluation_seed = episode_seeds[0] if episode_seeds else episode_seed_first
+  torch.manual_seed(evaluation_seed)
   env_cfg = load_env_cfg(module.TASK_ID, play=True)
   env_cfg.scene.num_envs = num_envs
-  env_cfg.seed = episode_seed_first
-  env_cfg.commands["workyard"].evaluation_episode_seed_base = episode_seed_first
+  env_cfg.seed = evaluation_seed
+  if episode_seeds is None:
+    env_cfg.commands["workyard"].evaluation_episode_seed_base = episode_seed_first
+  else:
+    env_cfg.commands["workyard"].evaluation_episode_seeds = tuple(episode_seeds)
   configure_artifacts(env_cfg, evidence)
   agent_cfg = load_rl_cfg(module.TASK_ID)
   raw_env = ManagerBasedRlEnv(cfg=env_cfg, device=DEVICE)
@@ -464,7 +521,11 @@ def contact_rollout(
     action_term = module._contact_action(raw_env)
     command = module.base._workyard_command(raw_env)
     initial_active_hand = command.active_hand.clone()
-    expected_seeds = torch.arange(
+    expected_seeds = torch.tensor(
+      episode_seeds,
+      dtype=torch.long,
+      device=DEVICE,
+    ) if episode_seeds is not None else torch.arange(
       episode_seed_first,
       episode_seed_first + num_envs,
       dtype=torch.long,
@@ -497,6 +558,18 @@ def contact_rollout(
     )
     first_pocket_step = torch.full_like(first_contact_step, -1)
     first_opposing_step = torch.full_like(first_contact_step, -1)
+    first_thumb_latch_step = torch.full_like(first_contact_step, -1)
+    first_opposing_digit_latch_step = torch.full_like(first_contact_step, -1)
+    first_thumb_latch_force = torch.zeros(num_envs, device=DEVICE)
+    first_opposing_digit_latch_force = torch.zeros(num_envs, device=DEVICE)
+    first_thumb_latch_rod_local = torch.zeros((num_envs, 3), device=DEVICE)
+    first_opposing_digit_latch_rod_local = torch.zeros(
+      (num_envs, 3), device=DEVICE
+    )
+    first_thumb_latch_coordination = torch.zeros((num_envs, 4), device=DEVICE)
+    first_opposing_digit_latch_coordination = torch.zeros(
+      (num_envs, 4), device=DEVICE
+    )
     success_step = torch.full_like(first_contact_step, -1)
     last_active_stage = torch.zeros(
       num_envs, dtype=torch.long, device=DEVICE
@@ -511,6 +584,39 @@ def contact_rollout(
     last_active_coordination = torch.zeros(
       (num_envs, 4), dtype=torch.float32, device=DEVICE
     )
+    last_active_authority_saturation = torch.zeros(
+      (num_envs, 7), dtype=torch.bool, device=DEVICE
+    )
+    last_active_soft_limit_saturation = torch.zeros_like(
+      last_active_authority_saturation
+    )
+    last_active_command_lead_saturation = torch.zeros_like(
+      last_active_authority_saturation
+    )
+    last_active_minimum_singular_value = torch.zeros(
+      num_envs, dtype=torch.float32, device=DEVICE
+    )
+    last_active_joint_position = torch.zeros(
+      (num_envs, 7), dtype=torch.float32, device=DEVICE
+    )
+    last_active_authority_lower_margin = torch.zeros_like(
+      last_active_joint_position
+    )
+    last_active_authority_upper_margin = torch.zeros_like(
+      last_active_joint_position
+    )
+    last_active_primary_delta = torch.zeros_like(last_active_joint_position)
+    last_active_secondary_delta = torch.zeros_like(last_active_joint_position)
+    last_active_projected_posture_delta = torch.zeros_like(
+      last_active_joint_position
+    )
+    last_active_joint_correction = torch.zeros_like(last_active_joint_position)
+    last_active_instantaneous_target = torch.zeros_like(
+      last_active_joint_position
+    )
+    last_active_authority_limited_target = torch.zeros_like(
+      last_active_joint_position
+    )
     precontact_object_contact = torch.zeros_like(active)
     base_assist_seen = torch.zeros_like(active)
     maximum_force = torch.zeros(num_envs, device=DEVICE)
@@ -523,6 +629,17 @@ def contact_rollout(
     force_peak_coordination = torch.zeros(num_envs, device=DEVICE)
     force_peak_opposed = torch.zeros_like(active)
     force_peak_hand_target_lag = torch.zeros(num_envs, device=DEVICE)
+    force_peak_wrist_delta = torch.zeros((num_envs, 3), device=DEVICE)
+    force_peak_bearing_error = torch.zeros(num_envs, device=DEVICE)
+    force_peak_axis_error = torch.zeros(num_envs, device=DEVICE)
+    force_peak_measured_rod_local = torch.zeros((num_envs, 3), device=DEVICE)
+    force_peak_pocket_local_error = torch.zeros(num_envs, device=DEVICE)
+    force_peak_target_offset_drift = torch.zeros(num_envs, device=DEVICE)
+    force_peak_wrist_orientation_drift = torch.zeros(num_envs, device=DEVICE)
+    pocket_entry_valid = torch.zeros_like(active)
+    pocket_entry_target_offset_w = torch.zeros((num_envs, 3), device=DEVICE)
+    pocket_entry_wrist_quat_w = torch.zeros((num_envs, 4), device=DEVICE)
+    pocket_entry_wrist_quat_w[:, 0] = 1.0
     maximum_stage = torch.zeros(num_envs, dtype=torch.long, device=DEVICE)
     reward_sum = torch.zeros(num_envs, device=DEVICE)
     minimum_opposing_normal_dot = 1.0
@@ -570,6 +687,29 @@ def contact_rollout(
         reached_contact |= contact_now
         reached_pocket |= pocket_now
         rows = torch.arange(num_envs, device=DEVICE)
+        root_pos = command.robot.data.root_link_pos_w
+        root_quat = command.robot.data.root_link_quat_w
+        wrist_pose = command.robot.data.body_link_pose_w[:, command._wrist_body_ids]
+        active_wrist_pose = wrist_pose[rows, command.active_hand]
+        target_position_p = command.wrist_targets_pelvis.reshape(
+          num_envs, 2, 7
+        )[..., :3][rows, command.active_hand]
+        target_position_w = root_pos + module.base.quat_apply(
+          root_quat, target_position_p
+        )
+        rod_position_w = command.rod.data.root_link_pos_w
+        newly_entered_pocket = pocket_now & ~pocket_entry_valid
+        pocket_entry_target_offset_w = torch.where(
+          newly_entered_pocket.unsqueeze(-1),
+          target_position_w - rod_position_w,
+          pocket_entry_target_offset_w,
+        )
+        pocket_entry_wrist_quat_w = torch.where(
+          newly_entered_pocket.unsqueeze(-1),
+          active_wrist_pose[:, 3:7],
+          pocket_entry_wrist_quat_w,
+        )
+        pocket_entry_valid |= pocket_now
         active_wrist_delta = module.reach.active_wrist_position_delta(raw_env)
         active_bearing_error = action_term.reach_teacher.wrist_bearing_error[
           rows, command.active_hand
@@ -578,6 +718,48 @@ def contact_rollout(
           rows, command.active_hand
         ]
         coordination_before = action_term.coordination.reshape(num_envs, 2, 4)[
+          rows, command.active_hand
+        ]
+        reach_teacher = action_term.reach_teacher
+        active_authority_saturation = reach_teacher.authority_saturation.reshape(
+          num_envs, 2, 7
+        )[rows, command.active_hand]
+        active_soft_limit_saturation = reach_teacher.soft_limit_saturation.reshape(
+          num_envs, 2, 7
+        )[rows, command.active_hand]
+        active_command_lead_saturation = (
+          reach_teacher.command_lead_saturation.reshape(num_envs, 2, 7)[
+            rows, command.active_hand
+          ]
+        )
+        active_minimum_singular_value = reach_teacher.minimum_singular_value[
+          rows, command.active_hand
+        ]
+        active_joint_position = action_term._entity.data.joint_pos[
+          :, action_term._body_ids[module.reach.UPPER_BODY_SLICE]
+        ].reshape(num_envs, 2, 7)[rows, command.active_hand]
+        active_authority_lower = reach_teacher._authority_lower[
+          rows, command.active_hand
+        ]
+        active_authority_upper = reach_teacher._authority_upper[
+          rows, command.active_hand
+        ]
+        active_primary_delta = reach_teacher.primary_delta[
+          rows, command.active_hand
+        ]
+        active_secondary_delta = reach_teacher.secondary_delta[
+          rows, command.active_hand
+        ]
+        active_projected_posture_delta = reach_teacher.projected_posture_delta[
+          rows, command.active_hand
+        ]
+        active_joint_correction = reach_teacher.joint_correction[
+          rows, command.active_hand
+        ]
+        active_instantaneous_target = reach_teacher.instantaneous_target[
+          rows, command.active_hand
+        ]
+        active_authority_limited_target = reach_teacher.authority_limited_target[
           rows, command.active_hand
         ]
         last_active_stage = torch.where(
@@ -599,6 +781,71 @@ def contact_rollout(
           coordination_before,
           last_active_coordination,
         )
+        last_active_authority_saturation = torch.where(
+          active_before.unsqueeze(-1),
+          active_authority_saturation,
+          last_active_authority_saturation,
+        )
+        last_active_soft_limit_saturation = torch.where(
+          active_before.unsqueeze(-1),
+          active_soft_limit_saturation,
+          last_active_soft_limit_saturation,
+        )
+        last_active_command_lead_saturation = torch.where(
+          active_before.unsqueeze(-1),
+          active_command_lead_saturation,
+          last_active_command_lead_saturation,
+        )
+        last_active_minimum_singular_value = torch.where(
+          active_before,
+          active_minimum_singular_value,
+          last_active_minimum_singular_value,
+        )
+        last_active_joint_position = torch.where(
+          active_before.unsqueeze(-1),
+          active_joint_position,
+          last_active_joint_position,
+        )
+        last_active_authority_lower_margin = torch.where(
+          active_before.unsqueeze(-1),
+          active_joint_position - active_authority_lower,
+          last_active_authority_lower_margin,
+        )
+        last_active_authority_upper_margin = torch.where(
+          active_before.unsqueeze(-1),
+          active_authority_upper - active_joint_position,
+          last_active_authority_upper_margin,
+        )
+        last_active_primary_delta = torch.where(
+          active_before.unsqueeze(-1),
+          active_primary_delta,
+          last_active_primary_delta,
+        )
+        last_active_secondary_delta = torch.where(
+          active_before.unsqueeze(-1),
+          active_secondary_delta,
+          last_active_secondary_delta,
+        )
+        last_active_projected_posture_delta = torch.where(
+          active_before.unsqueeze(-1),
+          active_projected_posture_delta,
+          last_active_projected_posture_delta,
+        )
+        last_active_joint_correction = torch.where(
+          active_before.unsqueeze(-1),
+          active_joint_correction,
+          last_active_joint_correction,
+        )
+        last_active_instantaneous_target = torch.where(
+          active_before.unsqueeze(-1),
+          active_instantaneous_target,
+          last_active_instantaneous_target,
+        )
+        last_active_authority_limited_target = torch.where(
+          active_before.unsqueeze(-1),
+          active_authority_limited_target,
+          last_active_authority_limited_target,
+        )
         if analytic_teacher:
           for side, fixture_index in parity_indexes.items():
             milestones = []
@@ -617,6 +864,7 @@ def contact_rollout(
                 raw_env,
                 observations["actor"],
                 fixture_index,
+                int(expected_seeds[fixture_index].item()),
                 step_index,
                 milestone,
               ))
@@ -728,6 +976,131 @@ def contact_rollout(
           active_hand_target_lag,
           force_peak_hand_target_lag,
         )
+        peak_wrist_delta = module.reach.active_wrist_position_delta(raw_env)
+        peak_wrist_pose = command.robot.data.body_link_pose_w[
+          :, command._wrist_body_ids
+        ][rows, command.active_hand]
+        peak_rod_position_w = command.rod.data.root_link_pos_w
+        peak_measured_rod_local = module.base.quat_apply_inverse(
+          peak_wrist_pose[:, 3:7],
+          peak_rod_position_w - peak_wrist_pose[:, :3],
+        )
+        active_thumb_latched = action_term.teacher_thumb_contact_latched[
+          rows, command.active_hand
+        ]
+        active_opposing_digit_latched = (
+          action_term.teacher_opposing_contact_latched[rows, command.active_hand]
+        )
+        new_thumb_latch = (
+          active_thumb_latched & active_before & (first_thumb_latch_step < 0)
+        )
+        new_opposing_digit_latch = (
+          active_opposing_digit_latched
+          & active_before
+          & (first_opposing_digit_latch_step < 0)
+        )
+        first_thumb_latch_step = torch.where(
+          new_thumb_latch,
+          torch.full_like(first_thumb_latch_step, step_index),
+          first_thumb_latch_step,
+        )
+        first_opposing_digit_latch_step = torch.where(
+          new_opposing_digit_latch,
+          torch.full_like(first_opposing_digit_latch_step, step_index),
+          first_opposing_digit_latch_step,
+        )
+        first_thumb_latch_force = torch.where(
+          new_thumb_latch, active_force, first_thumb_latch_force
+        )
+        first_opposing_digit_latch_force = torch.where(
+          new_opposing_digit_latch,
+          active_force,
+          first_opposing_digit_latch_force,
+        )
+        first_thumb_latch_rod_local = torch.where(
+          new_thumb_latch.unsqueeze(-1),
+          peak_measured_rod_local,
+          first_thumb_latch_rod_local,
+        )
+        first_opposing_digit_latch_rod_local = torch.where(
+          new_opposing_digit_latch.unsqueeze(-1),
+          peak_measured_rod_local,
+          first_opposing_digit_latch_rod_local,
+        )
+        active_coordination_after = coordination[rows, command.active_hand]
+        first_thumb_latch_coordination = torch.where(
+          new_thumb_latch.unsqueeze(-1),
+          active_coordination_after,
+          first_thumb_latch_coordination,
+        )
+        first_opposing_digit_latch_coordination = torch.where(
+          new_opposing_digit_latch.unsqueeze(-1),
+          active_coordination_after,
+          first_opposing_digit_latch_coordination,
+        )
+        desired_pocket_local = torch.zeros_like(peak_measured_rod_local)
+        desired_pocket_local[:, 0] = command.cfg.contact_pocket_forward_m
+        desired_pocket_local[:, 1] = torch.where(
+          command.active_hand == 0,
+          torch.full_like(active_force, -command.cfg.contact_pocket_lateral_m),
+          torch.full_like(active_force, command.cfg.contact_pocket_lateral_m),
+        )
+        desired_pocket_local[:, 2] = command.cfg.contact_pocket_vertical_m
+        peak_pocket_local_error = torch.linalg.vector_norm(
+          peak_measured_rod_local - desired_pocket_local,
+          dim=-1,
+        )
+        peak_root_pos = command.robot.data.root_link_pos_w
+        peak_root_quat = command.robot.data.root_link_quat_w
+        peak_target_position_p = command.wrist_targets_pelvis.reshape(
+          num_envs, 2, 7
+        )[..., :3][rows, command.active_hand]
+        peak_target_position_w = peak_root_pos + module.base.quat_apply(
+          peak_root_quat, peak_target_position_p
+        )
+        peak_target_offset_drift = torch.linalg.vector_norm(
+          (peak_target_position_w - peak_rod_position_w)
+            - pocket_entry_target_offset_w,
+          dim=-1,
+        )
+        peak_quat_dot = torch.sum(
+          peak_wrist_pose[:, 3:7] * pocket_entry_wrist_quat_w,
+          dim=-1,
+        ).abs().clamp(0.0, 1.0)
+        peak_wrist_orientation_drift = 2.0 * torch.acos(peak_quat_dot)
+        peak_bearing_error = action_term.reach_teacher.wrist_bearing_error[
+          rows, command.active_hand
+        ]
+        peak_axis_error = action_term.reach_teacher.wrist_axis_alignment_error[
+          rows, command.active_hand
+        ]
+        force_peak_wrist_delta = torch.where(
+          new_force_peak.unsqueeze(-1), peak_wrist_delta, force_peak_wrist_delta
+        )
+        force_peak_bearing_error = torch.where(
+          new_force_peak, peak_bearing_error, force_peak_bearing_error
+        )
+        force_peak_axis_error = torch.where(
+          new_force_peak, peak_axis_error, force_peak_axis_error
+        )
+        force_peak_measured_rod_local = torch.where(
+          new_force_peak.unsqueeze(-1),
+          peak_measured_rod_local,
+          force_peak_measured_rod_local,
+        )
+        force_peak_pocket_local_error = torch.where(
+          new_force_peak, peak_pocket_local_error, force_peak_pocket_local_error
+        )
+        force_peak_target_offset_drift = torch.where(
+          new_force_peak,
+          peak_target_offset_drift,
+          force_peak_target_offset_drift,
+        )
+        force_peak_wrist_orientation_drift = torch.where(
+          new_force_peak,
+          peak_wrist_orientation_drift,
+          force_peak_wrist_orientation_drift,
+        )
         opposing_seen |= active_opposed & active_before
         first_opposing_step = torch.where(
           active_opposed & active_before & (first_opposing_step < 0),
@@ -789,7 +1162,7 @@ def contact_rollout(
   )
   top_force_episodes = [
     {
-      "episode_seed": episode_seed_first + int(index.item()),
+      "episode_seed": int(expected_seeds[index].item()),
       "active_hand": (
         "left" if int(initial_active_hand[index].item()) == 0 else "right"
       ),
@@ -801,6 +1174,21 @@ def contact_rollout(
         force_peak_hand_target_lag[index].item()
       ),
       "opposing_contact": bool(force_peak_opposed[index].item()),
+      "wrist_delta_m": [
+        float(value) for value in force_peak_wrist_delta[index].tolist()
+      ],
+      "bearing_error_rad": float(force_peak_bearing_error[index].item()),
+      "axis_alignment_error_rad": float(force_peak_axis_error[index].item()),
+      "measured_rod_local_m": [
+        float(value) for value in force_peak_measured_rod_local[index].tolist()
+      ],
+      "pocket_local_error_m": float(force_peak_pocket_local_error[index].item()),
+      "target_offset_drift_from_pocket_entry_m": float(
+        force_peak_target_offset_drift[index].item()
+      ),
+      "wrist_orientation_drift_from_pocket_entry_rad": float(
+        force_peak_wrist_orientation_drift[index].item()
+      ),
       "success": bool(success[index].item()),
     }
     for force, index in zip(top_force_values, top_force_indexes, strict=True)
@@ -808,7 +1196,7 @@ def contact_rollout(
   failure_indexes = torch.where(~success)[0][:32]
   failure_episodes = [
     {
-      "episode_seed": episode_seed_first + int(index.item()),
+      "episode_seed": int(expected_seeds[index].item()),
       "active_hand": (
         "left" if int(initial_active_hand[index].item()) == 0 else "right"
       ),
@@ -816,6 +1204,31 @@ def contact_rollout(
       "first_contact_step": int(first_contact_step[index].item()),
       "first_pocket_step": int(first_pocket_step[index].item()),
       "first_opposing_step": int(first_opposing_step[index].item()),
+      "first_thumb_latch_step": int(first_thumb_latch_step[index].item()),
+      "first_opposing_digit_latch_step": int(
+        first_opposing_digit_latch_step[index].item()
+      ),
+      "first_thumb_latch_force_n": float(
+        first_thumb_latch_force[index].item()
+      ),
+      "first_opposing_digit_latch_force_n": float(
+        first_opposing_digit_latch_force[index].item()
+      ),
+      "first_thumb_latch_rod_local_m": [
+        float(value) for value in first_thumb_latch_rod_local[index].tolist()
+      ],
+      "first_opposing_digit_latch_rod_local_m": [
+        float(value)
+        for value in first_opposing_digit_latch_rod_local[index].tolist()
+      ],
+      "first_thumb_latch_coordination": [
+        float(value)
+        for value in first_thumb_latch_coordination[index].tolist()
+      ],
+      "first_opposing_digit_latch_coordination": [
+        float(value)
+        for value in first_opposing_digit_latch_coordination[index].tolist()
+      ],
       "last_wrist_delta_m": [
         float(value) for value in last_active_wrist_delta[index].tolist()
       ],
@@ -833,6 +1246,50 @@ def contact_rollout(
       ),
       "last_active_coordination": [
         float(value) for value in last_active_coordination[index].tolist()
+      ],
+      "last_authority_saturation": [
+        bool(value) for value in last_active_authority_saturation[index].tolist()
+      ],
+      "last_soft_limit_saturation": [
+        bool(value) for value in last_active_soft_limit_saturation[index].tolist()
+      ],
+      "last_command_lead_saturation": [
+        bool(value) for value in last_active_command_lead_saturation[index].tolist()
+      ],
+      "last_minimum_singular_value": float(
+        last_active_minimum_singular_value[index].item()
+      ),
+      "last_active_joint_position_rad": [
+        float(value) for value in last_active_joint_position[index].tolist()
+      ],
+      "last_authority_lower_margin_rad": [
+        float(value)
+        for value in last_active_authority_lower_margin[index].tolist()
+      ],
+      "last_authority_upper_margin_rad": [
+        float(value)
+        for value in last_active_authority_upper_margin[index].tolist()
+      ],
+      "last_primary_delta_rad": [
+        float(value) for value in last_active_primary_delta[index].tolist()
+      ],
+      "last_secondary_delta_rad": [
+        float(value) for value in last_active_secondary_delta[index].tolist()
+      ],
+      "last_projected_posture_delta_rad": [
+        float(value)
+        for value in last_active_projected_posture_delta[index].tolist()
+      ],
+      "last_joint_correction_rad": [
+        float(value) for value in last_active_joint_correction[index].tolist()
+      ],
+      "last_instantaneous_target_rad": [
+        float(value)
+        for value in last_active_instantaneous_target[index].tolist()
+      ],
+      "last_authority_limited_target_rad": [
+        float(value)
+        for value in last_active_authority_limited_target[index].tolist()
       ],
       "maximum_force_n": float(maximum_force[index].item()),
       "reached_contact": bool(reached_contact[index].item()),
@@ -866,7 +1323,7 @@ def contact_rollout(
     }
 
   return {
-    "protocol": "hear-workyard-contact-policy-evaluation-v1",
+    "protocol": "hear-workyard-contact-policy-evaluation-v2",
     "action_source": "analytic_teacher" if analytic_teacher else "learned_checkpoint",
     "environment_count": num_envs,
     "episode_count": num_envs,
@@ -874,10 +1331,17 @@ def contact_rollout(
     "completed_control_steps": completed_steps,
     "termination_count": termination_count,
     "seed_allocation": {
-      "protocol": "per_environment_deterministic_v1",
+      "protocol": (
+        "explicit_episode_seed_list_v1"
+        if episode_seeds is not None else "per_environment_deterministic_v1"
+      ),
       "first": int(expected_seeds[0].item()),
       "last": int(expected_seeds[-1].item()),
       "count": int(expected_seeds.numel()),
+      **(
+        {"seeds": [int(seed) for seed in expected_seeds.tolist()]}
+        if episode_seeds is not None else {}
+      ),
     },
     "success_count": int(success.sum().item()),
     "success_rate": float(success.float().mean().item()),
@@ -1620,7 +2084,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
   module = load_module()
   if module.TASK_ID not in list_tasks():
     raise RuntimeError(f"Contact task was not registered: {module.TASK_ID}")
-  contract, contract_path, evidence = validate_contract(module)
+  contract, contract_path, evidence = validate_contract(
+    module, args.mode in ("pilot", "train")
+  )
   if args.mode == "train":
     expected = contract["training"]
     selection = expected["checkpoint_selection"]
@@ -1655,6 +2121,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
       args.num_envs,
       args.rollout_steps,
       args.seed,
+      episode_seeds=args.episode_seeds,
       analytic_teacher=True,
     )
     fresh_preflight = None
@@ -1665,6 +2132,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
       args.num_envs,
       args.rollout_steps,
       args.seed,
+      episode_seeds=args.episode_seeds,
       analytic_teacher=True,
     )
     fresh_preflight = analytic_preflight_gate(evaluation, contract)
@@ -1695,9 +2163,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
     )
 
   structural_checks = {
-    "observation_size": module.HAND_OBSERVATION_SIZE == 247,
+    "observation_size": module.HAND_OBSERVATION_SIZE == 262,
     "learned_action_size": module.HAND_ACTION_SIZE == 8,
-    "logical_composition_size": module.COMPOSED_ACTION_SIZE == 22,
+    "logical_composition_size": module.COMPOSED_ACTION_SIZE == 37,
     "finite_and_closed": (
       evaluation["finite"] is True and evaluation["environment_closed"] is True
     ),
@@ -1719,7 +2187,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
       + json.dumps(structural_checks, ensure_ascii=False)
     )
   return {
-    "protocol": "hear-workyard-contact-run-v1",
+    "protocol": "hear-workyard-contact-run-v2",
     "ready": True,
     "mode": args.mode,
     "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1773,12 +2241,15 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
       "opposing_support_coordination": (
         contract["harness_executor"]["opposing_support_coordination"]
       ),
+      "hand_contact_solref_time_constant_s": (
+        contract["harness_executor"]["hand_contact_solref_time_constant_s"]
+      ),
     },
     "fresh_analytic_preflight": fresh_preflight,
     # Canonical qualified-input envelope retained for the training contract
     # and both local/Colab bundle validators.  It is an exact protocol alias of
     # the fresh gate above, not a second evaluation or a relaxed decision.
-    "gate": {
+    "gate": None if fresh_preflight is None else {
       "protocol": "hear-workyard-contact-analytic-teacher-preflight-v1",
       "checks": fresh_preflight["checks"],
       "passed": fresh_preflight["passed"],
@@ -1807,16 +2278,57 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
   }
 
 
+def emit_artifact_stream(sources: dict[str, Path]) -> list[dict[str, object]]:
+  """Return durable artifacts over the already-authenticated exec websocket."""
+
+  emitted: list[dict[str, object]] = []
+  prefix = "@@HEAR_ARTIFACT_V1@@"
+  for name, source in sources.items():
+    if not source.is_file():
+      continue
+    size = source.stat().st_size
+    digest = sha256(source)
+    print(prefix + json.dumps({
+      "kind": "begin",
+      "name": name,
+      "bytes": size,
+      "sha256": digest,
+    }, separators=(",", ":")), flush=True)
+    index = 0
+    with source.open("rb") as handle:
+      while chunk := handle.read(192 * 1024):
+        print(prefix + json.dumps({
+          "kind": "chunk",
+          "name": name,
+          "index": index,
+          "data": base64.b64encode(chunk).decode("ascii"),
+        }, separators=(",", ":")), flush=True)
+        index += 1
+    print(prefix + json.dumps({
+      "kind": "end",
+      "name": name,
+      "chunks": index,
+    }, separators=(",", ":")), flush=True)
+    emitted.append({"name": name, "bytes": size, "sha256": digest})
+  if "training-report.json" not in {value["name"] for value in emitted}:
+    raise RuntimeError("Artifact stream did not emit the training report")
+  return emitted
+
+
 def main() -> None:
   report: dict[str, object]
   mode = "unknown"
+  archive_path: Path | None = None
+  artifact_stream_enabled = False
   try:
     args = parse_args()
     mode = args.mode
+    archive_path = Path(args.archive).resolve()
+    artifact_stream_enabled = args.artifact_stream
     report = execute(args)
   except BaseException as error:
     report = {
-      "protocol": "hear-workyard-contact-run-v1",
+      "protocol": "hear-workyard-contact-run-v2",
       "ready": False,
       "mode": mode,
       "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1834,6 +2346,15 @@ def main() -> None:
   REMOTE_REPORT.write_text(
     json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
   )
+  streamed_artifacts = None
+  if artifact_stream_enabled:
+    streamed_artifacts = emit_artifact_stream({
+      "training-report.json": REMOTE_REPORT,
+      **(
+        {"training-artifacts.tar.gz": archive_path}
+        if archive_path is not None else {}
+      ),
+    })
   evaluation = report.get("evaluation")
   acceptance = report.get("acceptance")
   fresh_preflight = report.get("fresh_analytic_preflight")
@@ -1863,6 +2384,7 @@ def main() -> None:
       else None
     ),
     "error": report.get("error") if not report["ready"] else None,
+    "streamed_artifacts": streamed_artifacts,
   }
   print(json.dumps(console_summary, ensure_ascii=False))
   if not report["ready"]:

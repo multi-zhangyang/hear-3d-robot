@@ -64,10 +64,10 @@ export const G1_RIG_PARTS: readonly G1Part[] = [
 ];
 
 const COLORS = {
-  graphite: 0x111821,
-  shell: 0xc9d1d7,
-  joint: 0x68727b,
-  hand: 0x202830
+  graphite: 0x090909,
+  shell: 0xd4d4d4,
+  joint: 0x555555,
+  hand: 0x171717
 } as const;
 
 export class G1Rig {
@@ -75,9 +75,9 @@ export class G1Rig {
   readonly #links = new Map<string, THREE.Group>();
   readonly #footMaterials = new Map<"left" | "right", THREE.MeshStandardMaterial[]>();
   readonly #visionMaterial = new THREE.MeshStandardMaterial({
-    color: 0x72e9d2,
-    emissive: 0x35d7ba,
-    emissiveIntensity: 2.4,
+    color: 0xffffff,
+    emissive: 0xb8b8b8,
+    emissiveIntensity: 1.8,
     roughness: 0.18,
     metalness: 0.42
   });
@@ -125,9 +125,9 @@ export class G1Rig {
     }
     this.#setFootState("left", snapshot.robot.feet.left.touching, snapshot.robot.feet.left.normalForce);
     this.#setFootState("right", snapshot.robot.feet.right.touching, snapshot.robot.feet.right.normalForce);
-    this.#visionMaterial.emissiveIntensity = snapshot.robot.fallen ? 0.25 : 2.4;
-    this.#visionMaterial.color.set(snapshot.robot.fallen ? 0xd65a62 : 0x72e9d2);
-    this.#visionMaterial.emissive.set(snapshot.robot.fallen ? 0xb62f3d : 0x35d7ba);
+    this.#visionMaterial.emissiveIntensity = snapshot.robot.fallen ? 0.25 : 1.8;
+    this.#visionMaterial.color.set(snapshot.robot.fallen ? 0xd65a62 : 0xffffff);
+    this.#visionMaterial.emissive.set(snapshot.robot.fallen ? 0xb62f3d : 0xb8b8b8);
   }
 
   bounds(): THREE.Box3 {
@@ -151,8 +151,12 @@ export class G1Rig {
   #addPart(part: G1Part, geometry: THREE.BufferGeometry): void {
     const material = new THREE.MeshStandardMaterial({
       color: COLORS[part.tone],
-      roughness: part.tone === "shell" ? 0.32 : 0.48,
-      metalness: part.tone === "hand" ? 0.08 : 0.52,
+      roughness: part.tone === "shell"
+        ? 0.5
+        : part.tone === "graphite" ? 0.56 : part.tone === "joint" ? 0.4 : 0.62,
+      metalness: part.tone === "shell"
+        ? 0.18
+        : part.tone === "joint" ? 0.48 : part.tone === "graphite" ? 0.3 : 0.06,
       emissive: 0x000000,
       emissiveIntensity: 0
     });
@@ -188,8 +192,8 @@ export class G1Rig {
 
   #setFootState(side: "left" | "right", touching: boolean, force: number): void {
     for (const material of this.#footMaterials.get(side) ?? []) {
-      material.emissive.set(touching ? 0x35d7ba : 0x000000);
-      material.emissiveIntensity = touching ? Math.min(1.2, 0.25 + force / 900) : 0;
+      material.emissive.set(touching ? 0xffffff : 0x000000);
+      material.emissiveIntensity = touching ? Math.min(0.7, 0.15 + force / 1_200) : 0;
     }
   }
 }

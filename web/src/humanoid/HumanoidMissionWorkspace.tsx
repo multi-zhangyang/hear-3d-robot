@@ -9,16 +9,15 @@ import type {
 } from "../types";
 import { activeContextUsage } from "../context-memory";
 import { activeCheckpointGoal } from "../goal-state";
-import { buildAgentTree } from "../flow/agent-tree";
 import {
   actionLabel,
   agentNameLabel,
   bodyChannelLabel,
   entityLabel,
-  humanoidControllerExecutionLabel,
-  motionGeneratorLabel,
+  humanoidPolicyCapabilityLabel,
   nodeStatusLabel,
   predicateLabel,
+  runStatusLabel,
   streamStatusLabel
 } from "../ui-text";
 import { HumanoidStage } from "./HumanoidStage";
@@ -43,13 +42,19 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
   const { checkpoint } = props.details;
   const live = checkpoint.status === "starting" || checkpoint.status === "running";
   const frame = useHumanoidHudFrame(props.frameBuffer, checkpoint.world);
-  const nodes = useMemo(
-    () => buildAgentTree(checkpoint.nodes, checkpoint.root_id).map((entry) => entry.node),
-    [checkpoint.nodes, checkpoint.root_id]
-  );
   const current = checkpoint.active_agent_id
     ? checkpoint.nodes[checkpoint.active_agent_id]
     : checkpoint.nodes[checkpoint.root_id];
+  const controlPath = useMemo(
+    () => activeControlPath(
+      checkpoint.nodes,
+      checkpoint.root_id,
+      checkpoint.active_agent_ids.length > 0
+        ? checkpoint.active_agent_ids
+        : current ? [current.id] : []
+    ),
+    [checkpoint.active_agent_ids, checkpoint.nodes, checkpoint.root_id, current]
+  );
   const activeChannels = movingHumanoidChannels(frame);
   const latest = props.details.actions.at(-1);
   const goal = activeCheckpointGoal(checkpoint);
@@ -67,10 +72,6 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
   const total = goal?.predicates.length ?? 0;
   const context = checkpoint.context_memory;
   const contextUsage = activeContextUsage(context);
-  const archivedGoalOutcomes = checkpoint.goal_dag?.archive?.summary?.outcomes.selected;
-  const archivedGoalMemory = archivedGoalOutcomes
-    ? `${archivedGoalOutcomes.completed}/${archivedGoalOutcomes.total} 个归档 Goal 完成`
-    : `${checkpoint.goal_dag?.archive?.record_count ?? 0} 个归档 Goal`;
   const activeGrasps = activeHumanoidGrasps(frame);
   const manipulation = humanoidManipulationTelemetry(
     frame,
@@ -85,15 +86,15 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
       <section className="humanoid-agent-hud game-card" aria-label="层级智能体执行状态">
         <header>
           <span className={live ? "status-beacon live" : "status-beacon"} />
-          <b>{live ? "自主运行中" : "运行记录"}</b>
-          <small>{live ? streamStatusLabel(props.streamState) : "历史"}</small>
+          <b>层级控制</b>
+          <small>{live ? streamStatusLabel(props.streamState) : runStatusLabel(checkpoint.status)}</small>
         </header>
         <div className="humanoid-agent-focus">
           <span>{current ? agentNameLabel(current.name) : "等待智能体"}</span>
           <strong>{latest ? actionLabel(latest.action) : "正在建立世界状态"}</strong>
         </div>
         <div className="humanoid-agent-chain">
-          {nodes.map((node) => (
+          {controlPath.map((node) => (
             <div
               key={node.id}
               className={`${node.status} ${node.id === current?.id ? "current" : ""}`}
@@ -115,19 +116,22 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
 
       <section className="humanoid-state-hud game-card" aria-label="人形物理状态">
         <header>
-          <span>物理闭环</span>
-          <b>
-            {motionGeneratorLabel(frame.motionGenerator.implementation)} · {
-              humanoidControllerExecutionLabel(
-                frame.robot.controllerExecution,
-                frame.robot.controller.implementation
-              )
-            } · MuJoCo
-          </b>
+          <span>物理</span>
+          <b>{frame.robot.controller.learnedPolicy ? "ONNX · MuJoCo" : "MuJoCo"}</b>
         </header>
+        {frame.robot.controller.learnedPolicy && (
+          <div className="humanoid-policy-capabilities" aria-label="已安装学习策略能力">
+            <span>策略</span>
+            <div>
+              {frame.robot.controller.learnedPolicy.capabilities.map((capability) => (
+                <b key={capability}>{humanoidPolicyCapabilityLabel(capability)}</b>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="humanoid-state-grid">
-          <Metric label="世界版本" value={frame.worldRevision} />
-          <Metric label="物理时间" value={`${frame.robot.simulatedTime.toFixed(1)}s`} />
+          <Metric label="版本" value={frame.worldRevision} />
+          <Metric label="时间" value={`${frame.robot.simulatedTime.toFixed(1)}s`} />
           <Metric label="左脚" value={forceLabel(frame.robot.feet.left.normalForce)} active={frame.robot.feet.left.touching} />
           <Metric label="右脚" value={forceLabel(frame.robot.feet.right.normalForce)} active={frame.robot.feet.right.touching} />
         </div>
@@ -137,7 +141,7 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
         {manipulation && (
           <div className="humanoid-manipulation-state" aria-label="实时全身交互闭环">
             <div>
-              <small>全身交互</small>
+              <small>对象</small>
               <b>{entityLabel(manipulation.objectId)}</b>
             </div>
             <ol>
@@ -158,8 +162,8 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
                 <i />
                 <b>{graspHandLabel(assessment.hand)} · {entityLabel(assessment.object_id)}</b>
                 <small>
-                  {assessment.grasp_verified ? "已抓稳 · " : ""}
-                  接触 {assessment.evidence.relative_pose.stable_frames} 帧 · 抬离 {assessment.evidence.lifted_hold_frames} 帧
+                  {assessment.grasp_verified ? "稳定 · " : ""}
+                  {assessment.evidence.relative_pose.stable_frames}/{assessment.evidence.lifted_hold_frames} 帧
                 </small>
               </span>
             ))}
@@ -173,7 +177,7 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
 
       <section className="humanoid-goal-hud game-card" aria-label="目标与长期记忆">
         <div className="humanoid-goal-title">
-          <span>{checkpoint.version === 6 ? "Goal Epoch" : "目标"}</span>
+          <span>目标</span>
           <b>{goal ? `${passed}/${total}` : inactiveGoalStatus}</b>
         </div>
         <div className="humanoid-goal-list">
@@ -217,11 +221,38 @@ export function HumanoidMissionWorkspace(props: HumanoidMissionWorkspaceProps): 
             <b>{compactTokens(contextUsage.activeEstimatedTokens)} / {compactTokens(contextUsage.contextWindowTokens)}</b>
           </span>
           <i><em style={{ width: `${contextUsage.loadFraction * 100}%` }} /></i>
-          <small>压缩线 {compactTokens(contextUsage.compactTriggerTokens)} · {context.total_compactions} 次 · {checkpoint.embodied_memory.total_episodes} 段经历 · {archivedGoalMemory}</small>
         </div>
       </section>
     </section>
   );
+}
+
+function activeControlPath(
+  nodes: HumanoidRunDetails["checkpoint"]["nodes"],
+  rootId: string,
+  activeIds: readonly string[]
+): HumanoidRunDetails["checkpoint"]["nodes"][string][] {
+  const ordered: HumanoidRunDetails["checkpoint"]["nodes"][string][] = [];
+  const included = new Set<string>();
+  for (const activeId of activeIds) {
+    const branch: HumanoidRunDetails["checkpoint"]["nodes"][string][] = [];
+    const visited = new Set<string>();
+    let cursor = nodes[activeId];
+    while (cursor && !visited.has(cursor.id)) {
+      visited.add(cursor.id);
+      branch.push(cursor);
+      cursor = cursor.parent_id ? nodes[cursor.parent_id] : undefined;
+    }
+    branch.reverse();
+    for (const node of branch) {
+      if (included.has(node.id)) continue;
+      included.add(node.id);
+      ordered.push(node);
+    }
+  }
+  const root = nodes[rootId];
+  if (ordered.length === 0 && root) ordered.push(root);
+  return ordered;
 }
 
 function Metric(props: { label: string; value: string | number; active?: boolean }): React.JSX.Element {

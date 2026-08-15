@@ -186,6 +186,15 @@ function cloneSimulationOptions(
           objects: options.objects.map(resolveHumanoidSceneObject)
         }
       : {}),
+    ...(options.zones
+      ? {
+          zones: options.zones.map((zone) => ({
+            id: zone.id,
+            center: { ...zone.center },
+            size: { ...zone.size }
+          }))
+        }
+      : {}),
     ...(options.controllerFactory
       ? { controllerFactory: options.controllerFactory }
       : {})

@@ -30,9 +30,12 @@ import {
 
 const REACH_POLICY_ASSET_ID = "reach_policy";
 const REACH_REPORT_ASSET_ID = "reach_policy_report";
-const REACH_ACTION_SIZE = 14;
+const REACH_ACTION_SIZE = 29;
+const BALANCE_ACTION_SIZE = 15;
+const UPPER_BODY_ACTION_SIZE = 14;
 const FIRST_UPPER_BODY_JOINT_INDEX = 15;
-const UPPER_BODY_ACTION_SCALE = 0.5;
+const BALANCE_ACTION_SCALE = 0.12;
+const UPPER_BODY_ACTION_SCALE = 0.7;
 const CONTACT_ALIGNMENT_RADIUS_METERS = 0.15;
 const CONTACT_POCKET_SLOW_RADIUS_METERS = 0.06;
 const CONTACT_SUPPORTED_PLANAR_TOLERANCE_METERS = 0.045;
@@ -51,8 +54,8 @@ const ArtifactSchema = z.object({
   sha256: Sha256Schema
 }).strict();
 
-const ReachPolicyReportSchema = z.object({
-  protocol: z.literal("hear-frozen-reach-policy-export-v1"),
+const ReachCandidateReportSchema = z.object({
+  protocol: z.literal("hear-whole-body-reach-policy-candidate-v3"),
   created_at: z.iso.datetime({ offset: true }),
   source: z.object({
     training_report_file: z.string().trim().min(1),
@@ -64,14 +67,20 @@ const ReachPolicyReportSchema = z.object({
     phase_one_accepted: z.literal(true),
     hand_checkpoint_expansion_authorized: z.literal(true),
     waist_checkpoint_expansion_authorized: z.literal(false),
+    deployment_distribution_covered: z.literal(true),
+    training_deployment_accepted: z.literal(false),
+    initial_wrist_error_maximum_m: z.number().finite().min(0.35),
+    target_protocol: z.literal(
+      "typescript-pregrasp-geometry-top-wrist-target-v1"
+    ),
     held_out_environment_count: z.number().int().min(500),
-    held_out_success_rate: z.number().finite().min(0.99).max(1)
+    held_out_success_rate: z.number().finite().min(0.85).max(1)
   }).strict(),
   policy: ArtifactSchema.extend({
     runtime: z.literal("torchscript_cuda"),
     input: z.literal(WORKYARD_REACH_OBSERVATION_PROTOCOL),
     input_size: z.literal(WORKYARD_REACH_OBSERVATION_SIZE),
-    output: z.literal("bounded-upper-body-residual-mean"),
+    output: z.literal("bounded-whole-body-reach-mean"),
     output_size: z.literal(REACH_ACTION_SIZE),
     distribution: z.literal("beta_bounded_minus_one_one"),
     deterministic_statistic: z.literal("mean"),
@@ -87,7 +96,7 @@ const ReachPolicyReportSchema = z.object({
     input_protocol: z.literal(WORKYARD_REACH_OBSERVATION_PROTOCOL),
     input_size: z.literal(WORKYARD_REACH_OBSERVATION_SIZE),
     output: z.literal("reach_action"),
-    output_protocol: z.literal("bounded-upper-body-residual-mean"),
+    output_protocol: z.literal("bounded-whole-body-reach-mean"),
     output_size: z.literal(REACH_ACTION_SIZE),
     batch_dynamic: z.literal(true)
   }),
@@ -101,8 +110,38 @@ const ReachPolicyReportSchema = z.object({
   }).strict()
 }).strict();
 
+const ReachPolicyReportSchema = ReachCandidateReportSchema.omit({
+  protocol: true
+}).extend({
+  protocol: z.literal("hear-whole-body-reach-policy-deployment-v3"),
+  deployment: z.object({
+    protocol: z.literal("hear-typescript-mujoco-reach-deployment-gate-v1"),
+    accepted: z.literal(true),
+    runtime: z.literal("typescript-mujoco-onnxruntime-web"),
+    scenario_id: z.literal("humanoid_workyard"),
+    controller_mode: z.literal("learned_policy_only"),
+    target_protocol: z.literal(
+      "typescript-pregrasp-geometry-top-wrist-target-v1"
+    ),
+    case_count: z.number().int().min(12),
+    success_rate: z.number().finite().min(0.9).max(1),
+    initial_wrist_error_maximum_m: z.number().finite().min(0.35),
+    terminal_wrist_error_maximum_m: z.number().finite().min(0).max(0.06),
+    fall_count: z.literal(0),
+    unauthorized_collision_count: z.literal(0),
+    terminal_assistance_step_count: z.literal(0),
+    minimum_support_margin_m: z.number().finite().min(-0.04),
+    maximum_foot_planar_displacement_m: z.number().finite().min(0).max(0.08),
+    maximum_foot_slip_speed_m_s: z.number().finite().min(0).max(0.20),
+    double_support_loss_rate_maximum: z.number().finite().min(0).max(0.10),
+    no_foot_contact_rate_maximum: z.number().finite().min(0).max(0.01),
+    report_file: z.string().trim().min(1),
+    report_sha256: Sha256Schema
+  }).strict()
+}).strict();
+
 const ReachControllerStateSchema = z.object({
-  protocol: z.literal("workyard-reach-controller-state-v1"),
+  protocol: z.literal("workyard-whole-body-reach-controller-state-v2"),
   policy_sha256: Sha256Schema,
   previous_teacher_action: z.array(z.number().finite()).length(29),
   previous_reach_action: z.array(
@@ -142,10 +181,16 @@ export async function createWorkyardReachController(input: {
   body: HumanoidWholeBodyController;
   bodyPolicy: MjlabG1VelocityPolicy;
   targetZoneId: string;
+  qualificationCandidate?: boolean;
+  terminalTaskSpaceReflex?: "enabled" | "disabled";
 }): Promise<WorkyardReachController> {
   const policyAsset = requiredAsset(input.assets, REACH_POLICY_ASSET_ID);
   const reportAsset = requiredAsset(input.assets, REACH_REPORT_ASSET_ID);
-  parseReachReport(policyAsset, reportAsset);
+  parseReachReport(
+    policyAsset,
+    reportAsset,
+    input.qualificationCandidate === true
+  );
   ort.env.wasm.numThreads = 1;
   const session = await ort.InferenceSession.create(policyAsset.bytes, {
     executionProviders: ["wasm"]
@@ -157,7 +202,8 @@ export async function createWorkyardReachController(input: {
       policySha256: policyAsset.sha256,
       body: input.body,
       bodyPolicy: input.bodyPolicy,
-      targetZoneId: input.targetZoneId
+      targetZoneId: input.targetZoneId,
+      terminalTaskSpaceReflex: input.terminalTaskSpaceReflex ?? "enabled"
     });
   } catch (error) {
     await session.release();
@@ -166,15 +212,16 @@ export async function createWorkyardReachController(input: {
 }
 
 /**
- * Preserves the locomotion actor's lower-body/waist authority while applying
- * the accepted 14D reach actor to the arms.  Inside the typed 15 cm terminal
+ * Applies the accepted 29D whole-body reach skill around the locomotion
+ * reference: bounded balance residuals for lower-body/waist plus explicit arm
+ * targets. Inside the typed 15 cm terminal
  * shell, the existing MuJoCo task-space reference becomes a deterministic
  * active-arm executor; the learned reach actor never gains contact authority.
  */
 export class WorkyardReachController implements HumanoidWholeBodyController {
   readonly descriptor: HumanoidControllerDescriptor = {
     protocol: "humanoid-controller-v1",
-    implementation: "workyard_frozen_reach_onnx",
+    implementation: "workyard_whole_body_reach_onnx",
     actuation: "joint_position_pd",
     controlStepSeconds: 0.02,
     physicsStepSeconds: 0.005,
@@ -189,7 +236,7 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
         size: WORKYARD_REACH_OBSERVATION_SIZE
       },
       actionSpace: {
-        protocol: "bounded-upper-body-residual-mean",
+        protocol: "bounded-whole-body-reach-mean",
         size: REACH_ACTION_SIZE
       },
       observationFeatures: [
@@ -211,6 +258,7 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
   readonly #body: HumanoidWholeBodyController;
   readonly #bodyPolicy: MjlabG1VelocityPolicy;
   readonly #targetZoneId: string;
+  readonly #terminalTaskSpaceReflex: "enabled" | "disabled";
   readonly #upperStiffness: Float64Array;
   readonly #upperDamping: Float64Array;
   #previousTeacherAction = new Float64Array(HUMANOID_JOINT_NAMES.length);
@@ -226,14 +274,16 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
     body: HumanoidWholeBodyController;
     bodyPolicy: MjlabG1VelocityPolicy;
     targetZoneId: string;
+    terminalTaskSpaceReflex: "enabled" | "disabled";
   }) {
     this.#session = input.session;
     this.#policySha256 = input.policySha256;
     this.#body = input.body;
     this.#bodyPolicy = input.bodyPolicy;
     this.#targetZoneId = input.targetZoneId;
+    this.#terminalTaskSpaceReflex = input.terminalTaskSpaceReflex;
     this.#upperStiffness = Float64Array.from(
-      { length: REACH_ACTION_SIZE },
+      { length: UPPER_BODY_ACTION_SIZE },
       (_, offset) => offset % 7 < 4 ? 80 : 40
     );
     this.#upperDamping = Float64Array.from(
@@ -357,7 +407,7 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
       version: 1,
       implementation: this.descriptor.implementation,
       payload: {
-        protocol: "workyard-reach-controller-state-v1",
+        protocol: "workyard-whole-body-reach-controller-state-v2",
         policy_sha256: this.#policySha256,
         previous_teacher_action: [...this.#previousTeacherAction],
         previous_reach_action: [...this.#previousReachAction],
@@ -463,13 +513,19 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
     reference: HumanoidReference,
     options: HumanoidControllerInferenceOptions
   ): Float32Array {
+    if (this.#terminalTaskSpaceReflex === "disabled") {
+      this.#terminalExecutorActive = false;
+      this.#terminalHold = null;
+      this.#guardedRelease = null;
+      return learned;
+    }
     const assessment = options.handPolicyAuthority;
     const granted = assessment?.granted ? assessment.state : null;
     if (granted) {
       this.#guardedRelease = null;
       if (!sameTerminalAuthority(this.#terminalHold, granted)) {
-        const offset = granted.activeHand === "left" ? 0 : 7;
-        const bodyOffset = FIRST_UPPER_BODY_JOINT_INDEX + offset;
+        const armOffset = granted.activeHand === "left" ? 0 : 7;
+        const bodyOffset = FIRST_UPPER_BODY_JOINT_INDEX + armOffset;
         const action = Float64Array.from({ length: 7 }, (_, jointOffset) => (
           clampUnit(
             (state.jointPositions[bodyOffset + jointOffset]!
@@ -488,8 +544,9 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
         };
       }
       const output = Float32Array.from(learned);
-      const offset = granted.activeHand === "left" ? 0 : 7;
-      output.set(this.#terminalHold!.action, offset);
+      const actionOffset = FIRST_UPPER_BODY_JOINT_INDEX
+        + (granted.activeHand === "left" ? 0 : 7);
+      output.set(this.#terminalHold!.action, actionOffset);
       this.#terminalExecutorActive = true;
       return output;
     }
@@ -513,7 +570,8 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
       return learned;
     }
     const output = Float32Array.from(learned);
-    const offset = active === "left" ? 0 : 7;
+    const armOffset = active === "left" ? 0 : 7;
+    const actionOffset = FIRST_UPPER_BODY_JOINT_INDEX + armOffset;
     const grasp = options.taskCommand?.command.grasps[0];
     const contactSupportedPlanarTolerance = active === "right"
       ? CONTACT_SUPPORTED_RIGHT_PLANAR_TOLERANCE_METERS
@@ -545,7 +603,8 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
         objectId: grasp.objectId
       })) {
         const action = Float64Array.from({ length: 7 }, (_, armOffset) => {
-          const bodyIndex = FIRST_UPPER_BODY_JOINT_INDEX + offset + armOffset;
+          const bodyIndex = FIRST_UPPER_BODY_JOINT_INDEX
+            + (active === "left" ? 0 : 7) + armOffset;
           if (reference.jointTrackingWeights[bodyIndex]! <= 0) {
             throw new Error(
               "Typed Workyard guarded release requires an active-arm reference"
@@ -556,7 +615,9 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
               - this.#bodyPolicy.defaultJointPositions[bodyIndex]!)
               / UPPER_BODY_ACTION_SCALE
           );
-          const previousAction = this.#previousReachAction[offset + armOffset]!;
+          const previousAction = this.#previousReachAction[
+            actionOffset + armOffset
+          ]!;
           const approachDirection = clamp(
             requestedAction - previousAction,
             -actionSlew,
@@ -574,12 +635,12 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
       if (!this.#guardedRelease) {
         throw new Error("Typed Workyard guarded release failed to latch");
       }
-      output.set(this.#guardedRelease.action, offset);
+      output.set(this.#guardedRelease.action, actionOffset);
       return output;
     }
     this.#guardedRelease = null;
-    for (let armOffset = 0; armOffset < 7; armOffset += 1) {
-      const bodyIndex = FIRST_UPPER_BODY_JOINT_INDEX + offset + armOffset;
+    for (let jointOffset = 0; jointOffset < 7; jointOffset += 1) {
+      const bodyIndex = FIRST_UPPER_BODY_JOINT_INDEX + armOffset + jointOffset;
       if (reference.jointTrackingWeights[bodyIndex]! <= 0) {
         throw new Error(
           "Typed Workyard terminal executor requires an active-arm task-space reference"
@@ -600,8 +661,10 @@ export class WorkyardReachController implements HumanoidWholeBodyController {
         measuredAction - commandLead,
         measuredAction + commandLead
       );
-      const previousAction = this.#previousReachAction[offset + armOffset]!;
-      output[offset + armOffset] = clampUnit(clamp(
+      const previousAction = this.#previousReachAction[
+        actionOffset + jointOffset
+      ]!;
+      output[actionOffset + jointOffset] = clampUnit(clamp(
         leadLimitedAction,
         previousAction - actionSlew,
         previousAction + actionSlew
@@ -633,10 +696,14 @@ function composeCommand(
   const positions = body.positions.slice();
   const stiffness = body.stiffness.slice();
   const damping = body.damping.slice();
-  for (let offset = 0; offset < REACH_ACTION_SIZE; offset += 1) {
+  for (let index = 0; index < BALANCE_ACTION_SIZE; index += 1) {
+    positions[index] = body.positions[index]!
+      + reachAction[index]! * BALANCE_ACTION_SCALE;
+  }
+  for (let offset = 0; offset < UPPER_BODY_ACTION_SIZE; offset += 1) {
     const index = FIRST_UPPER_BODY_JOINT_INDEX + offset;
     positions[index] = defaults[index]!
-      + reachAction[offset]! * UPPER_BODY_ACTION_SCALE;
+      + reachAction[index]! * UPPER_BODY_ACTION_SCALE;
     stiffness[index] = upperStiffness[offset]!;
     damping[index] = upperDamping[offset]!;
   }
@@ -667,21 +734,21 @@ function reachInferenceTrace(
   return {
     protocol: "humanoid-controller-inference-trace-v1",
     implementation,
-    route: "upper_body_overlay",
+    route: "primary",
     components: [
-      ...(body ? [{ ...structuredClone(body), role: "primary" as const }] : []),
+      ...(body ? [{ ...structuredClone(body), role: "direct" as const }] : []),
       {
         protocol: "humanoid-controller-tensor-trace-v1",
-        role: "fallback",
+        role: "primary",
         implementation: terminalExecutorActive
           ? "typed_terminal_task_space_executor"
-          : "workyard_frozen_reach_onnx",
+          : "workyard_whole_body_reach_onnx",
         observation: {
           protocol: WORKYARD_REACH_OBSERVATION_PROTOCOL,
           values: [...observation]
         },
         action: {
-          protocol: "bounded-upper-body-residual-mean",
+          protocol: "bounded-whole-body-reach-mean",
           values: [...action]
         }
       }
@@ -691,7 +758,8 @@ function reachInferenceTrace(
 
 function parseReachReport(
   policyAsset: HumanoidControllerModuleAsset,
-  reportAsset: HumanoidControllerModuleAsset
+  reportAsset: HumanoidControllerModuleAsset,
+  qualificationCandidate: boolean
 ): void {
   let value: unknown;
   try {
@@ -703,13 +771,17 @@ function parseReachReport(
       cause: error
     });
   }
-  const parsed = ReachPolicyReportSchema.safeParse(value);
+  const parsed = (
+    qualificationCandidate ? ReachCandidateReportSchema : ReachPolicyReportSchema
+  ).safeParse(value);
   if (!parsed.success
     || parsed.data.onnx.file !== "workyard_reach.onnx"
     || parsed.data.onnx.bytes !== policyAsset.bytes.byteLength
     || parsed.data.onnx.sha256 !== policyAsset.sha256
     || sha256(policyAsset.bytes) !== policyAsset.sha256) {
-    throw new Error("Workyard reach ONNX is not backed by the accepted v15 policy");
+    throw new Error(qualificationCandidate
+      ? "Workyard reach qualification candidate is invalid"
+      : "Workyard reach ONNX has not passed the TypeScript MuJoCo deployment gate");
   }
 }
 

@@ -47,7 +47,7 @@ import {
 import { createToolInputRecovery } from "../tool-input-recovery.js";
 import { ModelDecisionStallError } from "../model-telemetry.js";
 import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.js";
-import type { HumanoidCoordinatorPhase } from "./run-runtime.js";
+import type { HumanoidAutonomyReadiness } from "./run-runtime.js";
 import { GOAL_HISTORY_PREDICATE_TYPES } from "./goal-history.js";
 
 const SpecialistDelegationSchema = z.object({}).strict();
@@ -156,7 +156,7 @@ export function goalManagerInvocationInput(
     run_mode: root.run_mode ?? null,
     mission_goal: root.mission_goal ?? null,
     goal_dag_status: goalDAG.status ?? null,
-    coordinator_phase: root.coordinator_phase ?? null,
+    autonomy_readiness: root.autonomy_readiness ?? null,
     recovery_authority: root.recovery_authority ?? null,
     previous_cycle_transition: root.previous_cycle_transition ?? null,
     goal_state: root.goal_state ?? null,
@@ -252,7 +252,7 @@ export function motionInvocationInput(authority: JsonValue): string {
       run_mode: root.run_mode ?? null,
       current_goal_epoch_id: goalDAG.current_epoch_id ?? null,
       active_goal: root.active_goal ?? null,
-      coordinator_phase: root.coordinator_phase ?? null,
+      autonomy_readiness: root.autonomy_readiness ?? null,
       active_cycle: root.active_cycle ?? null,
       planning_tool_state: root.planning_tool_state ?? null,
       grounding_snapshot: root.grounding_snapshot ?? null,
@@ -278,7 +278,7 @@ export function motionActorInvocationInput(
       run_mode: root.run_mode ?? null,
       current_goal_epoch_id: goalDAG.current_epoch_id ?? null,
       active_goal: root.active_goal ?? null,
-      coordinator_phase: root.coordinator_phase ?? null,
+      autonomy_readiness: root.autonomy_readiness ?? null,
       active_cycle: root.active_cycle ?? null,
       planning_tool_state: root.planning_tool_state ?? null,
       grounding_snapshot: root.grounding_snapshot ?? null
@@ -309,7 +309,7 @@ export function coordinatorAuthorityProjection(authority: JsonValue): JsonValue 
     },
     active_goal: root.active_goal ?? null,
     active_cycle: root.active_cycle ?? null,
-    coordinator_phase: root.coordinator_phase ?? null,
+    autonomy_readiness: root.autonomy_readiness ?? null,
     cycle_completion: root.cycle_completion ?? null,
     execution_authority: root.execution_authority ?? null,
     recovery_authority: root.recovery_authority ?? null,
@@ -415,7 +415,7 @@ type HumanoidHierarchyRuntime = HumanoidActionInvoker
   contextAnchor(agentId: string): JsonValue;
   validateCycleEvidence(evidenceTransactionIds: readonly string[]): HumanoidActionReceipt;
   cycleCompletionReadiness(): HumanoidCycleCompletionReadiness;
-  coordinatorPhase(): HumanoidCoordinatorPhase;
+  autonomyReadiness(): HumanoidAutonomyReadiness;
   executorDelegationAvailable(): boolean;
   goalRetirementDelegationAvailable(): boolean;
   sentryDelegationAvailable?(): boolean;
@@ -937,7 +937,7 @@ function guardCoordinatorToolExecution(
         tool: name,
         result: {
           accepted: false,
-          code: "coordinator_phase_rejected",
+          code: "autonomy_readiness_rejected",
           automatic_actuation: false
         },
         coordinator_state: coordinatorAuthorityProjection(
@@ -1045,7 +1045,7 @@ function coordinatorToolAvailable(
   runtime: HumanoidHierarchyRuntime
 ): boolean {
   const completion = runtime.cycleCompletionReadiness();
-  const phase = runtime.coordinatorPhase();
+  const phase = runtime.autonomyReadiness();
   if (name === "complete_autonomous_cycle") {
     return completion.status === "ready"
       && completion.observed_after_execution
@@ -1320,11 +1320,11 @@ function coordinatorInstructions(): string {
     "你是人形机器人的 Manager Agent。你始终拥有任务；Goal Manager 和 Motion 仅作为有界 agent-as-tool 专家，Grounding Monitor 与 Execution Gate 是确定性服务。",
     "每次模型响应必须且只能调用一个正式工具。不要在工具调用之前或之后输出说明、摘要或普通聊天；你不能直接改变物理世界。",
     "运行开始时读取 CURRENT COORDINATOR STEP。每次工具返回后，只读取最新 coordinator_step_result.coordinator_state 作为当前权威状态；更早的状态、回执和召回内容均为历史。",
-    "严格按 coordinator_phase 选择下一层级动作：goal_selection 或 goal_transition 调用 delegate_goal_manager；observe_or_plan 或 post_failure_observation 调用 delegate_humanoid_sentry；plan 调用 delegate_motion_reference；execute_plan 调用 delegate_physics_executor；post_execution 调用 delegate_humanoid_sentry；complete_cycle 调用 complete_autonomous_cycle；complete_satisfied_goal 调用 complete_satisfied_goal。",
+    "严格按 autonomy_readiness 选择下一层级动作：goal_selection 或 goal_transition 调用 delegate_goal_manager；observe_or_plan 或 post_failure_observation 调用 delegate_humanoid_sentry；plan 调用 delegate_motion_reference；execute_plan 调用 delegate_physics_executor；post_execution 调用 delegate_humanoid_sentry；complete_cycle 调用 complete_autonomous_cycle；complete_satisfied_goal 调用 complete_satisfied_goal。",
     "replan_or_retire 时依据最新失败观察和 recovery_authority 自主选择 delegate_motion_reference 重新规划，或在物理证据证明 Goal 本身不可继续时调用 delegate_goal_manager。规划失败本身只否定策略，不自动证明 Goal blocked。",
     "delegate_goal_manager、delegate_humanoid_sentry 和 delegate_motion_reference 的参数必须是 {}。不得替专家预选 Goal、坐标、手、Link、接触、Skill、路线或动作参数。",
     "execute_plan 时只使用最新 execution_authority，逐字复制 planning_action 与 planning_transaction_id；不得使用历史 transactionId、内部 plan_id 或被拒绝回执。",
-    "物理执行后必须重新感知。只有最新 coordinator_state 同时给出 coordinator_phase=complete_cycle、cycle_completion.status=ready 和 observed_after_execution=true 时，才逐字提交其中的 evidence_transaction_ids。",
+    "物理执行后必须重新感知。只有最新 autonomy state 同时给出 autonomy_readiness=complete_cycle、cycle_completion.status=ready 和 observed_after_execution=true 时，才逐字提交其中的 evidence_transaction_ids。",
     "召回结果只用于避免重复失败，不能代替当前传感或授权。工具被阶段拒绝时，读取同一回执中的最新 coordinator_state 并改用该阶段合法工具。",
     "不得使用固定动作表、预设路径、程序随机列表或假执行；运动意图必须由 Motion 基于实时几何生成，低层控制器负责逐帧运动。"
   ].join("\n");
@@ -1359,7 +1359,7 @@ function motionPlannerInstructions(): string {
     "根据 active Goal、实时空间信念、对象世界模型、Affordance、关节状态、掌指几何、平衡和近期真实失败，自主选择当前局部阶段。不得使用固定巡逻点、预设动作序列、随机电机噪声或猜测坐标。",
     "每个 Skill 必须对 active Goal 具有可验证因果关系：空间目标应推进对应位置或区域谓词，操作 Skill 应匹配 Goal 中的对象、方块或关节，准备阶段应建立同一实体的真实前置条件。与 Goal 无关或令目标距离增加的另一 frontier 会被 Harness 拒绝；真实物理失败授权的安全恢复除外。",
     "观察中的 control_authority 区分 MuJoCo 物理后端、已加载学习策略的真实能力和任务空间生成器。active_control 是当前物理帧实际执行的控制来源：learned_policy 为学习控制，reference_control 为参考控制，hybrid_control 为学习式下肢运动与参考式上肢跟踪的同帧组合；transition 表示尚未结束的连续交接。只有 learned_policy.capabilities 明确列出的能力才能称为已经由策略学习；未列出的接触操作能力不能靠叙述冒充已训练，是否可执行仍以当前控制后端的完整 MuJoCo 预演为准。",
-    "观察回执的 interaction.available_skills 中 learned_policy_ready 与 learned_policy_missing_capabilities 表示训练策略是否完整覆盖该 Skill；false 只表示使用 reference_control_fallback，仍须通过完整 MuJoCo 预演。",
+    "观察回执的 interaction.available_skills 中 learned_policy_ready 与 learned_policy_missing_capabilities 表示训练策略是否完整覆盖该 Skill；缺少训练能力的 Skill 不可执行，不能用参考控制冒充已训练策略。",
     "观察后若当前没有仍与 world_revision 一致的 Skill 计划，明确提出 submit_humanoid_skill_plan 所需的短程 Skill DAG；已有有效计划时继续其中依赖已满足的节点。你必须自己选择策略、Skill、目标对象或 frontier、交互点、手、操作方向及依赖。",
     "若 planning_tool_state.ready_skill_bindings 非空，从中自主选择一项，并在计划中明确要求 Motion Actor 将 skill_plan_transaction_id、skill_node_id、invocation、phase 原样复制到 begin_humanoid_skill。若有多个 ready binding，选择权属于你而非 Harness。",
     "长程语义 Skill 可能由多个真实物理 chunk 完成。物理 chunk 成功不等于 Skill phase 完成；若下一次委派的 planning_tool_state 保留 skill_plan 且给出 ready_skill_bindings，从中选择并原样调用 begin_humanoid_skill，继续同一模型提交的 DAG，禁止重复提交整个 DAG。",
