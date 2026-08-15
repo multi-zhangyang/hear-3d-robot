@@ -100,8 +100,9 @@ import {
   transportRetryPlan
 } from "./transport-recovery.js";
 import { HumanoidWorld } from "../world/humanoid/world.js";
-import type {
-  HumanoidControllerSource
+import {
+  findKnownHumanoidControllerSource,
+  type HumanoidControllerSource
 } from "../world/humanoid/controller-module.js";
 import { drawSeed } from "../world/world-generator.js";
 
@@ -140,6 +141,24 @@ export function resolveHumanoidControllerSourceForRun(
   }
   throw new Error(
     "The configured humanoid controller module does not match the source used by this run"
+  );
+}
+
+async function recoverHumanoidControllerSourceForRun(
+  persistedSourceSha256: string | undefined,
+  configuredSource: HumanoidControllerSource | undefined
+): Promise<HumanoidControllerSource | undefined> {
+  if (persistedSourceSha256 === undefined) return undefined;
+  if (configuredSource?.sourceSha256 === persistedSourceSha256) {
+    return configuredSource;
+  }
+  const knownSource = await findKnownHumanoidControllerSource(
+    persistedSourceSha256
+  );
+  if (knownSource) return knownSource;
+  return resolveHumanoidControllerSourceForRun(
+    persistedSourceSha256,
+    configuredSource
   );
 }
 
@@ -250,7 +269,7 @@ export async function resumeHumanoidMission(input: {
   if (store.definition.runtime !== "humanoid_g1") {
     throw new Error("This run was not created by the humanoid runtime");
   }
-  const controllerSource = resolveHumanoidControllerSourceForRun(
+  const controllerSource = await recoverHumanoidControllerSourceForRun(
     store.definition.controller_source_sha256,
     input.controllerSource
   );

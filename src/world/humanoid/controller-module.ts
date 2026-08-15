@@ -14,6 +14,12 @@ import {
 } from "./whole-body-controller.js";
 
 export const HUMANOID_CONTROLLER_MODULE_ENV = "HEAR_HUMANOID_CONTROLLER_MODULE";
+const KNOWN_HUMANOID_CONTROLLER_MODULES = [
+  "hear/controllers/yahmp",
+  "hear/controllers/mjlab-g1-velocity",
+  "hear/controllers/workyard-reach",
+  "hear/controllers/workyard-contact"
+] as const;
 const BUNDLED_WORKYARD_CONTROLLER_SOURCE =
   "hear-bundled-workyard-whole-body-contact-controller-v3";
 const HUMANOID_CONTROLLER_MODULE_FACTORY =
@@ -53,6 +59,27 @@ export async function loadConfiguredHumanoidControllerSource(
   const specifier = environment[HUMANOID_CONTROLLER_MODULE_ENV]?.trim();
   if (!specifier) return loadBundledWorkyardControllerSource(environment);
   return loadHumanoidControllerSource(specifier, baseDirectory);
+}
+
+export async function findKnownHumanoidControllerSource(
+  sourceSha256: string,
+  environment: NodeJS.ProcessEnv = process.env,
+  baseDirectory = process.cwd()
+): Promise<HumanoidControllerSource | undefined> {
+  for (const specifier of KNOWN_HUMANOID_CONTROLLER_MODULES) {
+    try {
+      const source = await loadHumanoidControllerSource(specifier, baseDirectory);
+      if (source.sourceSha256 === sourceSha256) return source;
+    } catch {
+      continue;
+    }
+  }
+  try {
+    const bundled = await loadBundledWorkyardControllerSource(environment);
+    return bundled.sourceSha256 === sourceSha256 ? bundled : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function loadBundledWorkyardControllerSource(

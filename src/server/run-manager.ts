@@ -72,6 +72,8 @@ export class RunManager {
     string,
     ReturnType<typeof setTimeout>
   >();
+  readonly #continuousRecoveryScheduling = new Map<string, symbol>();
+  readonly #pendingContinuousRecoveries = new Map<string, number>();
   #launchController: AbortController | undefined;
   #launchOperation: Promise<void> | undefined;
   #launching = false;
@@ -648,11 +650,17 @@ export class RunManager {
       if (this.#launchOperation === settled) this.#launchOperation = undefined;
       if (this.#launchController === controller) this.#launchController = undefined;
     });
-    const runId = await created.promise.finally(() => {
+    let runId: string;
+    try {
+      runId = await created.promise;
+    } catch (error) {
       this.#launching = false;
-    });
+      this.#flushPendingContinuousRecovery();
+      throw error;
+    }
     this.#controllers.set(runId, controller);
     this.#operations.set(runId, settled);
+    this.#launching = false;
     const activeSince = Date.now();
     void settled.finally(() => {
       if (this.#controllers.get(runId) === controller) {
@@ -665,6 +673,7 @@ export class RunManager {
         runId,
         Math.max(0, Date.now() - activeSince)
       );
+      this.#flushPendingContinuousRecovery();
     });
     return runId;
   }
@@ -673,7 +682,11 @@ export class RunManager {
     runId: string,
     activeDurationMs: number
   ): Promise<void> {
-    if (!this.#accepting || this.#continuousRecoveryTimers.has(runId)) return;
+    if (!this.#accepting
+      || this.#continuousRecoveryTimers.has(runId)
+      || this.#continuousRecoveryScheduling.has(runId)) return;
+    const schedulingToken = Symbol(runId);
+    this.#continuousRecoveryScheduling.set(runId, schedulingToken);
     let store: RunStore;
     let checkpoint: AnyRunCheckpoint;
     try {
@@ -683,14 +696,35 @@ export class RunManager {
       );
       checkpoint = await store.readCheckpoint();
     } catch {
+      if (this.#continuousRecoveryScheduling.get(runId) !== schedulingToken
+        || !this.#accepting) return;
+      this.#continuousRecoveryScheduling.delete(runId);
+      const timer = setTimeout(() => {
+        this.#continuousRecoveryTimers.delete(runId);
+        void this.#scheduleContinuousRecovery(runId, activeDurationMs);
+      }, CONTINUOUS_RECOVERY_INITIAL_DELAY_MS);
+      this.#continuousRecoveryTimers.set(runId, timer);
       return;
     }
+    if (this.#continuousRecoveryScheduling.get(runId) !== schedulingToken
+      || !this.#accepting) return;
+    this.#continuousRecoveryScheduling.delete(runId);
     if (store.definition.run_mode !== "continuous"
       || checkpoint.status !== "interrupted") {
       this.#continuousRecoveryAttempts.delete(runId);
+      this.#pendingContinuousRecoveries.delete(runId);
+      this.#flushPendingContinuousRecovery();
       return;
     }
-    if (!this.#accepting || this.#controllers.size > 0 || this.#launching) return;
+    if (this.#controllers.size > 0 || this.#launching) {
+      const pendingDuration = this.#pendingContinuousRecoveries.get(runId) ?? 0;
+      this.#pendingContinuousRecoveries.set(
+        runId,
+        Math.max(pendingDuration, activeDurationMs)
+      );
+      return;
+    }
+    this.#pendingContinuousRecoveries.delete(runId);
 
     const previousAttempts = activeDurationMs >= CONTINUOUS_RECOVERY_STABILITY_MS
       ? 0
@@ -702,10 +736,29 @@ export class RunManager {
     this.#continuousRecoveryAttempts.set(runId, previousAttempts + 1);
     const timer = setTimeout(() => {
       this.#continuousRecoveryTimers.delete(runId);
-      if (!this.#accepting || this.#controllers.size > 0 || this.#launching) return;
+      if (!this.#accepting) return;
+      if (this.#controllers.size > 0 || this.#launching) {
+        this.#pendingContinuousRecoveries.set(runId, activeDurationMs);
+        return;
+      }
       void this.resume(runId).catch(() => undefined);
     }, delayMs);
     this.#continuousRecoveryTimers.set(runId, timer);
+  }
+
+  #flushPendingContinuousRecovery(): void {
+    if (!this.#accepting
+      || this.#controllers.size > 0
+      || this.#launching
+      || this.#continuousRecoveryTimers.size > 0
+      || this.#continuousRecoveryScheduling.size > 0) return;
+    const next = this.#pendingContinuousRecoveries.entries().next().value as
+      | [string, number]
+      | undefined;
+    if (!next) return;
+    const [runId, activeDurationMs] = next;
+    this.#pendingContinuousRecoveries.delete(runId);
+    void this.#scheduleContinuousRecovery(runId, activeDurationMs);
   }
 
   #cancelContinuousRecoveries(): void {
@@ -714,6 +767,8 @@ export class RunManager {
     }
     this.#continuousRecoveryTimers.clear();
     this.#continuousRecoveryAttempts.clear();
+    this.#continuousRecoveryScheduling.clear();
+    this.#pendingContinuousRecoveries.clear();
   }
 
   async #summarize(directory: string): Promise<RunListItem> {
