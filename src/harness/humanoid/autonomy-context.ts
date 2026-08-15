@@ -25,15 +25,19 @@ export function createHumanoidAutonomyContext(input: {
     throw new Error("Autonomy context requires current affordance-bearing world evidence");
   }
   const observation = input.worldEvidence.observation;
+  const lifetime = goalHistoryLifetimeProjection(input.goalDAG);
   const epochs = input.goalDAG.epochs.slice(-HISTORY_WINDOW);
   const history = epochs.flatMap((epoch) => {
     const candidate = input.goalDAG.candidates[epoch.candidate_id];
     return candidate ? [{ epoch, candidate }] : [];
   });
-  const objectCounts = new Map<string, OutcomeCounts>();
-  const solidCounts = new Map<string, OutcomeCounts>();
-  const zoneCounts = new Map<string, OutcomeCounts>();
-  const predicateCounts = new Map<string, number>();
+  const objectCounts = lifetimeEntityCounts(lifetime.entity_outcomes, "object");
+  const solidCounts = lifetimeEntityCounts(lifetime.entity_outcomes, "solid");
+  const zoneCounts = lifetimeEntityCounts(lifetime.entity_outcomes, "zone");
+  const predicateCounts = new Map(lifetime.predicate_outcomes.map((entry) => [
+    entry.predicate_type,
+    entry.selected.total
+  ]));
   const missionGoalIdentity = input.missionGoal
     ? goalConstraintSha256(input.missionGoal)
     : null;
@@ -48,18 +52,18 @@ export function createHumanoidAutonomyContext(input: {
       && goalConstraintSha256(candidate.goal) === missionGoalIdentity) {
       incrementOutcomeValue(missionGoalOutcomes, epoch.status);
     }
-    for (const predicate of candidate.goal.predicates) {
+    if (epoch.status !== "active") continue;
+    for (const predicateType of new Set(candidate.goal.predicates.map(
+      (predicate) => predicate.type
+    ))) {
       predicateCounts.set(
-        predicate.type,
-        (predicateCounts.get(predicate.type) ?? 0) + 1
+        predicateType,
+        (predicateCounts.get(predicateType) ?? 0) + 1
       );
-      const objectId = predicateObjectId(predicate);
-      if (objectId) incrementOutcome(objectCounts, objectId, epoch.status);
-      const solidId = predicateSolidId(predicate);
-      if (solidId) incrementOutcome(solidCounts, solidId, epoch.status);
-      const zoneId = predicateZoneId(predicate);
-      if (zoneId) incrementOutcome(zoneCounts, zoneId, epoch.status);
     }
+    incrementActiveEntityCounts(objectCounts, candidate.goal.predicates, predicateObjectId);
+    incrementActiveEntityCounts(solidCounts, candidate.goal.predicates, predicateSolidId);
+    incrementActiveEntityCounts(zoneCounts, candidate.goal.predicates, predicateZoneId);
   }
   return {
     source_world_frame: input.worldEvidence.evidence.world_frame,
@@ -159,7 +163,7 @@ export function createHumanoidAutonomyContext(input: {
     history: {
       total_epoch_count: input.goalDAG.next_epoch_index,
       analyzed_epoch_count: history.length,
-      lifetime_outcomes: goalHistoryLifetimeProjection(input.goalDAG),
+      lifetime_outcomes: lifetime,
       predicate_counts: Object.fromEntries(
         [...predicateCounts.entries()].sort(([left], [right]) => compare(left, right))
       ),
@@ -183,6 +187,44 @@ interface OutcomeCounts {
   completed: number;
   unsuccessful: number;
   active: number;
+}
+
+interface LifetimeEntityOutcome {
+  entity_kind: "object" | "zone" | "solid" | "end_effector";
+  entity_id: string;
+  selected: {
+    total: number;
+    completed: number;
+  };
+}
+
+function lifetimeEntityCounts(
+  entries: readonly LifetimeEntityOutcome[],
+  kind: LifetimeEntityOutcome["entity_kind"]
+): Map<string, OutcomeCounts> {
+  return new Map(entries.filter((entry) => (
+    entry.entity_kind === kind && entry.selected.total > 0
+  )).map((entry) => [
+    entry.entity_id,
+    {
+      total: entry.selected.total,
+      completed: entry.selected.completed,
+      unsuccessful: entry.selected.total - entry.selected.completed,
+      active: 0
+    }
+  ]));
+}
+
+function incrementActiveEntityCounts(
+  counts: Map<string, OutcomeCounts>,
+  predicates: readonly GoalPredicate[],
+  identity: (predicate: GoalPredicate) => string | null
+): void {
+  for (const id of new Set(predicates.map(identity).filter(
+    (value): value is string => value !== null
+  ))) {
+    incrementOutcome(counts, id, "active");
+  }
 }
 
 function incrementOutcome(
