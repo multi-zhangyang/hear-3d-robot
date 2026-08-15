@@ -2953,8 +2953,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#applyActiveAgentSet(active, agentId, at);
     await this.emit("hierarchy_focus_changed", {
       active_agent_id: agentId,
-      active_agent_ids: [...active],
-      nodes: json(this.#checkpoint.nodes)
+      active_agent_ids: [...active]
     });
   }
 
@@ -2966,8 +2965,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     this.#applyActiveAgentSet(new Set(unique), unique[0]!, at);
     await this.emit("hierarchy_focus_changed", {
       active_agent_id: unique[0]!,
-      active_agent_ids: unique,
-      nodes: json(this.#checkpoint.nodes)
+      active_agent_ids: unique
     });
   }
 
@@ -5493,7 +5491,12 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         version: anchor.version,
         goal_dag_state_sha256: anchor.goal_dag_state_sha256,
         control_state_sha256: anchor.control_state_sha256,
-        goal_dag: goalDAG,
+        // The Goal DAG itself is already the immutable, hash-verified value in
+        // checkpoint.json and changes only at Goal lifecycle boundaries. The
+        // anchor journal is the write-ahead identity for the current control
+        // cut; repeating the full DAG for every progress/model-call update
+        // made continuous runs grow by megabytes per hour without providing a
+        // recovery path. Legacy rows that include goal_dag remain valid.
         goal_control_state: goalControlState
       })
     };
@@ -5863,8 +5866,8 @@ function assertHumanoidGoalStateAnchorEvent(
     || data.version !== anchor.version
     || data.goal_dag_state_sha256 !== anchor.goal_dag_state_sha256
     || data.control_state_sha256 !== anchor.control_state_sha256
-    || object(data.goal_dag ?? null).state_sha256
-      !== anchor.goal_dag_state_sha256
+    || (data.goal_dag !== undefined
+      && object(data.goal_dag).state_sha256 !== anchor.goal_dag_state_sha256)
     || data.goal_control_state === undefined
     || actionCommitPayloadSha256(json(data.goal_control_state))
       !== anchor.control_state_sha256) {

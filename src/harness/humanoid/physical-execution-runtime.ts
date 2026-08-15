@@ -49,10 +49,13 @@ import { groundHumanoidPhysicalExecution } from "./dispatch-grounding.js";
 import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 
 // Every terminal physical cut is persisted independently of this interval.
-// Periodic cuts only bound crash recovery loss, so checkpoint once per second
-// of controller time instead of serializing the full MuJoCo state several
-// times per simulated second.
-const EXECUTION_CHECKPOINT_INTERVAL_SECONDS = 1;
+// Periodic cuts only bound crash recovery rollback; terminal cuts remain
+// immediate. A full execution cut includes MuJoCo state, the active plan and
+// its recovery ledger, so writing it every simulated second creates quadratic
+// journal growth on long navigation skills. Five controller-seconds keeps
+// unattended recovery bounded while making long-horizon locomotion durable
+// without turning persistence into the dominant control-loop workload.
+const EXECUTION_CHECKPOINT_INTERVAL_SECONDS = 5;
 const STATIONARY_CHECKPOINT_INTERVAL_SECONDS = 5 * 60;
 
 type HumanoidPersistenceCut = Awaited<

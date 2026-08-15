@@ -469,7 +469,12 @@ async function executeHumanoidMission(input: {
       agentId: string,
       event: RunStreamEvent
     ): Promise<void> => {
-      await input.runtime.setActiveAgent(agentId);
+      // Model telemetry already owns the active-Agent lifecycle at request
+      // start/completion. SDK streams from parallel siblings interleave at
+      // item granularity; treating every item as a focus transition produced
+      // thousands of full hierarchy snapshots without changing authority or
+      // control. Persist the SDK event itself and keep focus bounded to the
+      // actual model-call lifetime.
       await persistStreamEvent(input.runtime, agentId, event);
       if (isModelResponseStarted(event)) {
         modelRequestSessionBaseline = await captureHumanoidSessionBaseline(sessions);
