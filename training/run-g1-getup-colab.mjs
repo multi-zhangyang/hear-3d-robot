@@ -241,7 +241,7 @@ function writeDriveBackup() {
   ].join("\n"), "utf8");
 }
 
-function colab(args, timeoutMs = 120_000) {
+function colab(args, timeoutMs = 600_000) {
   const result = spawnSync("wsl.exe", ["-d", distro, "--", colabPath, ...args], {
     cwd: workspace,
     stdio: "inherit",

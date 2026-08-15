@@ -1,6 +1,4 @@
-import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
   HumanoidControllerModuleAsset,
   HumanoidControllerModuleContext
@@ -9,11 +7,10 @@ import type {
   HumanoidWholeBodyController
 } from "../world/humanoid/whole-body-controller.js";
 import {
-  G1_GETUP_POLICY_ASSET_ID,
-  G1_GETUP_REPORT_ASSET_ID,
-  createG1GetupController
-} from "./g1-getup-controller.js";
-import { G1RecoveryGatedController } from "./g1-recovery-gated-controller.js";
+  G1_GETUP_POLICY_DIRECTORY_ENV,
+  attachG1RecoveryExpert,
+  g1RecoveryControllerAssets
+} from "./g1-recovery-module.js";
 import {
   createMjlabG1VelocityController,
   parseMjlabG1VelocityTrainingBundle
@@ -24,8 +21,7 @@ export const WORKYARD_CONTACT_TARGET_ZONE_ENV =
   "HEAR_WORKYARD_CONTACT_TARGET_ZONE_ID";
 export const WORKYARD_REACH_POLICY_DIRECTORY_ENV =
   "HEAR_WORKYARD_REACH_POLICY_DIRECTORY";
-export const G1_GETUP_POLICY_DIRECTORY_ENV =
-  "HEAR_G1_GETUP_POLICY_DIRECTORY";
+export { G1_GETUP_POLICY_DIRECTORY_ENV };
 const BODY_POLICY_DIRECTORY_ENV = "HEAR_MJLAB_G1_POLICY_DIRECTORY";
 
 export function humanoidControllerAssets(
@@ -34,18 +30,6 @@ export function humanoidControllerAssets(
   const bodyDirectory = environment[BODY_POLICY_DIRECTORY_ENV]?.trim();
   const reachDirectory = environment[WORKYARD_REACH_POLICY_DIRECTORY_ENV]
     ?.trim();
-  const getupDirectory = environment[G1_GETUP_POLICY_DIRECTORY_ENV]?.trim();
-  const bundledGetupPolicy = new URL(
-    "../../assets/humanoid/controllers/g1-getup/g1_getup.onnx",
-    import.meta.url
-  );
-  const bundledGetupReport = new URL(
-    "../../assets/humanoid/controllers/g1-getup/getup-policy-report.json",
-    import.meta.url
-  );
-  const getupAvailable = Boolean(getupDirectory)
-    || (existsSync(fileURLToPath(bundledGetupPolicy))
-      && existsSync(fileURLToPath(bundledGetupReport)));
   return [
     {
       id: "body_policy",
@@ -83,20 +67,7 @@ export function humanoidControllerAssets(
             import.meta.url
           )
     },
-    ...(getupAvailable ? [
-      {
-        id: G1_GETUP_POLICY_ASSET_ID,
-        path: getupDirectory
-          ? resolve(getupDirectory, "g1_getup.onnx")
-          : bundledGetupPolicy
-      },
-      {
-        id: G1_GETUP_REPORT_ASSET_ID,
-        path: getupDirectory
-          ? resolve(getupDirectory, "getup-policy-report.json")
-          : bundledGetupReport
-      }
-    ] : [])
+    ...g1RecoveryControllerAssets(environment)
   ];
 }
 
@@ -138,16 +109,7 @@ export async function createWorkyardReachControllerFromModuleContext(
     await body.dispose();
     throw error;
   }
-  if (!context.assets.some(({ id }) => id === G1_GETUP_POLICY_ASSET_ID)) {
-    return reach;
-  }
-  try {
-    const getup = await createG1GetupController({ assets: context.assets });
-    return new G1RecoveryGatedController(reach, getup);
-  } catch (error) {
-    await reach.dispose();
-    throw error;
-  }
+  return attachG1RecoveryExpert(reach, context);
 }
 
 function remapAsset(

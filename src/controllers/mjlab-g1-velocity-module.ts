@@ -5,6 +5,13 @@ import {
 import type {
   HumanoidControllerModuleContext
 } from "../world/humanoid/controller-module.js";
+import type {
+  HumanoidWholeBodyController
+} from "../world/humanoid/whole-body-controller.js";
+import {
+  attachG1RecoveryExpert,
+  g1RecoveryControllerAssets
+} from "./g1-recovery-module.js";
 
 export const MJLAB_G1_POLICY_DIRECTORY_ENV =
   "HEAR_MJLAB_G1_POLICY_DIRECTORY";
@@ -30,12 +37,14 @@ export function humanoidControllerAssets(
       );
   return [
     { id: "policy", path: policy },
-    { id: "training_report", path: report }
+    { id: "training_report", path: report },
+    ...g1RecoveryControllerAssets(environment)
   ];
 }
 
-export function createHumanoidWholeBodyController(
+export async function createHumanoidWholeBodyController(
   context: HumanoidControllerModuleContext
-) {
-  return createMjlabG1VelocityController(context);
+): Promise<HumanoidWholeBodyController> {
+  const body = await createMjlabG1VelocityController(context);
+  return attachG1RecoveryExpert(body, context);
 }

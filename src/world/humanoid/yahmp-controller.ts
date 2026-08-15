@@ -81,11 +81,13 @@ export class YahmpController implements HumanoidWholeBodyController {
   #history: Float32Array[] = [];
   #lastInferenceTrace: HumanoidControllerInferenceTrace | null = null;
 
-  static async create(): Promise<YahmpController> {
+  static async create(policyBytes?: Uint8Array): Promise<YahmpController> {
     ort.env.wasm.numThreads = 1;
-    const session = await ort.InferenceSession.create(await readFile(POLICY_PATH), {
+    const session = await ort.InferenceSession.create(
+      policyBytes ?? await readFile(POLICY_PATH), {
       executionProviders: ["wasm"]
-    });
+      }
+    );
     return new YahmpController(session);
   }
 
