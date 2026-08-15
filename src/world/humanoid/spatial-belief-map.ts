@@ -30,13 +30,27 @@ const SpatialCellSchema = z.object({
     });
   }
 });
+const SpatialCellIdentitySchema = z.object({
+  x: z.number().int().nonnegative(),
+  z: z.number().int().nonnegative()
+}).strict();
 
 export const HumanoidSpatialBeliefMapCheckpointSchema = z.object({
   version: z.literal(1),
   resolution_m: z.literal(HUMANOID_SPATIAL_MAP_RESOLUTION_METERS),
   last_updated_frame: z.number().int().min(-1),
+  last_sensor_observed_frame: z.number().int().min(-1).optional(),
+  last_visited_cell: SpatialCellIdentitySchema.nullable().optional(),
   cells: z.array(SpatialCellSchema)
 }).strict().superRefine((checkpoint, context) => {
+  if ((checkpoint.last_sensor_observed_frame ?? checkpoint.last_updated_frame)
+    > checkpoint.last_updated_frame) {
+    context.addIssue({
+      code: "custom",
+      path: ["last_sensor_observed_frame"],
+      message: "Spatial sensor observation head exceeds the map update head"
+    });
+  }
   const identities = new Set<string>();
   checkpoint.cells.forEach((cell, index) => {
     const identity = key(cell.x, cell.z);
@@ -100,6 +114,8 @@ export class HumanoidSpatialBeliefMap {
   readonly #rows: number;
   readonly #cells = new Map<string, SpatialCell>();
   #lastUpdatedFrame = -1;
+  #lastSensorObservedFrame = -1;
+  #lastVisitedCell: { x: number; z: number } | null = null;
 
   constructor(
     private readonly scenario: Pick<Scenario, "bounds">,
@@ -114,6 +130,11 @@ export class HumanoidSpatialBeliefMap {
     if (!checkpoint) return;
     const parsed = HumanoidSpatialBeliefMapCheckpointSchema.parse(checkpoint);
     this.#lastUpdatedFrame = parsed.last_updated_frame;
+    this.#lastSensorObservedFrame = parsed.last_sensor_observed_frame
+      ?? parsed.last_updated_frame;
+    this.#lastVisitedCell = parsed.last_visited_cell
+      ? { ...parsed.last_visited_cell }
+      : null;
     for (const cell of parsed.cells) {
       if (!this.#inside(cell.x, cell.z)) {
         throw new Error(`Spatial belief cell is outside the world bounds: ${key(cell.x, cell.z)}`);
@@ -149,7 +170,7 @@ export class HumanoidSpatialBeliefMap {
     if (input.frame < this.#lastUpdatedFrame) {
       throw new Error("Spatial belief observation cannot move backwards in time");
     }
-    if (input.frame === this.#lastUpdatedFrame) return;
+    if (input.frame === this.#lastSensorObservedFrame) return;
     const inverseSensorRotation = inverseQuaternion(input.sensor.rotation);
     const candidates: Array<{ x: number; z: number; point: Vec3 }> = [];
     for (let z = 0; z < this.#rows; z += 1) {
@@ -177,12 +198,25 @@ export class HumanoidSpatialBeliefMap {
     ))) {
       this.#markSolid(solid, input.frame);
     }
-    const root = this.#index(input.rootPosition);
-    if (root) {
-      const cell = this.#markObserved(root.x, root.z, input.frame, false);
-      cell.visitCount += 1;
+    this.recordTraversal(input.frame, input.rootPosition);
+    this.#lastSensorObservedFrame = input.frame;
+  }
+
+  recordTraversal(frame: number, rootPosition: Vec3): void {
+    if (frame < this.#lastUpdatedFrame) {
+      throw new Error("Spatial belief traversal cannot move backwards in time");
     }
-    this.#lastUpdatedFrame = input.frame;
+    const root = this.#index(rootPosition);
+    if (root) {
+      const cell = this.#markObserved(root.x, root.z, frame, false);
+      if (!this.#lastVisitedCell
+        || root.x !== this.#lastVisitedCell.x
+        || root.z !== this.#lastVisitedCell.z) {
+        cell.visitCount += 1;
+        this.#lastVisitedCell = { ...root };
+      }
+    }
+    this.#lastUpdatedFrame = Math.max(this.#lastUpdatedFrame, frame);
   }
 
   observation(rootPosition: Vec3): HumanoidSpatialBeliefObservation {
@@ -212,6 +246,10 @@ export class HumanoidSpatialBeliefMap {
       version: 1,
       resolution_m: HUMANOID_SPATIAL_MAP_RESOLUTION_METERS,
       last_updated_frame: this.#lastUpdatedFrame,
+      last_sensor_observed_frame: this.#lastSensorObservedFrame,
+      last_visited_cell: this.#lastVisitedCell
+        ? { ...this.#lastVisitedCell }
+        : null,
       cells: [...this.#cells.values()]
         .sort((left, right) => left.z - right.z || left.x - right.x)
         .map((cell) => ({

@@ -1307,7 +1307,10 @@ export class HumanoidWorld {
               worldRevision: this.#worldRevision
             },
             (snapshot) => {
-              this.#commitFrameState({ motionPlanId: planId });
+              this.#commitFrameState(
+                { motionPlanId: planId },
+                snapshot.rootPosition
+              );
               this.#observeGraspFrame(this.#frame, snapshot);
               this.#observeCarriedObjectFrame(snapshot);
             }
@@ -1585,7 +1588,10 @@ export class HumanoidWorld {
               releaseTrackedObjectIds
             ),
             commitPhysicalFrame: (snapshot) => {
-              this.#commitFrameState({ motionPlanId: planId });
+              this.#commitFrameState(
+                { motionPlanId: planId },
+                snapshot.rootPosition
+              );
               this.#observeGraspFrame(this.#frame, snapshot);
               const continuation = humanoidCarriedObjectContinuationEvidence({
                 state: stored.carriedObjectBindings,
@@ -2629,7 +2635,10 @@ export class HumanoidWorld {
           this.#reference = execution.reference;
           const step = prepared
             ? (() => {
-                this.#commitFrameState({ routePlanId: planId });
+                this.#commitFrameState(
+                  { routePlanId: planId },
+                  prepared.snapshot.rootPosition
+                );
                 this.#observeGraspFrame(this.#frame, prepared.snapshot);
                 const continuation = humanoidCarriedObjectContinuationEvidence({
                   state: stored.carriedObjectBindings,
@@ -3269,7 +3278,7 @@ export class HumanoidWorld {
     const snapshot = await this.#simulation.step(this.#reference, {
       taskCommand: this.#stationKeepingTaskCommand()
     });
-    this.#commitFrameState();
+    this.#commitFrameState({}, snapshot.rootPosition);
     this.#observeGraspFrame(this.#frame, snapshot);
     this.#observeCarriedObjectFrame(snapshot);
     return this.snapshot();
@@ -3468,10 +3477,12 @@ export class HumanoidWorld {
   }
 
   #commitFrameState(
-    activePlan: { motionPlanId?: string; routePlanId?: string } = {}
+    activePlan: { motionPlanId?: string; routePlanId?: string },
+    rootPosition: Vec3
   ): void {
     this.#frame += 1;
     this.#worldRevision += 1;
+    this.#spatialBelief.recordTraversal(this.#frame, rootPosition);
     this.#pruneUnconsumablePlans(activePlan);
   }
 
