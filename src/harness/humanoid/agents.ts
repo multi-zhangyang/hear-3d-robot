@@ -117,6 +117,7 @@ export function goalManagerInvocationInput(
   const goalContext = jsonRecord(root.goal_context);
   const autonomy = jsonRecord(goalContext.autonomy);
   const autonomyHistory = jsonRecord(autonomy.history);
+  const continuousDriveState = jsonRecord(autonomy.continuous_drive_state);
   const observation = jsonRecord(goalContext.observation);
   const candidates = jsonRecord(goalDAG.candidates);
   const projection = jsonRecord(goalDAG.context_projection);
@@ -184,6 +185,19 @@ export function goalManagerInvocationInput(
       truncated: projection.history_truncated === true,
       lifetime_outcomes: autonomyHistory.lifetime_outcomes ?? null
     },
+    continuous_drive_state: {
+      bootstrap_mission_goal_completed:
+        continuousDriveState.bootstrap_mission_goal_completed ?? null,
+      exact_mission_goal_history_complete:
+        continuousDriveState.exact_mission_goal_history_complete ?? null,
+      working_exact_mission_goal_outcomes:
+        continuousDriveState.working_exact_mission_goal_outcomes ?? null,
+      untried_visible_object_ids:
+        stringArray(continuousDriveState.untried_visible_object_ids),
+      untried_observable_solid_ids:
+        stringArray(continuousDriveState.untried_observable_solid_ids),
+      untried_zone_ids: stringArray(continuousDriveState.untried_zone_ids)
+    },
     observable_goal_surface: {
       predicate_types: [...GOAL_HISTORY_PREDICATE_TYPES],
       zone_ids: stringArray(observation.zone_ids),
@@ -221,7 +235,16 @@ export function goalManagerInvocationInput(
         frontier_candidates: Array.isArray(spatialBelief.frontiers)
           ? spatialBelief.frontiers.slice(0, 12)
           : []
-      }
+      },
+      object_frontier: Array.isArray(autonomy.object_frontier)
+        ? autonomy.object_frontier
+        : [],
+      solid_frontier: Array.isArray(autonomy.solid_frontier)
+        ? autonomy.solid_frontier
+        : [],
+      zone_frontier: Array.isArray(autonomy.zone_frontier)
+        ? autonomy.zone_frontier
+        : []
     }
   };
   return [
