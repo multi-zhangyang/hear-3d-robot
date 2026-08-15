@@ -4,7 +4,7 @@ import type { HumanoidObjectSnapshot } from "./simulation.js";
 import { humanoidDynamicNavigationObstacles } from "./navigation-obstacles.js";
 
 describe("humanoid dynamic navigation obstacles", () => {
-  it("keeps baked solids out of the dynamic tile cache and tracks live objects", () => {
+  it("adds articulated transit clearance around baked solids and tracks live objects", () => {
     const scenario = ScenarioSchema.parse({
       title: "Navigation obstacle ownership",
       seed: 9,
@@ -53,6 +53,11 @@ describe("humanoid dynamic navigation obstacles", () => {
       scenario,
       objectSnapshots
     })).toEqual([{
+      id: "static-transit-solid-baked-wall",
+      center: { x: 4, y: 0.5, z: 4 },
+      halfExtents: { x: 1.22, y: 0.5, z: 0.47 },
+      yaw: 0
+    }, {
       id: "fixed-object-fixed-crate",
       center: { x: 5, y: 0.25, z: 5 },
       halfExtents: { x: 0.25, y: 0.25, z: 0.25 },

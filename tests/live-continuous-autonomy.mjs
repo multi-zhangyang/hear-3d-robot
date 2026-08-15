@@ -41,12 +41,14 @@ const manager = new RunManager({
 let runId;
 let store;
 let scenario;
+let retainedControllerSourceSha256;
 
 try {
   if (resumeRunId) {
     store = await RunStore.open(resolveRunDirectory(runsDir, resumeRunId));
     assert.equal(store.definition.run_mode, "continuous",
       "Only a continuous run can be resumed by the continuous observer");
+    retainedControllerSourceSha256 = store.definition.controller_source_sha256;
     scenario = structuredClone(store.definition.scenario);
     runId = await manager.resume(resumeRunId, {
       ...(freshAgentEpoch ? { freshAgentEpoch: true } : {})
@@ -62,11 +64,19 @@ try {
     });
     store = await RunStore.open(resolveRunDirectory(runsDir, runId));
   }
-  assert.equal(
-    store.definition.controller_source_sha256,
-    controllerSource?.sourceSha256,
-    "Continuous run did not retain the configured humanoid controller source"
-  );
+  if (resumeRunId) {
+    assert.equal(
+      store.definition.controller_source_sha256,
+      retainedControllerSourceSha256,
+      "Continuous resume changed the run's immutable humanoid controller source"
+    );
+  } else {
+    assert.equal(
+      store.definition.controller_source_sha256,
+      controllerSource?.sourceSha256,
+      "Continuous run did not retain the configured humanoid controller source"
+    );
+  }
   await observeContinuousRun(
     manager,
     store,

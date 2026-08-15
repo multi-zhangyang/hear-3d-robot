@@ -86,6 +86,15 @@ import { modelReceiptDetail } from "./receipt-context.js";
 const EmptyDelegationSchema = z.object({}).strict();
 const NEURAL_OUTPUT_SUBMISSION_TOOL_NAME = "submit_neural_output";
 const MODEL_EPISODE_SIGNAL_TTL_REVISIONS = 10_000;
+type NeuralDelegationSourceSignalContract = Readonly<{
+  requiredKinds: readonly NeuralSignalKind[];
+  allowedKinds: readonly NeuralSignalKind[];
+}>;
+const CURRENT_SENSORY_EVIDENCE_SOURCE_CONTRACT:
+  NeuralDelegationSourceSignalContract = {
+    requiredKinds: ["sensory_evidence"],
+    allowedKinds: ["sensory_evidence"]
+  };
 const MOTOR_INTENT_PLANNING_ACTIONS: ReadonlySet<string> = new Set([
   "plan_humanoid_skill",
   "plan_whole_body_motion_candidates",
@@ -660,6 +669,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     child: Agent<unknown, TOutput>;
     description: string;
     requiredSignalKind?: NeuralSignalKind;
+    sourceSignalContract?: NeuralDelegationSourceSignalContract;
     isEnabled?: () => boolean;
     phases?: readonly NeuralHarnessPhase[];
     requireCommitment?: boolean;
@@ -670,7 +680,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     const delegationSchema = neuralDelegationSchema(
       inputTool.parentKey,
       inputTool.childKey,
-      inputTool.requiredSignalKind
+      inputTool.requiredSignalKind,
+      inputTool.sourceSignalContract
     );
     const nestedParallelism = childDescriptor.key === "perceptionManager"
       || childDescriptor.key === "sensorimotorManager";
@@ -1088,6 +1099,50 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           recovery: "Use only the child edge authorized for the current Harness phase and active commitment."
         });
       }
+      const sourceSignalContract = inputTool.sourceSignalContract;
+      if (sourceSignalContract) {
+        const sourceSignals = delegation.source_signal_ids.map(
+          (signalId) => input.runtime.neuralHierarchyState().signals[signalId]!
+        );
+        const sourceKinds = new Set(sourceSignals.map((signal) => signal.kind));
+        const missingSourceKinds = sourceSignalContract.requiredKinds.filter(
+          (kind) => !sourceKinds.has(kind)
+        );
+        const disallowedSourceSignals = sourceSignals.filter(
+          (signal) => !sourceSignalContract.allowedKinds.includes(signal.kind)
+        );
+        if (missingSourceKinds.length > 0 || disallowedSourceSignals.length > 0) {
+          const admissibleSourceSignals = currentParentSignals.filter(
+            (signal) => sourceSignalContract.allowedKinds.includes(signal.kind)
+          );
+          return JSON.stringify({
+            accepted: false,
+            code: "neural_source_signal_kind_mismatch",
+            tool: childTool.name,
+            parent_node_id: parentId,
+            child_node_id: childId,
+            parent_episode_id: parentInvocation.invocationId,
+            required_source_signal_kinds: sourceSignalContract.requiredKinds,
+            allowed_source_signal_kinds: sourceSignalContract.allowedKinds,
+            missing_source_signal_kinds: missingSourceKinds,
+            rejected_source_signals: disallowedSourceSignals.map((signal) => ({
+              signal_id: signal.signal_id,
+              kind: signal.kind
+            })),
+            admissible_current_source_signals: admissibleSourceSignals.map(
+              (signal) => ({ signal_id: signal.signal_id, kind: signal.kind })
+            ),
+            automatic_actuation: false,
+            next_response_contract: {
+              mode: "corrected_tool_call_only",
+              tool: childTool.name,
+              preserve_valid_fields: true,
+              narration_allowed: false
+            },
+            recovery: "Call this same direct-child tool once using the exact admissible_current_source_signals required by this structural edge. A signal UUID cannot be relabeled as another semantic kind."
+          });
+        }
+      }
       try {
         const output = await invoke(context, rawInput, details);
         const childOutput = outputObject(output);
@@ -1469,6 +1524,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         childKey: "sceneInterpreter",
         child: sceneInterpreter,
         description: "Interpret the current authoritative sensory signal.",
+        requiredSignalKind: "sensory_evidence",
+        sourceSignalContract: CURRENT_SENSORY_EVIDENCE_SOURCE_CONTRACT,
         phases: ["perception", "feedback"],
         isEnabled: () => hasCurrentManagerEpisodeSignal(
           input.runtime,
@@ -1485,6 +1542,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         childKey: "memoryRetriever",
         child: memoryRetriever,
         description: "Retrieve only relevant historical embodied experience.",
+        requiredSignalKind: "sensory_evidence",
+        sourceSignalContract: CURRENT_SENSORY_EVIDENCE_SOURCE_CONTRACT,
         phases: ["perception", "feedback"],
         isEnabled: () => hasCurrentManagerEpisodeSignal(
           input.runtime,
@@ -3073,10 +3132,14 @@ function recoveryAuthorityTool(
             parentInvocationId: recoveryInvocation.parentInvocationId,
             payload: parsed.payload
           });
-          await runtime.consumeNeuralSignals(
-            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            recoveryDemands.map((signal) => signal.signal_id)
-          );
+          // Recovery owns only the descending signal created for this bounded
+          // child episode.  The enclosing Sensorimotor Agent.asTool invocation
+          // owns its Action Selection inputs and consumes them after the
+          // ascending result is published.  Consuming the earlier snapshot of
+          // every pending recovery demand here crossed invocation boundaries:
+          // an old Premotor escalation could expire during the model call and
+          // then abort an otherwise valid Recovery result on return.
+          await runtime.consumeNeuralSignals(recoveryId, [descending.signal_id]);
           await runtime.transitionNeuralHarnessPhase({
             phase: parsed.signal_kind === "escalation"
               ? "goal_valuation"
@@ -5191,7 +5254,8 @@ function managerJoinEvidence(
 function neuralDelegationSchema(
   parentKey: HumanoidNeuralAgentKey,
   childKey: HumanoidNeuralAgentKey,
-  requiredSignalKind?: NeuralSignalKind
+  requiredSignalKind?: NeuralSignalKind,
+  sourceSignalContract?: NeuralDelegationSourceSignalContract
 ) {
   const parentId = HUMANOID_NEURAL_AGENT_IDS[parentKey];
   const childId = HUMANOID_NEURAL_AGENT_IDS[childKey];
@@ -5212,6 +5276,15 @@ function neuralDelegationSchema(
         + `${parentId} -> ${childId}`
     );
   }
+  if (sourceSignalContract) {
+    const allowedKinds = new Set(sourceSignalContract.allowedKinds);
+    if (sourceSignalContract.allowedKinds.length === 0
+      || sourceSignalContract.requiredKinds.some((kind) => !allowedKinds.has(kind))) {
+      throw new Error(
+        `Invalid source signal contract: ${parentId} -> ${childId}`
+      );
+    }
+  }
   const signalKinds = [
     ...(requiredSignalKind === undefined
       ? contract.signalKinds
@@ -5224,9 +5297,16 @@ function neuralDelegationSchema(
     signal_kind: z.enum(signalKinds).describe(
       "The allowed typed signal on this fixed structural parent-child edge. It does not authorize choosing a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters."
     ),
-    source_signal_ids: z.array(z.string().uuid()).max(64).default([]).describe(
-      "Exact pending causal signal ids owned by this current parent episode. Consumed, expired, sibling-owned, foreign-parent, and earlier-episode ids are rejected even when their UUID still exists. The Harness supplies all child state and derives the child's responsibility from the structural edge and current phase."
-    ),
+    source_signal_ids: z.array(z.string().uuid()).max(64).default([]).describe([
+      "Exact pending causal signal ids owned by this current parent episode. Consumed, expired, sibling-owned, foreign-parent, and earlier-episode ids are rejected even when their UUID still exists.",
+      ...(sourceSignalContract
+        ? [
+            `This edge requires source kinds: ${sourceSignalContract.requiredKinds.join(", ")}.`,
+            `Only these source kinds are admissible: ${sourceSignalContract.allowedKinds.join(", ")}. A UUID never changes its semantic kind.`
+          ]
+        : []),
+      "The Harness supplies all child state and derives the child's responsibility from the structural edge and current phase."
+    ].join(" ")),
     ttl_revisions: z.number().int().min(1).max(1_000_000)
       .default(MODEL_EPISODE_SIGNAL_TTL_REVISIONS),
     priority: z.number().int().min(0).max(100).default(50)
