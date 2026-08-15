@@ -864,6 +864,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           targetChildNodeId: childId,
           allowedSignalKinds: [...new Set<NeuralSignalKind>([
             params.signal_kind,
+            ...(lifecycleFeedback ? [lifecycleFeedback.kind] : []),
             ...(attachOwnedCommitment ? ["skill_commitment" as const] : []),
             ...(currentBelief ? ["perceptual_belief" as const] : []),
             ...(acceptedProposal ? ["skill_proposal" as const] : []),
@@ -889,6 +890,27 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           parentInvocationId: invocation.parentInvocationId,
           payload: descendingPayload
         });
+        if (lifecycleFeedback) {
+          // Physical completion may outlive the Action Selection episode that
+          // launched it. Rebind that exact durable feedback into this new SDK
+          // invocation as a direct Executive-owned edge, so the child can
+          // legally close its commitment without quoting a prior episode's
+          // grandchild signal or weakening the lifecycle transition contract.
+          await input.runtime.publishNeuralSignal({
+            kind: lifecycleFeedback.kind,
+            pathway: "executive_control",
+            direction: "descending",
+            sourceNodeId: parentId,
+            targetNodeId: childId,
+            ttlRevisions: params.ttl_revisions,
+            priority: 100,
+            causalParentIds: [lifecycleFeedback.signal_id],
+            authorityLeaseId: authorityLease.lease_id,
+            invocationId: invocation.invocationId,
+            parentInvocationId: invocation.parentInvocationId,
+            payload: lifecycleFeedback.payload
+          });
+        }
         if (attachOwnedCommitment) {
           await input.runtime.publishNeuralSignal({
             kind: "skill_commitment",
