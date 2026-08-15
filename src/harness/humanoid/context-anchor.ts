@@ -98,7 +98,10 @@ export function createHumanoidContextAnchor(input: {
         observation: worldEvidence.observation,
         autonomy: createHumanoidAutonomyContext({
           goalDAG: input.checkpoint.goal_dag,
-          worldEvidence
+          worldEvidence,
+          runMode: input.runMode,
+          missionGoal: input.missionGoal,
+          spatialBelief: input.observation.spatialBelief
         })
       },
       cycle_index: input.checkpoint.cycle_index,

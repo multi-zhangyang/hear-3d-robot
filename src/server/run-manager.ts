@@ -52,6 +52,9 @@ const MAX_BUFFERED_LIVE_EVENTS_DURING_BACKFILL = 256;
 const MAX_BUFFERED_LIVE_BYTES_DURING_BACKFILL = 1024 * 1024;
 const EVENT_REPLAY_PAGE_SIZE = 64;
 const EVENT_REPLAY_PAGE_MAX_BYTES = 512 * 1024;
+const CONTINUOUS_RECOVERY_INITIAL_DELAY_MS = 1_000;
+const CONTINUOUS_RECOVERY_MAX_DELAY_MS = 60_000;
+const CONTINUOUS_RECOVERY_STABILITY_MS = 5 * 60_000;
 
 export class RunManager {
   readonly #runsDir: string;
@@ -64,6 +67,11 @@ export class RunManager {
   readonly #subscribers = new Map<string, Set<Subscriber>>();
   readonly #controllers = new Map<string, AbortController>();
   readonly #operations = new Map<string, Promise<void>>();
+  readonly #continuousRecoveryAttempts = new Map<string, number>();
+  readonly #continuousRecoveryTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
   #launchController: AbortController | undefined;
   #launchOperation: Promise<void> | undefined;
   #launching = false;
@@ -252,7 +260,12 @@ export class RunManager {
         : {}),
       ...(this.#mutationFence ? { mutationFence: this.#mutationFence } : {})
     });
-    return this.#trackLaunch(operation, created, controller);
+    try {
+      return await this.#trackLaunch(operation, created, controller);
+    } catch (error) {
+      void this.#scheduleContinuousRecovery(runId, 0);
+      throw error;
+    }
   }
 
   isActive(runId: string): boolean {
@@ -376,6 +389,7 @@ export class RunManager {
   }
 
   stopAll(reason = "Operator server stopped"): void {
+    this.#cancelContinuousRecoveries();
     this.#abortAll(() => new RunPauseRequestedError(reason));
   }
 
@@ -389,6 +403,7 @@ export class RunManager {
 
   async #drain(reason: () => Error): Promise<void> {
     this.#accepting = false;
+    this.#cancelContinuousRecoveries();
     this.#abortAll(reason);
     const operations = new Set(this.#operations.values());
     if (this.#launchOperation) operations.add(this.#launchOperation);
@@ -638,11 +653,67 @@ export class RunManager {
     });
     this.#controllers.set(runId, controller);
     this.#operations.set(runId, settled);
+    const activeSince = Date.now();
     void settled.finally(() => {
+      if (this.#controllers.get(runId) === controller) {
         this.#controllers.delete(runId);
+      }
+      if (this.#operations.get(runId) === settled) {
         this.#operations.delete(runId);
-      });
+      }
+      void this.#scheduleContinuousRecovery(
+        runId,
+        Math.max(0, Date.now() - activeSince)
+      );
+    });
     return runId;
+  }
+
+  async #scheduleContinuousRecovery(
+    runId: string,
+    activeDurationMs: number
+  ): Promise<void> {
+    if (!this.#accepting || this.#continuousRecoveryTimers.has(runId)) return;
+    let store: RunStore;
+    let checkpoint: AnyRunCheckpoint;
+    try {
+      store = await RunStore.open(
+        resolveRunDirectory(this.#runsDir, runId),
+        this.#storeOptions()
+      );
+      checkpoint = await store.readCheckpoint();
+    } catch {
+      return;
+    }
+    if (store.definition.run_mode !== "continuous"
+      || checkpoint.status !== "interrupted") {
+      this.#continuousRecoveryAttempts.delete(runId);
+      return;
+    }
+    if (!this.#accepting || this.#controllers.size > 0 || this.#launching) return;
+
+    const previousAttempts = activeDurationMs >= CONTINUOUS_RECOVERY_STABILITY_MS
+      ? 0
+      : this.#continuousRecoveryAttempts.get(runId) ?? 0;
+    const delayMs = Math.min(
+      CONTINUOUS_RECOVERY_INITIAL_DELAY_MS * (2 ** Math.min(previousAttempts, 6)),
+      CONTINUOUS_RECOVERY_MAX_DELAY_MS
+    );
+    this.#continuousRecoveryAttempts.set(runId, previousAttempts + 1);
+    const timer = setTimeout(() => {
+      this.#continuousRecoveryTimers.delete(runId);
+      if (!this.#accepting || this.#controllers.size > 0 || this.#launching) return;
+      void this.resume(runId).catch(() => undefined);
+    }, delayMs);
+    this.#continuousRecoveryTimers.set(runId, timer);
+  }
+
+  #cancelContinuousRecoveries(): void {
+    for (const timer of this.#continuousRecoveryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.#continuousRecoveryTimers.clear();
+    this.#continuousRecoveryAttempts.clear();
   }
 
   async #summarize(directory: string): Promise<RunListItem> {

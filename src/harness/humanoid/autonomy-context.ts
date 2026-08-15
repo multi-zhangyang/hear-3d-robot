@@ -1,7 +1,11 @@
 import type { GoalDAG } from "../../domain/goal-epoch.js";
-import type { GoalPredicate } from "../../domain/schema.js";
+import { goalConstraintSha256 } from "../../domain/goal-identity.js";
+import type { HumanoidRunMode } from "../../domain/run-mode.js";
+import type { Goal, GoalPredicate } from "../../domain/schema.js";
 import { goalHistoryLifetimeProjection } from
   "../../domain/goal-history-summary.js";
+import type { HumanoidSpatialBeliefObservation } from
+  "../../world/humanoid/spatial-belief-map.js";
 import type { GoalEvidenceArtifact } from "./goal-evidence.js";
 
 const HISTORY_WINDOW = 128;
@@ -10,6 +14,9 @@ const RECENT_EPOCH_LIMIT = 12;
 export function createHumanoidAutonomyContext(input: {
   goalDAG: GoalDAG;
   worldEvidence: GoalEvidenceArtifact;
+  runMode?: HumanoidRunMode;
+  missionGoal?: Goal;
+  spatialBelief?: HumanoidSpatialBeliefObservation;
 }) {
   if ((input.worldEvidence.version !== 2
     && input.worldEvidence.version !== 3
@@ -27,7 +34,20 @@ export function createHumanoidAutonomyContext(input: {
   const solidCounts = new Map<string, OutcomeCounts>();
   const zoneCounts = new Map<string, OutcomeCounts>();
   const predicateCounts = new Map<string, number>();
+  const missionGoalIdentity = input.missionGoal
+    ? goalConstraintSha256(input.missionGoal)
+    : null;
+  const missionGoalOutcomes: OutcomeCounts = {
+    total: 0,
+    completed: 0,
+    unsuccessful: 0,
+    active: 0
+  };
   for (const { epoch, candidate } of history) {
+    if (missionGoalIdentity !== null
+      && goalConstraintSha256(candidate.goal) === missionGoalIdentity) {
+      incrementOutcomeValue(missionGoalOutcomes, epoch.status);
+    }
     for (const predicate of candidate.goal.predicates) {
       predicateCounts.set(
         predicate.type,
@@ -47,6 +67,39 @@ export function createHumanoidAutonomyContext(input: {
     goal_dag_state_sha256: input.goalDAG.state_sha256,
     selection_authority: "goal_manager_model" as const,
     harness_selection: "none" as const,
+    continuous_drive_state: input.runMode === "continuous"
+      ? {
+          bootstrap_mission_goal_completed: missionGoalOutcomes.completed > 0
+            ? true
+            : input.goalDAG.archive.record_count > 0 ? null : false,
+          exact_mission_goal_history_complete:
+            input.goalDAG.archive.record_count === 0,
+          working_exact_mission_goal_outcomes: missionGoalOutcomes,
+          untried_visible_object_ids: observation.objects
+            .filter((object) => !objectCounts.has(object.id))
+            .map((object) => object.id),
+          untried_observable_solid_ids: "solids" in observation
+            ? observation.solids
+                .filter((solid) => !solidCounts.has(solid.id))
+                .map((solid) => solid.id)
+            : [],
+          untried_zone_ids: observation.zones
+            .filter((zone) => !zoneCounts.has(zone.id))
+            .map((zone) => zone.id),
+          spatial_exploration: input.spatialBelief
+            ? {
+                protocol: input.spatialBelief.protocol,
+                frontier_model: input.spatialBelief.frontier_model,
+                coverage_ratio: input.spatialBelief.coverage_ratio,
+                observed_cell_count: input.spatialBelief.observed_cell_count,
+                visited_cell_count: input.spatialBelief.visited_cell_count,
+                reachable_free_cell_count:
+                  input.spatialBelief.reachable_free_cell_count,
+                frontier_candidates: input.spatialBelief.frontiers
+              }
+            : null
+        }
+      : null,
     capability_surface: {
       embodiment_predicates: [
         "robot_at",
@@ -143,11 +196,18 @@ function incrementOutcome(
     unsuccessful: 0,
     active: 0
   };
+  incrementOutcomeValue(current, status);
+  counts.set(id, current);
+}
+
+function incrementOutcomeValue(
+  current: OutcomeCounts,
+  status: "active" | "completed" | "blocked" | "abandoned" | "superseded" | "expired"
+): void {
   current.total += 1;
   if (status === "completed") current.completed += 1;
   else if (status === "active") current.active += 1;
   else current.unsuccessful += 1;
-  counts.set(id, current);
 }
 
 function outcome(counts?: OutcomeCounts): OutcomeCounts {
