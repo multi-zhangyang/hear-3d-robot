@@ -84,7 +84,8 @@ export function appendGoalHistorySummary(
     records_without_alternate_history: summary.records_without_alternate_history
       + (input.alternateHistoryComplete ? 0 : 1),
     exact_goal_outcomes_complete:
-      summary.exact_goal_outcomes_complete ?? false,
+      summary.exact_goal_outcomes_complete
+        ?? summary.archived_epoch_count === 0,
     outcomes
   });
 }
