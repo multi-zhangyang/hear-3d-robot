@@ -1,0 +1,68 @@
+diff --git a/dist/agent.d.ts b/dist/agent.d.ts
+index 84cdb85036a0498902e9ccdc5a3dfb46e4e4e5c3..4bf81012fc8f7a161501153193b481c516530e68 100644
+--- a/dist/agent.d.ts
++++ b/dist/agent.d.ts
+@@ -3,7 +3,7 @@ import { AgentHooks } from './lifecycle';
+ import { type MCPServer, type MCPToolErrorFunction } from './mcp';
+ import type { Model, ModelSettings, Prompt } from './model';
+ import { RunContext } from './runContext';
+-import { type FunctionTool, type FunctionToolResult, type Tool, type ToolApprovalFunction, type ToolExecuteArgument, type ToolInputParametersStrict } from './tool';
++import { type FunctionTool, type FunctionToolResult, type Tool, type ToolApprovalFunction, type ToolErrorFunction, type ToolExecuteArgument, type ToolInputParametersStrict } from './tool';
+ import type { ResolvedAgentOutput, JsonSchemaDefinition, HandoffsOutput, Expand } from './types';
+ import type { RunResult, StreamedRunResult } from './result';
+ import { type Handoff } from './handoff';
+@@ -51,6 +51,12 @@ export type AgentToolOptions<TContext, TAgent extends Agent<TContext, any>, TPar
+      * from the agent will be used.
+      */
+     customOutputExtractor?: (output: CompletedAgentToolInvocationRunResult<TContext, TAgent>) => string | Promise<string>;
++    /**
++     * Converts nested agent failures into tool output. Set to null to propagate
++     * the original failure to the owning manager instead of replacing it with
++     * the generic function-tool error message.
++     */
++    errorFunction?: ToolErrorFunction<TContext, string> | null;
+     /**
+      * Whether invoking this tool requires approval, matching the behavior of {@link tool} helpers.
+      * When provided as a function it receives the tool arguments and can implement custom approval
+diff --git a/dist/agent.js b/dist/agent.js
+index 6e06469c29ed7ea5e8f08d730655bf4c25a272e0..5a22d9d5aaaa9a3dab335128dfc3d3bc5ae3f8cf 100644
+--- a/dist/agent.js
++++ b/dist/agent.js
+@@ -202,7 +202,7 @@ class Agent extends lifecycle_1.AgentHooks {
+         });
+     }
+     asTool(options) {
+-        const { toolName, toolDescription, customOutputExtractor, needsApproval, parameters, inputBuilder, includeInputSchema, runConfig, runOptions, resumeState, isEnabled, onStream, } = options;
++        const { toolName, toolDescription, customOutputExtractor, errorFunction, needsApproval, parameters, inputBuilder, includeInputSchema, runConfig, runOptions, resumeState, isEnabled, onStream, } = options;
+         // Event handlers are scoped to this agent tool instance and are not shared; we only support registration (no removal) to keep the API surface small.
+         const eventHandlers = new Map();
+         const emitEvent = async (event) => {
+@@ -233,6 +233,7 @@ class Agent extends lifecycle_1.AgentHooks {
+             description: toolDescription ?? '',
+             parameters: toolParameters,
+             strict: true,
++            errorFunction,
+             needsApproval: needsApproval,
+             isEnabled,
+             execute: async (params, context, details) => {
+diff --git a/dist/agent.mjs b/dist/agent.mjs
+index d83c3096452e45a91d9638e47430c3975fcd49d5..9027f8f77fd1207f9c20a9a551e04bac35795f24 100644
+--- a/dist/agent.mjs
++++ b/dist/agent.mjs
+@@ -196,7 +196,7 @@ export class Agent extends AgentHooks {
+         });
+     }
+     asTool(options) {
+-        const { toolName, toolDescription, customOutputExtractor, needsApproval, parameters, inputBuilder, includeInputSchema, runConfig, runOptions, resumeState, isEnabled, onStream, } = options;
++        const { toolName, toolDescription, customOutputExtractor, errorFunction, needsApproval, parameters, inputBuilder, includeInputSchema, runConfig, runOptions, resumeState, isEnabled, onStream, } = options;
+         // Event handlers are scoped to this agent tool instance and are not shared; we only support registration (no removal) to keep the API surface small.
+         const eventHandlers = new Map();
+         const emitEvent = async (event) => {
+@@ -227,6 +227,7 @@ export class Agent extends AgentHooks {
+             description: toolDescription ?? '',
+             parameters: toolParameters,
+             strict: true,
++            errorFunction,
+             needsApproval: needsApproval,
+             isEnabled,
+             execute: async (params, context, details) => {

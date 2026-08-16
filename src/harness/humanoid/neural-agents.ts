@@ -697,6 +697,10 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       toolName: humanoidNeuralAgentToolName(inputTool.childKey),
       toolDescription: inputTool.description,
       parameters: delegationSchema,
+      // A child failure is a failed control edge. Preserve the originating
+      // exception through Agent.asTool instead of turning it into generic prose
+      // that the owning manager could mistake for a neural result.
+      errorFunction: null,
       inputBuilder: async ({ params }) => {
         const invocation = requiredHarnessInvocation(childId);
         await prepareHarnessPhaseForChild(
@@ -1025,11 +1029,6 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     // changing it from Harness state leaves earlier tool calls in history while
     // removing their definitions from the next compatible request. Phase and
     // signal admissibility remain hard execute-time checks in the wrapper below.
-    // A hierarchy child failure is a control-path failure, not model-visible
-    // prose. The SDK function-tool default converts exceptions into
-    // "An error occurred...", which destroys the originating node and makes
-    // the parent parse an error sentence as a neural JSON envelope.
-    childTool.errorFunction = null;
     const inputRecovery = createToolInputRecovery();
     const invoke = childTool.invoke;
     childTool.invoke = (context, rawInput, details) => invocationMutex.runExclusive(async () => {
@@ -2682,29 +2681,43 @@ function transitionSkillCommitmentTool(
         targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection
       });
       const pendingIds = new Set(pending.map((signal) => signal.signal_id));
-      if (!params.source_signal_ids.some((signalId) => pendingIds.has(signalId))) {
-        throw new Error("Commitment transition requires current child feedback");
-      }
       const requiredKind: Partial<Record<typeof state, NeuralSignalKind>> = {
         completed: "skill_completed",
         failed: "skill_failed"
       };
       const kind = requiredKind[state];
-      if (kind && !pending.some((signal) => (
-        signal.kind === kind && params.source_signal_ids.includes(signal.signal_id)
-      ))) {
-        throw new Error(`Commitment ${state} requires a current ${kind} signal`);
+      let transitionSourceSignalIds = params.source_signal_ids;
+      if (kind) {
+        // Lifecycle provenance is Harness state, not a UUID-selection task for
+        // the model. Compatible providers can legally retain an older direct
+        // child id in Session history after the SDK opens a replacement parent
+        // episode. Resolve the newest current descendant of this exact
+        // commitment instead of failing an otherwise valid physical outcome.
+        const lifecycleSignal = pending.filter((signal) => (
+          signal.kind === kind
+            && neuralSignalBindsCommitment(hierarchy, signal, active)
+        )).sort((left, right) => right.sequence - left.sequence)[0];
+        if (!lifecycleSignal) {
+          throw new Error(
+            `Commitment ${state} has no current ${kind} signal bound to the active Skill`
+          );
+        }
+        transitionSourceSignalIds = [lifecycleSignal.signal_id];
+      } else if (!params.source_signal_ids.some(
+        (signalId) => pendingIds.has(signalId)
+      )) {
+        throw new Error("Commitment transition requires current child feedback");
       }
       const commitment = await runtime.transitionNeuralSkillCommitment({
         ownerNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
         commitmentId: params.commitment_id,
         state,
-        sourceSignalIds: params.source_signal_ids
+        sourceSignalIds: transitionSourceSignalIds
       });
       return JSON.stringify({
         status: `skill_${state}`,
         commitment,
-        source_signal_ids: params.source_signal_ids
+        source_signal_ids: transitionSourceSignalIds
       });
     }
   });
@@ -6790,6 +6803,32 @@ function neuralSignalHasAncestorKind(
     if (!ancestor) continue;
     if (ancestor.kind === kind) return true;
     pending.push(...ancestor.causal_parent_ids);
+  }
+  return false;
+}
+
+function neuralSignalBindsCommitment(
+  state: NeuralHierarchyState,
+  signal: NeuralSignal,
+  commitment: NeuralSkillCommitment
+): boolean {
+  const visited = new Set<string>();
+  const pending = [signal.signal_id];
+  while (pending.length > 0) {
+    const signalId = pending.pop()!;
+    if (visited.has(signalId)) continue;
+    visited.add(signalId);
+    const candidate = state.signals[signalId];
+    if (!candidate) continue;
+    if (candidate.kind === "skill_commitment") {
+      const bound = NeuralSkillCommitmentSchema.safeParse(candidate.payload);
+      if (bound.success
+        && bound.data.commitment_id === commitment.commitment_id
+        && bound.data.goal_epoch_id === commitment.goal_epoch_id) {
+        return true;
+      }
+    }
+    pending.push(...candidate.causal_parent_ids);
   }
   return false;
 }

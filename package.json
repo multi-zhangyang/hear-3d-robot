@@ -127,5 +127,10 @@
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
     "vitest": "^4.1.10"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@openai/agents-core@0.16.0": "patches/@openai__agents-core@0.16.0.patch"
+    }
   }
 }
