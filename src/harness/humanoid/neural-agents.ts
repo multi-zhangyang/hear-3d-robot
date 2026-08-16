@@ -740,6 +740,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     requireCommitment?: boolean;
     prepareModelInput?: (input: {
       invocationId: string;
+      authorityLeaseId: string;
       signal?: AbortSignal;
     }) => Promise<void>;
   }): FunctionTool<unknown, any, unknown> => {
@@ -1108,6 +1109,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         }).map((signal) => signal.signal_id);
         await inputTool.prepareModelInput?.({
           invocationId: invocation.invocationId,
+          authorityLeaseId: authorityLease.lease_id,
           ...(scopedSignal ? { signal: scopedSignal } : {})
         });
         return neuralInvocationInput(
@@ -2042,52 +2044,185 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       && input.runtime.neuralHierarchyState().active_skill_commitment?.state
         === "executing"
   });
+  const sensorimotorAffordanceTool = asChildTool({
+    parentKey: "sensorimotorManager",
+    childKey: "affordance",
+    child: affordance,
+    description: "Assess current affordances read-only.",
+    phases: ["skill_proposal", "motor_assessment"],
+    isEnabled: () => !hasCurrentRecoveryDemand(input.runtime)
+      && !neuralSkillCommitmentIsOpen(
+        input.runtime.neuralHierarchyState().active_skill_commitment
+      )
+      && hasCurrentManagerEpisodeSignal(
+        input.runtime,
+        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        "perceptual_belief"
+      )
+      && !hasCurrentManagerEpisodeSignal(
+        input.runtime,
+        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        "affordance_hypothesis"
+      )
+  });
+  const sensorimotorRiskTool = asChildTool({
+    parentKey: "sensorimotorManager",
+    childKey: "risk",
+    child: risk,
+    description: "Assess balance, contact, collision, and commitment risk read-only.",
+    phases: ["skill_proposal", "motor_assessment"],
+    isEnabled: () => !hasCurrentRecoveryDemand(input.runtime)
+      && !neuralSkillCommitmentIsOpen(
+        input.runtime.neuralHierarchyState().active_skill_commitment
+      )
+      && hasCurrentManagerEpisodeSignal(
+        input.runtime,
+        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        "perceptual_belief"
+      )
+      && !hasCurrentManagerEpisodeSignalsAny(
+        input.runtime,
+        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        ["risk_assessment", "escalation"]
+      )
+  });
+  const invokeSensorimotorAffordance = sensorimotorAffordanceTool.invoke;
+  const invokeSensorimotorRisk = sensorimotorRiskTool.invoke;
+  const prepareSensorimotorModelInput = async (prepared: {
+    invocationId: string;
+    authorityLeaseId: string;
+    signal?: AbortSignal;
+  }): Promise<void> => {
+    if (input.runtime.neuralHarnessPhase().phase !== "skill_proposal"
+      || hasCurrentRecoveryDemand(input.runtime)
+      || neuralSkillCommitmentIsOpen(
+        input.runtime.neuralHierarchyState().active_skill_commitment
+      )) return;
+    prepared.signal?.throwIfAborted();
+    const currentSignals = (
+      kinds: readonly NeuralSignalKind[]
+    ): NeuralSignal[] => input.runtime.pendingNeuralSignals({
+      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+      kinds
+    }).filter((signal) => (
+      (signal.direction === "descending"
+        ? signal.invocation_id === prepared.invocationId
+        : signal.parent_episode_id === prepared.invocationId)
+        && isCurrentNeuralSignal(input.runtime, signal)
+    ));
+    const directBeliefs = currentSignals(["perceptual_belief"]).filter(
+      (signal) => signal.direction === "descending"
+        && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+    );
+    // A recovered SDK Session deliberately reuses its durable invocation id,
+    // but the new process owns a new lease. Retire inputs from the abandoned
+    // control edge before forking specialists so one episode cannot join
+    // beliefs from two process lifetimes.
+    const supersededInputIds = directBeliefs.filter(
+      (signal) => signal.authority_lease_id !== prepared.authorityLeaseId
+    ).map((signal) => signal.signal_id);
+    if (supersededInputIds.length > 0) {
+      await input.runtime.consumeNeuralSignals(
+        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        supersededInputIds
+      );
+    }
+    const beliefs = currentSignals(["perceptual_belief"]).filter(
+      (signal) => signal.direction === "descending"
+        && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+        && signal.authority_lease_id === prepared.authorityLeaseId
+        && isSemanticPerceptualBeliefSignal(signal)
+    );
+    if (beliefs.length !== 1) {
+      throw new Error(
+        `Sensorimotor input requires one current-authority semantic perceptual belief; found ${beliefs.length}`
+      );
+    }
+    const belief = beliefs[0]!;
+    const delegationInput = JSON.stringify({
+      signal_kind: "perceptual_belief",
+      source_signal_ids: [belief.signal_id],
+      ttl_revisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+      priority: 80
+    });
+    const branches: Promise<unknown>[] = [];
+    if (currentSignals(["affordance_hypothesis"]).length === 0) {
+      branches.push(invokeSensorimotorAffordance(
+        new RunContext(),
+        delegationInput,
+        {
+          toolCall: {
+            type: "function_call",
+            callId: stableAgentToolInvocationId(
+              HUMANOID_NEURAL_AGENT_IDS.affordance,
+              `sensorimotor-input:${prepared.invocationId}`
+            ),
+            name: sensorimotorAffordanceTool.name,
+            arguments: delegationInput
+          },
+          ...(prepared.signal ? { signal: prepared.signal } : {})
+        }
+      ));
+    }
+    if (currentSignals(["risk_assessment", "escalation"]).filter(
+      (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.risk
+    ).length === 0) {
+      branches.push(invokeSensorimotorRisk(
+        new RunContext(),
+        delegationInput,
+        {
+          toolCall: {
+            type: "function_call",
+            callId: stableAgentToolInvocationId(
+              HUMANOID_NEURAL_AGENT_IDS.risk,
+              `sensorimotor-input:${prepared.invocationId}`
+            ),
+            name: sensorimotorRiskTool.name,
+            arguments: delegationInput
+          },
+          ...(prepared.signal ? { signal: prepared.signal } : {})
+        }
+      ));
+    }
+    const settled = await Promise.allSettled(branches);
+    const failures = settled.flatMap((result) => (
+      result.status === "rejected" ? [result.reason] : []
+    ));
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "Sensorimotor Affordance/Risk fan-out failed"
+      );
+    }
+    prepared.signal?.throwIfAborted();
+    const affordances = currentSignals(["affordance_hypothesis"]).filter(
+      (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.affordance
+        && neuralSignalHasAncestorId(
+          input.runtime.neuralHierarchyState(),
+          signal,
+          belief.signal_id
+        )
+    );
+    const risks = currentSignals(["risk_assessment", "escalation"]).filter(
+      (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.risk
+        && neuralSignalHasAncestorId(
+          input.runtime.neuralHierarchyState(),
+          signal,
+          belief.signal_id
+        )
+    );
+    if (affordances.length !== 1 || risks.length !== 1) {
+      throw new Error(
+        "Sensorimotor input fan-out did not produce one Affordance and one Risk return"
+      );
+    }
+  };
   const sensorimotorManager = register(
     "sensorimotorManager",
     SensorimotorOutputSchema,
     [
-      asChildTool({
-        parentKey: "sensorimotorManager",
-        childKey: "affordance",
-        child: affordance,
-        description: "Assess current affordances read-only.",
-        phases: ["skill_proposal", "motor_assessment"],
-        isEnabled: () => !hasCurrentRecoveryDemand(input.runtime)
-          && !neuralSkillCommitmentIsOpen(
-            input.runtime.neuralHierarchyState().active_skill_commitment
-          )
-          && hasCurrentManagerEpisodeSignal(
-            input.runtime,
-            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            "perceptual_belief"
-          )
-          && !hasCurrentManagerEpisodeSignal(
-            input.runtime,
-            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            "affordance_hypothesis"
-          )
-      }),
-      asChildTool({
-        parentKey: "sensorimotorManager",
-        childKey: "risk",
-        child: risk,
-        description: "Assess balance, contact, collision, and commitment risk read-only.",
-        phases: ["skill_proposal", "motor_assessment"],
-        isEnabled: () => !hasCurrentRecoveryDemand(input.runtime)
-          && !neuralSkillCommitmentIsOpen(
-            input.runtime.neuralHierarchyState().active_skill_commitment
-          )
-          && hasCurrentManagerEpisodeSignal(
-            input.runtime,
-            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            "perceptual_belief"
-          )
-          && !hasCurrentManagerEpisodeSignalsAny(
-            input.runtime,
-            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            ["risk_assessment", "escalation"]
-          )
-      }),
+      sensorimotorAffordanceTool,
+      sensorimotorRiskTool,
       asChildTool({
         parentKey: "sensorimotorManager",
         childKey: "premotor",
@@ -2129,7 +2264,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       parallel: true,
       toolUseBehavior: sensorimotorToolUseBehavior(input.runtime),
       extraInstructions: [
-        "Affordance and Risk are the only parallel pre-action fan-out; join both yourself.",
+        "In skill_proposal, the Harness has already completed the mandatory parallel Affordance/Risk fan-out before your first reasoning turn. Do not call those structural tools again in that episode.",
         "A skill_proposal must semantically join the current perceptual_belief with both Affordance and Risk results. The Harness binds all three exact episode-local signals; do not copy their UUIDs.",
         "If directed input contains direct_parent_correction, treat it as binding causal feedback from Action Selection. Do not repeat the rejected invocation while its physical preconditions are unchanged; select the structured required prerequisite Skill when present, using the current observation and specialist evidence.",
         "Return exactly one next bounded catalog Skill as proposed_skill={skill, phase, params, rationale}. Future steps may appear only in phase_sequence; never make a compound skill_name or the whole task the proposal.",
@@ -2180,6 +2315,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           "recovery"
         ],
         requireCommitment: false,
+        prepareModelInput: prepareSensorimotorModelInput,
         isEnabled: () => input.runtime.neuralHarnessPhase().phase !== "recovery"
           || input.runtime.neuralHierarchyState().active_skill_commitment === null
           || ["completed", "failed", "released"].includes(
@@ -6137,7 +6273,8 @@ function currentActionSelectionBelief(
   const beliefs = runtime.pendingNeuralSignals({
     targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
     kinds: ["perceptual_belief"]
-  }).filter((signal) => isCurrentNeuralSignal(runtime, signal));
+  }).filter((signal) => isCurrentNeuralSignal(runtime, signal)
+    && isSemanticPerceptualBeliefSignal(signal));
   const causallyBound = beliefs.filter((belief) => sourceSignals.some((source) => (
     belief.signal_id === source.signal_id
       || neuralSignalHasAncestorId(state, belief, source.signal_id)
@@ -6159,6 +6296,13 @@ function currentActionSelectionBelief(
     (left, right) => right.world_revision - left.world_revision
       || right.sequence - left.sequence
   )[0];
+}
+
+function isSemanticPerceptualBeliefSignal(signal: NeuralSignal): boolean {
+  const payload = jsonRecord(signal.payload);
+  if (payload?.protocol === "compact_perceptual_belief_v1") return true;
+  if (payload?.protocol !== "materialized_perceptual_belief_v1") return false;
+  return jsonRecord(payload.belief)?.protocol === "compact_perceptual_belief_v1";
 }
 
 function hasCurrentManagerEpisodeSignal(
@@ -6593,6 +6737,7 @@ function managerJoinEvidence(
         && (kind === "perceptual_belief"
           ? candidate.direction === "descending"
             && candidate.invocation_id === invocationId
+            && isSemanticPerceptualBeliefSignal(candidate)
           : candidate.direction === "ascending"
             && candidate.parent_episode_id === invocationId)
     ));
