@@ -268,7 +268,7 @@ export async function startHumanoidMission(input: {
   }
 }
 
-export async function resumeHumanoidMission(input: {
+export interface ResumeHumanoidMissionInput {
   runDir: string;
   catalog: RuntimeCatalog;
   provider: ProviderConfig;
@@ -278,7 +278,14 @@ export async function resumeHumanoidMission(input: {
   mutationFence?: MutationFence;
   controllerSource?: HumanoidControllerSource;
   densePolicyRolloutDir?: string;
-}): Promise<HumanoidMissionRunResult> {
+}
+
+export async function resumeHumanoidMission(
+  input: ResumeHumanoidMissionInput
+): Promise<HumanoidMissionRunResult> {
+  if (input.freshAgentEpoch) {
+    await recoverUnfinishedPhysicalAuthorityBeforeFreshAgentEpoch(input);
+  }
   const store = await RunStore.open(
     input.runDir,
     {
@@ -355,6 +362,88 @@ export async function resumeHumanoidMission(input: {
       resumed: true,
       ...(input.signal ? { signal: input.signal } : {})
     });
+  } finally {
+    await Promise.all([
+      densePolicyWriter?.flush() ?? Promise.resolve(),
+      world.dispose()
+    ]);
+  }
+}
+
+/**
+ * A model/Session epoch may be replaced, but an admitted physical transaction
+ * belongs to the robot and its durable Execution Gate ledger rather than to a
+ * replaceable SDK conversation. Finish that exact transaction under the
+ * manifest that admitted it, publish its ascending neural feedback, and only
+ * then let RunStore archive and replace the cognitive epoch.
+ */
+async function recoverUnfinishedPhysicalAuthorityBeforeFreshAgentEpoch(
+  input: ResumeHumanoidMissionInput
+): Promise<void> {
+  const store = await RunStore.open(input.runDir, {
+    ...(input.mutationFence ? { mutationFence: input.mutationFence } : {})
+  });
+  if (store.definition.runtime !== "humanoid_g1") {
+    throw new Error("This run was not created by the humanoid runtime");
+  }
+  const checkpoint = await store.readHumanoidCheckpoint();
+  const unfinishedExecutionCount = Object.keys(
+    checkpoint.action_execution_ledger.active
+  ).length;
+  const unfinishedCommitCount = Object.keys(
+    checkpoint.action_commit_outbox.pending
+  ).length;
+  if (unfinishedExecutionCount === 0 && unfinishedCommitCount === 0) return;
+
+  const controllerSource = await recoverHumanoidControllerSourceForRun(
+    store.definition.controller_source_sha256,
+    input.controllerSource,
+    store.runDir
+  );
+  const scenarioChunks = await store.readScenarioChunkDeltaState();
+  assertHumanoidPhysicalWorldDeltaRecovery({
+    scenario: store.definition.scenario,
+    chunks: scenarioChunks,
+    world: checkpoint.world
+  });
+  const world = await HumanoidWorld.create(
+    store.definition.scenario,
+    checkpoint.world_checkpoint,
+    {
+      scenarioChunks,
+      ...(controllerSource
+        ? { controllerFactory: controllerSource.controllerFactory }
+        : {})
+    }
+  );
+  const densePolicyWriter = input.densePolicyRolloutDir
+    ? new DensePolicyRolloutWriter({
+        rootDir: input.densePolicyRolloutDir,
+        runId: store.definition.run_id
+      })
+    : undefined;
+  try {
+    const runtime = new HumanoidRunRuntime({
+      store,
+      goal: store.definition.goal,
+      world,
+      checkpoint,
+      ...(densePolicyWriter
+        ? { policyFrameSink: densePolicyWriter.recordFrame }
+        : {}),
+      ...(input.eventSink ? { eventSink: input.eventSink } : {}),
+      ...(input.signal ? { signal: input.signal } : {})
+    });
+    await runtime.initializeGoalAutonomy(await store.readAgentManifest());
+    await runtime.start(true);
+    if (runtime.pendingPhysicalExecutionTransactionId()) {
+      throw new Error(
+        "Durable physical execution remained active after deterministic recovery"
+      );
+    }
+    await runtime.pause(
+      "Recovered unfinished physical authority before fresh Agent epoch"
+    );
   } finally {
     await Promise.all([
       densePolicyWriter?.flush() ?? Promise.resolve(),
