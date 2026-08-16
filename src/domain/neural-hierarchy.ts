@@ -1769,6 +1769,41 @@ export function issueNeuralRolloutCertificate(
   };
 }
 
+export function revokeNeuralRolloutCertificate(
+  stateInput: NeuralHierarchyState,
+  input: {
+    certificateId: string;
+    commitmentId: string;
+    reason: string;
+    at?: string;
+  }
+): { state: NeuralHierarchyState; certificate: NeuralRolloutCertificate } {
+  const state = NeuralHierarchyStateSchema.parse(structuredClone(stateInput));
+  const certificate = state.rollout_certificates[input.certificateId];
+  if (!certificate || certificate.commitment_id !== input.commitmentId) {
+    throw new Error(`Unknown rollout certificate: ${input.certificateId}`);
+  }
+  if (certificate.status === "revoked") {
+    return { state, certificate: structuredClone(certificate) };
+  }
+  if (certificate.status !== "active") {
+    throw new Error(
+      `Only an active rollout certificate may be revoked: ${input.certificateId}`
+    );
+  }
+  const reason = input.reason.trim();
+  if (!reason) throw new Error("Rollout certificate revocation requires a reason");
+  const at = input.at ?? new Date().toISOString();
+  certificate.status = "revoked";
+  certificate.closed_at = at;
+  certificate.close_reason = reason;
+  state.updated_at = at;
+  return {
+    state: NeuralHierarchyStateSchema.parse(state),
+    certificate: structuredClone(certificate)
+  };
+}
+
 export function consumeNeuralRolloutCertificate(
   stateInput: NeuralHierarchyState,
   input: {

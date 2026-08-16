@@ -225,6 +225,7 @@ import {
   recordNeuralSafetyInterrupt,
   recordNeuralReflexArcFrame,
   resolveNeuralSafetyInterrupts,
+  revokeNeuralRolloutCertificate,
   transitionNeuralHarnessPhase,
   transitionNeuralSkillCommitment,
   type NeuralAuthorityLease,
@@ -718,25 +719,56 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         }
       } else if (readiness === "execute_plan") {
         const storedCommitment = state.active_skill_commitment;
-        const activeCommitment = storedCommitment
+        let activeCommitment = storedCommitment
           && !["completed", "failed", "released"].includes(storedCommitment.state)
           ? storedCommitment
           : null;
-        const commitmentPlan = activeCommitment
+        const commitmentEstablishedWorldRevision =
+          activeCommitment?.established_world_revision;
+        const commitmentPlan = commitmentEstablishedWorldRevision !== undefined
           ? humanoidActionReceiptsInCommitOrder(
               checkpoint.committed_actions
             ).findLast((receipt) => (
               receipt.accepted
                 && isHumanoidPlanningReceipt(receipt)
                 && receipt.worldAfterRevision
-                  >= activeCommitment.established_world_revision
+                  >= commitmentEstablishedWorldRevision
                 && sameAutonomousCycle(receipt.cycle, checkpoint.active_cycle)
             ))
           : undefined;
-        const activeCertificates = Object.values(state.rollout_certificates).filter(
+        let activeCertificates = Object.values(state.rollout_certificates).filter(
           (certificate) => certificate.status === "active"
             && certificate.commitment_id === activeCommitment?.commitment_id
         );
+        if (activeCertificates.length > 1) {
+          throw new Error(
+            `Active Skill has ${activeCertificates.length} rollout certificates`
+          );
+        }
+        const activeCertificate = activeCertificates[0];
+        let certifiedReturnRecovered = true;
+        if (activeCertificate && activeCommitment) {
+          const worldRevision = this.currentWorldRevision();
+          if (worldRevision > activeCertificate.expires_world_revision) {
+            const commitmentReleased = await this.#revokeRolloutCertificate(
+              activeCertificate,
+              "expired_before_execution_authorization"
+            );
+            if (commitmentReleased) activeCommitment = null;
+            activeCertificates = [];
+          } else if (activeCommitment.state === "committed") {
+            certifiedReturnRecovered =
+              await this.#recoverCertifiedSensorimotorReturn(activeCertificate);
+            if (!certifiedReturnRecovered) {
+              const commitmentReleased = await this.#revokeRolloutCertificate(
+                activeCertificate,
+                "incomplete_structural_return_after_process_recovery"
+              );
+              if (commitmentReleased) activeCommitment = null;
+              activeCertificates = [];
+            }
+          }
+        }
         if (activeCommitment === null) {
           // The accepted plan receipt belongs to an earlier Agent epoch.  It
           // remains durable evidence, but the fresh hierarchy has neither its
@@ -751,7 +783,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           && activeCertificates.length === 1) {
           phase = "execution";
           reason = "certified_commitment_requires_serial_execution";
-        } else if (activeCertificates.length === 1) {
+        } else if (activeCertificates.length === 1 && certifiedReturnRecovered) {
           phase = "rollout_review";
           reason = "certified_rollout_requires_action_selection_authorization";
         } else {
@@ -785,6 +817,184 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       ...(current.phase === "terminal" && checkpoint.status === "running"
         ? { resumeFromTerminal: true }
         : {})
+    });
+  }
+
+  /**
+   * A Predictive certificate can reach durable storage one callback before
+   * the enclosing Sensorimotor Agent.asTool publishes its aggregate return.
+   * Recreate only that deterministic structural join after process loss; the
+   * model-authored prediction and real Rollout Gate payload remain the sole
+   * semantic authority.
+   */
+  async #recoverCertifiedSensorimotorReturn(
+    certificate: NeuralRolloutCertificate
+  ): Promise<boolean> {
+    return this.#neuralStateMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
+      const state = this.#checkpoint.neural_hierarchy_state;
+      const active = state.rollout_certificates[certificate.certificate_id];
+      if (!active || active.status !== "active"
+        || active.commitment_id !== certificate.commitment_id) return false;
+      const existing = Object.values(state.signals).filter((signal) => (
+        signal.status === "pending"
+          && signal.kind === "rollout_result"
+          && signal.direction === "ascending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+          && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+          && signal.causal_parent_ids.includes(active.predictive_signal_id)
+          && neuralSignalDescendsFrom(
+            state,
+            signal,
+            active.rollout_signal_id
+          )
+      ));
+      if (existing.length > 1) {
+        throw new Error(
+          `Predictive certificate has ${existing.length} Sensorimotor returns`
+        );
+      }
+      if (existing.length === 1) return true;
+
+      const rawRollout = state.signals[active.rollout_signal_id];
+      const prediction = state.signals[active.predictive_signal_id];
+      if (!rawRollout || rawRollout.kind !== "rollout_result"
+        || rawRollout.direction !== "reentrant"
+        || rawRollout.source_node_id !== HUMANOID_NEURAL_AGENT_IDS.rolloutGate
+        || modelPayloadSha256(rawRollout.payload) !== active.rollout_payload_sha256
+        || !prediction || prediction.kind !== "forward_prediction"
+        || prediction.source_node_id !== HUMANOID_NEURAL_AGENT_IDS.predictive
+        || prediction.target_node_id !== HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+        || !neuralSignalDescendsFrom(state, prediction, rawRollout.signal_id)) {
+        throw new Error("Active Predictive certificate lost its durable causal evidence");
+      }
+      const premotorReturns = Object.values(state.signals).filter((signal) => (
+        signal.status === "pending"
+          && signal.kind === "rollout_result"
+          && signal.direction === "ascending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.premotor
+          && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+          && signal.parent_episode_id === prediction.parent_episode_id
+          && modelPayloadSha256(signal.payload) === active.rollout_payload_sha256
+          && neuralSignalDescendsFrom(state, signal, rawRollout.signal_id)
+      ));
+      if (premotorReturns.length !== 1) return false;
+      const leases = Object.values(state.authority_leases).filter((lease) => (
+        lease.issuing_parent_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+          && lease.target_child_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+          && lease.invocation_id === prediction.parent_episode_id
+          && lease.commitment_id === active.commitment_id
+      ));
+      if (leases.length !== 1) return false;
+      const lease = leases[0]!;
+      const descendingInputs = Object.values(state.signals).filter((signal) => (
+        signal.kind === "skill_commitment"
+          && signal.direction === "descending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+          && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+          && signal.authority_lease_id === lease.lease_id
+          && signal.invocation_id === lease.invocation_id
+      ));
+      if (descendingInputs.length !== 1) return false;
+      const world = this.#world.snapshot();
+      const route = assertHumanoidNeuralSignalRoute({
+        kind: "rollout_result",
+        direction: "ascending",
+        sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection
+      });
+      const recovered = publishNeuralSignal(state, {
+        kind: "rollout_result",
+        pathway: "sensorimotor_selection",
+        direction: "ascending",
+        sourceNodeId: route.source.id,
+        sourceLayer: route.source.layer,
+        targetNodeId: route.target.id,
+        targetLayer: route.target.layer,
+        worldFrame: world.frame,
+        worldRevision: world.worldRevision,
+        ttlRevisions: Math.max(
+          1,
+          active.expires_world_revision - active.issued_world_revision
+        ),
+        priority: 50,
+        invocationId: lease.invocation_id,
+        parentInvocationId: lease.parent_invocation_id,
+        parentEpisodeId: lease.parent_episode_id,
+        causalParentIds: [
+          descendingInputs[0]!.signal_id,
+          premotorReturns[0]!.signal_id,
+          prediction.signal_id
+        ],
+        sourceAuthorityLeaseId: lease.lease_id,
+        payload: premotorReturns[0]!.payload,
+        liveInvocationIds: this.#liveNeuralInvocationIds()
+      });
+      this.#checkpoint.neural_hierarchy_state = recovered.state;
+      await this.#persistNeuralState();
+      await this.emit("neural_signal_published", json({
+        signal: recovered.signal,
+        automatic_actuation: false
+      }));
+      await this.emit("neural_certified_rollout_return_recovered", json({
+        certificate_id: active.certificate_id,
+        signal_id: recovered.signal.signal_id,
+        source: "durable_predictive_certificate",
+        automatic_actuation: false
+      }));
+      return true;
+    });
+  }
+
+  async #revokeRolloutCertificate(
+    certificate: NeuralRolloutCertificate,
+    reason: string
+  ): Promise<boolean> {
+    return this.#neuralStateMutex.runExclusive(async () => {
+      const active = this.#checkpoint.neural_hierarchy_state
+        .rollout_certificates[certificate.certificate_id];
+      if (!active || active.status !== "active") return false;
+      const revoked = revokeNeuralRolloutCertificate(
+        this.#checkpoint.neural_hierarchy_state,
+        {
+          certificateId: active.certificate_id,
+          commitmentId: active.commitment_id,
+          reason
+        }
+      );
+      let nextState = revoked.state;
+      let releasedCommitment: NeuralSkillCommitment | null = null;
+      const commitment = nextState.active_skill_commitment;
+      if (commitment?.commitment_id === active.commitment_id
+        && commitment.state === "executing"
+        && activeActionExecutions(
+          this.#checkpoint.action_execution_ledger
+        ).length === 0) {
+        const released = transitionNeuralSkillCommitment(nextState, {
+          commitmentId: commitment.commitment_id,
+          ownerNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+          state: "released",
+          worldRevision: this.#world.snapshot().worldRevision,
+          sourceSignalIds: [active.predictive_signal_id]
+        });
+        nextState = released.state;
+        releasedCommitment = released.commitment;
+      }
+      this.#checkpoint.neural_hierarchy_state = nextState;
+      await this.#persistNeuralState();
+      await this.emit("neural_rollout_certificate_revoked", json({
+        rollout_certificate: revoked.certificate,
+        reason,
+        automatic_actuation: false
+      }));
+      if (releasedCommitment) {
+        await this.emit("neural_skill_commitment_transitioned", json({
+          commitment: releasedCommitment,
+          transition_reason: "certificate_revoked_without_physical_execution",
+          automatic_actuation: false
+        }));
+      }
+      return releasedCommitment !== null;
     });
   }
 
@@ -6779,6 +6989,24 @@ function replanModelCallEvent(
       )
     })
   };
+}
+
+function neuralSignalDescendsFrom(
+  state: NeuralHierarchyState,
+  signal: NeuralSignal,
+  ancestorSignalId: string
+): boolean {
+  const pending = [...signal.causal_parent_ids];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const signalId = pending.pop()!;
+    if (signalId === ancestorSignalId) return true;
+    if (visited.has(signalId)) continue;
+    visited.add(signalId);
+    const ancestor = state.signals[signalId];
+    if (ancestor) pending.push(...ancestor.causal_parent_ids);
+  }
+  return false;
 }
 
 function isHumanoidPlanningReceipt(receipt: HumanoidActionReceipt): boolean {
