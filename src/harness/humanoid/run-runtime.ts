@@ -222,6 +222,7 @@ import {
   pendingNeuralSignals,
   pendingNeuralSafetyInterrupts,
   publishNeuralSignal,
+  NeuralSensingAuthoritySchema,
   recordNeuralSafetyInterrupt,
   recordNeuralReflexArcFrame,
   resolveNeuralSafetyInterrupts,
@@ -236,6 +237,7 @@ import {
   type NeuralPredictionError,
   type NeuralRolloutCertificate,
   type NeuralSafetyInterrupt,
+  type NeuralSensingAuthority,
   type NeuralSignal,
   type NeuralSignalKind,
   type NeuralSkillCommitment
@@ -623,6 +625,83 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       }
     }
     return path;
+  }
+
+  #assertNeuralSensingAuthority(
+    rawAuthority: NeuralSensingAuthority
+  ): void {
+    const authority = NeuralSensingAuthoritySchema.parse(rawAuthority);
+    if (authority.manager_node_id
+        !== HUMANOID_NEURAL_AGENT_IDS.perceptionManager
+      || authority.sensor_node_id !== HUMANOID_NEURAL_AGENT_IDS.sensorFusion) {
+      throw new Error("Neural sensing authority crossed its structural edge");
+    }
+    const invocation = currentAgentHarnessInvocation();
+    if (invocation?.agentId !== HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+      || invocation.invocationId !== authority.sensor_invocation_id
+      || invocation.parentInvocationId !== authority.manager_invocation_id) {
+      throw new Error("Neural sensing authority is outside its Sensor Fusion invocation");
+    }
+    const state = this.#checkpoint.neural_hierarchy_state;
+    if (!["perception", "feedback"].includes(state.harness_phase.phase)) {
+      throw new Error("Neural sensing authority is outside a perception phase");
+    }
+    const path = this.#activeNeuralAuthorityPath(
+      HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+    );
+    const direct = path?.at(-1);
+    if (!direct
+      || direct.parentNodeId !== HUMANOID_NEURAL_AGENT_IDS.perceptionManager
+      || direct.childNodeId !== HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+      || direct.lease.lease_id !== authority.authority_lease_id) {
+      throw new Error("Neural sensing authority lacks its complete control path");
+    }
+    const lease = direct.lease;
+    if (lease.invocation_id !== authority.sensor_invocation_id
+      || lease.parent_invocation_id !== authority.manager_invocation_id
+      || lease.parent_episode_id !== authority.manager_invocation_id) {
+      throw new Error("Neural sensing authority does not match its lease episode");
+    }
+    const request = state.signals[authority.request_signal_id];
+    if (!request || request.status !== "pending"
+      || request.kind !== "goal_context"
+      || request.direction !== "descending"
+      || request.source_node_id !== HUMANOID_NEURAL_AGENT_IDS.perceptionManager
+      || request.target_node_id !== HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+      || request.authority_lease_id !== authority.authority_lease_id
+      || request.invocation_id !== authority.sensor_invocation_id
+      || request.parent_invocation_id !== authority.manager_invocation_id
+      || request.parent_episode_id !== authority.manager_invocation_id
+      || request.world_revision !== authority.issued_world_revision) {
+      throw new Error("Neural sensing authority lost its direct request signal");
+    }
+  }
+
+  #assertPersistedNeuralSensingReceipt(
+    receipt: HumanoidActionReceipt
+  ): NeuralSensingAuthority {
+    const authority = NeuralSensingAuthoritySchema.parse(
+      receipt.neuralSensingAuthority
+    );
+    if (receipt.decision
+      || receipt.transactionId !== authority.transaction_id
+      || receipt.agentId !== HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+      || receipt.action !== "observe_humanoid"
+      || modelPayloadSha256(receipt.input) !== modelPayloadSha256({})
+      || !receipt.accepted
+      || receipt.code !== "humanoid_observed"
+      || receipt.frameCount !== 0
+      || receipt.channels.length !== 0
+      || receipt.worldAfterRevision < authority.issued_world_revision
+      || !receipt.cycle
+      || authority.manager_node_id
+        !== HUMANOID_NEURAL_AGENT_IDS.perceptionManager
+      || authority.sensor_node_id !== HUMANOID_NEURAL_AGENT_IDS.sensorFusion) {
+      throw new Error(
+        `Persisted Sensor Fusion receipt has invalid Harness authority: ${receipt.transactionId}`
+      );
+    }
+    return authority;
   }
 
   async reconcileNeuralHarnessPhase(): Promise<NeuralHierarchyState["harness_phase"]> {
@@ -1900,6 +1979,10 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       receipts: this.#checkpoint.committed_actions,
       identities: actionTransactionIdentities,
       assertDecisionAuthority: (receipt, toolAuthority) => {
+        if (receipt.neuralSensingAuthority) {
+          this.#assertPersistedNeuralSensingReceipt(receipt);
+          return;
+        }
         if (!receipt.decision || !receipt.cycle) {
           throw new Error(
             `Committed action has no durable model decision: ${receipt.transactionId}`
@@ -2484,6 +2567,53 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     agentId: string
   ): boolean {
     return this.#actions.isActionAvailable(action, agentId);
+  }
+
+  async captureNeuralObservation(input: {
+    transactionId: string;
+    authority: NeuralSensingAuthority;
+    signal?: AbortSignal;
+  }): Promise<HumanoidActionReceipt> {
+    const authority = NeuralSensingAuthoritySchema.parse(input.authority);
+    return this.#actionMutex.runExclusive(async () => {
+      this.#assertRunAcceptsDecisions();
+      this.#assertNeuralSensingAuthority(authority);
+      await this.#assertKnownTransactionFingerprint(
+        "observe_humanoid",
+        {},
+        input.transactionId,
+        HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+      );
+      this.#assertActionRoleAuthority(
+        "observe_humanoid",
+        HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+      );
+      this.#physicsClock.throwIfFailed();
+      this.#physicalExecution.assertExecutionOwner(input.transactionId);
+      const resumeClock = this.#continuousPhysicsEnabled;
+      await this.#physicsClock.stop();
+      try {
+        return await this.#actions.invoke(
+          "observe_humanoid",
+          {},
+          input.transactionId,
+          HUMANOID_NEURAL_AGENT_IDS.sensorFusion,
+          undefined,
+          {
+            neuralSensingAuthority: authority,
+            ...(input.signal ? { signal: input.signal } : {})
+          }
+        );
+      } finally {
+        if (resumeClock
+          && this.#checkpoint.status === "running"
+          && activeActionExecutions(
+            this.#checkpoint.action_execution_ledger
+          ).length === 0) {
+          await this.#resumeContinuousPhysicsIfSafe();
+        }
+      }
+    });
   }
 
   async invoke(
@@ -4072,23 +4202,45 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
 
   async #commitReceipt(receipt: HumanoidActionReceipt): Promise<void> {
     const activeCycle = this.#requiredActiveCycleRef();
-    if (!receipt.decision || !sameAutonomousCycle(receipt.cycle, activeCycle)) {
+    if (!sameAutonomousCycle(receipt.cycle, activeCycle)) {
       throw new Error(
-        `Humanoid action has no cycle-bound model decision authority: ${receipt.transactionId}`
+        `Humanoid action has no active Cycle authority: ${receipt.transactionId}`
       );
     }
-    const toolAuthority = this.#actions.toolCallAuthority(receipt.transactionId)
-      ?? this.#checkpoint.action_execution_ledger.active[receipt.transactionId]
-        ?.admission.tool_call_authority;
-    this.#assertActionDecisionRef(
-      receipt.decision,
-      receipt.action,
-      receipt.input,
-      receipt.transactionId,
-      receipt.agentId,
-      activeCycle,
-      toolAuthority
-    );
+    const sensingAuthority = receipt.neuralSensingAuthority
+      ? NeuralSensingAuthoritySchema.parse(receipt.neuralSensingAuthority)
+      : undefined;
+    let toolAuthority: HumanoidActionToolCallAuthority | undefined;
+    if (sensingAuthority) {
+      if (receipt.decision
+        || receipt.action !== "observe_humanoid"
+        || receipt.agentId !== HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+        || receipt.transactionId !== sensingAuthority.transaction_id) {
+        throw new Error(
+          `Humanoid observation has invalid neural sensing authority: ${receipt.transactionId}`
+        );
+      }
+      this.#assertPersistedNeuralSensingReceipt(receipt);
+      this.#assertNeuralSensingAuthority(sensingAuthority);
+    } else {
+      if (!receipt.decision) {
+        throw new Error(
+          `Humanoid action has no model or sensing authority: ${receipt.transactionId}`
+        );
+      }
+      toolAuthority = this.#actions.toolCallAuthority(receipt.transactionId)
+        ?? this.#checkpoint.action_execution_ledger.active[receipt.transactionId]
+          ?.admission.tool_call_authority;
+      this.#assertActionDecisionRef(
+        receipt.decision,
+        receipt.action,
+        receipt.input,
+        receipt.transactionId,
+        receipt.agentId,
+        activeCycle,
+        toolAuthority
+      );
+    }
     const pending = this.#checkpoint.action_commit_outbox.pending[receipt.transactionId];
     if (pending) {
       assertPendingActionReceipt(pending.action_record, receipt);

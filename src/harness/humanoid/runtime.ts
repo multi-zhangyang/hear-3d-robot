@@ -15,7 +15,10 @@ import type { HumanoidGroundingReceipt } from
 import type { AutonomousCycleRef } from "../../domain/autonomous-cycle.js";
 import type { NeuralRolloutExecutionAdmission } from
   "../../domain/action-execution-ledger.js";
-import type { NeuralSafetyInterrupt } from "../../domain/neural-hierarchy.js";
+import type {
+  NeuralSafetyInterrupt,
+  NeuralSensingAuthority
+} from "../../domain/neural-hierarchy.js";
 import type { ScenarioBlockRemovalTransaction } from "../../domain/scenario-block-removal.js";
 import {
   HUMANOID_SKILL_CONTRACTS,
@@ -252,6 +255,7 @@ export interface HumanoidActionToolCallAuthority {
 export interface HumanoidActionInvocationOptions {
   signal?: AbortSignal;
   toolAuthority?: HumanoidActionToolCallAuthority;
+  neuralSensingAuthority?: NeuralSensingAuthority;
   /** Internal crash recovery only: replay the decision persisted at admission. */
   recoveryDecision?: ModelDecisionRef;
   /** Harness-issued rollout authority consumed atomically with physical admission. */
@@ -277,6 +281,7 @@ export interface HumanoidActionReceipt {
   transactionId: string;
   agentId: string;
   decision?: ModelDecisionRef | undefined;
+  neuralSensingAuthority?: NeuralSensingAuthority | undefined;
   cycle?: AutonomousCycleRef | undefined;
   action: HumanoidActionName;
   input: JsonValue;
@@ -381,6 +386,7 @@ export class HumanoidActionRuntime {
     decisionSha256: string | undefined;
     toolAuthoritySha256: string | undefined;
     toolAuthority: HumanoidActionToolCallAuthority | undefined;
+    neuralSensingAuthoritySha256: string | undefined;
     neuralRolloutCertificateSha256: string | undefined;
     promise: Promise<HumanoidActionReceipt>;
   }>();
@@ -510,6 +516,9 @@ export class HumanoidActionRuntime {
           : undefined,
         toolAuthoritySha256: undefined,
         toolAuthority: undefined,
+        neuralSensingAuthoritySha256: receipt.neuralSensingAuthority
+          ? modelPayloadSha256(receipt.neuralSensingAuthority)
+          : undefined,
         neuralRolloutCertificateSha256: undefined,
         promise: Promise.resolve(receipt)
       });
@@ -899,6 +908,9 @@ export class HumanoidActionRuntime {
     const toolAuthoritySha256 = options.toolAuthority
       ? modelPayloadSha256(options.toolAuthority)
       : undefined;
+    const neuralSensingAuthoritySha256 = options.neuralSensingAuthority
+      ? modelPayloadSha256(options.neuralSensingAuthority)
+      : undefined;
     const neuralRolloutCertificateSha256 = options.neuralRolloutCertificate
       ? modelPayloadSha256(options.neuralRolloutCertificate)
       : undefined;
@@ -907,6 +919,8 @@ export class HumanoidActionRuntime {
       if (existing.fingerprint !== fingerprint
         || existing.decisionSha256 !== decisionSha256
         || existing.toolAuthoritySha256 !== toolAuthoritySha256
+        || existing.neuralSensingAuthoritySha256
+          !== neuralSensingAuthoritySha256
         || existing.neuralRolloutCertificateSha256
           !== neuralRolloutCertificateSha256) {
         throw new Error(
@@ -940,6 +954,7 @@ export class HumanoidActionRuntime {
       toolAuthority: options.toolAuthority
         ? structuredClone(options.toolAuthority)
         : undefined,
+      neuralSensingAuthoritySha256,
       neuralRolloutCertificateSha256,
       promise
     });
@@ -1009,6 +1024,9 @@ export class HumanoidActionRuntime {
       fingerprint,
       ...(decision ? { decision } : {}),
       ...(options.toolAuthority ? { toolAuthority: options.toolAuthority } : {}),
+      ...(options.neuralSensingAuthority
+        ? { neuralSensingAuthority: options.neuralSensingAuthority }
+        : {}),
       ...(options.neuralRolloutCertificate
         ? { neuralRolloutCertificate: options.neuralRolloutCertificate }
         : {}),
@@ -1019,6 +1037,13 @@ export class HumanoidActionRuntime {
       transactionId,
       agentId,
       ...(decision ? { decision: structuredClone(decision) } : {}),
+      ...(options.neuralSensingAuthority
+        ? {
+            neuralSensingAuthority: structuredClone(
+              options.neuralSensingAuthority
+            )
+          }
+        : {}),
       action: name,
       input: jsonValue(rawInput),
       fingerprint,
@@ -1380,6 +1405,7 @@ export class HumanoidActionRuntime {
       fingerprint: string;
       decision?: ModelDecisionRef;
       toolAuthority?: HumanoidActionToolCallAuthority;
+      neuralSensingAuthority?: NeuralSensingAuthority;
       neuralRolloutCertificate?: NeuralRolloutExecutionAdmission;
       signal?: AbortSignal;
     }

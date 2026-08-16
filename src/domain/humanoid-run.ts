@@ -46,6 +46,7 @@ import {
 } from "../world/humanoid/snapshot-schema.js";
 import type { HumanoidWorldSnapshot } from "../world/humanoid/world-contract.js";
 import {
+  NeuralSensingAuthoritySchema,
   NeuralHierarchyStateSchema,
   createNeuralHierarchyState
 } from "./neural-hierarchy.js";
@@ -137,6 +138,7 @@ export const PersistedHumanoidActionReceiptSchema = z.object({
   transactionId: z.string().min(1),
   agentId: z.string().min(1),
   decision: ModelDecisionRefSchema.optional(),
+  neuralSensingAuthority: NeuralSensingAuthoritySchema.optional(),
   cycle: AutonomousCycleRefSchema.optional(),
   action: HumanoidActionNameSchema,
   input: JsonValueSchema,
@@ -150,7 +152,15 @@ export const PersistedHumanoidActionReceiptSchema = z.object({
   detail: JsonValueSchema,
   commitSequence: z.number().int().positive().optional(),
   committedAt: z.string().datetime()
-}).strict();
+}).strict().superRefine((receipt, context) => {
+  if (receipt.decision && receipt.neuralSensingAuthority) {
+    context.addIssue({
+      code: "custom",
+      path: ["neuralSensingAuthority"],
+      message: "A humanoid receipt cannot combine model and neural sensing authority"
+    });
+  }
+});
 
 export function humanoidActionReceiptEntriesInCommitOrder<
   T extends { commitSequence?: number | undefined }

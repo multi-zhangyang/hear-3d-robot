@@ -64,6 +64,22 @@ export const NeuralSignalKindSchema = z.enum([
 
 export type NeuralSignalKind = z.infer<typeof NeuralSignalKindSchema>;
 
+export const NeuralSensingAuthoritySchema = z.object({
+  protocol: z.literal("neural-sensing-authority-v1"),
+  transaction_id: z.string().uuid(),
+  manager_node_id: z.string().trim().min(1),
+  sensor_node_id: z.string().trim().min(1),
+  manager_invocation_id: z.string().uuid(),
+  sensor_invocation_id: z.string().uuid(),
+  authority_lease_id: z.string().uuid(),
+  request_signal_id: z.string().uuid(),
+  issued_world_revision: z.number().int().nonnegative()
+}).strict();
+
+export type NeuralSensingAuthority = z.infer<
+  typeof NeuralSensingAuthoritySchema
+>;
+
 export const NeuralSignalDirectionSchema = z.enum([
   "descending",
   "ascending",

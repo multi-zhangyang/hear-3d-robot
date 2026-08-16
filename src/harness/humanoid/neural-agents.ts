@@ -29,6 +29,7 @@ import type {
   NeuralPlanningAction,
   NeuralRolloutCertificate,
   NeuralSafetyInterrupt,
+  NeuralSensingAuthority,
   NeuralSignal,
   NeuralSignalKind,
   NeuralSkillCommitment
@@ -527,6 +528,11 @@ export interface HumanoidNeuralAgentRuntime extends HumanoidActionInvoker,
     predictiveInvocationId: string;
     ttlRevisions?: number;
   }): Promise<NeuralRolloutCertificate>;
+  captureNeuralObservation(input: {
+    transactionId: string;
+    authority: NeuralSensingAuthority;
+    signal?: AbortSignal;
+  }): Promise<HumanoidActionReceipt>;
 }
 
 export interface HumanoidNeuralAgentHierarchy extends Omit<
@@ -732,6 +738,10 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     isEnabled?: () => boolean;
     phases?: readonly NeuralHarnessPhase[];
     requireCommitment?: boolean;
+    prepareModelInput?: (input: {
+      invocationId: string;
+      signal?: AbortSignal;
+    }) => Promise<void>;
   }): FunctionTool<unknown, any, unknown> => {
     const parentId = HUMANOID_NEURAL_AGENT_IDS[inputTool.parentKey];
     const childId = HUMANOID_NEURAL_AGENT_IDS[inputTool.childKey];
@@ -753,6 +763,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     let authorityLease: NeuralAuthorityLease | undefined;
     let invocationInputSignalIds: string[] = [];
     let scopedInvocationId: ReturnType<typeof stableAgentToolInvocationId> | undefined;
+    let scopedSignal: AbortSignal | undefined;
     // A compatible model may end one SDK run turn in prose after a child tool
     // returns. The parent retries the same structural edge, but that retry is
     // still the same logical child episode and must retain its signal scope.
@@ -1095,6 +1106,10 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           targetNodeId: childId,
           invocationId: invocation.invocationId
         }).map((signal) => signal.signal_id);
+        await inputTool.prepareModelInput?.({
+          invocationId: invocation.invocationId,
+          ...(scopedSignal ? { signal: scopedSignal } : {})
+        });
         return neuralInvocationInput(
           input.runtime,
           parentId,
@@ -1305,6 +1320,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
             parentInvocationId: parentInvocation.invocationId
           }) ?? stableAgentToolInvocationId(childId, details?.toolCall?.callId);
       scopedInvocationId = childInvocationId;
+      scopedSignal = details?.signal;
       try {
         let childOutput: Record<string, JsonValue> | undefined;
         while (!childOutput) {
@@ -1661,6 +1677,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         descendingSignal = undefined;
         invocationInputSignalIds = [];
         scopedInvocationId = undefined;
+        scopedSignal = undefined;
       }
     });
     // Agent.asTool delegation is an episode-stable capability surface.  The
@@ -1717,53 +1734,188 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       ]
     }
   );
+  const perceptionSensorFusionTool = sensorFusionTool(input.runtime);
+  const perceptionSceneTool = asChildTool({
+    parentKey: "perceptionManager",
+    childKey: "sceneInterpreter",
+    child: sceneInterpreter,
+    description: "Interpret the current authoritative sensory signal.",
+    requiredSignalKind: "sensory_evidence",
+    sourceSignalContract: CURRENT_SENSORY_EVIDENCE_SOURCE_CONTRACT,
+    phases: ["perception", "feedback"],
+    isEnabled: () => hasCurrentManagerEpisodeSignal(
+      input.runtime,
+      HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
+      "sensory_evidence"
+    ) && !hasCurrentManagerEpisodeSignal(
+      input.runtime,
+      HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
+      "scene_interpretation"
+    )
+  });
+  const perceptionMemoryTool = asChildTool({
+    parentKey: "perceptionManager",
+    childKey: "memoryRetriever",
+    child: memoryRetriever,
+    description: "Retrieve only relevant historical embodied experience.",
+    requiredSignalKind: "sensory_evidence",
+    sourceSignalContract: CURRENT_SENSORY_EVIDENCE_SOURCE_CONTRACT,
+    phases: ["perception", "feedback"],
+    isEnabled: () => hasCurrentManagerEpisodeSignal(
+      input.runtime,
+      HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
+      "sensory_evidence"
+    ) && !hasCurrentManagerEpisodeSignal(
+      input.runtime,
+      HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
+      "memory_retrieval"
+    )
+  });
+  // Capture the structural invokers before register() wraps their public
+  // capability admission. This path is called only from the owning
+  // Perception Agent.asTool input builder, where the parent invocation and
+  // lease already exist; it never exposes a second root or sibling channel.
+  const invokePerceptionSensorFusion = perceptionSensorFusionTool.invoke;
+  const invokePerceptionScene = perceptionSceneTool.invoke;
+  const invokePerceptionMemory = perceptionMemoryTool.invoke;
+  const preparePerceptionModelInput = async (prepared: {
+    invocationId: string;
+    signal?: AbortSignal;
+  }): Promise<void> => {
+    prepared.signal?.throwIfAborted();
+    const currentChildSignals = (
+      kinds: readonly NeuralSignalKind[]
+    ): NeuralSignal[] => input.runtime.pendingNeuralSignals({
+      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
+      kinds
+    }).filter((signal) => signal.parent_episode_id === prepared.invocationId
+      && isCurrentNeuralSignal(input.runtime, signal));
+
+    let sensorySignals = currentChildSignals(["sensory_evidence"]).filter(
+      (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+    );
+    if (sensorySignals.length === 0) {
+      const rawInput = JSON.stringify({});
+      await invokePerceptionSensorFusion(
+        new RunContext(),
+        rawInput,
+        {
+          toolCall: {
+            type: "function_call",
+            callId: stableAgentToolInvocationId(
+              HUMANOID_NEURAL_AGENT_IDS.sensorFusion,
+              `perception-input:${prepared.invocationId}`
+            ),
+            name: perceptionSensorFusionTool.name,
+            arguments: rawInput
+          },
+          ...(prepared.signal ? { signal: prepared.signal } : {})
+        }
+      );
+      sensorySignals = currentChildSignals(["sensory_evidence"]).filter(
+        (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+      );
+    }
+    if (sensorySignals.length !== 1) {
+      throw new Error(
+        `Perception input requires one current Sensor Fusion signal; found ${sensorySignals.length}`
+      );
+    }
+    const sensorySignal = sensorySignals[0]!;
+    const delegationInput = JSON.stringify({
+      signal_kind: "sensory_evidence",
+      source_signal_ids: [sensorySignal.signal_id],
+      ttl_revisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+      priority: 80
+    });
+    const branches: Promise<unknown>[] = [];
+    const sceneSignals = currentChildSignals(["scene_interpretation"]).filter(
+      (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sceneInterpreter
+    );
+    if (sceneSignals.length === 0) {
+      branches.push(invokePerceptionScene(
+        new RunContext(),
+        delegationInput,
+        {
+          toolCall: {
+            type: "function_call",
+            callId: stableAgentToolInvocationId(
+              HUMANOID_NEURAL_AGENT_IDS.sceneInterpreter,
+              `perception-input:${prepared.invocationId}`
+            ),
+            name: perceptionSceneTool.name,
+            arguments: delegationInput
+          },
+          ...(prepared.signal ? { signal: prepared.signal } : {})
+        }
+      ));
+    }
+    const memorySignals = currentChildSignals(["memory_retrieval"]).filter(
+      (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.memoryRetriever
+    );
+    if (memorySignals.length === 0) {
+      branches.push(invokePerceptionMemory(
+        new RunContext(),
+        delegationInput,
+        {
+          toolCall: {
+            type: "function_call",
+            callId: stableAgentToolInvocationId(
+              HUMANOID_NEURAL_AGENT_IDS.memoryRetriever,
+              `perception-input:${prepared.invocationId}`
+            ),
+            name: perceptionMemoryTool.name,
+            arguments: delegationInput
+          },
+          ...(prepared.signal ? { signal: prepared.signal } : {})
+        }
+      ));
+    }
+    const settled = await Promise.allSettled(branches);
+    const failures = settled.flatMap((result) => (
+      result.status === "rejected" ? [result.reason] : []
+    ));
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "Perception Scene/Memory fan-out failed"
+      );
+    }
+    prepared.signal?.throwIfAborted();
+    const completedScene = currentChildSignals(["scene_interpretation"]).filter(
+      (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sceneInterpreter
+        && neuralSignalHasAncestorId(
+          input.runtime.neuralHierarchyState(),
+          signal,
+          sensorySignal.signal_id
+        )
+    );
+    const completedMemory = currentChildSignals(["memory_retrieval"]).filter(
+      (signal) => signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.memoryRetriever
+        && neuralSignalHasAncestorId(
+          input.runtime.neuralHierarchyState(),
+          signal,
+          sensorySignal.signal_id
+        )
+    );
+    if (completedScene.length !== 1 || completedMemory.length !== 1) {
+      throw new Error(
+        "Perception input fan-out did not produce one Scene and one Memory return"
+      );
+    }
+  };
   const perceptionManager = register(
     "perceptionManager",
     PerceptionOutputSchema,
     [
-      sensorFusionTool(input.runtime),
-      asChildTool({
-        parentKey: "perceptionManager",
-        childKey: "sceneInterpreter",
-        child: sceneInterpreter,
-        description: "Interpret the current authoritative sensory signal.",
-        requiredSignalKind: "sensory_evidence",
-        sourceSignalContract: CURRENT_SENSORY_EVIDENCE_SOURCE_CONTRACT,
-        phases: ["perception", "feedback"],
-        isEnabled: () => hasCurrentManagerEpisodeSignal(
-          input.runtime,
-          HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
-          "sensory_evidence"
-        ) && !hasCurrentManagerEpisodeSignal(
-          input.runtime,
-          HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
-          "scene_interpretation"
-        )
-      }),
-      asChildTool({
-        parentKey: "perceptionManager",
-        childKey: "memoryRetriever",
-        child: memoryRetriever,
-        description: "Retrieve only relevant historical embodied experience.",
-        requiredSignalKind: "sensory_evidence",
-        sourceSignalContract: CURRENT_SENSORY_EVIDENCE_SOURCE_CONTRACT,
-        phases: ["perception", "feedback"],
-        isEnabled: () => hasCurrentManagerEpisodeSignal(
-          input.runtime,
-          HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
-          "sensory_evidence"
-        ) && !hasCurrentManagerEpisodeSignal(
-          input.runtime,
-          HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
-          "memory_retrieval"
-        )
-      })
+      perceptionSensorFusionTool,
+      perceptionSceneTool,
+      perceptionMemoryTool
     ],
     {
       parallel: true,
       extraInstructions: [
-        "Call capture_sensor_fusion before any interpretation.",
-        "After sensing, fan out scene and memory tools in one response; both branches are mandatory for perceptual_belief.",
+        "The Harness has already captured Sensor Fusion and completed the mandatory parallel Scene/Memory fan-out before your first reasoning turn. Do not call those structural tools again in this episode.",
         "Return perceptual_belief only after Sensor Fusion, Scene, and Memory have all returned. The Harness owns their fork/join provenance and binds the three formal source ids to your aggregate; concentrate on the semantic belief rather than protocol UUID bookkeeping.",
         "Perception owns state estimation, not action selection. Submit only compact_perceptual_belief_v1: bounded observations, uncertainty, changed entity ids, and safety facts. Never copy raw Sensor Fusion, Scene, Memory, or reachable-base arrays into payload; the Harness attaches those exact child signals after validating your compact belief.",
         "Never recommend or select a Skill, hand, interaction point, motor program, or next action. Action Selection and Sensorimotor own those decisions.",
@@ -2008,6 +2160,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         child: perceptionManager,
         description: "Build one current perceptual belief through the owned perception subtree.",
         phases: ["perception", "feedback"],
+        prepareModelInput: preparePerceptionModelInput,
         isEnabled: () => input.runtime.neuralHarnessPhase().phase !== "feedback"
           || ["completed", "released"].includes(
             input.runtime.neuralHierarchyState().active_skill_commitment?.state ?? ""
@@ -2398,17 +2551,31 @@ function sensorFusionTool(
             capture: "authoritative_current_observation"
           }
         });
-        const output = await invokeDeterministicHumanoidAction({
-          runtime,
-          actorAgentId: HUMANOID_NEURAL_AGENT_IDS.sensorFusion,
-          sourceToolName: name,
-          sourceInput: {},
-          action: "observe_humanoid",
-          actionInput: {},
-          contractId: "grounding_monitor_v1",
-          ...(details ? { details } : {})
+        const transactionId = details?.toolCall?.callId;
+        if (!transactionId) {
+          throw new Error("Sensor Fusion requires one Harness transaction identity");
+        }
+        if (details?.toolCall?.name !== name) {
+          throw new Error("Sensor Fusion Harness tool identity mismatch");
+        }
+        const receipt = await runtime.captureNeuralObservation({
+          transactionId,
+          authority: {
+            protocol: "neural-sensing-authority-v1",
+            transaction_id: transactionId,
+            manager_node_id: HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
+            sensor_node_id: HUMANOID_NEURAL_AGENT_IDS.sensorFusion,
+            manager_invocation_id: parentEpisodeId,
+            sensor_invocation_id: invocation.invocationId,
+            authority_lease_id: lease.lease_id,
+            request_signal_id: request.signal_id,
+            issued_world_revision: request.world_revision
+          },
+          ...(details?.signal ? { signal: details.signal } : {})
         });
-        const receiptPayload = z.json().parse(JSON.parse(output));
+        const receiptPayload = z.json().parse(JSON.parse(
+          humanoidActionReceiptModelOutput(receipt)
+        ));
         const sensoryEvidence = await runtime.publishNeuralSignal({
           kind: "sensory_evidence",
           pathway: "ascending_feedback",
@@ -5266,9 +5433,9 @@ function neuralInvocationInput(
   invocationId: string
 ): string {
   const signals = runtime.pendingNeuralSignals({
-    targetNodeId: childAgentId,
-    invocationId
-  });
+    targetNodeId: childAgentId
+  }).filter((signal) => signal.invocation_id === invocationId
+    || signal.parent_episode_id === invocationId);
   const anchor = humanoidNeuralContextProjection(
     runtime.contextAnchor(childAgentId),
     childAgentId,
