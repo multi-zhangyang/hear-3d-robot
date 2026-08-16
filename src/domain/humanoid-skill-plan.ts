@@ -9,7 +9,7 @@ const HumanoidSkillPlanNodeSchema = z.object({
 
 const HumanoidSkillPlanStrategySchema = z.object({
   strategy_id: z.string().trim().min(1),
-  rationale: z.string().trim().min(1).max(500),
+  rationale: z.string().trim().min(1).max(2_000),
   nodes: z.array(HumanoidSkillPlanNodeSchema).min(1).max(16)
 }).strict().superRefine((strategy, context) => {
   const ids = strategy.nodes.map(({ node_id }) => node_id);

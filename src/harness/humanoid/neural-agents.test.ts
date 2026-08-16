@@ -192,7 +192,11 @@ describe("humanoid neural Agent hierarchy", () => {
     });
 
     const dedicatedTerminalAgents = new Set([
+      HUMANOID_NEURAL_AGENT_IDS.executive,
       HUMANOID_NEURAL_AGENT_IDS.goalManager,
+      HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      HUMANOID_NEURAL_AGENT_IDS.memoryRetriever,
+      HUMANOID_NEURAL_AGENT_IDS.premotor,
       HUMANOID_NEURAL_AGENT_IDS.motorIntent,
       HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
     ]);

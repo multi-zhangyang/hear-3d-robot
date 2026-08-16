@@ -88,6 +88,16 @@ import { modelReceiptDetail } from "./receipt-context.js";
 const EmptyDelegationSchema = z.object({}).strict();
 const NEURAL_OUTPUT_SUBMISSION_TOOL_NAME = "submit_neural_output";
 const MODEL_EPISODE_SIGNAL_TTL_REVISIONS = 10_000;
+const GENERIC_NEURAL_SUBMISSION_AGENT_KEYS: ReadonlySet<HumanoidNeuralAgentKey>
+  = new Set([
+    "perceptionManager",
+    "sceneInterpreter",
+    "sensorimotorManager",
+    "affordance",
+    "risk",
+    "predictive",
+    "recovery"
+  ]);
 type NeuralDelegationSourceSignalContract = Readonly<{
   requiredKinds: readonly NeuralSignalKind[];
   allowedKinds: readonly NeuralSignalKind[];
@@ -198,11 +208,15 @@ const BoundedSkillProposalPayloadSchema = z.object({
 const EstablishSkillCommitmentSchema = z.object({
   skill: z.string().trim().min(1).max(2_000),
   termination_contract_json: NeuralJsonTextSchema,
-  source_signal_ids: z.array(z.string().uuid()).min(1).max(64)
+  source_signal_ids: z.array(z.string().uuid()).max(64).default([]).describe(
+    "Optional only when more than one current Sensorimotor proposal is semantically admissible. The Harness binds the unique latest direct proposal automatically."
+  )
 }).strict();
 const TransitionSkillCommitmentSchema = z.object({
   commitment_id: z.string().uuid(),
-  source_signal_ids: z.array(z.string().uuid()).min(1).max(64),
+  source_signal_ids: z.array(z.string().uuid()).max(64).default([]).describe(
+    "Harness-bound lifecycle feedback. Supply ids only when multiple current feedback signals are semantically admissible."
+  ),
   reason: z.string().trim().min(1).max(2_000)
 }).strict();
 const AcknowledgeSafetyInterruptSchema = z.object({
@@ -215,8 +229,8 @@ const AuthorizeSkillExecutionSchema = z.object({
 }).strict();
 const CycleCompletionSchema = z.object({
   summary: z.string().trim().min(1).max(8_000),
-  perceptual_belief_signal_ids: z.array(z.string().uuid()).length(1).describe(
-    "Copy the one UUID from the direct post-execution perceptual_belief return's outer source_signal_ids. This is a neural signal id, never a call_* physical evidence transaction id."
+  perceptual_belief_signal_ids: z.array(z.string().uuid()).max(1).default([]).describe(
+    "Optional only if multiple current post-execution beliefs are admissible. The Harness binds the unique direct belief automatically."
   ),
   next_intent: z.string().trim().min(1).max(4_000).optional()
 }).strict();
@@ -228,7 +242,9 @@ const ExecutionTaskSchema = z.object({
   // The model owns only the direct parent -> child decision edge. Certificate
   // internals and planning identifiers are durable Harness state and must not
   // be copied through another model response.
-  source_signal_ids: z.array(z.string().uuid()).length(1)
+  source_signal_ids: z.array(z.string().uuid()).max(1).default([]).describe(
+    "Harness-bound direct executing commitment; omit when it is unique."
+  )
 }).strict();
 
 const RelevantMemoryIntentSchema = z.object({
@@ -313,7 +329,7 @@ const CompactPerceptualBeliefPayloadSchema = z.object({
   uncertainties: z.array(z.string().trim().min(1).max(320)).max(4).default([]),
   changed_entity_ids: z.array(z.string().trim().min(1).max(160)).max(16).default([]),
   safety_relevant: z.array(z.string().trim().min(1).max(320)).max(4).default([]),
-  escalation_reason: z.string().trim().min(1).max(1_000).optional()
+  escalation_reason: z.string().trim().max(1_000).optional()
 }).strict();
 
 const SensorimotorOutputSchema = NeuralAgentOutputSchema.extend({
@@ -643,14 +659,13 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     // can therefore retain an earlier tool call while omitting that tool's
     // definition from a later request. Keep every real Agent capability stable
     // and enforce phase/signal/commitment authority at invoke time instead.
-    // Goal Manager and Motor Intent always terminate through their dedicated
-    // domain tools, so their permanently-disabled generic submission endpoint
-    // is not a capability and is omitted from the static surface entirely.
-    const capabilityTools = (key === "goalManager"
-      || key === "motorIntent"
-      || key === "executionDispatcher"
-      ? [...tools]
-      : [...tools, submissionTool]
+    // Managers that synthesize a join and model-only leaf specialists own the
+    // generic typed submission endpoint. Structural pass-through nodes and
+    // domain-tool nodes terminate through their owned tool result; advertising
+    // a generic endpoint there creates a competing, permanently illegal route.
+    const capabilityTools = (GENERIC_NEURAL_SUBMISSION_AGENT_KEYS.has(key)
+      ? [...tools, submissionTool]
+      : [...tools]
     ).map((candidate) => stableNeuralToolCapability(
       candidate,
       descriptor.id,
@@ -1083,7 +1098,22 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         childTool.name
       );
       if (rejection !== undefined) return rejection;
-      const delegation = delegationSchema.parse(JSON.parse(rawInput));
+      const modelDelegation = delegationSchema.parse(JSON.parse(rawInput));
+      const parentInvocation = requiredHarnessInvocation(parentId);
+      const currentParentSignals = currentDelegationSourceSignals(
+        input.runtime,
+        parentId,
+        parentInvocation.invocationId
+      );
+      const delegation = {
+        ...modelDelegation,
+        source_signal_ids: canonicalDirectDelegationSourceSignalIds({
+          currentParentSignals,
+          requestedSourceSignalIds: modelDelegation.source_signal_ids,
+          signalKind: modelDelegation.signal_kind,
+          sourceSignalContract: inputTool.sourceSignalContract
+        })
+      };
       const unknownSourceSignalIds = delegation.source_signal_ids.filter(
         (signalId) => input.runtime.neuralHierarchyState().signals[signalId] === undefined
       );
@@ -1103,12 +1133,6 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           recovery: "Call this same delegation tool once with only exact signal_id values present in the current invocation. Use [] when no causal source signal exists; never invent or substitute a UUID."
         });
       }
-      const parentInvocation = requiredHarnessInvocation(parentId);
-      const currentParentSignals = currentDelegationSourceSignals(
-        input.runtime,
-        parentId,
-        parentInvocation.invocationId
-      );
       const currentParentSignalIds = new Set(currentParentSignals.map(
         (signal) => signal.signal_id
       ));
@@ -1218,7 +1242,11 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           }) ?? stableAgentToolInvocationId(childId, details?.toolCall?.callId);
       scopedInvocationId = childInvocationId;
       try {
-        const output = await invoke(context, rawInput, details);
+        const output = await invoke(
+          context,
+          JSON.stringify(delegation),
+          details
+        );
         const childOutput = outputObject(output);
         if (!childOutput) {
           throw new Error(
@@ -1755,7 +1783,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       toolUseBehavior: certifiedExecutionDispatcherToolUseBehavior(input.runtime),
       extraInstructions: [
         "This is a pure execution node. The Harness has already fixed the commitment, rollout certificate, and serial writer.",
-        "Call execute_certified_motor_intent exactly once. Copy the one direct skill_commitment signal_id from this invocation into source_signal_ids and use a short execution objective.",
+        "Call execute_certified_motor_intent exactly once with a short execution objective. The Harness binds the unique direct skill_commitment; do not copy signal UUIDs.",
         "Do not plan, compare options, reason about alternatives, submit a separate neural output, or return prose."
       ]
     }
@@ -1861,7 +1889,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       toolUseBehavior: sensorimotorToolUseBehavior(input.runtime),
       extraInstructions: [
         "Affordance and Risk are the only parallel pre-action fan-out; join both yourself.",
-        "A skill_proposal must cite the current perceptual_belief plus both Affordance and Risk harness signal ids in source_signal_ids.",
+        "A skill_proposal must semantically join the current perceptual_belief with both Affordance and Risk results. The Harness binds all three exact episode-local signals; do not copy their UUIDs.",
         "If directed input contains direct_parent_correction, treat it as binding causal feedback from Action Selection. Do not repeat the rejected invocation while its physical preconditions are unchanged; select the structured required prerequisite Skill when present, using the current observation and specialist evidence.",
         "Return exactly one next bounded catalog Skill as proposed_skill={skill, phase, params, rationale}. Future steps may appear only in phase_sequence; never make a compound skill_name or the whole task the proposal.",
         "Every normal proposal must make measurable physical progress toward an active Goal predicate or establish its real prerequisite. For robot_in_zone, prefer navigate_to_zone; a navigate_to_point or explore frontier is admissible only when its actual target reduces distance to that zone. Information gain never authorizes movement away from the active Goal.",
@@ -1926,7 +1954,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "Perception precedes sensorimotor selection whenever the belief is absent or stale.",
         "Sensorimotor may return only a skill_proposal before authorization.",
         "A skill_proposal must select exactly one next bounded catalog Skill in proposed_skill.skill. A multi-step skill_sequence may describe future causal order, but skill_name, skill_id, or the whole sequence is never the proposed Skill commitment.",
-        "You alone establish one durable skill commitment. Copy the outer delegate_sensorimotor_manager.source_signal_ids into establish_skill_commitment.source_signal_ids; nested Affordance/Risk ids do not authorize commitment. Then invoke Sensorimotor again with the resulting skill_commitment signal.",
+        "You alone establish one durable skill commitment from the newest direct Sensorimotor proposal. The Harness binds that unique proposal; do not copy child UUIDs. Then invoke Sensorimotor again with the resulting skill_commitment signal.",
         "A replacement Sensorimotor proposal supersedes every earlier proposal in this Action Selection episode. Establish only the newest direct proposal and its exact bounded Skill; never restore a rejected proposal because it matched the previous commitment or intention.",
         "Authorize execution only after the committed branch returns a real accepted rollout_result. Call authorize_skill_execution with the active commitment id and your reason; the Harness binds the unique direct certified rollout, so do not copy a rollout or Predictive signal id into that call.",
         "After authorize_skill_execution returns skill_executing, your bounded decision episode ends. The Harness deterministically routes the unique certified commitment through Sensorimotor to Executor without another model decision; your next wake is typed physical feedback, never a request to wait or redispatch execution.",
@@ -1980,7 +2008,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "A supervisory prediction_error carrying causal_interrupt_ids is a Body→Reflex afferent safety interrupt. Delegate Action Selection with prediction_error and no invented source signal so it can acknowledge the exact durable interrupt before Perception and Recovery.",
         "In recovery, preserve the active Goal and delegate the direct failure signal through Action Selection; after physical failure, Action Selection must first close the old commitment and obtain current Perception before Recovery is reachable through Sensorimotor.",
         "After execution, delegate Action Selection once to resolve its commitment, then again for current Perception when the Harness requests it. A failed execution continues from that fresh belief into Recovery, not directly from stale pre-action state.",
-        "After post-execution Sensor Fusion, decide whether to complete from the direct perceptual_belief. To complete, copy exactly the UUID in the outer direct child return's source_signal_ids into perceptual_belief_signal_ids. Never put cycle_completion.evidence_transaction_ids or any call_* id in that field; the Harness resolves physical transaction ids internally. Never self-certify success."
+        "After post-execution Sensor Fusion, decide whether to complete from the direct perceptual_belief. The Harness binds the unique current belief and resolves physical transaction ids internally; do not copy UUIDs or self-certify success."
       ]
     }
   );
@@ -2473,62 +2501,22 @@ function establishSkillCommitmentTool(
         && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection)
         .sort((left, right) => right.sequence - left.sequence);
       const latestProposal = proposalSignals[0];
-      const citedProposalSignals = proposalSignals.filter((signal) => (
-        params.source_signal_ids.includes(signal.signal_id)
-      ));
-      const staleCitedProposals = citedProposalSignals.filter(
-        (signal) => signal.signal_id !== latestProposal?.signal_id
-      );
-      if (latestProposal && staleCitedProposals.length > 0) {
-        const requiredSkill = boundedProposedSkillFromPayload(latestProposal.payload);
+      if (!latestProposal) {
         return JSON.stringify({
           accepted: false,
-          code: "stale_sensorimotor_proposal",
+          code: "sensorimotor_proposal_unavailable",
           tool: "establish_skill_commitment",
           action_selection_episode_id: invocation.invocationId,
-          latest_proposal_signal_id: latestProposal.signal_id,
-          latest_proposed_skill: requiredSkill ?? null,
-          rejected_proposal_signal_ids: staleCitedProposals.map(
-            (signal) => signal.signal_id
-          ),
-          rejected_source_signal_ids: params.source_signal_ids,
           automatic_actuation: false,
           next_response_contract: {
-            mode: "corrected_tool_call_only",
-            tool: "establish_skill_commitment",
-            required_source_signal_ids: [latestProposal.signal_id],
-            required_skill: requiredSkill ?? null,
-            preserve_goal_epoch_id: true,
-            preserve_termination_contract: true,
+            mode: "new_sensorimotor_proposal_required",
             narration_allowed: false
           },
-          recovery: "The cited Sensorimotor proposal was superseded inside this Action Selection episode. Retry once using only the latest direct Sensorimotor proposal signal id and its bounded Skill; do not reuse an earlier rejected proposal."
+          recovery: "Delegate Sensorimotor once in the current Action Selection episode before establishing a commitment."
         });
       }
-      const citedProposal = latestProposal
-        && params.source_signal_ids.includes(latestProposal.signal_id)
-        ? latestProposal
-        : undefined;
-      if (!citedProposal) {
-        return JSON.stringify({
-          accepted: false,
-          code: "sensorimotor_proposal_not_cited",
-          tool: "establish_skill_commitment",
-          action_selection_episode_id: invocation.invocationId,
-          current_proposal_signal_ids: proposalSignals.map(
-            (signal) => signal.signal_id
-          ),
-          rejected_source_signal_ids: params.source_signal_ids,
-          automatic_actuation: false,
-          next_response_contract: {
-            mode: "corrected_tool_call_only",
-            tool: "establish_skill_commitment",
-            preserve_valid_fields: true,
-            narration_allowed: false
-          },
-          recovery: "Call establish_skill_commitment once more, preserving the Goal, Skill, and termination contract, and include the exact current proposal signal id returned in delegate_sensorimotor_manager.source_signal_ids. Nested Affordance/Risk source ids do not authorize a commitment."
-        });
-      }
+      const citedProposal = latestProposal;
+      const commitmentSourceSignalIds = [citedProposal.signal_id];
       const proposedSkill = boundedProposedSkillFromPayload(citedProposal.payload);
       if (typeof proposedSkill !== "string" || proposedSkill !== params.skill) {
         return JSON.stringify({
@@ -2586,12 +2574,12 @@ function establishSkillCommitmentTool(
           params.termination_contract_json,
           "Skill termination contract"
         ),
-        sourceSignalIds: params.source_signal_ids
+        sourceSignalIds: commitmentSourceSignalIds
       });
       return JSON.stringify({
         status: "skill_committed",
         commitment,
-        source_signal_ids: params.source_signal_ids
+        source_signal_ids: commitmentSourceSignalIds
       });
     }
   });
@@ -2602,7 +2590,7 @@ function neuralCycleCompletionTool(
 ): FunctionTool<unknown, typeof CycleCompletionSchema, string> {
   return tool({
     name: "complete_neural_autonomous_cycle",
-    description: "Executive closes one physical cycle after citing the direct post-execution perceptual_belief UUID. Copy the outer source_signal_ids from that child return into perceptual_belief_signal_ids; never pass call_* evidence transaction ids. The Harness resolves physical evidence internally.",
+    description: "Executive closes one physical cycle from the unique direct post-execution perceptual belief. The Harness binds its neural signal and physical evidence internally.",
     parameters: CycleCompletionSchema,
     strict: true,
     timeoutBehavior: "raise_exception",
@@ -2621,23 +2609,32 @@ function neuralCycleCompletionTool(
       }
       const evidenceTransactionIds = readiness.evidence_transaction_ids;
       const execution = runtime.validateCycleEvidence(evidenceTransactionIds);
-      const postExecutionBeliefs = runtime.pendingNeuralSignals({
-        targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
-        kinds: ["perceptual_belief"]
-      }).filter((signal) => (
-        params.perceptual_belief_signal_ids.includes(signal.signal_id)
-          && signal.world_revision >= execution.worldAfterRevision
-      ));
-      if (postExecutionBeliefs.length === 0) {
+      const invocation = requiredHarnessInvocation(
+        HUMANOID_NEURAL_AGENT_IDS.executive
+      );
+      const eligiblePostExecutionBeliefs = currentDelegationSourceSignals(
+        runtime,
+        HUMANOID_NEURAL_AGENT_IDS.executive,
+        invocation.invocationId
+      ).filter((signal) => signal.kind === "perceptual_belief"
+        && signal.world_revision >= execution.worldAfterRevision)
+        .sort((left, right) => right.sequence - left.sequence);
+      const postExecutionBeliefs = eligiblePostExecutionBeliefs.length === 1
+        ? eligiblePostExecutionBeliefs
+        : eligiblePostExecutionBeliefs.filter((signal) => (
+            params.perceptual_belief_signal_ids.includes(signal.signal_id)
+          ));
+      if (postExecutionBeliefs.length !== 1) {
         throw new Error(
-          "Executive cycle completion requires the exact perceptual belief observed after the durable physical execution"
+          "Executive cycle completion requires one current direct perceptual belief observed after durable physical execution"
         );
       }
+      const sourceSignalIds = [postExecutionBeliefs[0]!.signal_id];
       return JSON.stringify({
         status: "cycle_completed",
         summary: params.summary,
         evidence_transaction_ids: evidenceTransactionIds,
-        source_signal_ids: params.perceptual_belief_signal_ids,
+        source_signal_ids: sourceSignalIds,
         world_revision: execution.worldAfterRevision,
         executed_action: execution.action,
         ...(params.next_intent ? { next_intent: params.next_intent } : {})
@@ -3202,10 +3199,10 @@ function serialExecutionTool(
         || hierarchy.harness_phase.commitment_id !== commitment.commitment_id) {
         throw new Error("Serial execution requires an Action Selection-authorized commitment");
       }
-      const directCommitmentSignals = params.source_signal_ids.map(
-        (signalId) => hierarchy.signals[signalId]
-      ).filter((signal): signal is NeuralSignal => signal !== undefined
-        && signal.status === "pending"
+      const directCommitmentSignals = runtime.pendingNeuralSignals({
+        targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
+        kinds: ["skill_commitment"]
+      }).filter((signal) => signal.status === "pending"
         && signal.kind === "skill_commitment"
         && signal.direction === "descending"
         && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
@@ -3240,6 +3237,7 @@ function serialExecutionTool(
       });
       const resolvedSourceInput = {
         ...params,
+        source_signal_ids: [directCommitmentSignals[0]!.signal_id],
         rollout_certificate_id: certificate.certificate_id,
         execution
       };
@@ -5505,6 +5503,46 @@ function currentDelegationSourceSignals(
   );
 }
 
+/**
+ * Direct-edge provenance is Harness state. A model selects the structural child
+ * and outgoing signal kind; it selects UUIDs only when the current parent
+ * episode contains more than one genuinely admissible semantic source. This
+ * prevents a persistent Session from turning an otherwise correct decision
+ * into a correction round merely by repeating an older episode's UUID.
+ */
+function canonicalDirectDelegationSourceSignalIds(input: {
+  currentParentSignals: readonly NeuralSignal[];
+  requestedSourceSignalIds: readonly string[];
+  signalKind: NeuralSignalKind;
+  sourceSignalContract: NeuralDelegationSourceSignalContract | undefined;
+}): string[] {
+  const requested = [...new Set(input.requestedSourceSignalIds)];
+  if (input.sourceSignalContract) {
+    const allowedKinds = new Set(input.sourceSignalContract.allowedKinds);
+    const requiredKinds = new Set(input.sourceSignalContract.requiredKinds);
+    const admissible = input.currentParentSignals.filter(
+      (signal) => allowedKinds.has(signal.kind)
+    );
+    const required = input.sourceSignalContract.requiredKinds.map((kind) => (
+      admissible.filter((signal) => signal.kind === kind)
+    ));
+    const optional = admissible.filter((signal) => !requiredKinds.has(signal.kind));
+    if (optional.length === 0
+      && required.every((signals) => signals.length === 1)) {
+      return required.map((signals) => signals[0]!.signal_id);
+    }
+  }
+
+  const exactKind = input.currentParentSignals.filter(
+    (signal) => signal.kind === input.signalKind
+  );
+  if (exactKind.length === 1) return [exactKind[0]!.signal_id];
+  if (exactKind.length === 0 && input.currentParentSignals.length <= 1) {
+    return input.currentParentSignals.map((signal) => signal.signal_id);
+  }
+  return requested;
+}
+
 function currentManagerChildSignals(
   runtime: HumanoidNeuralAgentRuntime,
   managerNodeId: string,
@@ -5872,7 +5910,7 @@ function neuralDelegationSchema(
       "The allowed typed signal on this fixed structural parent-child edge. It does not authorize choosing a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters."
     ),
     source_signal_ids: z.array(z.string().uuid()).max(64).default([]).describe([
-      "Exact pending causal signal ids owned by this current parent episode. Consumed, expired, sibling-owned, foreign-parent, and earlier-episode ids are rejected even when their UUID still exists.",
+      "Usually omit this field. The Harness binds a unique current causal source on this fixed edge. Supply ids only when the invocation exposes multiple genuinely admissible semantic candidates; consumed, expired, sibling-owned, foreign-parent, and earlier-episode ids are rejected.",
       ...(sourceSignalContract
         ? [
             `This edge requires source kinds: ${sourceSignalContract.requiredKinds.join(", ")}.`,
@@ -5957,10 +5995,14 @@ function baseInstructions(key: HumanoidNeuralAgentKey): string[] {
     ? [
         "Your only valid response is the required execute_certified_motor_intent tool call. Its result terminates this episode."
       ]
-    : [
+    : GENERIC_NEURAL_SUBMISSION_AGENT_KEYS.has(key)
+      ? [
         `Submit every final neural signal through ${NEURAL_OUTPUT_SUBMISSION_TOOL_NAME}; never return the envelope as assistant text.`,
         "Pass the structured signal body directly in the submission tool's payload field; do not JSON-stringify it."
-      ];
+        ]
+      : [
+          "Terminate only through an owned direct-child, lifecycle, or domain tool result; never restate that result through a generic neural submission."
+        ];
   return [
     `You are ${descriptor.name}, structural id ${descriptor.id}.`,
     `Your one control parent is ${descriptor.parentKey === null
@@ -5971,8 +6013,8 @@ function baseInstructions(key: HumanoidNeuralAgentKey): string[] {
     `Activation cadence: ${descriptor.cadence}; maximum correction scope: ${descriptor.maximumCorrectionScope}.`,
     "This is a strict hierarchy. Never contact siblings, read their Sessions, or bypass your parent.",
     "Treat only directed world-versioned neural signals and your bounded invocation anchor as current.",
-    "When delegating, choose only one owned child edge, an allowed signal_kind, and exact causal source_signal_ids. The structural edge and current Harness phase define the child's bounded responsibility; there is no free-text delegation channel and you cannot prescribe a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters.",
-    "For source_signal_ids copy only exact signal_id values present in the current invocation. Use [] when none exists; never invent a UUID or placeholder.",
+    "When delegating, choose only one owned child edge and an allowed signal_kind. The Harness binds the unique causal source; use source_signal_ids only when multiple current semantic candidates remain. The structural edge and current Harness phase define the child's bounded responsibility; there is no free-text delegation channel and you cannot prescribe a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters.",
+    "Never copy a UUID merely for protocol bookkeeping. If multiple admissible sources are present, select only exact signal_id values from the current invocation; never invent a UUID or placeholder.",
     ...outputInstructions,
     "The Harness canonicalizes the payload after schema validation. Escalate only errors outside your local correction scope."
   ];
@@ -6254,7 +6296,11 @@ function compactPerceptualBeliefPayloadJsonSchema(): Record<string, unknown> {
         items: { type: "string", minLength: 1, maxLength: 160 }
       },
       safety_relevant: boundedTextArray(4),
-      escalation_reason: { type: "string", minLength: 1, maxLength: 1_000 }
+      escalation_reason: {
+        type: "string",
+        maxLength: 1_000,
+        description: "Optional; omit or use an empty string when no escalation exists"
+      }
     },
     required: [
       "protocol",
@@ -6269,46 +6315,70 @@ function compactPerceptualBeliefPayloadJsonSchema(): Record<string, unknown> {
 }
 
 function boundedSkillProposalPayloadJsonSchema(): Record<string, unknown> {
-  const phaseReference = {
+  type SkillInvocationJsonSchema = Record<string, unknown> & {
+    oneOf?: Array<Record<string, unknown> & {
+      properties?: Record<string, unknown> & {
+        skill?: { const?: unknown };
+      };
+      required?: string[];
+    }>;
+  };
+  const invocationSchema = z.toJSONSchema(
+    HumanoidSkillInvocationSchema
+  ) as SkillInvocationJsonSchema;
+  const invocationVariants = invocationSchema.oneOf ?? [];
+  const proposedSkillVariants = HUMANOID_SKILL_IDS.map((skill) => {
+    const invocationVariant = invocationVariants.find(
+      (candidate) => candidate.properties?.skill?.const === skill
+    );
+    if (!invocationVariant?.properties) {
+      throw new Error(`Humanoid Skill JSON Schema is missing ${skill}`);
+    }
+    const params = structuredClone(invocationVariant);
+    delete params.properties!.skill;
+    params.required = (params.required ?? []).filter((key) => key !== "skill");
+    const phases = HUMANOID_SKILL_CONTRACTS[skill].process.map(
+      (entry) => entry.phase
+    );
+    return {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        skill: { type: "string", const: skill },
+        phase: {
+          type: "string",
+          enum: phases,
+          description: `${skill} process phase`
+        },
+        params,
+        rationale: { type: "string", minLength: 1, maxLength: 8_000 }
+      },
+      required: ["skill", "phase", "params", "rationale"]
+    };
+  });
+  const phaseReferences = HUMANOID_SKILL_IDS.map((skill) => ({
     type: "object",
     additionalProperties: false,
     properties: {
-      skill: { type: "string", enum: [...HUMANOID_SKILL_IDS] },
-      phase: { type: "string", minLength: 1, maxLength: 256 }
+      skill: { type: "string", const: skill },
+      phase: {
+        type: "string",
+        enum: HUMANOID_SKILL_CONTRACTS[skill].process.map((entry) => entry.phase)
+      }
     },
     required: ["skill", "phase"]
-  };
+  }));
   return {
     type: "object",
     additionalProperties: false,
     properties: {
       proposed_skill: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          skill: {
-            type: "string",
-            enum: [...HUMANOID_SKILL_IDS],
-            description: "Exactly one bounded Skill id"
-          },
-          phase: {
-            type: "string",
-            minLength: 1,
-            maxLength: 256,
-            description: "One phase from that Skill's live process contract"
-          },
-          params: {
-            type: "object",
-            additionalProperties: true,
-            description: "Exact catalog parameters for this one Skill; never include another skill field"
-          },
-          rationale: { type: "string", minLength: 1, maxLength: 8_000 }
-        },
-        required: ["skill", "phase", "params", "rationale"]
+        oneOf: proposedSkillVariants,
+        description: "Exactly one bounded Skill with its real invocation parameters and process phase"
       },
       phase_sequence: {
         type: "array",
-        items: phaseReference,
+        items: { oneOf: phaseReferences },
         maxItems: 32,
         description: "Optional future causal order; never replaces proposed_skill"
       }

@@ -126,7 +126,7 @@ flowchart TB
 
 ![HEAR 19 节点严格单父层级](docs/screenshots/hierarchy.png)
 
-这是控制权树，不是平级多 Agent 网络。除 Executive 外，每个节点只有一个直接父级；父级通常通过 `Agent.asTool()` 调用模型子级并保留控制权。兄弟节点不互相通信、不共享 Session，只允许由共同父级发起并汇合两组只读并行：Scene + Memory、Affordance + Risk。每次直接子级调用都有独立 `invocation_id`，并绑定共同父级的 `parent_episode_id`；共同父级只能汇合属于自己本次 episode 的返回，禁止依靠队列顺序、payload 相等或“第一个 pending 信号”猜测配对。父子委派没有自由文本 `intent` 通道：父级只能选择自己拥有的子边和当前父 episode 真正拥有的 pending `source_signal_ids`；允许多种信号的边仍受合同约束，而当前相位只有一种合法输入的边会把 `signal_kind` 收窄为单一 schema 字面值。旧 episode、兄弟、其他父级、已消费或过期信号即使 UUID 仍在历史中也会被代码拒绝。反馈信号可以沿白名单回路唤醒最近责任层，但不会生成第二父级。
+这是控制权树，不是平级多 Agent 网络。除 Executive 外，每个节点只有一个直接父级；父级通常通过 `Agent.asTool()` 调用模型子级并保留控制权。兄弟节点不互相通信、不共享 Session，只允许由共同父级发起并汇合两组只读并行：Scene + Memory、Affordance + Risk。每次直接子级调用都有独立 `invocation_id`，并绑定共同父级的 `parent_episode_id`；共同父级只能汇合属于自己本次 episode 的返回，禁止依靠队列顺序、payload 相等或“第一个 pending 信号”猜测配对。父子委派没有自由文本 `intent` 通道：父级选择自己拥有的子边与类型化 `signal_kind`，Harness 自动绑定当前父 episode 唯一合法的直接信号；只有存在多个真实语义候选时模型才选择 `source_signal_ids`。旧 episode、兄弟、其他父级、已消费或过期信号即使 UUID 仍在历史中也不会获得控制权。反馈信号可以沿白名单回路唤醒最近责任层，但不会生成第二父级。
 
 Perception Manager 不再把整份 Sensor Fusion、Scene 和 Memory 文档重新生成一遍；它只提交有界的 `compact_perceptual_belief_v1`。Harness 在校验后依据本次 Manager episode 的三个直接子信号物化完整知觉证据，再沿唯一父边上送。这让模型负责状态估计、Harness 负责无损证据运输，避免长几何数组把函数调用 JSON 截断，同时不会替模型选择 Skill、手、交互点、路线或姿态。
 

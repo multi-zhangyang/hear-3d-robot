@@ -32,12 +32,12 @@ The hierarchy is a recursive control system rather than a long prompt chain:
 
 Every model-to-model delegation has the same wire law:
 
-- the parent chooses only one owned child edge and exact causal
-  `source_signal_ids`; when an edge admits more than one current contract kind,
-  its typed `signal_kind` remains constrained to that set, while a phase-bound
-  edge such as rollout review exposes one literal kind instead of asking the
-  model to select protocol state; there is no parent-authored free-text intent
-  channel;
+- the parent chooses one owned child edge and its typed `signal_kind`; the
+  Harness binds a unique current causal signal from the exact parent episode,
+  and the model selects `source_signal_ids` only when more than one genuinely
+  admissible semantic candidate remains; a phase-bound edge such as rollout
+  review exposes one literal kind instead of asking the model to select protocol
+  state, and there is no parent-authored free-text intent channel;
 - every cited signal must be pending, current, directed to that parent, and
   bound to that exact parent episode; a UUID from an earlier episode, sibling,
   foreign parent, consumed signal, or expired signal is rejected even if it
@@ -862,12 +862,14 @@ At the parent-facing `Agent.asTool()` boundary, `source_signal_ids` is rebound
 to the single ascending signal created for that direct ownership edge. The
 child's internal source IDs and the closed `source_authority_lease_id` remain
 in durable Harness state as causal ancestry; they are not exposed as a second
-competing ID namespace in the tool receipt. A parent therefore always copies
-the returned `source_signal_ids` when citing its immediate child.
+competing ID namespace in the tool receipt. On the next direct edge the Harness
+recognizes and binds that unique signal without making the parent model copy its
+UUID. Explicit model selection remains available only for a real multi-candidate
+semantic branch.
 
-Before opening the next child episode, the common delegation gate intersects
-those model-cited IDs with the pending signals owned by the exact current
-parent episode. Descending inputs must carry that parent's `invocation_id`;
+Before opening the next child episode, the common delegation gate resolves the
+canonical source against pending signals owned by the exact current parent
+episode. Descending inputs must carry that parent's `invocation_id`;
 ascending or reentrant returns must carry its `parent_episode_id`. This check is
 performed in code before a child lease or Session is opened, so a model's long
 Session can remember historical UUIDs without gaining authority to reuse them.
