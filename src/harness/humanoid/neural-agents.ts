@@ -3903,6 +3903,29 @@ export async function recoverCommittedNeuralPhysicalExecutionFeedback(
     );
   }
 
+  // The Body and Reflex invocations that owned a physical transaction are
+  // process-local lexical scopes. If the process stops while MuJoCo is still
+  // executing, their durable leases remain active even though those scopes can
+  // never unwind their finally blocks. Physical recovery deliberately creates
+  // a new deterministic return episode below, so retire only the two leases
+  // proven by this transaction's original motor-intent chain before opening
+  // that replacement path. Other Agent leases remain available for normal SDK
+  // RunState/Session recovery.
+  await revokeDetachedPhysicalExecutionLease({
+    runtime,
+    signal: bodyIntent,
+    issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
+    targetChildNodeId: HUMANOID_NEURAL_AGENT_IDS.body,
+    executionTransactionId: receipt.transactionId
+  });
+  await revokeDetachedPhysicalExecutionLease({
+    runtime,
+    signal: motorIntent,
+    issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
+    targetChildNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
+    executionTransactionId: receipt.transactionId
+  });
+
   const receiptPayload = z.json().parse(JSON.parse(
     humanoidActionReceiptModelOutput(receipt)
   ));
@@ -3978,6 +4001,36 @@ export async function recoverCommittedNeuralPhysicalExecutionFeedback(
     rootInvocationId
   );
   return true;
+}
+
+async function revokeDetachedPhysicalExecutionLease(input: {
+  runtime: HumanoidNeuralAgentRuntime;
+  signal: NeuralSignal;
+  issuingParentNodeId: HumanoidNeuralAgentId;
+  targetChildNodeId: HumanoidNeuralAgentId;
+  executionTransactionId: string;
+}): Promise<void> {
+  const leaseId = input.signal.authority_lease_id;
+  const lease = leaseId === null
+    ? undefined
+    : input.runtime.neuralHierarchyState().authority_leases[leaseId];
+  if (!lease
+    || lease.issuing_parent_node_id !== input.issuingParentNodeId
+    || lease.target_child_node_id !== input.targetChildNodeId
+    || lease.invocation_id !== input.signal.invocation_id
+    || lease.parent_invocation_id !== input.signal.parent_invocation_id
+    || lease.parent_episode_id !== input.signal.parent_episode_id) {
+    throw new Error(
+      `Recovered physical transaction has invalid detached neural lease: ${input.executionTransactionId}`
+    );
+  }
+  if (lease.status !== "active" && lease.status !== "suspended") return;
+  await input.runtime.closeNeuralAuthorityLease({
+    leaseId: lease.lease_id,
+    closedByNodeId: input.issuingParentNodeId,
+    status: "revoked",
+    reason: "physical_execution_invocation_detached_after_restart"
+  });
 }
 
 async function publishRecoveredSensorimotorCompletion(input: {
