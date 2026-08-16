@@ -71,6 +71,7 @@
     "smoke:g1:getup:colab": "node training/run-g1-getup-colab.mjs --mode smoke",
     "train:g1:getup:colab": "node training/run-g1-getup-colab.mjs --mode train",
     "install:g1:getup": "node training/install-g1-getup-policy-assets.mjs",
+    "qualify:g1:getup:runtime": "tsx src/training/g1-getup-deployment-cli.ts",
     "prepare:g1:getup": "node training/run-g1-getup-pipeline.mjs",
     "train:workyard:colab": "node training/run-workyard-colab-ppo.mjs",
     "train:workyard:residual:colab": "node training/run-workyard-colab-residual.mjs --mode train",

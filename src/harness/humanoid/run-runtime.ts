@@ -1239,6 +1239,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
     return this.#neuralStateMutex.runExclusive(async () => {
       this.#assertRunAcceptsDecisions();
+      const activeGoalEpochId = this.#checkpoint.goal_dag.current_epoch_id;
+      const harnessGoalEpochId = this.#checkpoint.neural_hierarchy_state
+        .harness_phase.goal_epoch_id;
+      if (!activeGoalEpochId
+        || input.goalEpochId !== activeGoalEpochId
+        || harnessGoalEpochId !== activeGoalEpochId) {
+        throw new Error(
+          "A neural skill commitment must remain inside the current active Goal epoch"
+        );
+      }
       const worldRevision = this.#world.snapshot().worldRevision;
       const established = establishNeuralSkillCommitment(
         this.#checkpoint.neural_hierarchy_state,

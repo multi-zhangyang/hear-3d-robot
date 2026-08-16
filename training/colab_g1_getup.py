@@ -6,8 +6,10 @@ import importlib.metadata
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +30,8 @@ REMOTE_ROOT = Path(os.environ.get(
 REMOTE_REPORT = Path(os.environ.get(
   "HEAR_GETUP_REPORT", str(EXECUTION_ROOT / "hear-g1-getup-report.json")
 ))
+DRIVE_ROOT = Path("/content/drive/MyDrive")
+HEARTBEAT_SECONDS = 900
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +44,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--output-root", default="/content/hear-g1-getup")
   parser.add_argument("--archive", default="/content/hear-g1-getup-artifacts.tar.gz")
+  parser.add_argument("--worker", action="store_true")
   if REMOTE_CONFIG.is_file():
     configured = json.loads(REMOTE_CONFIG.read_text(encoding="utf-8"))
     valid = {action.dest for action in parser._actions}
@@ -69,6 +74,103 @@ def sha256(path: Path) -> str:
     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
       digest.update(chunk)
   return digest.hexdigest()
+
+
+def atomic_json(path: Path, value: dict[str, object]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  temporary = path.with_name(path.name + ".partial")
+  temporary.write_text(
+    json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+  )
+  temporary.replace(path)
+
+
+def assert_drive_writable(args: argparse.Namespace, output_root: Path) -> None:
+  if args.mode != "train":
+    return
+  if not DRIVE_ROOT.is_dir():
+    raise RuntimeError(
+      "Formal G1 training requires a mounted /content/drive/MyDrive"
+    )
+  try:
+    output_root.relative_to(DRIVE_ROOT.resolve())
+  except ValueError as error:
+    raise RuntimeError(
+      f"Formal G1 training output must live in Google Drive: {output_root}"
+    ) from error
+  output_root.parent.mkdir(parents=True, exist_ok=True)
+  probe = output_root.parent / f".hear-drive-probe-{os.getpid()}"
+  payload = f"hear-drive-write-probe:{time.time_ns()}\n"
+  try:
+    probe.write_text(payload, encoding="utf-8")
+    if probe.read_text(encoding="utf-8") != payload:
+      raise RuntimeError("Google Drive write/read probe changed bytes")
+  finally:
+    probe.unlink(missing_ok=True)
+
+
+def supervised_main(args: argparse.Namespace) -> None:
+  extract_bundle()
+  output_root = Path(args.output_root).resolve()
+  assert_drive_writable(args, output_root)
+  output_root.mkdir(parents=True, exist_ok=True)
+  log_path = output_root / "training.log"
+  state_path = output_root / "training-state.json"
+  worker_path = REMOTE_ROOT / "training" / "colab_g1_getup.py"
+  with log_path.open("a", encoding="utf-8", buffering=1) as log:
+    log.write(
+      f"\n[hear] supervised worker start {datetime.now(timezone.utc).isoformat()}\n"
+    )
+    process = subprocess.Popen(
+      [sys.executable, "-u", str(worker_path), "--worker"],
+      cwd=REMOTE_ROOT,
+      stdout=log,
+      stderr=subprocess.STDOUT,
+      text=True,
+    )
+    started = time.monotonic()
+    print(json.dumps({
+      "event": "g1_getup_training_started",
+      "worker_pid": process.pid,
+      "drive_output": str(output_root),
+      "heartbeat_seconds": HEARTBEAT_SECONDS,
+    }), flush=True)
+    try:
+      while True:
+        try:
+          exit_code = process.wait(timeout=HEARTBEAT_SECONDS)
+          break
+        except subprocess.TimeoutExpired:
+          state = {}
+          try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+          except (FileNotFoundError, json.JSONDecodeError):
+            pass
+          print(json.dumps({
+            "event": "g1_getup_training_heartbeat",
+            "elapsed_seconds": round(time.monotonic() - started),
+            "stage": state.get("stage", "starting"),
+            "checkpoint_iteration": state.get("checkpoint_iteration"),
+            "drive_output": str(output_root),
+          }), flush=True)
+    except BaseException:
+      process.terminate()
+      try:
+        process.wait(timeout=30)
+      except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+      raise
+  if exit_code != 0:
+    tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+    if tail:
+      print("\n".join(tail), file=sys.stderr)
+    raise RuntimeError(f"G1 get-up worker exited with code {exit_code}")
+  print(json.dumps({
+    "event": "g1_getup_training_complete",
+    "elapsed_seconds": round(time.monotonic() - started),
+    "drive_output": str(output_root),
+  }), flush=True)
 
 
 def extract_bundle() -> None:
@@ -141,14 +243,15 @@ def train(
 
   staging = output_root / "artifacts"
   log_dir = output_root / "logs"
-  staging.mkdir(parents=True, exist_ok=False)
-  log_dir.mkdir(parents=True, exist_ok=False)
+  state_path = output_root / "training-state.json"
+  staging.mkdir(parents=True, exist_ok=True)
+  log_dir.mkdir(parents=True, exist_ok=True)
   env_cfg = load_env_cfg(module.TASK_ID, play=False)
   env_cfg.scene.num_envs = args.num_envs
   env_cfg.seed = args.seed
   agent_cfg = load_rl_cfg(module.TASK_ID)
   agent_cfg.max_iterations = args.iterations
-  agent_cfg.save_interval = max(1, min(250, args.iterations // 4))
+  agent_cfg.save_interval = max(1, min(100, args.iterations))
   agent_cfg.seed = args.seed
   agent_cfg.logger = "tensorboard"
   agent_cfg.run_name = "proprioceptive_getup"
@@ -162,13 +265,65 @@ def train(
   runner = runner_cls(env, asdict(agent_cfg), str(log_dir), "cuda:0")
   checkpoint = staging / "g1_getup.pt"
   onnx = staging / "g1_getup.onnx"
+  original_save = runner.save
+
+  def atomic_runner_save(path: str, infos=None) -> None:
+    destination = Path(path)
+    temporary = destination.with_name(destination.name + ".partial")
+    temporary.unlink(missing_ok=True)
+    original_save(str(temporary), infos)
+    temporary.replace(destination)
+    if destination.parent == log_dir and destination.stem.startswith("model_"):
+      try:
+        iteration = int(destination.stem.removeprefix("model_"))
+      except ValueError:
+        return
+      atomic_json(state_path, {
+        "protocol": "hear-g1-getup-training-state-v1",
+        "stage": "training",
+        "checkpoint": destination.name,
+        "checkpoint_iteration": iteration,
+        "target_iterations": args.iterations,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+      })
+
+  runner.save = atomic_runner_save
+  checkpoints = []
+  for candidate in log_dir.glob("model_*.pt"):
+    try:
+      iteration = int(candidate.stem.removeprefix("model_"))
+    except ValueError:
+      continue
+    checkpoints.append((iteration, candidate))
+  completed_before_resume = 0
+  if checkpoints:
+    _, latest = max(checkpoints, key=lambda item: item[0])
+    runner.load(str(latest), strict=True, map_location="cuda:0")
+    completed_before_resume = int(runner.current_learning_iteration) + 1
+    if completed_before_resume > args.iterations:
+      raise RuntimeError(
+        f"Drive checkpoint already exceeds target: {completed_before_resume}"
+      )
+    runner.current_learning_iteration = completed_before_resume
+  remaining_iterations = args.iterations - completed_before_resume
+  atomic_json(state_path, {
+    "protocol": "hear-g1-getup-training-state-v1",
+    "stage": "training",
+    "resumed_iterations": completed_before_resume,
+    "target_iterations": args.iterations,
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+  })
   try:
-    runner.learn(
-      num_learning_iterations=args.iterations,
-      init_at_random_ep_len=True,
-    )
+    if remaining_iterations > 0:
+      runner.learn(
+        num_learning_iterations=remaining_iterations,
+        init_at_random_ep_len=True,
+      )
     runner.save(str(checkpoint))
-    runner.export_policy_to_onnx(str(staging), onnx.name)
+    onnx_temporary = onnx.with_name(onnx.name + ".partial")
+    onnx_temporary.unlink(missing_ok=True)
+    runner.export_policy_to_onnx(str(staging), onnx_temporary.name)
+    onnx_temporary.replace(onnx)
   finally:
     writer = getattr(getattr(runner, "logger", None), "writer", None)
     if writer is not None:
@@ -185,6 +340,7 @@ def train(
     )
   training = {
     "iterations": completed,
+    "resumed_iterations": completed_before_resume,
     "environment_count": args.num_envs,
     "steps_per_environment_per_iteration": agent_cfg.num_steps_per_env,
     "environment_steps": completed * args.num_envs * agent_cfg.num_steps_per_env,
@@ -315,9 +471,7 @@ def write_archive(staging: Path, archive_path: Path) -> None:
     archive.add(staging, arcname="hear-g1-getup")
 
 
-def main() -> None:
-  args = parse_args()
-  extract_bundle()
+def worker_main(args: argparse.Namespace) -> None:
   run([sys.executable, "-m", "pip", "install", "--quiet", f"mjlab=={MJLAB_VERSION}"])
   import torch
   if not torch.cuda.is_available():
@@ -325,14 +479,39 @@ def main() -> None:
   module = load_environment()
   contract, contract_path = validate_contract(module)
   output_root = Path(args.output_root).resolve()
-  if output_root.exists():
-    raise FileExistsError(f"Get-up output already exists: {output_root}")
+  assert_drive_writable(args, output_root)
+  output_root.mkdir(parents=True, exist_ok=True)
+  environment_path = Path(module.__file__).resolve()
+  resume_identity = {
+    "protocol": "hear-g1-getup-resume-identity-v1",
+    "task_id": module.TASK_ID,
+    "mjlab_version": MJLAB_VERSION,
+    "training_contract_sha256": sha256(contract_path),
+    "environment_sha256": sha256(environment_path),
+    "seed": args.seed,
+    "environment_count": args.num_envs,
+  }
+  resume_path = output_root / "resume-identity.json"
+  if resume_path.is_file():
+    existing = json.loads(resume_path.read_text(encoding="utf-8"))
+    if existing != resume_identity:
+      raise RuntimeError(
+        "Drive checkpoint identity differs from the requested training source"
+      )
+  else:
+    atomic_json(resume_path, resume_identity)
   staging, checkpoint, onnx, training = train(args, module, output_root)
+  atomic_json(output_root / "training-state.json", {
+    "protocol": "hear-g1-getup-training-state-v1",
+    "stage": "evaluating",
+    "checkpoint_iteration": training["iterations"] - 1,
+    "target_iterations": args.iterations,
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+  })
   evaluation = evaluate(args, module, checkpoint)
   gate_passed = accepted(evaluation, contract["deployment_gate"])
   evaluation["deployment_accepted"] = gate_passed
   identity = onnx_identity(onnx)
-  environment_path = Path(module.__file__).resolve()
   report = {
     "protocol": "hear-g1-getup-policy-deployment-v1",
     "created_at": datetime.now(timezone.utc).isoformat(),
@@ -387,6 +566,14 @@ def main() -> None:
     json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
   )
   write_archive(staging, Path(args.archive).resolve())
+  atomic_json(output_root / "training-state.json", {
+    "protocol": "hear-g1-getup-training-state-v1",
+    "stage": "completed" if gate_passed else "rejected",
+    "checkpoint_iteration": training["iterations"] - 1,
+    "target_iterations": args.iterations,
+    "deployment_accepted": gate_passed,
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+  })
   print(json.dumps({
     "report": str(REMOTE_REPORT),
     "archive": args.archive,
@@ -395,6 +582,14 @@ def main() -> None:
   }, ensure_ascii=False))
   if args.mode == "train" and not gate_passed:
     raise RuntimeError("G1 get-up policy did not pass the deployment gate")
+
+
+def main() -> None:
+  args = parse_args()
+  if args.worker:
+    worker_main(args)
+  else:
+    supervised_main(args)
 
 
 if __name__ == "__main__":

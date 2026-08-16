@@ -21,7 +21,7 @@ const KNOWN_HUMANOID_CONTROLLER_MODULES = [
   "hear/controllers/workyard-contact"
 ] as const;
 const BUNDLED_YAHMP_CONTROLLER_SOURCE =
-  "hear-bundled-yahmp-recovery-controller-v1";
+  "hear-bundled-yahmp-recovery-controller-v2";
 const BUNDLED_WORKYARD_CONTROLLER_SOURCE =
   "hear-bundled-workyard-whole-body-contact-controller-v3";
 const HUMANOID_CONTROLLER_MODULE_FACTORY =
@@ -52,6 +52,13 @@ export type HumanoidControllerModuleFactory = (
 interface HumanoidControllerAssetDeclaration {
   readonly id: string;
   readonly path: string | URL;
+  /** Metadata may be loaded by the module without changing executable identity. */
+  readonly sourceIdentity: boolean;
+}
+
+interface LoadedHumanoidControllerModuleAsset
+  extends HumanoidControllerModuleAsset {
+  readonly sourceIdentity: boolean;
 }
 
 export async function loadConfiguredHumanoidControllerSource(
@@ -152,7 +159,7 @@ export async function loadHumanoidControllerSource(
 function createControllerSource(
   namespace: unknown,
   sourceSha256: string,
-  assets: readonly HumanoidControllerModuleAsset[]
+  assets: readonly LoadedHumanoidControllerModuleAsset[]
 ): HumanoidControllerSource {
   const moduleFactory = controllerModuleFactory(namespace);
   const instances = new WeakSet<object>();
@@ -183,7 +190,7 @@ async function loadControllerAssets(
   namespace: unknown,
   entryPath: string,
   environment?: NodeJS.ProcessEnv
-): Promise<HumanoidControllerModuleAsset[]> {
+): Promise<LoadedHumanoidControllerModuleAsset[]> {
   const assetExport = moduleExport(namespace, HUMANOID_CONTROLLER_MODULE_ASSETS);
   if (assetExport === undefined) return [];
   const exported: unknown = typeof assetExport === "function"
@@ -199,10 +206,19 @@ async function loadControllerAssets(
   if (new Set(ids).size !== ids.length) {
     throw new Error("Humanoid controller asset identifiers must be unique");
   }
-  const assets = await Promise.all(declarations.map(async ({ id, path }) => {
+  const assets = await Promise.all(declarations.map(async ({
+    id,
+    path,
+    sourceIdentity
+  }) => {
     const resolvedPath = await realpath(resolveAssetPath(path, entryPath));
     const bytes = await readFile(resolvedPath);
-    return Object.freeze({ id, sha256: sha256(bytes), bytes });
+    return Object.freeze({
+      id,
+      sha256: sha256(bytes),
+      bytes,
+      sourceIdentity
+    });
   }));
   return assets.sort((left, right) => left.id.localeCompare(right.id));
 }
@@ -214,10 +230,16 @@ function assetDeclaration(
   if (!isRecord(value)
     || !isNonEmptyString(value.id)
     || !/^[a-z0-9][a-z0-9._-]*$/.test(value.id)
-    || !(isNonEmptyString(value.path) || value.path instanceof URL)) {
+    || !(isNonEmptyString(value.path) || value.path instanceof URL)
+    || (value.sourceIdentity !== undefined
+      && typeof value.sourceIdentity !== "boolean")) {
     throw new Error(`Humanoid controller asset ${index} is invalid`);
   }
-  return { id: value.id, path: value.path };
+  return {
+    id: value.id,
+    path: value.path,
+    sourceIdentity: value.sourceIdentity ?? true
+  };
 }
 
 function resolveAssetPath(path: string | URL, entryPath: string): string {
@@ -233,13 +255,14 @@ function resolveAssetPath(path: string | URL, entryPath: string): string {
 
 function controllerSourceSha256(
   entrySha256: string,
-  assets: readonly HumanoidControllerModuleAsset[]
+  assets: readonly LoadedHumanoidControllerModuleAsset[]
 ): string {
-  if (assets.length === 0) return entrySha256;
+  const identityAssets = assets.filter(({ sourceIdentity }) => sourceIdentity);
+  if (identityAssets.length === 0) return entrySha256;
   return sha256(JSON.stringify({
     protocol: "hear-humanoid-controller-source-v2",
     entry_sha256: entrySha256,
-    assets: assets.map(({ id, sha256: assetSha256, bytes }) => ({
+    assets: identityAssets.map(({ id, sha256: assetSha256, bytes }) => ({
       id,
       sha256: assetSha256,
       bytes: bytes.byteLength

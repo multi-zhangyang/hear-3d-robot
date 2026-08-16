@@ -4,12 +4,11 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   rmSync,
   rmdirSync,
   writeFileSync
 } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { create, extract } from "tar";
 
@@ -56,9 +55,8 @@ const driveDirectory = options.driveDirectory ?? `HEAR/g1-getup/${session}`;
 const remoteDriveOutputRoot = `/content/drive/MyDrive/${driveDirectory}`;
 const desktopDriveRoot = options.desktopDriveRoot
   ?? process.env.HEAR_G1_GETUP_DESKTOP_DRIVE_ROOT?.trim();
-const remoteTrainingOutputRoot = desktopDriveRoot
-  ? `/content/hear-g1-getup-output-${session}`
-  : remoteDriveOutputRoot;
+const remoteTrainingOutputRoot = remoteDriveOutputRoot;
+const reuseSession = options.reuseSession ?? false;
 
 let activeSession = null;
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -97,22 +95,28 @@ async function main() {
   let executionStatus = 1;
   try {
     activeSession = session;
-    requireSuccess(colab([
-      "new", "--session", session, "--gpu", options.gpu ?? "L4"
-    ]), "create G1 get-up Colab session");
+    if (reuseSession) {
+      requireSuccess(colab([
+        "status", "--session", session
+      ]), "attach to the existing G1 get-up Colab session");
+    } else {
+      requireSuccess(colab([
+        "new", "--session", session, "--gpu", options.gpu ?? "L4"
+      ]), "create G1 get-up Colab session");
+    }
     requireSuccess(colab([
       "upload", "--session", session, toWslPath(bundle), REMOTE_BUNDLE
     ]), "upload G1 get-up bundle");
     requireSuccess(colab([
       "upload", "--session", session, toWslPath(config), REMOTE_CONFIG
     ]), "upload G1 get-up configuration");
-    if (mode === "train" && !desktopDriveRoot) {
+    if (mode === "train" && !reuseSession) {
       requireSuccess(colab([
         "drivemount", "--session", session, "/content/drive"
-      ], 300_000), "mount Google Drive for G1 get-up checkpoints");
+      ], 900_000), "mount Google Drive for G1 get-up checkpoints");
     }
     const timeoutSeconds = options.timeoutSeconds
-      ?? (mode === "train" ? 21_600 : 1_800);
+      ?? (mode === "train" ? 64_800 : 1_800);
     executionStatus = colab([
       "exec", "--session", session,
       "--file", toWslPath(resolve("training/colab_g1_getup.py")),
@@ -134,20 +138,19 @@ async function main() {
       );
     }
     if (mode === "train") {
-      if (desktopDriveRoot) {
-        persistDesktopDriveBackup(desktopDriveRoot);
-      } else {
-        const backupStatus = colab([
-          "exec", "--session", session, "--file", toWslPath(driveBackup),
-          "--timeout", "1200"
-        ], 1_260_000);
-        requireSuccess(backupStatus, "persist G1 get-up artifacts to Google Drive");
-      }
+      const backupStatus = colab([
+        "exec", "--session", session, "--file", toWslPath(driveBackup),
+        "--timeout", "1200"
+      ], 1_260_000);
+      requireSuccess(backupStatus, "persist G1 get-up artifacts to Google Drive");
     }
     console.log(`G1 get-up policy: ${output}`);
-    console.log(`G1 get-up Drive backup: ${desktopDriveRoot
-      ? resolve(desktopDriveRoot, ...driveDirectory.split("/"))
-      : `MyDrive/${driveDirectory}`}`);
+    console.log(`G1 get-up Drive backup: MyDrive/${driveDirectory}`);
+    if (desktopDriveRoot) {
+      console.log(`G1 get-up desktop Drive sync: ${resolve(
+        desktopDriveRoot, ...driveDirectory.split("/")
+      )}`);
+    }
   } catch (error) {
     failure = error;
   } finally {
@@ -253,52 +256,6 @@ function writeDriveBackup() {
   ].join("\n"), "utf8");
 }
 
-function persistDesktopDriveBackup(rootInput) {
-  const root = resolve(rootInput);
-  if (!existsSync(root)) {
-    throw new Error(`Desktop Google Drive root is unavailable: ${root}`);
-  }
-  const destination = resolve(root, ...driveDirectory.split("/"));
-  assertInsideRoot(root, destination, "desktop Google Drive destination");
-  if (existsSync(destination)) {
-    throw new Error(`Desktop Google Drive backup already exists: ${destination}`);
-  }
-  const parent = dirname(destination);
-  mkdirSync(parent, { recursive: true });
-  const staging = resolve(parent, `.${session}-${randomUUID()}.partial`);
-  assertInsideRoot(root, staging, "desktop Google Drive staging directory");
-  mkdirSync(staging);
-  try {
-    const files = [...ARTIFACT_FILES].map((path) => (
-      path.slice(path.lastIndexOf("/") + 1)
-    ));
-    for (const filename of files) {
-      copyVerified(resolve(output, filename), resolve(staging, filename));
-    }
-    copyVerified(archive, resolve(staging, "training-artifacts.tar.gz"));
-    copyVerified(report, resolve(staging, "remote-report.json"));
-    renameSync(staging, destination);
-  } catch (error) {
-    rmSync(staging, { recursive: true, force: true });
-    throw error;
-  }
-}
-
-function copyVerified(source, destination) {
-  copyFileSync(source, destination);
-  if (sha256(source) !== sha256(destination)) {
-    throw new Error(`Desktop Google Drive copy changed bytes: ${destination}`);
-  }
-}
-
-function assertInsideRoot(root, candidate, label) {
-  const child = relative(root, candidate);
-  if (!child || child === ".." || child.startsWith("../")
-    || child.startsWith("..\\")) {
-    throw new Error(`Unsafe ${label}: ${candidate}`);
-  }
-}
-
 function colab(args, timeoutMs = 600_000) {
   const result = spawnSync("wsl.exe", ["-d", distro, "--", colabPath, ...args], {
     cwd: workspace,
@@ -338,7 +295,8 @@ function parseOptions(args) {
     ["--eval-envs", ["evalEnvs", positiveInteger]],
     ["--eval-steps", ["evalSteps", positiveInteger]],
     ["--seed", ["seed", nonnegativeInteger]],
-    ["--timeout-seconds", ["timeoutSeconds", positiveInteger]]
+    ["--timeout-seconds", ["timeoutSeconds", positiveInteger]],
+    ["--reuse-session", ["reuseSession", booleanValue]]
   ]);
   for (let index = 0; index < args.length; index += 2) {
     const entry = names.get(args[index]);
@@ -372,6 +330,12 @@ function nonnegativeInteger(value) {
     throw new Error(`Expected a non-negative integer, received: ${value}`);
   }
   return parsed;
+}
+
+function booleanValue(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`Expected true or false, received: ${value}`);
 }
 
 function toWslPath(path) {

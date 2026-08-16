@@ -1997,7 +1997,6 @@ function sensorimotorHierarchyModel(
               "bind-sensorimotor-proposal",
               "establish_skill_commitment",
               {
-                goal_epoch_id: goalEpochId,
                 skill: "navigate_to_zone",
                 termination_contract_json: JSON.stringify({
                   type: "robot_at",
@@ -2282,7 +2281,6 @@ function premotorRecoveryHierarchyModel(
             "action-selection-binds-premotor-recovery",
             "establish_skill_commitment",
             {
-              goal_epoch_id: goalEpochId,
               skill: "retreat",
               termination_contract_json: JSON.stringify({
                 type: "robot_at",
@@ -2442,7 +2440,6 @@ function recoveryHierarchyModel(
             "action-selection-binds-recovery-proposal",
             "establish_skill_commitment",
             {
-              goal_epoch_id: goalEpochId,
               skill: "retreat",
               termination_contract_json: JSON.stringify({
                 type: "rejoin_original_goal_path",

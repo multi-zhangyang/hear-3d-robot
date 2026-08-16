@@ -17,7 +17,8 @@ const destination = resolve(
 );
 const source = {
   onnx: resolve(sourceRoot, "g1_getup.onnx"),
-  report: resolve(sourceRoot, "getup-policy-report.json")
+  report: resolve(sourceRoot, "getup-policy-report.json"),
+  qualification: resolve(sourceRoot, "runtime-deployment-report.json")
 };
 
 assertWorkspaceChild(sourceRoot, "G1 get-up source");
@@ -26,7 +27,8 @@ for (const path of Object.values(source)) {
   if (!existsSync(path)) throw new Error(`G1 get-up deployment input is missing: ${path}`);
 }
 const report = JSON.parse(readFileSync(source.report, "utf8"));
-validateReport(report);
+const qualification = JSON.parse(readFileSync(source.qualification, "utf8"));
+validateReport(report, qualification);
 
 const parent = resolve(destination, "..");
 mkdirSync(parent, { recursive: true });
@@ -40,6 +42,10 @@ let installed = false;
 try {
   copyFileSync(source.onnx, resolve(staged, "g1_getup.onnx"));
   copyFileSync(source.report, resolve(staged, "getup-policy-report.json"));
+  copyFileSync(
+    source.qualification,
+    resolve(staged, "runtime-deployment-report.json")
+  );
   assertInstalled(staged);
   if (existsSync(destination)) {
     renameSync(destination, previous);
@@ -62,10 +68,11 @@ console.log(JSON.stringify({
   protocol: "hear-g1-getup-policy-install-v1",
   destination: relative(workspace, destination).replaceAll("\\", "/"),
   onnx_sha256: sha256(source.onnx),
+  runtime_qualification_sha256: sha256(source.qualification),
   evaluation: report.evaluation
 }, null, 2));
 
-function validateReport(value) {
+function validateReport(value, runtimeQualification) {
   const policy = value.policy;
   const evaluation = value.evaluation;
   if (value.protocol !== "hear-g1-getup-policy-deployment-v1"
@@ -97,14 +104,25 @@ function validateReport(value) {
     || evaluation?.supine_success_rate < 0.75
     || evaluation?.side_success_rate < 0.75
     || evaluation?.stable_exit_rate < 0.75
-    || evaluation?.non_finite_action_count !== 0) {
+    || evaluation?.non_finite_action_count !== 0
+    || runtimeQualification?.protocol
+      !== "hear-typescript-mujoco-g1-getup-deployment-gate-v1"
+    || runtimeQualification?.accepted !== true
+    || runtimeQualification?.policy_sha256 !== sha256(source.onnx)
+    || runtimeQualification?.deployment_report_sha256 !== sha256(source.report)
+    || runtimeQualification?.summary?.recovered_count !== 4
+    || !Array.isArray(runtimeQualification?.poses)
+    || runtimeQualification.poses.length !== 4
+    || runtimeQualification.poses.some(({ recovered }) => recovered !== true)) {
     throw new Error("G1 get-up deployment export is not qualified for installation");
   }
 }
 
 function assertInstalled(root) {
   if (sha256(resolve(root, "g1_getup.onnx")) !== sha256(source.onnx)
-    || sha256(resolve(root, "getup-policy-report.json")) !== sha256(source.report)) {
+    || sha256(resolve(root, "getup-policy-report.json")) !== sha256(source.report)
+    || sha256(resolve(root, "runtime-deployment-report.json"))
+      !== sha256(source.qualification)) {
     throw new Error("Installed G1 get-up policy changed during copy");
   }
 }

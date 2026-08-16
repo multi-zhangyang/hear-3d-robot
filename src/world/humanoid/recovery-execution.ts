@@ -197,7 +197,7 @@ export class HumanoidRecoveryExecution {
       (sum, { normalForce }) => sum + normalForce,
       0
     );
-    this.#failure ??= recoverySafetyFailure(
+    this.#failure ??= humanoidRecoverySafetyFailure(
       snapshot,
       contract,
       index + 1,
@@ -279,7 +279,7 @@ export class HumanoidRecoveryExecution {
   }
 
   #updateStableStanding(snapshot: HumanoidSimulationSnapshot): void {
-    this.#stableSteps = recoveryStandingSatisfied(
+    this.#stableSteps = humanoidRecoveryStandingSatisfied(
       snapshot,
       this.#stored.recoveryContract!
     ) ? this.#stableSteps + 1 : 0;
@@ -329,7 +329,7 @@ export class HumanoidRecoveryExecution {
   }
 }
 
-function recoveryStandingSatisfied(
+export function humanoidRecoveryStandingSatisfied(
   snapshot: HumanoidSimulationSnapshot,
   contract: NonNullable<StoredHumanoidMotionPlan["recoveryContract"]>
 ): boolean {
@@ -351,7 +351,7 @@ function recoveryStandingSatisfied(
     && maximumJointSpeed <= standing.maximumJointSpeedRadiansPerSecond;
 }
 
-function recoverySafetyFailure(
+export function humanoidRecoverySafetyFailure(
   snapshot: HumanoidSimulationSnapshot,
   contract: NonNullable<StoredHumanoidMotionPlan["recoveryContract"]>,
   frame: number,

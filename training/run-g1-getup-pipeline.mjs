@@ -12,9 +12,9 @@ import { dirname, relative, resolve } from "node:path";
 
 const options = parseOptions(process.argv.slice(2));
 const workspace = process.cwd();
-const upstreamStatus = insideWorkspace(
-  options.upstreamStatus ?? ".tmp/workyard-autonomy-pipeline/status.json"
-);
+const upstreamStatus = options.upstreamStatus
+  ? insideWorkspace(options.upstreamStatus)
+  : undefined;
 const statusPath = insideWorkspace(
   options.status ?? ".tmp/g1-getup-pipeline/status.json"
 );
@@ -28,6 +28,7 @@ const desktopDriveRoot = options.desktopDriveRoot
 const waitTimeoutMs = (options.waitTimeoutSeconds ?? 64_800) * 1000;
 const pollMs = (options.pollSeconds ?? 120) * 1000;
 const node = process.execPath;
+const tsx = insideWorkspace("node_modules/tsx/dist/cli.mjs");
 
 let activeChild;
 let interrupted = false;
@@ -53,10 +54,16 @@ async function main() {
   if (!/^[A-Za-z0-9._-]+$/.test(session)) {
     throw new Error(`Unsafe G1 get-up pipeline session: ${session}`);
   }
-  writeStatus("waiting_for_colab_training_lane", {
-    upstream_status: repositoryRelative(upstreamStatus)
-  });
-  await waitForUpstreamPipeline();
+  if (upstreamStatus) {
+    writeStatus("waiting_for_colab_training_lane", {
+      upstream_status: repositoryRelative(upstreamStatus)
+    });
+    await waitForUpstreamPipeline(upstreamStatus);
+  } else {
+    writeStatus("colab_training_lane_available", {
+      lane: "dedicated_g1_session"
+    });
+  }
 
   const reportPath = resolve(output, "getup-policy-report.json");
   if (!qualifiedOutput(output)) {
@@ -75,7 +82,7 @@ async function main() {
       "--num-envs", String(options.numEnvs ?? 2048),
       "--eval-envs", String(options.evalEnvs ?? 500),
       "--eval-steps", String(options.evalSteps ?? 750),
-      "--timeout-seconds", String(options.trainingTimeoutSeconds ?? 21_600),
+      "--timeout-seconds", String(options.trainingTimeoutSeconds ?? 64_800),
       ...(desktopDriveRoot
         ? ["--desktop-drive-root", desktopDriveRoot]
         : [])
@@ -87,6 +94,26 @@ async function main() {
     writeStatus("getup_training_already_complete");
   }
 
+  const runtimeQualification = resolve(
+    output, "runtime-deployment-report.json"
+  );
+  writeStatus("getup_runtime_qualification", {
+    runtime: "typescript-mujoco-onnxruntime-web",
+    report: repositoryRelative(runtimeQualification)
+  });
+  await run(node, [
+    repositoryRelative(tsx),
+    "src/training/g1-getup-deployment-cli.ts",
+    "--output", repositoryRelative(runtimeQualification),
+    "--policy-directory", repositoryRelative(output)
+  ]);
+  const qualification = readJson(runtimeQualification);
+  if (qualification?.protocol
+      !== "hear-typescript-mujoco-g1-getup-deployment-gate-v1"
+    || qualification?.accepted !== true
+    || qualification?.summary?.recovered_count !== 4) {
+    throw new Error("G1 get-up policy failed its production runtime qualification");
+  }
   writeStatus("getup_policy_install", {
     source: repositoryRelative(output)
   });
@@ -102,15 +129,16 @@ async function main() {
   writeStatus("completed", {
     source: repositoryRelative(output),
     report: repositoryRelative(reportPath),
+    runtime_qualification: repositoryRelative(runtimeQualification),
     installed: "assets/humanoid/controllers/g1-getup"
   });
 }
 
-async function waitForUpstreamPipeline() {
+async function waitForUpstreamPipeline(path) {
   const started = Date.now();
   while (true) {
     if (interrupted) throw new Error("G1 get-up pipeline interrupted");
-    const status = readJson(upstreamStatus);
+    const status = readJson(path);
     if (status?.protocol === "hear-workyard-autonomy-pipeline-status-v1"
       && (status.stage === "completed" || status.stage === "failed")) {
       writeStatus("colab_training_lane_available", {

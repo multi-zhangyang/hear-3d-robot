@@ -16,10 +16,15 @@ import { G1RecoveryGatedController } from "./g1-recovery-gated-controller.js";
 
 export const G1_GETUP_POLICY_DIRECTORY_ENV =
   "HEAR_G1_GETUP_POLICY_DIRECTORY";
+export const G1_GETUP_QUALIFICATION_MODE_ENV =
+  "HEAR_G1_GETUP_QUALIFICATION_MODE";
+export const G1_GETUP_QUALIFICATION_ASSET_ID =
+  "getup_runtime_qualification";
 
 interface ControllerAssetDeclaration {
   readonly id: string;
   readonly path: string | URL;
+  readonly sourceIdentity?: boolean;
 }
 
 /**
@@ -40,11 +45,13 @@ export function g1RecoveryControllerAssets(
     "../../assets/humanoid/controllers/g1-getup/getup-policy-report.json",
     import.meta.url
   );
-  const available = Boolean(configuredDirectory)
-    || (existsSync(fileURLToPath(bundledPolicy))
-      && existsSync(fileURLToPath(bundledReport)));
-  if (!available) return [];
-  return [
+  const bundledQualification = new URL(
+    "../../assets/humanoid/controllers/g1-getup/runtime-deployment-report.json",
+    import.meta.url
+  );
+  const qualificationMode = Boolean(configuredDirectory)
+    && environment[G1_GETUP_QUALIFICATION_MODE_ENV] === "1";
+  const declarations: ControllerAssetDeclaration[] = [
     {
       id: G1_GETUP_POLICY_ASSET_ID,
       path: configuredDirectory
@@ -56,8 +63,24 @@ export function g1RecoveryControllerAssets(
       path: configuredDirectory
         ? resolve(configuredDirectory, "getup-policy-report.json")
         : bundledReport
+    },
+    {
+      id: G1_GETUP_QUALIFICATION_ASSET_ID,
+      sourceIdentity: false,
+      path: configuredDirectory
+        ? resolve(configuredDirectory, "runtime-deployment-report.json")
+        : bundledQualification
     }
   ];
+  if (qualificationMode) return declarations.slice(0, 2);
+  if (configuredDirectory) return declarations;
+  const existing = [bundledPolicy, bundledReport, bundledQualification]
+    .map((path) => existsSync(fileURLToPath(path)));
+  if (!existing.some(Boolean)) return [];
+  // Once any bundled recovery file exists, the directory is an asserted
+  // deployment bundle. Returning every declaration makes partial installs
+  // fail closed in the controller loader instead of silently losing recovery.
+  return declarations;
 }
 
 /**
@@ -76,13 +99,19 @@ export async function attachG1RecoveryExpert(
   const hasReport = context.assets.some(
     ({ id }) => id === G1_GETUP_REPORT_ASSET_ID
   );
-  if (!hasPolicy && !hasReport) return body;
-  if (!hasPolicy || !hasReport) {
+  const hasQualification = context.assets.some(
+    ({ id }) => id === G1_GETUP_QUALIFICATION_ASSET_ID
+  );
+  if (!hasPolicy && !hasReport && !hasQualification) return body;
+  const qualificationMode = process.env[G1_GETUP_QUALIFICATION_MODE_ENV] === "1";
+  if (!hasPolicy || !hasReport
+    || (!hasQualification && !qualificationMode)) {
     await body.dispose();
     throw new Error("G1 recovery expert deployment bundle is incomplete");
   }
   let recovery: HumanoidWholeBodyController | undefined;
   try {
+    if (hasQualification) assertRuntimeQualification(context);
     recovery = await createG1GetupController({ assets: context.assets });
     return new G1RecoveryGatedController(body, recovery);
   } catch (error) {
@@ -92,4 +121,42 @@ export async function attachG1RecoveryExpert(
     ]);
     throw error;
   }
+}
+
+function assertRuntimeQualification(
+  context: HumanoidControllerModuleContext
+): void {
+  const assets = context.assets;
+  const policy = assets.find(({ id }) => id === G1_GETUP_POLICY_ASSET_ID);
+  const deployment = assets.find(({ id }) => id === G1_GETUP_REPORT_ASSET_ID);
+  const qualification = assets.find(
+    ({ id }) => id === G1_GETUP_QUALIFICATION_ASSET_ID
+  );
+  if (!policy || !deployment || !qualification) {
+    throw new Error("G1 recovery expert deployment bundle is incomplete");
+  }
+  let report: unknown;
+  try {
+    report = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(
+      qualification.bytes
+    ));
+  } catch (error) {
+    throw new Error("G1 runtime qualification is not valid UTF-8 JSON", {
+      cause: error
+    });
+  }
+  if (!isRecord(report)
+    || report.protocol !== "hear-typescript-mujoco-g1-getup-deployment-gate-v1"
+    || report.accepted !== true
+    || report.controller_source_sha256 !== context.sourceSha256
+    || report.policy_sha256 !== policy.sha256
+    || report.deployment_report_sha256 !== deployment.sha256
+    || !isRecord(report.summary)
+    || report.summary.recovered_count !== 4) {
+    throw new Error("G1 recovery expert lacks a matching runtime qualification");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

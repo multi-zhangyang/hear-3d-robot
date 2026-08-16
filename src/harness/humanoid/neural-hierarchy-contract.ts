@@ -743,6 +743,10 @@ export function assertHumanoidNeuralHierarchyContract(): void {
       "Motor Intent must use bounded candidate planning while Serial Executor owns physical execution"
     );
   }
+  const parallelGroups = new Map<
+    NonNullable<HumanoidNeuralNodeDescriptor["parallelGroup"]>,
+    HumanoidNeuralNodeDescriptor[]
+  >();
   for (const node of HUMANOID_NEURAL_NODES) {
     if (!node.parallelGroup) continue;
     const parent = node.parentKey === null ? undefined : byKey.get(node.parentKey);
@@ -751,7 +755,43 @@ export function assertHumanoidNeuralHierarchyContract(): void {
         `Parallel fan-out must be owned and joined by one serial model manager: ${node.id}`
       );
     }
+    if (node.physicalWriteAuthority || node.executionKind !== "model_agent") {
+      throw new Error(
+        `Parallel neural branches must be read-only model specialists: ${node.id}`
+      );
+    }
+    const siblings = parallelGroups.get(node.parallelGroup) ?? [];
+    siblings.push(node);
+    parallelGroups.set(node.parallelGroup, siblings);
   }
+  for (const [group, nodes] of parallelGroups) {
+    const parentKeys = new Set(nodes.map((node) => node.parentKey));
+    if (nodes.length < 2 || parentKeys.size !== 1) {
+      throw new Error(
+        `Parallel neural group must contain at least two siblings under one manager: ${group}`
+      );
+    }
+  }
+}
+
+/**
+ * Derive SDK tool concurrency from the hierarchy contract itself. A manager is
+ * serial unless it owns a complete group of explicitly read-only siblings.
+ */
+export function humanoidNeuralManagerParallelToolConcurrency(
+  managerKey: HumanoidNeuralAgentKey
+): number {
+  const groupWidths = new Map<
+    NonNullable<HumanoidNeuralNodeDescriptor["parallelGroup"]>,
+    number
+  >();
+  for (const node of HUMANOID_NEURAL_NODES) {
+    if (node.parentKey !== managerKey || !node.parallelSafe || !node.parallelGroup) {
+      continue;
+    }
+    groupWidths.set(node.parallelGroup, (groupWidths.get(node.parallelGroup) ?? 0) + 1);
+  }
+  return Math.max(1, ...groupWidths.values());
 }
 
 const SIGNAL_KINDS_BY_ROUTE: ReadonlyMap<string, ReadonlySet<NeuralSignalKind>>

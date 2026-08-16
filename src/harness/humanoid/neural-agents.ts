@@ -73,6 +73,7 @@ import {
   HUMANOID_NEURAL_NODE_BY_ID,
   HUMANOID_NEURAL_NODES,
   HUMANOID_NEURAL_SIGNAL_CONTRACTS,
+  humanoidNeuralManagerParallelToolConcurrency,
   type HumanoidNeuralAgentId,
   type HumanoidNeuralAgentKey
 } from "./neural-hierarchy-contract.js";
@@ -194,7 +195,6 @@ const BoundedSkillProposalPayloadSchema = z.object({
   phase_sequence: z.array(BoundedSkillPhaseSchema).max(32).optional()
 }).strict();
 const EstablishSkillCommitmentSchema = z.object({
-  goal_epoch_id: z.string().trim().min(1),
   skill: z.string().trim().min(1).max(2_000),
   termination_contract_json: NeuralJsonTextSchema,
   source_signal_ids: z.array(z.string().uuid()).min(1).max(64)
@@ -602,7 +602,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
             }
           }
         : {}),
-      parallelToolCalls: options.parallel ?? false,
+      parallelToolCalls: options.parallel === true
+        && humanoidNeuralManagerParallelToolConcurrency(key) > 1,
       toolChoice
     };
   };
@@ -683,9 +684,9 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       inputTool.requiredSignalKind,
       inputTool.sourceSignalContract
     );
-    const nestedParallelism = childDescriptor.key === "perceptionManager"
-      || childDescriptor.key === "sensorimotorManager";
-    const maximumToolConcurrency = nestedParallelism ? 2 : 1;
+    const maximumToolConcurrency
+      = humanoidNeuralManagerParallelToolConcurrency(childDescriptor.key);
+    const nestedParallelism = maximumToolConcurrency > 1;
     let descendingSignal: NeuralSignal | undefined;
     let authorityLease: NeuralAuthorityLease | undefined;
     let invocationInputSignalIds: string[] = [];
@@ -728,7 +729,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           && activeCommitment?.state === "executing"
           ? currentCommitmentLifecycleFeedback(
               input.runtime,
-              activeCommitment
+              activeCommitment,
+              { pendingOnly: false }
             )
           : undefined;
         const exactSourceSignals = lifecycleFeedback
@@ -2356,6 +2358,10 @@ function establishSkillCommitmentTool(
       const invocation = requiredHarnessInvocation(
         HUMANOID_NEURAL_AGENT_IDS.actionSelection
       );
+      const harnessPhase = runtime.neuralHarnessPhase();
+      if (!harnessPhase.goal_epoch_id) {
+        throw new Error("Skill commitment requires one Harness-owned active Goal epoch");
+      }
       const proposalSignals = currentManagerChildSignals(
         runtime,
         HUMANOID_NEURAL_AGENT_IDS.actionSelection,
@@ -2472,7 +2478,7 @@ function establishSkillCommitmentTool(
       }
       const commitment = await runtime.establishNeuralSkillCommitment({
         ownerNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
-        goalEpochId: params.goal_epoch_id,
+        goalEpochId: harnessPhase.goal_epoch_id,
         skill: params.skill,
         terminationContract: parseNeuralJsonText(
           params.termination_contract_json,
@@ -2793,6 +2799,10 @@ function serialExecutionTool(
   runtime: HumanoidNeuralAgentRuntime
 ): FunctionTool<unknown, typeof ExecutionTaskSchema, string> {
   const name = humanoidNeuralAgentToolName("executor");
+  // Sensorimotor may run its explicitly read-only specialist group in
+  // parallel, but physical admission remains a process-local single-writer
+  // boundary even if a provider emits duplicate execution calls in one turn.
+  const executionMutex = new Mutex();
   return tool({
     name,
     description: "Execute the certified plan bound to the current direct skill_commitment signal. Pass no certificate or planning internals.",
@@ -2813,7 +2823,7 @@ function serialExecutionTool(
           && candidate.commitment_id === runtime.neuralHierarchyState()
             .active_skill_commitment?.commitment_id
       ).length === 1,
-    execute: async (params, _context, details) => {
+    execute: (params, _context, details) => executionMutex.runExclusive(async () => {
       const managerInvocation = requiredHarnessInvocation(
         HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
       );
@@ -2943,7 +2953,7 @@ function serialExecutionTool(
         HUMANOID_NEURAL_AGENT_IDS.executor,
         details?.toolCall?.callId
       ));
-    }
+    })
   });
 }
 
