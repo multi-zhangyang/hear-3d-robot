@@ -2997,9 +2997,19 @@ function authorizeSkillExecutionTool(
           && candidate.commitment_id === active.commitment_id
       );
       if (certificates.length !== 1) {
-        throw new Error(
-          `Execution authorization requires one active Predictive certificate; found ${certificates.length}`
-        );
+        // Tool discovery is fixed at the beginning of an Agents SDK episode,
+        // while the nested Predictive child may issue its certificate later
+        // in that same episode. A premature compatible-model call is therefore
+        // an ordinary rejected decision, not a Harness/runtime failure.
+        return JSON.stringify({
+          accepted: false,
+          code: "predictive_certificate_pending",
+          active_certificate_count: certificates.length,
+          commitment_id: active.commitment_id,
+          required_next_tool: humanoidNeuralAgentToolName("sensorimotorManager"),
+          automatic_actuation: false,
+          recovery: "Delegate the committed branch to Sensorimotor so its Predictive child can certify the real rollout before execution authorization."
+        });
       }
       const certificate = certificates[0]!;
       const certifiedRawRollout = hierarchy.signals[

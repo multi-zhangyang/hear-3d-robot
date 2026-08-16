@@ -751,9 +751,18 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
           && activeCertificates.length === 1) {
           phase = "execution";
           reason = "certified_commitment_requires_serial_execution";
-        } else {
+        } else if (activeCertificates.length === 1) {
           phase = "rollout_review";
-          reason = "accepted_plan_requires_action_selection_authorization";
+          reason = "certified_rollout_requires_action_selection_authorization";
+        } else {
+          // An accepted physical plan is not execution authority. If the
+          // process stopped after Rollout Gate returned but before Predictive
+          // issued its certificate, the invocation-scoped lower-loop edge is
+          // gone. Re-enter assessment and recreate that read-only rollout
+          // under the new structural episode; never expose execution
+          // authorization merely because a planning receipt survived.
+          phase = "motor_assessment";
+          reason = "uncertified_plan_requires_fresh_motor_assessment";
         }
       } else if (current.phase === "bootstrapping"
         || current.phase === "goal_valuation"

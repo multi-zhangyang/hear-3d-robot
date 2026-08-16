@@ -283,6 +283,38 @@ export interface ResumeHumanoidMissionInput {
 export async function resumeHumanoidMission(
   input: ResumeHumanoidMissionInput
 ): Promise<HumanoidMissionRunResult> {
+  try {
+    return await resumeHumanoidMissionEpoch(input, "operator_configuration");
+  } catch (error) {
+    if (input.freshAgentEpoch || !(error instanceof AgentManifestIncompatibleError)) {
+      throw error;
+    }
+    const store = await RunStore.open(
+      input.runDir,
+      input.mutationFence ? { mutationFence: input.mutationFence } : {}
+    );
+    if (store.definition.run_mode !== "continuous") throw error;
+    input.signal?.throwIfAborted();
+
+    // A continuous robot outlives any one model/Agent configuration. Normal
+    // resume remains strict so an old conversation is never replayed under a
+    // different Harness, but configuration drift is itself the boundary of a
+    // new cognitive epoch rather than a reason to strand the physical run.
+    // The fresh-epoch path first drains any already-admitted physical
+    // transaction under its original manifest before replacing Agent state.
+    return resumeHumanoidMissionEpoch(
+      { ...input, freshAgentEpoch: true },
+      "continuous_manifest_rollover"
+    );
+  }
+}
+
+async function resumeHumanoidMissionEpoch(
+  input: ResumeHumanoidMissionInput,
+  freshAgentEpochSource:
+    | "operator_configuration"
+    | "continuous_manifest_rollover"
+): Promise<HumanoidMissionRunResult> {
   if (input.freshAgentEpoch) {
     await recoverUnfinishedPhysicalAuthorityBeforeFreshAgentEpoch(input);
   }
@@ -360,6 +392,7 @@ export async function resumeHumanoidMission(
       runtime,
       provider: input.provider,
       resumed: true,
+      ...(input.freshAgentEpoch ? { freshAgentEpochSource } : {}),
       ...(input.signal ? { signal: input.signal } : {})
     });
   } finally {
@@ -456,6 +489,9 @@ async function executeHumanoidMission(input: {
   runtime: HumanoidRunRuntime;
   provider: ProviderConfig;
   resumed: boolean;
+  freshAgentEpochSource?:
+    | "operator_configuration"
+    | "continuous_manifest_rollover";
   signal?: AbortSignal;
 }): Promise<HumanoidMissionRunResult> {
   // A continuous embodied run is stopped only by an explicit abort or a
@@ -694,7 +730,9 @@ async function executeHumanoidMission(input: {
     if (resumedWithFreshAgentEpoch) {
       await input.runtime.recordProvider({
         status: "agent_epoch_started",
-        source: "operator_configuration",
+        source: input.freshAgentEpochSource ?? "operator_configuration",
+        automatic_rollover:
+          input.freshAgentEpochSource === "continuous_manifest_rollover",
         previous_session_history_attached: false,
         context_checkpoint_preserved: true,
         physical_authority_preserved: true,
