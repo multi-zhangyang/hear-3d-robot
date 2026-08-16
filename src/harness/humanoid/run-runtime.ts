@@ -423,8 +423,13 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         await input.policyFrameSink?.(frame);
       },
       physicalFrameSink: (cut) => this.#physicalExecution.recordPhysicalCut(cut),
+      physicalPersistenceFrameStride:
+        this.#physicalExecution.executionCheckpointIntervalFrames(),
       physicalExecutionFrameOffset: (transactionId) => (
         this.#physicalExecution.executionFrameOffset(transactionId)
+      ),
+      physicalExecutionStartWorldRevision: (transactionId) => (
+        this.#physicalExecution.executionStartWorldRevision(transactionId)
       ),
       completedPhysicalPlanFrameCount: (transactionId) => (
         this.#physicalExecution.executionCompletedPlanFrameCount(transactionId)

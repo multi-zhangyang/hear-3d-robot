@@ -978,7 +978,13 @@ export function recordNeuralReflexArcFrame(
   stateInput: NeuralHierarchyState,
   input: RecordNeuralReflexArcFrameInput
 ): NeuralHierarchyState {
-  let state = NeuralHierarchyStateSchema.parse(structuredClone(stateInput));
+  // This is the controller-frequency path. The surrounding runtime already
+  // owns the checkpoint under its neural-state mutex, and the state was
+  // schema-validated at every structural transition. Cloning and reparsing
+  // the complete signal/lease graph at 50 Hz made neural bookkeeping slower
+  // than MuJoCo. Preserve functional ownership with a shallow state copy and
+  // validate only the reflex-arc value changed by this tick.
+  let state = stateInput;
   if (state.reflex_arc.status !== "active") {
     state = beginNeuralReflexArc(state, input);
   }
@@ -1005,7 +1011,7 @@ export function recordNeuralReflexArcFrame(
     throw new Error("A reflex controller frame requires an implementation identity");
   }
   const at = input.at ?? new Date().toISOString();
-  state.reflex_arc = NeuralReflexArcStateSchema.parse({
+  const reflexArc = NeuralReflexArcStateSchema.parse({
     ...arc,
     controller_tick_count: arc.controller_tick_count + 1,
     physics_substep_count: arc.physics_substep_count + input.physicsSubsteps,
@@ -1043,8 +1049,11 @@ export function recordNeuralReflexArcFrame(
     last_simulated_time_seconds: input.simulatedTimeSeconds,
     updated_at: at
   });
-  state.updated_at = at;
-  return NeuralHierarchyStateSchema.parse(state);
+  return {
+    ...state,
+    reflex_arc: reflexArc,
+    updated_at: at
+  };
 }
 
 export function completeNeuralReflexArc(
@@ -1428,17 +1437,23 @@ export function transitionNeuralHarnessPhase(
   for (const lease of Object.values(state.authority_leases)) {
     if (lease.status !== "active" && lease.status !== "suspended") continue;
     const invocationIsLive = liveInvocationIds.has(lease.invocation_id);
-    // A nested child may legitimately advance the global phase before its
-    // typed result has unwound through every structural parent. Preserve only
-    // leases on that exact live invocation stack long enough to publish those
-    // already-authorized return edges; non-live leases are revoked immediately.
-    // Terminal entry always closes the graph.
-    const preserveLiveReturnPath = next !== "terminal" && invocationIsLive;
-    const incompatibleGoal = !preserveLiveReturnPath
-      && lease.goal_epoch_id !== null
+    // One live Agent episode can own a real state transition and then continue
+    // through its next structural child (for example Action Selection binds a
+    // Skill and immediately enters the committed Sensorimotor branch). Rebind
+    // only leases on that exact async invocation stack to the new authority
+    // tuple. Merely leaving a pre-commitment lease active is insufficient:
+    // activeNeuralAuthorityLease correctly rejects its stale commitment id and
+    // strands the same owner that just established the commitment. Non-live
+    // episodes are never upgraded. Terminal entry still closes the graph.
+    const preserveLiveEpisode = next !== "terminal" && invocationIsLive;
+    if (preserveLiveEpisode) {
+      lease.goal_epoch_id = input.goalEpochId;
+      lease.commitment_id = input.commitmentId;
+      continue;
+    }
+    const incompatibleGoal = lease.goal_epoch_id !== null
       && lease.goal_epoch_id !== input.goalEpochId;
-    const incompatibleCommitment = !preserveLiveReturnPath
-      && lease.commitment_id !== null
+    const incompatibleCommitment = lease.commitment_id !== null
       && lease.commitment_id !== input.commitmentId;
     const expiredRevision = !invocationIsLive
       && input.worldRevision > lease.expires_world_revision;

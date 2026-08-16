@@ -307,7 +307,17 @@ export type HumanoidPersistenceSink = (
 export interface HumanoidExecutionOptions {
   realtime?: boolean;
   retainTerminal?: boolean;
+  /**
+   * Lightweight, ordered per-controller-frame projection. Long executions use
+   * this between durable cuts so trajectory/Goal state advances without
+   * serializing the complete MuJoCo checkpoint on every control step.
+   */
+  progressSink?: HumanoidFrameSink;
   persistenceSink?: HumanoidPersistenceSink;
+  /** Persist every Nth world revision; terminal and replan cuts stay immediate. */
+  persistenceFrameStride?: number;
+  /** World revision at physical admission, used to align periodic cut cadence. */
+  persistenceStartWorldRevision?: number;
   skillEventSink?: HumanoidSkillEventSink;
   /** Internal shared lifecycle for a deterministic multi-plan Skill horizon. */
   skillEventStream?: HumanoidSkillEventStream;

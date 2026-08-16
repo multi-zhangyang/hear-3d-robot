@@ -296,7 +296,9 @@ export interface HumanoidActionRuntimeOptions {
   frameSink?: HumanoidFrameSink;
   policyFrameSink?: HumanoidPolicyFrameSink;
   physicalFrameSink?: HumanoidPersistenceSink;
+  physicalPersistenceFrameStride?: number;
   physicalExecutionFrameOffset?: (transactionId: string) => number;
+  physicalExecutionStartWorldRevision?: (transactionId: string) => number | undefined;
   completedPhysicalPlanFrameCount?: (transactionId: string) => number;
   completedPhysicalPlanCount?: (transactionId: string) => number;
   skillEventSink?: HumanoidSkillEventSink;
@@ -341,8 +343,12 @@ export class HumanoidActionRuntime {
   readonly #frameSink: HumanoidFrameSink | undefined;
   readonly #policyFrameSink: HumanoidPolicyFrameSink | undefined;
   readonly #physicalFrameSink: HumanoidPersistenceSink | undefined;
+  readonly #physicalPersistenceFrameStride: number | undefined;
   readonly #physicalExecutionFrameOffset: NonNullable<
     HumanoidActionRuntimeOptions["physicalExecutionFrameOffset"]
+  >;
+  readonly #physicalExecutionStartWorldRevision: NonNullable<
+    HumanoidActionRuntimeOptions["physicalExecutionStartWorldRevision"]
   >;
   readonly #completedPhysicalPlanFrameCount: NonNullable<
     HumanoidActionRuntimeOptions["completedPhysicalPlanFrameCount"]
@@ -425,8 +431,16 @@ export class HumanoidActionRuntime {
     this.#frameSink = options.frameSink;
     this.#policyFrameSink = options.policyFrameSink;
     this.#physicalFrameSink = options.physicalFrameSink;
+    this.#physicalPersistenceFrameStride = options.physicalPersistenceFrameStride;
+    if (this.#physicalPersistenceFrameStride !== undefined
+      && (!Number.isSafeInteger(this.#physicalPersistenceFrameStride)
+        || this.#physicalPersistenceFrameStride <= 0)) {
+      throw new Error("Physical persistence frame stride must be a positive integer");
+    }
     this.#physicalExecutionFrameOffset = options.physicalExecutionFrameOffset
       ?? (() => 0);
+    this.#physicalExecutionStartWorldRevision =
+      options.physicalExecutionStartWorldRevision ?? (() => undefined);
     this.#completedPhysicalPlanFrameCount = options.completedPhysicalPlanFrameCount
       ?? (() => 0);
     this.#completedPhysicalPlanCount = options.completedPhysicalPlanCount
@@ -2105,7 +2119,20 @@ export class HumanoidActionRuntime {
         realtime: this.#realtimeExecution,
         retainTerminal: this.#retainPhysicalTerminals,
         ...(this.#physicalFrameSink
-          ? { persistenceSink: this.#physicalFrameSink }
+          ? {
+              persistenceSink: this.#physicalFrameSink,
+              ...(this.#frameSink ? { progressSink: this.#frameSink } : {}),
+              ...(this.#physicalPersistenceFrameStride === undefined
+                ? {}
+                : {
+                    persistenceFrameStride:
+                      this.#physicalPersistenceFrameStride,
+                    persistenceStartWorldRevision:
+                      this.#physicalExecutionStartWorldRevision(
+                        invocation.transactionId
+                      ) ?? this.#world.snapshot().worldRevision
+                  })
+            }
           : {}),
         ...(this.#skillEventSink
           ? { skillEventSink: this.#skillEventSink }
@@ -2409,7 +2436,20 @@ export class HumanoidActionRuntime {
           realtime: this.#realtimeExecution,
           retainTerminal: this.#retainPhysicalTerminals,
           ...(this.#physicalFrameSink
-            ? { persistenceSink: this.#physicalFrameSink }
+            ? {
+                persistenceSink: this.#physicalFrameSink,
+                ...(this.#frameSink ? { progressSink: this.#frameSink } : {}),
+                ...(this.#physicalPersistenceFrameStride === undefined
+                  ? {}
+                  : {
+                      persistenceFrameStride:
+                        this.#physicalPersistenceFrameStride,
+                      persistenceStartWorldRevision:
+                        this.#physicalExecutionStartWorldRevision(
+                          invocation.transactionId
+                        ) ?? this.#world.snapshot().worldRevision
+                    })
+              }
             : {}),
           ...(this.#skillEventSink
             ? { skillEventSink: this.#skillEventSink }
@@ -2601,7 +2641,20 @@ export class HumanoidActionRuntime {
         realtime: this.#realtimeExecution,
         retainTerminal: this.#retainPhysicalTerminals,
         ...(this.#physicalFrameSink
-          ? { persistenceSink: this.#physicalFrameSink }
+          ? {
+              persistenceSink: this.#physicalFrameSink,
+              ...(this.#frameSink ? { progressSink: this.#frameSink } : {}),
+              ...(this.#physicalPersistenceFrameStride === undefined
+                ? {}
+                : {
+                    persistenceFrameStride:
+                      this.#physicalPersistenceFrameStride,
+                    persistenceStartWorldRevision:
+                      this.#physicalExecutionStartWorldRevision(
+                        invocation.transactionId
+                      ) ?? this.#world.snapshot().worldRevision
+                  })
+            }
           : {}),
         ...(this.#skillEventSink
           ? { skillEventSink: this.#skillEventSink }

@@ -38,7 +38,7 @@ import {
   physicalExecutionReceipt
 } from "./run-runtime-persistence.js";
 import {
-  advancePhysicalTrajectory,
+  advanceTrustedPhysicalTrajectory,
   createPhysicalTrajectory
 } from "./physical-trajectory-recorder.js";
 import type {
@@ -57,6 +57,11 @@ import { HUMANOID_NEURAL_AGENT_IDS } from "./neural-hierarchy-contract.js";
 // without turning persistence into the dominant control-loop workload.
 const EXECUTION_CHECKPOINT_INTERVAL_SECONDS = 5;
 const STATIONARY_CHECKPOINT_INTERVAL_SECONDS = 5 * 60;
+// Operator projections are non-authoritative. Serializing the complete
+// observation at controller frequency steals time from the 50 Hz physical
+// loop, while 10 Hz is sufficient for downstream streaming/interpolation.
+// Durable cuts and terminal frames bypass this throttle.
+const FRAME_PROJECTION_INTERVAL_SECONDS = 0.1;
 
 type HumanoidPersistenceCut = Awaited<
   ReturnType<HumanoidWorld["capturePersistenceState"]>
@@ -79,6 +84,7 @@ export class HumanoidPhysicalExecutionRuntime {
   readonly #signal: AbortSignal | undefined;
   readonly #physicalTrajectories = new Map<string, PhysicalTrajectorySummary>();
   #lastStationaryCheckpointSimulationTime: number;
+  #lastFrameProjectionSimulationTime: number;
 
   constructor(input: {
     runId: string;
@@ -107,6 +113,7 @@ export class HumanoidPhysicalExecutionRuntime {
     this.#signal = input.signal;
     this.#lastStationaryCheckpointSimulationTime =
       input.checkpoint().world.robot.simulatedTime;
+    this.#lastFrameProjectionSimulationTime = Number.NEGATIVE_INFINITY;
   }
 
   assertExecutionOwner(transactionId: string): void {
@@ -131,6 +138,12 @@ export class HumanoidPhysicalExecutionRuntime {
     return entry?.progress.committed_frame_count ?? 0;
   }
 
+  executionStartWorldRevision(transactionId: string): number | undefined {
+    return this.#checkpoint().action_execution_ledger.active[
+      transactionId.trim()
+    ]?.admission.world_revision;
+  }
+
   executionCompletedPlanFrameCount(transactionId: string): number {
     const entry = this.#checkpoint().action_execution_ledger.active[
       transactionId.trim()
@@ -145,6 +158,13 @@ export class HumanoidPhysicalExecutionRuntime {
     return this.#checkpoint().action_execution_ledger.active[
       transactionId.trim()
     ]?.progress.completed_plan_terminals.length ?? 0;
+  }
+
+  executionCheckpointIntervalFrames(): number {
+    return Math.max(1, Math.round(
+      EXECUTION_CHECKPOINT_INTERVAL_SECONDS
+        / this.#checkpoint().world.robot.controller.controlStepSeconds
+    ));
   }
 
   async admit(
@@ -444,12 +464,15 @@ export class HumanoidPhysicalExecutionRuntime {
         throw new Error("Physical execution frame has no durable execution intent");
       }
       this.#recordTrajectoryFrame(entry, frame);
-      const cut = await this.#capturePhysicalCut();
-      const durableAdvance = this.#advanceGoal(cut.world);
-      this.#applyPhysicalCut(cut);
-      checkpoint.goal_progress = durableAdvance?.progress ?? null;
-      checkpoint.checker = durableAdvance?.checker ?? null;
-      await this.#persistExecutionCut(cut);
+      // This is the ordered lightweight path between durable physical cuts.
+      // The world snapshot is already detached and frame-aligned; constructing
+      // a complete MuJoCo/plan checkpoint here made every control tick pay the
+      // cost even though only five-second cuts were written. The paired
+      // persistence sink owns full aligned checkpoints at the configured
+      // stride and at every terminal/replan boundary.
+      checkpoint.world = frame;
+      checkpoint.goal_progress = advanced?.progress ?? null;
+      checkpoint.checker = advanced?.checker ?? null;
     }
     if (this.#signal?.aborted) return;
     await this.#publishFrame(frame, advanced, source);
@@ -470,7 +493,7 @@ export class HumanoidPhysicalExecutionRuntime {
     checkpoint.checker = advanced?.checker ?? null;
     await this.#persistExecutionCut(cut);
     if (this.#signal?.aborted) return;
-    await this.#publishFrame(frame, advanced, "execution");
+    await this.#publishFrame(frame, advanced, "execution", true);
   }
 
   async acknowledgeTerminals(
@@ -519,10 +542,7 @@ export class HumanoidPhysicalExecutionRuntime {
     if (!entry) {
       throw new Error("Physical frame was committed without a durable execution intent");
     }
-    const checkpointIntervalFrames = Math.max(1, Math.round(
-      EXECUTION_CHECKPOINT_INTERVAL_SECONDS
-        / cut.world.robot.controller.controlStepSeconds
-    ));
+    const checkpointIntervalFrames = this.executionCheckpointIntervalFrames();
     if (!physicalExecutionCheckpointDue(
       entry,
       cut,
@@ -548,8 +568,13 @@ export class HumanoidPhysicalExecutionRuntime {
   async #publishFrame(
     frame: HumanoidWorldSnapshot,
     advanced: ReturnType<typeof advanceHumanoidGoal> | null,
-    source: "execution" | "stationary"
+    source: "execution" | "stationary",
+    force = false
   ): Promise<void> {
+    if (!force && frame.robot.simulatedTime
+      - this.#lastFrameProjectionSimulationTime
+        < FRAME_PROJECTION_INTERVAL_SECONDS) return;
+    this.#lastFrameProjectionSimulationTime = frame.robot.simulatedTime;
     try {
       await this.#emitFrame({
         world: frame,
@@ -712,7 +737,7 @@ export class HumanoidPhysicalExecutionRuntime {
     const existing = this.#physicalTrajectories.get(entry.transaction_id)
       ?? entry.progress.physical_trajectory
       ?? createPhysicalTrajectory(frame, false);
-    const advanced = advancePhysicalTrajectory(existing, frame);
+    const advanced = advanceTrustedPhysicalTrajectory(existing, frame);
     this.#physicalTrajectories.set(entry.transaction_id, advanced);
     return advanced;
   }

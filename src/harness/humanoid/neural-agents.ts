@@ -546,6 +546,31 @@ const CERTIFIED_EXECUTION_DISPATCHER_TOOLS = new WeakMap<
   }
 >();
 
+const DIRECT_ACTION_SELECTION_TOOLS = new WeakMap<
+  HumanoidNeuralAgentRuntime,
+  {
+    tool: FunctionTool<unknown, any, unknown>;
+    parent: Agent<unknown, "text">;
+  }
+>();
+
+const DETERMINISTIC_CYCLE_TOOLS = new WeakMap<
+  HumanoidNeuralAgentRuntime,
+  {
+    completion: FunctionTool<unknown, any, unknown>;
+    satisfied: FunctionTool<unknown, any, unknown>;
+    parent: Agent<unknown, "text">;
+  }
+>();
+
+const DIRECT_GOAL_MANAGER_TOOLS = new WeakMap<
+  HumanoidNeuralAgentRuntime,
+  {
+    tool: FunctionTool<unknown, any, unknown>;
+    parent: Agent<unknown, "text">;
+  }
+>();
+
 export function createHumanoidNeuralAgentHierarchy(input: {
   createModel: (agentId: string, provider: ModelProviderConfig) => Model;
   createSession: (agentId: string) => Session;
@@ -733,6 +758,9 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     let continuedChildEpisode: {
       parentInvocationId: string;
       invocationId: ReturnType<typeof stableAgentToolInvocationId>;
+      authorityLeaseId: string;
+      descendingSignalId: string;
+      invocationInputSignalIds: readonly string[];
     } | undefined;
     const invocationMutex = new Mutex();
     const childTool = scopeAgentToolInvocation(
@@ -747,10 +775,46 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       errorFunction: null,
       inputBuilder: async ({ params }) => {
         const invocation = requiredHarnessInvocation(childId);
+        const parentEpisodeId = requiredParentEpisodeId(parentId);
+        const continuation = continuedChildEpisode?.parentInvocationId
+          === parentEpisodeId
+          && continuedChildEpisode.invocationId === invocation.invocationId
+          ? continuedChildEpisode
+          : undefined;
+        if (continuation) {
+          const state = input.runtime.neuralHierarchyState();
+          const retainedLease = state.authority_leases[
+            continuation.authorityLeaseId
+          ];
+          const retainedSignal = state.signals[
+            continuation.descendingSignalId
+          ];
+          if (retainedLease?.status === "active"
+            && retainedLease.invocation_id === invocation.invocationId
+            && retainedLease.parent_invocation_id === invocation.parentInvocationId
+            && retainedSignal?.status === "pending"
+            && retainedSignal.authority_lease_id === retainedLease.lease_id
+            && retainedSignal.invocation_id === invocation.invocationId) {
+            authorityLease = retainedLease;
+            descendingSignal = retainedSignal;
+            invocationInputSignalIds = [...continuation.invocationInputSignalIds];
+            return neuralAgentToolTurnContinuationInput(
+              input.runtime,
+              parentId,
+              childId,
+              invocation.invocationId
+            );
+          }
+          // A process pause or lease deadline may invalidate the in-memory
+          // continuation. Recreate the edge once from durable state below;
+          // never treat an expired lease as current authority.
+          continuedChildEpisode = undefined;
+        }
         await prepareHarnessPhaseForChild(
           input.runtime,
           inputTool.parentKey,
-          inputTool.childKey
+          inputTool.childKey,
+          params.signal_kind
         );
         const activeCommitment = input.runtime.neuralHierarchyState()
           .active_skill_commitment;
@@ -759,7 +823,6 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           && activeCommitment !== null
           && !["completed", "failed", "released"].includes(activeCommitment.state)
           && params.signal_kind !== "skill_commitment";
-        const parentEpisodeId = requiredParentEpisodeId(parentId);
         const suppliedSourceSignals = params.source_signal_ids.map(
           (signalId) => input.runtime.neuralHierarchyState().signals[signalId]
         );
@@ -1242,23 +1305,39 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           }) ?? stableAgentToolInvocationId(childId, details?.toolCall?.callId);
       scopedInvocationId = childInvocationId;
       try {
-        const output = await invoke(
-          context,
-          JSON.stringify(delegation),
-          details
-        );
-        const childOutput = outputObject(output);
-        if (!childOutput) {
-          throw new Error(
-            `${childId} returned a non-neural Agent.asTool result: ${String(output)}`
+        let childOutput: Record<string, JsonValue> | undefined;
+        while (!childOutput) {
+          const output = await invoke(
+            context,
+            JSON.stringify(delegation),
+            details
           );
-        }
-        if (isNeuralAgentTurnContinuationReceipt(childOutput)) {
+          const candidate = outputObject(output);
+          if (!candidate) {
+            throw new Error(
+              `${childId} returned a non-neural Agent.asTool result: ${String(output)}`
+            );
+          }
+          if (!isNeuralAgentTurnContinuationReceipt(candidate)) {
+            childOutput = candidate;
+            break;
+          }
+          if (!authorityLease || !descendingSignal) {
+            throw new Error(
+              `Neural child continuation lost its active control edge: ${childId}`
+            );
+          }
           continuedChildEpisode = {
             parentInvocationId: parentInvocation.invocationId,
-            invocationId: childInvocationId
+            invocationId: childInvocationId,
+            authorityLeaseId: authorityLease.lease_id,
+            descendingSignalId: descendingSignal.signal_id,
+            invocationInputSignalIds: [...invocationInputSignalIds]
           };
-          return JSON.stringify(childOutput);
+          // Agent.asTool has completed one SDK run, but its independent
+          // Session and the Harness edge are still live. Retry the child here
+          // with the explicit continuation input instead of returning the
+          // receipt to its parent and waking the whole hierarchy again.
         }
         continuedChildEpisode = undefined;
         const childSpecificOutput = childOutputSchema.parse(childOutput);
@@ -1561,8 +1640,16 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           // the wrong authority namespace on the next call.
           source_signal_ids: [ascendingSignal.signal_id]
         });
+      } catch (error) {
+        // Continuation state is valid only while this local Agent.asTool loop
+        // still owns the caller. If the replacement SDK turn fails, no future
+        // invocation can legally reuse that edge, so let `finally` close it.
+        continuedChildEpisode = undefined;
+        throw error;
       } finally {
-        if (authorityLease) {
+        const retainedForContinuation = authorityLease !== undefined
+          && continuedChildEpisode?.authorityLeaseId === authorityLease.lease_id;
+        if (authorityLease && !retainedForContinuation) {
           await input.runtime.closeNeuralAuthorityLease({
             leaseId: authorityLease.lease_id,
             closedByNodeId: parentId,
@@ -1966,48 +2053,54 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       ]
     }
   );
+  const actionSelectionTool = asChildTool({
+    parentKey: "executive",
+    childKey: "actionSelection",
+    child: actionSelection,
+    description: "Run one bounded hierarchical action-selection episode.",
+    phases: [
+      "perception",
+      "skill_proposal",
+      "commitment_authorization",
+      "motor_assessment",
+      "motor_planning",
+      "rollout_review",
+      "execution",
+      "feedback",
+      "safety_interrupt",
+      "recovery",
+      "cycle_completion"
+    ]
+  });
+  const cycleCompletionTool = neuralCycleCompletionTool(input.runtime);
+  const satisfiedGoalCompletionTool = neuralSatisfiedGoalCompletionTool(
+    input.runtime
+  );
+  const goalManagerTool = asChildTool({
+    parentKey: "executive",
+    childKey: "goalManager",
+    child: goalManager,
+    description: "Value, select, continue, or retire the current Goal.",
+    phases: ["bootstrapping", "goal_valuation", "cycle_completion"]
+  });
   const executive = register(
     "executive",
     ExecutiveOutputSchema,
     [
-      neuralCycleCompletionTool(input.runtime),
-      neuralSatisfiedGoalCompletionTool(input.runtime),
-      asChildTool({
-        parentKey: "executive",
-        childKey: "goalManager",
-        child: goalManager,
-        description: "Value, select, continue, or retire the current Goal.",
-        phases: ["bootstrapping", "goal_valuation", "cycle_completion"]
-      }),
-      asChildTool({
-        parentKey: "executive",
-        childKey: "actionSelection",
-        child: actionSelection,
-        description: "Run one bounded hierarchical action-selection episode.",
-        phases: [
-          "perception",
-          "skill_proposal",
-          "commitment_authorization",
-          "motor_assessment",
-          "motor_planning",
-          "rollout_review",
-          "execution",
-          "feedback",
-          "safety_interrupt",
-          "recovery",
-          "cycle_completion"
-        ]
-      })
+      cycleCompletionTool,
+      satisfiedGoalCompletionTool,
+      goalManagerTool,
+      actionSelectionTool
     ],
     {
       toolUseBehavior: executiveToolUseBehavior(),
       extraInstructions: [
         "You are the only root. Goal Valuation and Action Selection are children, never peers.",
         "Do not wake lower layers unless an event requires work; never poll all Agents.",
-        "A typed direct child return ends this Executive episode; the Harness scheduler starts the next phase in a fresh event. Never relabel or resubmit a child result.",
+        "A typed Action Selection return ends this Executive episode. A newly selected Goal stays in the same local Executive episode: immediately delegate Action Selection after the Harness enters perception. Never relabel or resubmit a child result.",
         "A supervisory prediction_error carrying causal_interrupt_ids is a Body→Reflex afferent safety interrupt. Delegate Action Selection with prediction_error and no invented source signal so it can acknowledge the exact durable interrupt before Perception and Recovery.",
         "In recovery, preserve the active Goal and delegate the direct failure signal through Action Selection; after physical failure, Action Selection must first close the old commitment and obtain current Perception before Recovery is reachable through Sensorimotor.",
-        "After execution, delegate Action Selection once to resolve its commitment, then again for current Perception when the Harness requests it. A failed execution continues from that fresh belief into Recovery, not directly from stale pre-action state.",
+        "After execution, delegate Action Selection once. That one child episode must resolve the commitment and obtain current Perception before returning; on failure it continues from the fresh belief into Recovery instead of returning to Executive or using stale pre-action state.",
         "After post-execution Sensor Fusion, decide whether to complete from the direct perceptual_belief. The Harness binds the unique current belief and resolves physical transaction ids internally; do not copy UUIDs or self-certify success."
       ]
     }
@@ -2021,6 +2114,19 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       parent: sensorimotorManager
     }
   );
+  DIRECT_ACTION_SELECTION_TOOLS.set(input.runtime, {
+    tool: actionSelectionTool,
+    parent: executive
+  });
+  DETERMINISTIC_CYCLE_TOOLS.set(input.runtime, {
+    completion: cycleCompletionTool,
+    satisfied: satisfiedGoalCompletionTool,
+    parent: executive
+  });
+  DIRECT_GOAL_MANAGER_TOOLS.set(input.runtime, {
+    tool: goalManagerTool,
+    parent: executive
+  });
   return {
     root: executive,
     agents,
@@ -2576,6 +2682,13 @@ function establishSkillCommitmentTool(
         ),
         sourceSignalIds: commitmentSourceSignalIds
       });
+      await runtime.transitionNeuralHarnessPhase({
+        phase: "motor_assessment",
+        enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+        reason: "action_selection_established_local_motor_commitment",
+        goalEpochId: commitment.goal_epoch_id,
+        commitmentId: commitment.commitment_id
+      });
       return JSON.stringify({
         status: "skill_committed",
         commitment,
@@ -2814,6 +2927,17 @@ function transitionSkillCommitmentTool(
         state,
         sourceSignalIds: transitionSourceSignalIds
       });
+      if (state === "completed" || state === "failed") {
+        await runtime.transitionNeuralHarnessPhase({
+          phase: state === "completed" ? "feedback" : "perception",
+          enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+          reason: state === "completed"
+            ? "action_selection_closed_commitment_for_feedback"
+            : "action_selection_failed_commitment_observation_required",
+          goalEpochId: commitment.goal_epoch_id,
+          commitmentId: null
+        });
+      }
       return JSON.stringify({
         status: `skill_${state}`,
         commitment,
@@ -2906,6 +3030,336 @@ function authorizeSkillExecutionTool(
       });
     }
   });
+}
+
+/**
+ * Invoke Goal Valuation directly when the durable state exposes exactly one
+ * legal Executive edge. Goal choice still belongs to the Goal Manager model;
+ * the Harness merely avoids spending a separate root turn on saying which
+ * child must make that choice.
+ */
+export async function orchestrateDirectNeuralGoalValuation(
+  runtime: HumanoidNeuralAgentRuntime,
+  signal?: AbortSignal
+): Promise<boolean> {
+  const phase = runtime.neuralHarnessPhase();
+  if (phase.phase !== "bootstrapping" && phase.phase !== "goal_valuation") {
+    return false;
+  }
+  const pendingEscalation = runtime.pendingNeuralSignals({
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+    kinds: ["escalation"]
+  }).some((candidate) => candidate.direction === "ascending"
+    && isCurrentNeuralSignal(runtime, candidate));
+  if (pendingEscalation) return false;
+  const binding = DIRECT_GOAL_MANAGER_TOOLS.get(runtime);
+  if (!binding) {
+    throw new Error("Direct Goal Manager is not bound to the active hierarchy");
+  }
+  const orchestrationKey = [
+    "direct-goal-valuation-v1",
+    runtime.neuralHierarchyState().epoch_id,
+    phase.goal_epoch_id ?? "no-goal",
+    phase.sequence
+  ].join(":");
+  const executiveInvocationId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    orchestrationKey
+  );
+  const toolCallId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.goalManager,
+    orchestrationKey
+  );
+  return withAgentInvocation(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    async () => {
+      const context = new RunContext();
+      const enabled = binding.tool.isEnabled
+        ? await binding.tool.isEnabled(context, binding.parent)
+        : true;
+      if (!enabled) throw new Error("Goal Manager is disabled during valuation");
+      const rawInput = JSON.stringify({
+        signal_kind: "goal_context",
+        source_signal_ids: [],
+        ttl_revisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+        priority: 100
+      });
+      const output = await binding.tool.invoke(context, rawInput, {
+        toolCall: {
+          type: "function_call",
+          callId: toolCallId,
+          name: binding.tool.name,
+          arguments: rawInput
+        },
+        ...(signal ? { signal } : {})
+      });
+      const parsed = outputObject(output);
+      const result = parsed
+        ? directChildNeuralOutput(GoalValuationOutputSchema, parsed)
+        : undefined;
+      if (!result) {
+        throw new Error("Direct Goal Manager returned no typed valuation result");
+      }
+      return result.signal_kind === "goal_selected";
+    },
+    false,
+    executiveInvocationId
+  );
+}
+
+/**
+ * Commit a cycle only after the physical checker and post-execution belief
+ * have already reduced the transition to a single legal operation. The
+ * Executive still owns Goal valuation and escalation choices; repeating a
+ * deterministic completion receipt through another model response is not a
+ * cognitive decision.
+ */
+export async function orchestrateDeterministicNeuralCycleCompletion(
+  runtime: HumanoidNeuralAgentRuntime,
+  signal?: AbortSignal
+): Promise<string | undefined> {
+  if (runtime.neuralHarnessPhase().phase !== "cycle_completion") {
+    return undefined;
+  }
+  const readiness = runtime.autonomyReadiness();
+  if (readiness !== "complete_cycle"
+    && readiness !== "complete_satisfied_goal") return undefined;
+  const binding = DETERMINISTIC_CYCLE_TOOLS.get(runtime);
+  if (!binding) {
+    throw new Error("Deterministic cycle tools are not bound to the active hierarchy");
+  }
+  const belief = runtime.pendingNeuralSignals({
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+    kinds: ["perceptual_belief"]
+  }).filter((candidate) => (
+    candidate.direction === "ascending"
+      && isCurrentNeuralSignal(runtime, candidate)
+  )).sort((left, right) => right.sequence - left.sequence)[0];
+  if (readiness === "complete_cycle" && !belief) {
+    throw new Error(
+      "Deterministic cycle completion requires current post-execution perception"
+    );
+  }
+  const bindingTool = readiness === "complete_cycle"
+    ? binding.completion
+    : binding.satisfied;
+  const orchestrationKey = [
+    "deterministic-cycle-completion-v1",
+    runtime.neuralHierarchyState().epoch_id,
+    runtime.neuralHarnessPhase().goal_epoch_id ?? "no-goal",
+    runtime.neuralHarnessPhase().sequence,
+    readiness
+  ].join(":");
+  const beliefEpisode = z.string().uuid().safeParse(belief?.parent_episode_id);
+  const executiveInvocationId = beliefEpisode.success
+    ? beliefEpisode.data as ReturnType<typeof stableAgentToolInvocationId>
+    : stableAgentToolInvocationId(
+        HUMANOID_NEURAL_AGENT_IDS.executive,
+        orchestrationKey
+      );
+  const toolCallId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    `${orchestrationKey}:tool`
+  );
+  return withAgentInvocation(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    async () => {
+      const context = new RunContext();
+      const enabled = bindingTool.isEnabled
+        ? await bindingTool.isEnabled(context, binding.parent)
+        : true;
+      if (!enabled) {
+        throw new Error(`Cycle completion is disabled for ${readiness}`);
+      }
+      const rawInput = JSON.stringify(readiness === "complete_cycle"
+        ? {
+            summary: "Completed the active Goal cycle from verified physical execution and current perception.",
+            perceptual_belief_signal_ids: belief ? [belief.signal_id] : []
+          }
+        : {
+            summary: "Completed the active Goal from its already verified physical state."
+          });
+      const output = await bindingTool.invoke(context, rawInput, {
+        toolCall: {
+          type: "function_call",
+          callId: toolCallId,
+          name: bindingTool.name,
+          arguments: rawInput
+        },
+        ...(signal ? { signal } : {})
+      });
+      const parsed = outputObject(output);
+      if (!parsed || (parsed.status !== "cycle_completed"
+        && parsed.status !== "satisfied_goal_completed")) {
+        throw new Error("Deterministic cycle tool returned no terminal receipt");
+      }
+      const sourceSignalIds = z.array(z.string().uuid()).max(64).catch([]).parse(
+        parsed.source_signal_ids
+      );
+      return JSON.stringify({
+        signal_kind: "skill_completed",
+        summary: typeof parsed.summary === "string"
+          ? parsed.summary
+          : String(parsed.status),
+        payload_json: JSON.stringify(parsed),
+        source_signal_ids: sourceSignalIds,
+        confidence: 1
+      });
+    },
+    false,
+    executiveInvocationId
+  );
+}
+
+/**
+ * Advance phases where the Executive has no semantic branch to choose. The
+ * structural root still owns the invocation, while Action Selection remains
+ * a real independent Agent.asTool episode with its own Session and model
+ * decisions. This removes an otherwise redundant Executive model turn that
+ * could only say "delegate Action Selection" and occasionally ended in prose.
+ */
+export async function orchestrateDirectNeuralActionSelection(
+  runtime: HumanoidNeuralAgentRuntime,
+  signal?: AbortSignal
+): Promise<boolean> {
+  const state = runtime.neuralHierarchyState();
+  const phase = state.harness_phase.phase;
+  if (![
+    "perception",
+    "skill_proposal",
+    "commitment_authorization",
+    "motor_assessment",
+    "motor_planning",
+    "rollout_review",
+    "feedback",
+    "safety_interrupt",
+    "recovery"
+  ].includes(phase)) return false;
+  const binding = DIRECT_ACTION_SELECTION_TOOLS.get(runtime);
+  if (!binding) {
+    throw new Error("Direct Action Selection is not bound to the active hierarchy");
+  }
+  const source = directActionSelectionSource(runtime, phase);
+  const signalKind = directActionSelectionSignalKind(runtime, phase, source);
+  const rawInput = JSON.stringify({
+    signal_kind: signalKind,
+    source_signal_ids: source ? [source.signal_id] : [],
+    ttl_revisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+    priority: 100
+  });
+  const orchestrationKey = [
+    "direct-action-selection-v1",
+    state.epoch_id,
+    state.harness_phase.goal_epoch_id ?? "no-goal",
+    state.harness_phase.sequence,
+    state.harness_phase.commitment_id ?? "no-commitment"
+  ].join(":");
+  const sourceParentEpisode = z.string().uuid().safeParse(
+    source?.parent_episode_id
+  );
+  const executiveInvocationId = sourceParentEpisode.success
+    ? sourceParentEpisode.data as ReturnType<typeof stableAgentToolInvocationId>
+    : stableAgentToolInvocationId(
+        HUMANOID_NEURAL_AGENT_IDS.executive,
+        orchestrationKey
+      );
+  const toolCallId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+    orchestrationKey
+  );
+  return withAgentInvocation(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    async () => {
+      const context = new RunContext();
+      const enabled = binding.tool.isEnabled
+        ? await binding.tool.isEnabled(context, binding.parent)
+        : true;
+      if (!enabled) {
+        throw new Error(`Action Selection is disabled in ${phase}`);
+      }
+      const output = await binding.tool.invoke(context, rawInput, {
+        toolCall: {
+          type: "function_call",
+          callId: toolCallId,
+          name: binding.tool.name,
+          arguments: rawInput
+        },
+        ...(signal ? { signal } : {})
+      });
+      const parsed = outputObject(output);
+      if (!parsed || !directChildNeuralOutput(
+        ActionSelectionOutputSchema,
+        parsed
+      )) {
+        throw new Error(
+          "Direct Action Selection returned no typed hierarchical result"
+        );
+      }
+      return true;
+    },
+    false,
+    executiveInvocationId
+  );
+}
+
+function directActionSelectionSource(
+  runtime: HumanoidNeuralAgentRuntime,
+  phase: NeuralHarnessPhase
+): NeuralSignal | undefined {
+  const preferredKinds: readonly NeuralSignalKind[] = phase === "perception"
+    ? [
+        "goal_selected",
+        "skill_completed",
+        "skill_failed",
+        "execution_receipt",
+        "goal_context"
+      ]
+    : phase === "skill_proposal" || phase === "commitment_authorization"
+      ? ["perceptual_belief", "goal_selected", "goal_context"]
+      : phase === "feedback"
+        ? ["skill_completed", "skill_failed", "execution_receipt"]
+        : phase === "safety_interrupt" || phase === "recovery"
+          ? ["prediction_error", "skill_failed", "escalation"]
+          : ["skill_commitment", "rollout_result", "goal_context"];
+  return runtime.pendingNeuralSignals({
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+    kinds: preferredKinds
+  }).filter((candidate) => (
+    candidate.direction === "ascending"
+      && isCurrentNeuralSignal(runtime, candidate)
+  )).sort((left, right) => right.sequence - left.sequence)[0];
+}
+
+function directActionSelectionSignalKind(
+  runtime: HumanoidNeuralAgentRuntime,
+  phase: NeuralHarnessPhase,
+  source: NeuralSignal | undefined
+): NeuralSignalKind {
+  if (phase === "feedback") {
+    const commitment = runtime.neuralHierarchyState().active_skill_commitment;
+    const feedback = commitment
+      ? currentCommitmentLifecycleFeedback(runtime, commitment, {
+          pendingOnly: false
+        })
+      : undefined;
+    if (feedback?.kind === "skill_completed" || feedback?.kind === "skill_failed") {
+      return feedback.kind;
+    }
+    throw new Error("Feedback phase has no authoritative physical completion signal");
+  }
+  if (phase === "safety_interrupt" || phase === "recovery") {
+    return "prediction_error";
+  }
+  if (["motor_assessment", "motor_planning", "rollout_review"].includes(phase)) {
+    return "skill_commitment";
+  }
+  if (phase === "perception"
+    && (source?.kind === "goal_selected"
+      || source?.kind === "skill_completed"
+      || source?.kind === "skill_failed")) {
+    return source.kind;
+  }
+  return "goal_context";
 }
 
 /**
@@ -3476,47 +3930,50 @@ function recoveryAuthorityTool(
             toolExecution: { maxFunctionToolConcurrency: 1 },
             ...(details?.signal ? { signal: details.signal } : {})
           };
-          let finalOutput: unknown;
-          if (!outer.onAgentStream) {
-            const result = await runner.run(
-              recovery,
-              neuralInvocationInput(
-                outer.runtime,
-                HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-                recoveryId,
-                recoveryInvocation.invocationId
-              ),
-              runOptions
-            );
-            finalOutput = result.finalOutput;
-          } else {
-            const stream = await runner.run(
-              recovery,
-              neuralInvocationInput(
-                outer.runtime,
-                HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-                recoveryId,
-                recoveryInvocation.invocationId
-              ),
-              { ...runOptions, stream: true as const }
-            );
-            for await (const event of stream) {
-              await outer.onAgentStream(recoveryId, event);
-            }
-            await stream.completed;
-            finalOutput = stream.finalOutput;
-          }
-          const validatedOutput = parseNeuralAgentFinalOutput(
-            RecoveryOutputSchema,
-            finalOutput
+          let turnInput = neuralInvocationInput(
+            outer.runtime,
+            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+            recoveryId,
+            recoveryInvocation.invocationId
           );
-          if (!validatedOutput.success) {
-            return neuralAgentTurnContinuationReceipt(
+          let validatedOutput: z.infer<typeof RecoveryOutputSchema> | undefined;
+          for (;;) {
+            let finalOutput: unknown;
+            if (!outer.onAgentStream) {
+              const result = await runner.run(recovery, turnInput, runOptions);
+              finalOutput = result.finalOutput;
+            } else {
+              const stream = await runner.run(
+                recovery,
+                turnInput,
+                { ...runOptions, stream: true as const }
+              );
+              for await (const event of stream) {
+                await outer.onAgentStream(recoveryId, event);
+              }
+              await stream.completed;
+              finalOutput = stream.finalOutput;
+            }
+            const candidate = parseNeuralAgentFinalOutput(
+              RecoveryOutputSchema,
+              finalOutput
+            );
+            if (candidate.success) {
+              validatedOutput = candidate.data;
+              break;
+            }
+            // Recovery owns an exclusive bounded decision domain. A prose-only
+            // SDK turn has no authority, so continue this same child episode
+            // locally instead of returning a correction receipt that makes
+            // Sensorimotor rebuild and republish the recovery edge.
+            turnInput = neuralAgentToolTurnContinuationInput(
+              outer.runtime,
+              HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
               recoveryId,
-              humanoidNeuralAgentToolName("recovery")
+              recoveryInvocation.invocationId
             );
           }
-          const parsed = parseNeuralAgentOutput(validatedOutput.data);
+          const parsed = parseNeuralAgentOutput(validatedOutput);
           const recoveryResult = await runtime.publishNeuralSignal({
             kind: parsed.signal_kind,
             pathway: "interoceptive_risk",
@@ -5161,7 +5618,8 @@ function durablePendingChildInvocationId(input: {
 async function prepareHarnessPhaseForChild(
   runtime: HumanoidNeuralAgentRuntime,
   parentKey: HumanoidNeuralAgentKey,
-  childKey: HumanoidNeuralAgentKey
+  childKey: HumanoidNeuralAgentKey,
+  signalKind: NeuralSignalKind
 ): Promise<void> {
   const phase = runtime.neuralHarnessPhase();
   const transition = async (
@@ -5187,10 +5645,20 @@ async function prepareHarnessPhaseForChild(
     return;
   }
   if (childKey === "sensorimotorManager") {
-    if (phase.phase === "recovery") {
+    const directRecoveryDemand = parentKey === "actionSelection"
+      && (signalKind === "prediction_error"
+        || signalKind === "skill_failed"
+        || signalKind === "escalation");
+    if (phase.phase === "recovery" || directRecoveryDemand) {
       // Recovery is a strict Executive -> Action Selection -> Sensorimotor
-      // control episode. Preserve its decision domain until Sensorimotor has
-      // opened and closed the exclusive Recovery child lease.
+      // control episode. A lower-loop failure first closes/releases the old
+      // commitment, then this exact direct signal opens the Recovery decision
+      // domain before Sensorimotor receives it. Preserve that domain until
+      // Sensorimotor has opened and closed the exclusive Recovery child lease.
+      await transition(
+        "recovery",
+        "action_selection_delegated_local_recovery_demand"
+      );
       return;
     }
     const commitment = runtime.neuralHierarchyState().active_skill_commitment;
@@ -7062,13 +7530,7 @@ function goalValuationToolUseBehavior(): ToolUseBehavior {
 function actionSelectionToolUseBehavior(
   runtime: HumanoidNeuralAgentRuntime
 ): ToolUseBehavior {
-  const statuses = new Set([
-    "skill_committed",
-    "skill_executing",
-    "skill_completed",
-    "skill_failed",
-    "skill_released"
-  ]);
+  const statuses = new Set(["skill_executing"]);
   const perceptionToolName = humanoidNeuralAgentToolName("perceptionManager");
   const sensorimotorToolName = humanoidNeuralAgentToolName("sensorimotorManager");
   return (_context, results) => {
@@ -7129,11 +7591,7 @@ function actionSelectionToolUseBehavior(
         isFinalOutput: true,
         isInterrupted: undefined,
         finalOutput: JSON.stringify({
-          signal_kind: status === "skill_completed"
-            ? "skill_completed"
-            : status === "skill_failed"
-              ? "skill_failed"
-              : "skill_commitment",
+          signal_kind: "skill_commitment",
           summary: status,
           payload_json: JSON.stringify(parsed),
           source_signal_ids: sourceSignalIds,
@@ -7392,6 +7850,13 @@ function executiveToolUseBehavior(): ToolUseBehavior {
       if (result.tool.name === goalToolName) {
         const childOutput = NeuralAgentOutputSchema.passthrough().safeParse(parsed);
         if (!childOutput.success) continue;
+        if (childOutput.data.signal_kind === "goal_selected") {
+          // Goal selection and initial action dispatch are one supervisory
+          // event. The Harness has already entered perception, so keep the
+          // Executive Agent loop open and let it invoke Action Selection
+          // directly instead of scheduling a redundant root model turn.
+          continue;
+        }
         const executiveOutput = ExecutiveOutputSchema.safeParse({
           signal_kind: "goal_context",
           summary: childOutput.data.summary,
@@ -7629,6 +8094,19 @@ function neuralAgentTurnContinuationReceipt(
     },
     recovery: "The child SDK turn ended in assistant text without a verified terminal tool receipt. Invoke the same direct-child tool again so its independent Session can continue; do not reinterpret its prose as a neural signal."
   });
+}
+
+function neuralAgentToolTurnContinuationInput(
+  runtime: HumanoidNeuralAgentRuntime,
+  parentNodeId: string,
+  childNodeId: string,
+  invocationId: string
+): string {
+  return [
+    neuralInvocationInput(runtime, parentNodeId, childNodeId, invocationId),
+    "SDK_TURN_CONTINUATION=verified_tool_receipt_required",
+    "Your preceding turn ended in assistant text, so it made no Harness transition. Continue this same invocation and call exactly one currently enabled formal tool now. Do not narrate, promise, or describe the call; emit the tool call itself."
+  ].join("\n");
 }
 
 function isNeuralAgentTurnContinuationReceipt(

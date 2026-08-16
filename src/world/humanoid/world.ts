@@ -1326,7 +1326,7 @@ export class HumanoidWorld {
           }
           if (!step.done) {
             const snapshot = this.snapshot();
-            await options.persistenceSink?.(this.#capturePersistenceState(snapshot));
+            await this.#recordExecutionProgress(options, snapshot);
             if (skillEvents && stored.skillCallIdentity
               && !options.deferSkillProgress) {
               await skillEvents.progress(humanoidSkillStatus({
@@ -1337,7 +1337,9 @@ export class HumanoidWorld {
               }));
             }
             return {
-              ...(frameSink && !options.persistenceSink ? { snapshot } : {}),
+              ...(frameSink && !options.persistenceSink && !options.progressSink
+                ? { snapshot }
+                : {}),
               done: false
             };
           }
@@ -1401,7 +1403,10 @@ export class HumanoidWorld {
             options.retainTerminal ?? false
           );
           if (step.snapshot) {
-            await options.persistenceSink?.(this.#capturePersistenceState());
+            await this.#recordTerminalExecutionProgress(
+              options,
+              finalized.finalSnapshot
+            );
           }
           if (skillEvents && terminalStatus && !options.deferSkillTerminal) {
             await skillEvents.terminal(
@@ -1411,6 +1416,7 @@ export class HumanoidWorld {
           }
           return {
             ...(step.snapshot && frameSink && !options.persistenceSink
+              && !options.progressSink
               ? { snapshot: finalized.finalSnapshot }
               : {}),
             done: true,
@@ -1642,9 +1648,7 @@ export class HumanoidWorld {
           }
           if (!step.done) {
             const snapshot = this.snapshot();
-            await options.persistenceSink?.(
-              this.#capturePersistenceState(snapshot)
-            );
+            await this.#recordExecutionProgress(options, snapshot);
             if (skillEvents && stored.skillCallIdentity
               && !options.deferSkillProgress) {
               await skillEvents.progress(humanoidSkillStatus({
@@ -1655,7 +1659,9 @@ export class HumanoidWorld {
               }));
             }
             return {
-              ...(frameSink && !options.persistenceSink ? { snapshot } : {}),
+              ...(frameSink && !options.persistenceSink && !options.progressSink
+                ? { snapshot }
+                : {}),
               done: false
             };
           }
@@ -1729,7 +1735,10 @@ export class HumanoidWorld {
             options.retainTerminal ?? false
           );
           if (step.snapshot) {
-            await options.persistenceSink?.(this.#capturePersistenceState());
+            await this.#recordTerminalExecutionProgress(
+              options,
+              finalized.finalSnapshot
+            );
           }
           if (skillEvents && terminalStatus && !options.deferSkillTerminal) {
             await skillEvents.terminal(
@@ -1739,6 +1748,7 @@ export class HumanoidWorld {
           }
           return {
             ...(step.snapshot && frameSink && !options.persistenceSink
+              && !options.progressSink
               ? { snapshot: finalized.finalSnapshot }
               : {}),
             done: true,
@@ -2669,9 +2679,7 @@ export class HumanoidWorld {
           }
           if (!step.done) {
             const snapshot = this.snapshot();
-            await options.persistenceSink?.(
-              this.#capturePersistenceState(snapshot)
-            );
+            await this.#recordExecutionProgress(options, snapshot);
             if (skillEvents && stored.skillCallIdentity
               && !options.deferSkillProgress) {
               await skillEvents.progress(humanoidSkillStatus({
@@ -2682,7 +2690,9 @@ export class HumanoidWorld {
               }));
             }
             return {
-              ...(frameSink && !options.persistenceSink ? { snapshot } : {}),
+              ...(frameSink && !options.persistenceSink && !options.progressSink
+                ? { snapshot }
+                : {}),
               done: false
             };
           }
@@ -2800,7 +2810,10 @@ export class HumanoidWorld {
                 waypoints: stored.plan.waypoints.map((point) => ({ ...point })),
                 waypointIndex: stored.progress.waypoint_index
               };
-              await options.persistenceSink?.(this.#capturePersistenceState());
+              await this.#recordTerminalExecutionProgress(
+                options,
+                this.snapshot()
+              );
               if (skillEvents && stored.skillCallIdentity
                 && !options.deferSkillProgress) {
                 await skillEvents.progress(humanoidSkillStatus({
@@ -2812,6 +2825,7 @@ export class HumanoidWorld {
               }
               return {
                 ...(prepared && frameSink && !options.persistenceSink
+                  && !options.progressSink
                   ? { snapshot: this.snapshot() }
                   : {}),
                 done: false
@@ -2896,7 +2910,10 @@ export class HumanoidWorld {
             terminalStatus ? withHumanoidSkillStatus(receipt, terminalStatus) : receipt,
             options.retainTerminal ?? false
           );
-          await options.persistenceSink?.(this.#capturePersistenceState());
+          await this.#recordTerminalExecutionProgress(
+            options,
+            finalized.finalSnapshot
+          );
           if (skillEvents && terminalStatus && !options.deferSkillTerminal) {
             await skillEvents.terminal(
               terminalStatus.state === "succeeded" ? "succeeded" : "failed",
@@ -2905,6 +2922,7 @@ export class HumanoidWorld {
           }
           return {
             ...(step.snapshot && frameSink && !options.persistenceSink
+              && !options.progressSink
               ? { snapshot: finalized.finalSnapshot }
               : {}),
             done: true,
@@ -2976,6 +2994,41 @@ export class HumanoidWorld {
   async advanceStationary(frameSink?: HumanoidFrameSink): Promise<HumanoidWorldSnapshot | null> {
     const tick = await this.#authority.tick(frameSink);
     return tick.snapshot;
+  }
+
+  async #recordExecutionProgress(
+    options: HumanoidExecutionOptions,
+    snapshot: HumanoidWorldSnapshot
+  ): Promise<void> {
+    const stride = options.persistenceFrameStride;
+    if (stride !== undefined
+      && (!Number.isSafeInteger(stride) || stride <= 0)) {
+      throw new Error("Humanoid persistence frame stride must be a positive integer");
+    }
+    const startRevision = options.persistenceStartWorldRevision ?? 0;
+    if (!Number.isSafeInteger(startRevision) || startRevision < 0
+      || startRevision > snapshot.worldRevision) {
+      throw new Error("Humanoid persistence start revision is invalid");
+    }
+    const durableCutDue = options.persistenceSink !== undefined
+      && (stride === undefined
+        || (snapshot.worldRevision - startRevision) % stride === 0);
+    if (durableCutDue) {
+      await options.persistenceSink!(this.#capturePersistenceState(snapshot));
+      return;
+    }
+    await options.progressSink?.(snapshot);
+  }
+
+  async #recordTerminalExecutionProgress(
+    options: HumanoidExecutionOptions,
+    snapshot: HumanoidWorldSnapshot
+  ): Promise<void> {
+    if (options.persistenceSink) {
+      await options.persistenceSink(this.#capturePersistenceState(snapshot));
+      return;
+    }
+    await options.progressSink?.(snapshot);
   }
 
   async #driveAuthorityCommand<Result>(

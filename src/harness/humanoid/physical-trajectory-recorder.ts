@@ -51,8 +51,31 @@ export function advancePhysicalTrajectory(
   persisted: PhysicalTrajectorySummary,
   world: HumanoidWorldSnapshot
 ): PhysicalTrajectorySummary {
-  const summary = PhysicalTrajectorySummarySchema.parse(persisted);
-  const frame = captureFrame(world);
+  return advancePhysicalTrajectoryFrame(
+    PhysicalTrajectorySummarySchema.parse(persisted),
+    world,
+    true
+  );
+}
+
+/**
+ * Controller-frequency variant for a summary already admitted by the runtime.
+ * Durable checkpoints still pass through the full schema; reparsing the same
+ * 64-sample summary twice on every 50 Hz tick adds no new authority.
+ */
+export function advanceTrustedPhysicalTrajectory(
+  persisted: PhysicalTrajectorySummary,
+  world: HumanoidWorldSnapshot
+): PhysicalTrajectorySummary {
+  return advancePhysicalTrajectoryFrame(persisted, world, false);
+}
+
+function advancePhysicalTrajectoryFrame(
+  summary: PhysicalTrajectorySummary,
+  world: HumanoidWorldSnapshot,
+  validate: boolean
+): PhysicalTrajectorySummary {
+  const frame = captureFrame(world, validate);
   const previous = summary.samples.at(-1)!;
   if (frame.frame === summary.end_frame
     && frame.world_revision === summary.end_world_revision) {
@@ -91,7 +114,7 @@ export function advancePhysicalTrajectory(
     ));
   }
 
-  return PhysicalTrajectorySummarySchema.parse({
+  const next = {
     ...summary,
     end_frame: frame.frame,
     end_world_revision: frame.world_revision,
@@ -129,10 +152,14 @@ export function advancePhysicalTrajectory(
       summary.trajectory_sha256,
       frame.frame_sha256
     )
-  });
+  } as PhysicalTrajectorySummary;
+  return validate ? PhysicalTrajectorySummarySchema.parse(next) : next;
 }
 
-function captureFrame(world: HumanoidWorldSnapshot): PhysicalTrajectoryFrame {
+function captureFrame(
+  world: HumanoidWorldSnapshot,
+  validate = true
+): PhysicalTrajectoryFrame {
   const robot = world.robot;
   const identity = {
     frame: world.frame,
@@ -163,10 +190,11 @@ function captureFrame(world: HumanoidWorldSnapshot): PhysicalTrajectoryFrame {
     fallen: robot.fallen,
     controller_execution: controllerExecution(world)
   };
-  return PhysicalTrajectoryFrameSchema.parse({
+  const frame = {
     ...identity,
     frame_sha256: physicalTrajectoryFrameSha256(identity)
-  });
+  } as PhysicalTrajectoryFrame;
+  return validate ? PhysicalTrajectoryFrameSchema.parse(frame) : frame;
 }
 
 function controllerExecution(

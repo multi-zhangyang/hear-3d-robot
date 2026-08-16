@@ -45,7 +45,10 @@ import {
   createHumanoidNeuralAgentHierarchy,
   humanoidNeuralContextProjection,
   humanoidNeuralAgentProfile,
-  orchestrateCertifiedNeuralExecution
+  orchestrateCertifiedNeuralExecution,
+  orchestrateDeterministicNeuralCycleCompletion,
+  orchestrateDirectNeuralActionSelection,
+  orchestrateDirectNeuralGoalValuation
 } from "../harness/humanoid/neural-agents.js";
 import { HUMANOID_NEURAL_AGENT_IDS } from
   "../harness/humanoid/neural-hierarchy-contract.js";
@@ -743,6 +746,30 @@ async function executeHumanoidMission(input: {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
       await input.runtime.reconcileNeuralHarnessPhase();
+      const deterministicCompletion =
+        await orchestrateDeterministicNeuralCycleCompletion(
+          input.runtime,
+          input.signal
+        );
+      if (deterministicCompletion) {
+        const result = await acceptVerifiedTransition(deterministicCompletion);
+        if (result) return result;
+        await input.runtime.store.clearAgentState();
+        serializedState = undefined;
+        executiveTurnContinuation = undefined;
+        await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+        continue;
+      }
+      if (await orchestrateDirectNeuralGoalValuation(
+        input.runtime,
+        input.signal
+      )) {
+        await input.runtime.store.clearAgentState();
+        serializedState = undefined;
+        executiveTurnContinuation = undefined;
+        await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+        continue;
+      }
       if (await orchestrateCertifiedNeuralExecution(
         input.runtime,
         input.signal
@@ -751,6 +778,20 @@ async function executeHumanoidMission(input: {
         // wakes only the non-thinking required-tool Dispatcher. Its direct
         // Sensorimotor feedback then resumes the normal reasoning hierarchy in
         // feedback phase with every Agent Session left in a stable mode.
+        await input.runtime.store.clearAgentState();
+        serializedState = undefined;
+        executiveTurnContinuation = undefined;
+        await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+        continue;
+      }
+      if (await orchestrateDirectNeuralActionSelection(
+        input.runtime,
+        input.signal
+      )) {
+        // The Harness phase fixed the only legal root edge, so Action
+        // Selection ran directly as the Executive-owned Agent tool. Its typed
+        // return already advanced durable authority; no root model response is
+        // needed merely to repeat that delegation.
         await input.runtime.store.clearAgentState();
         serializedState = undefined;
         executiveTurnContinuation = undefined;
