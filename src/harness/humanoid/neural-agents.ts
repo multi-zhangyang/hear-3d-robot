@@ -42,6 +42,8 @@ import {
   HumanoidSkillIdSchema,
   HumanoidSkillInvocationSchema
 } from "../../domain/humanoid-skill.js";
+import { HumanoidSkillPlanProposalSchema } from
+  "../../domain/humanoid-skill-plan.js";
 import {
   agentInvocationMarker,
   currentAgentHarnessInvocation,
@@ -331,6 +333,11 @@ const CompactPerceptualBeliefPayloadSchema = z.object({
   changed_entity_ids: z.array(z.string().trim().min(1).max(160)).max(16).default([]),
   safety_relevant: z.array(z.string().trim().min(1).max(320)).max(4).default([]),
   escalation_reason: z.string().trim().max(1_000).optional()
+}).strict();
+
+const PremotorMotorProgramSchema = z.object({
+  protocol: z.literal("premotor_motor_program_v1"),
+  skill_plan: HumanoidSkillPlanProposalSchema
 }).strict();
 
 const SensorimotorOutputSchema = NeuralAgentOutputSchema.extend({
@@ -874,6 +881,15 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           && inputTool.childKey === "sensorimotorManager"
           ? currentSkillProposalAdmissionCorrection(input.runtime)
           : undefined;
+        const delegatedMotorProgram: JsonValue | undefined
+          = inputTool.parentKey === "premotor"
+          && inputTool.childKey === "motorIntent"
+          ? JsonValueSchema.parse(
+              PremotorMotorProgramSchema.parse(
+                (params as { motor_program?: unknown }).motor_program
+              )
+            )
+          : undefined;
         const forwardedParentInputKinds: readonly NeuralSignalKind[]
           = inputTool.parentKey === "sensorimotorManager"
             && inputTool.childKey === "premotor"
@@ -977,6 +993,9 @@ export function createHumanoidNeuralAgentHierarchy(input: {
               })),
               ...(proposalCorrection
                 ? { direct_parent_correction: proposalCorrection.payload }
+                : {}),
+              ...(delegatedMotorProgram
+                ? { motor_program: delegatedMotorProgram }
                 : {}),
               ...(inputTool.parentKey === "executive"
                 && inputTool.childKey === "actionSelection"
@@ -1966,7 +1985,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     {
       toolUseBehavior: planningReceiptToolUseBehavior(input.runtime),
       extraInstructions: [
-        "Complete the existing embodied Skill lifecycle in this one SDK episode: when planning_tool_state requires submit_humanoid_skill_plan, submit the committed short Skill DAG; when it requires begin_humanoid_skill, copy one ready_skill_binding verbatim; only then call the enabled semantic planning tool with the real bound skill_transaction_id.",
+        "Compile the exact Premotor-authored motor_program in your direct descending signal. When planning_tool_state requires submit_humanoid_skill_plan, copy motor_program.skill_plan verbatim; the Harness rejects any changed objective, strategy, node, dependency, Skill, or parameter. You do not redesign the Skill DAG.",
+        "Complete the remaining embodied Skill lifecycle in this one SDK episode: when planning_tool_state requires begin_humanoid_skill, copy one ready_skill_binding verbatim; only then call the enabled semantic planning tool with the real bound skill_transaction_id.",
         "submit_humanoid_skill_plan and begin_humanoid_skill are lifecycle transitions, not rollout results. Continue after each accepted transition and inspect the next planning_tool_state exposed by the Harness.",
         "Compile object-relative preparation with object-relative Skills. approach(object_id=...) is the navigation Skill that moves the base to a manipulation stance chosen from live reachable_base_placements; navigate_to_zone moves only the robot root into a semantic zone and cannot prepare an uncarried object for grasping or placement.",
         "For an object_placed termination contract, preserve one causal object chain in the Skill DAG: an uncarried object needs an object-targeted approach/reach/grasp/lift path before carry_to_zone/place. You choose the hand, interaction point, standoff, and exact bounded nodes from current geometry; never substitute the destination zone for the source object in the first ready node.",
@@ -1985,6 +2005,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       childKey: "motorIntent",
       child: motorIntent,
       description: "Compile one bounded committed skill into an existing planning call.",
+      requiredSignalKind: "skill_commitment",
       phases: ["motor_planning"],
       requireCommitment: true
     })],
@@ -1995,7 +2016,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       ),
       extraInstructions: [
         "Run only for an Action Selection-authorized commitment.",
-        "Compose one short Skill DAG, then delegate one bounded motor intent.",
+        "Compose one short Skill DAG that begins with the exact committed bounded Skill and preserves its invocation parameters. Call Motor Intent with motor_program={protocol:'premotor_motor_program_v1', skill_plan:{objective, strategies, selected_strategy_id}}. This structured handoff is your semantic output; reasoning text is not transferred.",
+        "Keep the selected strategy locally executable. Dependencies may express real near-term prerequisites, but never replace the committed first ready node with another Skill or expand into a long-horizon mission plan.",
         "The Motor Intent tool's typed rollout_result or escalation directly completes this episode; do not resubmit or relabel it."
       ]
     }
@@ -2866,6 +2888,42 @@ function motorIntentPlanningTools(
     { availability: "stable" }
   ).map((planningTool) => {
     if (planningTool.type !== "function") return planningTool;
+    if (planningTool.name === "submit_humanoid_skill_plan") {
+      const invoke = planningTool.invoke;
+      planningTool.invoke = async (context, rawInput, details) => {
+        const expected = currentPremotorMotorProgram(runtime);
+        let submittedInput: unknown;
+        try {
+          submittedInput = JSON.parse(rawInput);
+        } catch {
+          return invoke(context, rawInput, details);
+        }
+        const submitted = HumanoidSkillPlanProposalSchema.safeParse(
+          submittedInput
+        );
+        if (!submitted.success
+          || modelPayloadSha256(submitted.data)
+            !== modelPayloadSha256(expected.skill_plan)) {
+          return JSON.stringify({
+            accepted: false,
+            code: "premotor_motor_program_mismatch",
+            tool: planningTool.name,
+            required_protocol: expected.protocol,
+            required_skill_plan_sha256: modelPayloadSha256(expected.skill_plan),
+            automatic_actuation: false,
+            next_response_contract: {
+              mode: "corrected_tool_call_only",
+              tool: planningTool.name,
+              copy_directed_motor_program_verbatim: true,
+              narration_allowed: false
+            },
+            recovery: "Call submit_humanoid_skill_plan once with the exact motor_program.skill_plan from the direct Premotor signal. Motor Intent compiles that program and cannot rewrite the Premotor strategy."
+          });
+        }
+        return invoke(context, rawInput, details);
+      };
+      return planningTool;
+    }
     // Skill-plan registration and phase binding are control-state transitions,
     // not physical intents. Let the SDK Agent loop consume their receipts and
     // continue until the runtime exposes one genuinely enabled planner.
@@ -6520,11 +6578,24 @@ function canonicalDirectDelegationSourceSignalIds(input: {
   const exactKind = input.currentParentSignals.filter(
     (signal) => signal.kind === input.signalKind
   );
-  if (exactKind.length === 1) return [exactKind[0]!.signal_id];
+  const semanticExactKind = exactKind.filter(
+    (signal) => !isStructuralNeuralDelegationSignal(signal)
+  );
+  const canonicalExactKind = semanticExactKind.length > 0
+    ? semanticExactKind
+    : exactKind;
+  if (canonicalExactKind.length === 1) {
+    return [canonicalExactKind[0]!.signal_id];
+  }
   if (exactKind.length === 0 && input.currentParentSignals.length <= 1) {
     return input.currentParentSignals.map((signal) => signal.signal_id);
   }
   return requested;
+}
+
+function isStructuralNeuralDelegationSignal(signal: NeuralSignal): boolean {
+  return jsonRecord(jsonRecord(signal.payload)?.control)?.protocol
+    === "structural_neural_delegation_v1";
 }
 
 function currentManagerChildSignals(
@@ -6892,9 +6963,13 @@ function neuralDelegationSchema(
     NeuralSignalKind,
     ...NeuralSignalKind[]
   ];
-  return z.object({
+  const carriesPremotorProgram = parentKey === "premotor"
+    && childKey === "motorIntent";
+  const common = {
     signal_kind: z.enum(signalKinds).describe(
-      "The allowed typed signal on this fixed structural parent-child edge. It does not authorize choosing a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters."
+      carriesPremotorProgram
+        ? "The committed typed signal on the fixed Premotor-to-Motor-Intent edge. Premotor owns the semantic Skill DAG; Motor Intent owns only compilation and deterministic planner selection."
+        : "The allowed typed signal on this fixed structural parent-child edge. It does not authorize choosing a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters."
     ),
     source_signal_ids: z.array(z.string().uuid()).max(64).default([]).describe([
       "Usually omit this field. The Harness binds a unique current causal source on this fixed edge. Supply ids only when the invocation exposes multiple genuinely admissible semantic candidates; consumed, expired, sibling-owned, foreign-parent, and earlier-episode ids are rejected.",
@@ -6909,7 +6984,15 @@ function neuralDelegationSchema(
     ttl_revisions: z.number().int().min(1).max(1_000_000)
       .default(MODEL_EPISODE_SIGNAL_TTL_REVISIONS),
     priority: z.number().int().min(0).max(100).default(50)
-  }).strict();
+  };
+  return carriesPremotorProgram
+    ? z.object({
+        ...common,
+        motor_program: PremotorMotorProgramSchema.describe(
+          "Premotor-owned semantic Skill DAG. Motor Intent must compile it verbatim and cannot infer it from the parent transcript."
+        )
+      }).strict()
+    : z.object(common).strict();
 }
 
 export function humanoidNeuralAgentProfile(
@@ -7946,6 +8029,46 @@ function currentMotorIntentPlanningToolState(
     HUMANOID_NEURAL_AGENT_IDS.motorIntent
   ));
   return anchor?.planning_tool_state ?? null;
+}
+
+function currentPremotorMotorProgram(
+  runtime: HumanoidNeuralAgentRuntime
+): z.infer<typeof PremotorMotorProgramSchema> {
+  const invocation = requiredHarnessInvocation(
+    HUMANOID_NEURAL_AGENT_IDS.motorIntent
+  );
+  const state = runtime.neuralHierarchyState();
+  const candidates = runtime.pendingNeuralSignals({
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+    invocationId: invocation.invocationId
+  }).flatMap((signal) => {
+    if (signal.direction !== "descending"
+      || signal.source_node_id !== HUMANOID_NEURAL_AGENT_IDS.premotor
+      || signal.authority_lease_id === null) return [];
+    const lease = state.authority_leases[signal.authority_lease_id];
+    const program = PremotorMotorProgramSchema.safeParse(
+      jsonRecord(signal.payload)?.motor_program
+    );
+    return lease?.status === "active" && program.success
+      ? [{ signal, lease, program: program.data }]
+      : [];
+  }).sort((left, right) => (
+    right.lease.issued_world_revision - left.lease.issued_world_revision
+      || right.signal.sequence - left.signal.sequence
+  ));
+  const newest = candidates[0];
+  if (!newest) {
+    throw new Error("Motor Intent has no active Premotor motor_program authority");
+  }
+  const sameAuthority = candidates.filter(
+    (candidate) => candidate.lease.lease_id === newest.lease.lease_id
+  );
+  if (sameAuthority.length !== 1) {
+    throw new Error(
+      `Motor Intent requires one Premotor motor_program on its current authority edge; found ${sameAuthority.length}`
+    );
+  }
+  return newest.program;
 }
 
 function motorIntentRecoveryPlanningAvailable(
