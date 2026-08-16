@@ -102,6 +102,8 @@ import {
 import { HumanoidWorld } from "../world/humanoid/world.js";
 import {
   findKnownHumanoidControllerSource,
+  loadArchivedHumanoidControllerSource,
+  persistHumanoidControllerSourceArchive,
   type HumanoidControllerSource
 } from "../world/humanoid/controller-module.js";
 import { drawSeed } from "../world/world-generator.js";
@@ -146,12 +148,18 @@ export function resolveHumanoidControllerSourceForRun(
 
 async function recoverHumanoidControllerSourceForRun(
   persistedSourceSha256: string | undefined,
-  configuredSource: HumanoidControllerSource | undefined
+  configuredSource: HumanoidControllerSource | undefined,
+  runDirectory: string
 ): Promise<HumanoidControllerSource | undefined> {
   if (persistedSourceSha256 === undefined) return undefined;
   if (configuredSource?.sourceSha256 === persistedSourceSha256) {
     return configuredSource;
   }
+  const archivedSource = await loadArchivedHumanoidControllerSource(
+    runDirectory,
+    persistedSourceSha256
+  );
+  if (archivedSource) return archivedSource;
   const knownSource = await findKnownHumanoidControllerSource(
     persistedSourceSha256
   );
@@ -194,6 +202,12 @@ export async function startHumanoidMission(input: {
       ? { controllerSourceSha256: input.controllerSource.sourceSha256 }
       : {})
   }, input.mutationFence ? { mutationFence: input.mutationFence } : {});
+  if (input.controllerSource) {
+    await persistHumanoidControllerSourceArchive(
+      store.runDir,
+      input.controllerSource
+    );
+  }
   const scenarioChunks = await store.readScenarioChunkDeltaState();
   const world = await HumanoidWorld.create(scenario, undefined, {
     scenarioChunks,
@@ -271,7 +285,8 @@ export async function resumeHumanoidMission(input: {
   }
   const controllerSource = await recoverHumanoidControllerSourceForRun(
     store.definition.controller_source_sha256,
-    input.controllerSource
+    input.controllerSource,
+    store.runDir
   );
   const checkpoint = await store.readHumanoidCheckpoint();
   if (checkpoint.status === "succeeded") throw new Error("A succeeded run cannot be resumed");

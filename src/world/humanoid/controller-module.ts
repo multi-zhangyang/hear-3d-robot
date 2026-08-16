@@ -1,6 +1,14 @@
-import { createHash } from "node:crypto";
-import { realpath, readFile } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  unlink,
+  writeFile
+} from "node:fs/promises";
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -27,6 +35,10 @@ const BUNDLED_WORKYARD_CONTROLLER_SOURCE =
 const HUMANOID_CONTROLLER_MODULE_FACTORY =
   "createHumanoidWholeBodyController";
 const HUMANOID_CONTROLLER_MODULE_ASSETS = "humanoidControllerAssets";
+const CONTROLLER_SOURCE_ARCHIVE_DIRECTORY = "controller-source";
+const CONTROLLER_SOURCE_ARCHIVE_PROTOCOL =
+  "hear-humanoid-controller-source-archive-v1";
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
 export interface HumanoidControllerModuleAsset {
   readonly id: string;
@@ -43,6 +55,32 @@ export interface HumanoidControllerModuleContext {
 export interface HumanoidControllerSource {
   readonly sourceSha256: string;
   readonly controllerFactory: HumanoidWholeBodyControllerFactory;
+  readonly archive?: HumanoidControllerSourceArchive;
+}
+
+interface HumanoidControllerSourceArchive {
+  readonly entryBytes: Uint8Array;
+  readonly entryFileName: string;
+  readonly entryIdentitySha256: string;
+  readonly runtimeDirectory: string;
+  readonly assets: readonly LoadedHumanoidControllerModuleAsset[];
+}
+
+interface PersistedHumanoidControllerSourceArchive {
+  readonly protocol: typeof CONTROLLER_SOURCE_ARCHIVE_PROTOCOL;
+  readonly source_sha256: string;
+  readonly entry_file: string;
+  readonly entry_file_name: string;
+  readonly entry_sha256: string;
+  readonly entry_identity_sha256: string;
+  readonly runtime_directory: string;
+  readonly assets: readonly {
+    id: string;
+    file: string;
+    sha256: string;
+    bytes: number;
+    source_identity: boolean;
+  }[];
 }
 
 export type HumanoidControllerModuleFactory = (
@@ -100,42 +138,58 @@ export async function findKnownHumanoidControllerSource(
 async function loadBundledYahmpControllerSource(
   environment: NodeJS.ProcessEnv
 ): Promise<HumanoidControllerSource> {
-  const namespace: unknown = await import(
-    "../../controllers/yahmp-module.js"
+  const entryPath = await resolveControllerEntry(
+    "hear/controllers/yahmp",
+    process.cwd()
   );
+  const entryBytes = await readFile(entryPath);
+  const namespace: unknown = await import(pathToFileURL(entryPath).href);
   const assets = await loadControllerAssets(
     namespace,
-    fileURLToPath(import.meta.url),
+    entryPath,
     environment
   );
+  const entryIdentitySha256 = sha256(BUNDLED_YAHMP_CONTROLLER_SOURCE);
   return createControllerSource(
     namespace,
-    controllerSourceSha256(
-      sha256(BUNDLED_YAHMP_CONTROLLER_SOURCE),
-      assets
-    ),
-    assets
+    controllerSourceSha256(entryIdentitySha256, assets),
+    assets,
+    controllerSourceArchive({
+      entryPath,
+      entryBytes,
+      entryIdentitySha256,
+      assets,
+      baseDirectory: process.cwd()
+    })
   );
 }
 
 async function loadBundledWorkyardControllerSource(
   environment: NodeJS.ProcessEnv
 ): Promise<HumanoidControllerSource> {
-  const namespace: unknown = await import(
-    "../../controllers/workyard-contact-module.js"
+  const entryPath = await resolveControllerEntry(
+    "hear/controllers/workyard-contact",
+    process.cwd()
   );
+  const entryBytes = await readFile(entryPath);
+  const namespace: unknown = await import(pathToFileURL(entryPath).href);
   const assets = await loadControllerAssets(
     namespace,
-    fileURLToPath(import.meta.url),
+    entryPath,
     environment
   );
+  const entryIdentitySha256 = sha256(BUNDLED_WORKYARD_CONTROLLER_SOURCE);
   return createControllerSource(
     namespace,
-    controllerSourceSha256(
-      sha256(BUNDLED_WORKYARD_CONTROLLER_SOURCE),
-      assets
-    ),
-    assets
+    controllerSourceSha256(entryIdentitySha256, assets),
+    assets,
+    controllerSourceArchive({
+      entryPath,
+      entryBytes,
+      entryIdentitySha256,
+      assets,
+      baseDirectory: process.cwd()
+    })
   );
 }
 
@@ -153,13 +207,155 @@ export async function loadHumanoidControllerSource(
   const namespace: unknown = await import(moduleUrl.href);
   const assets = await loadControllerAssets(namespace, entryPath);
   const sourceSha256 = controllerSourceSha256(entrySha256, assets);
-  return createControllerSource(namespace, sourceSha256, assets);
+  return createControllerSource(
+    namespace,
+    sourceSha256,
+    assets,
+    controllerSourceArchive({
+      entryPath,
+      entryBytes,
+      entryIdentitySha256: entrySha256,
+      assets,
+      baseDirectory
+    })
+  );
+}
+
+export async function persistHumanoidControllerSourceArchive(
+  runDirectory: string,
+  source: HumanoidControllerSource
+): Promise<void> {
+  const archive = source.archive;
+  if (!archive) return;
+  const target = resolve(runDirectory, CONTROLLER_SOURCE_ARCHIVE_DIRECTORY);
+  const staging = resolve(
+    runDirectory,
+    `.${CONTROLLER_SOURCE_ARCHIVE_DIRECTORY}-${randomUUID()}`
+  );
+  const entryFile = "entry.bin";
+  const persistedAssets = archive.assets.map((asset, index) => ({
+    id: asset.id,
+    file: `asset-${index}-${asset.id}.bin`,
+    sha256: asset.sha256,
+    bytes: asset.bytes.byteLength,
+    source_identity: asset.sourceIdentity
+  }));
+  const manifest: PersistedHumanoidControllerSourceArchive = {
+    protocol: CONTROLLER_SOURCE_ARCHIVE_PROTOCOL,
+    source_sha256: source.sourceSha256,
+    entry_file: entryFile,
+    entry_file_name: archive.entryFileName,
+    entry_sha256: sha256(archive.entryBytes),
+    entry_identity_sha256: archive.entryIdentitySha256,
+    runtime_directory: archive.runtimeDirectory,
+    assets: persistedAssets
+  };
+  try {
+    await mkdir(staging, { recursive: false });
+    await Promise.all([
+      writeFile(resolve(staging, entryFile), archive.entryBytes),
+      ...persistedAssets.map((persisted, index) => writeFile(
+        resolve(staging, persisted.file),
+        archive.assets[index]!.bytes
+      ))
+    ]);
+    // The manifest is the archive commit record. Write it only after every
+    // content-addressed byte payload has reached the staging directory.
+    await writeFile(
+      resolve(staging, "manifest.json"),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      "utf8"
+    );
+    await rename(staging, target);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+}
+
+export async function loadArchivedHumanoidControllerSource(
+  runDirectory: string,
+  expectedSourceSha256: string
+): Promise<HumanoidControllerSource | undefined> {
+  const archiveDirectory = resolve(
+    runDirectory,
+    CONTROLLER_SOURCE_ARCHIVE_DIRECTORY
+  );
+  let rawManifest: string;
+  try {
+    rawManifest = await readFile(resolve(archiveDirectory, "manifest.json"), "utf8");
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  const manifest = persistedControllerSourceArchive(JSON.parse(rawManifest));
+  if (manifest.source_sha256 !== expectedSourceSha256) {
+    throw new Error("Humanoid controller archive does not match the Run identity");
+  }
+  const entryBytes = await readArchivedBytes(
+    archiveDirectory,
+    manifest.entry_file,
+    manifest.entry_sha256
+  );
+  const assets = await Promise.all(manifest.assets.map(async (asset) => {
+    const bytes = await readArchivedBytes(
+      archiveDirectory,
+      asset.file,
+      asset.sha256
+    );
+    if (bytes.byteLength !== asset.bytes) {
+      throw new Error(`Archived humanoid controller asset has wrong size: ${asset.id}`);
+    }
+    return Object.freeze({
+      id: asset.id,
+      sha256: asset.sha256,
+      bytes,
+      sourceIdentity: asset.source_identity
+    });
+  }));
+  const reconstructedSourceSha256 = controllerSourceSha256(
+    manifest.entry_identity_sha256,
+    assets
+  );
+  if (reconstructedSourceSha256 !== expectedSourceSha256) {
+    throw new Error("Humanoid controller archive failed source identity reconstruction");
+  }
+  const runtimeDirectory = safeRuntimeDirectory(
+    process.cwd(),
+    manifest.runtime_directory
+  );
+  const materializedEntry = resolve(
+    runtimeDirectory,
+    `.hear-${expectedSourceSha256}-${randomUUID()}-${manifest.entry_file_name}`
+  );
+  await writeFile(materializedEntry, entryBytes, { flag: "wx" });
+  try {
+    const moduleUrl = pathToFileURL(materializedEntry);
+    moduleUrl.searchParams.set("hear_controller_sha256", expectedSourceSha256);
+    const namespace: unknown = await import(moduleUrl.href);
+    return createControllerSource(
+      namespace,
+      expectedSourceSha256,
+      assets,
+      controllerSourceArchive({
+        entryPath: materializedEntry,
+        entryBytes,
+        entryIdentitySha256: manifest.entry_identity_sha256,
+        assets,
+        baseDirectory: process.cwd(),
+        entryFileName: manifest.entry_file_name,
+        runtimeDirectory: manifest.runtime_directory
+      })
+    );
+  } finally {
+    await unlink(materializedEntry).catch(() => undefined);
+  }
 }
 
 function createControllerSource(
   namespace: unknown,
   sourceSha256: string,
-  assets: readonly LoadedHumanoidControllerModuleAsset[]
+  assets: readonly LoadedHumanoidControllerModuleAsset[],
+  archive?: HumanoidControllerSourceArchive
 ): HumanoidControllerSource {
   const moduleFactory = controllerModuleFactory(namespace);
   const instances = new WeakSet<object>();
@@ -183,7 +379,39 @@ function createControllerSource(
     instances.add(controller);
     return controller;
   };
-  return Object.freeze({ sourceSha256, controllerFactory });
+  return Object.freeze({
+    sourceSha256,
+    controllerFactory,
+    ...(archive ? { archive } : {})
+  });
+}
+
+function controllerSourceArchive(input: {
+  entryPath: string;
+  entryBytes: Uint8Array;
+  entryIdentitySha256: string;
+  assets: readonly LoadedHumanoidControllerModuleAsset[];
+  baseDirectory: string;
+  entryFileName?: string;
+  runtimeDirectory?: string;
+}): HumanoidControllerSourceArchive | undefined {
+  const runtimeDirectory = input.runtimeDirectory ?? relative(
+    resolve(input.baseDirectory),
+    dirname(input.entryPath)
+  );
+  if (!safeRelativePath(runtimeDirectory)) return undefined;
+  return Object.freeze({
+    entryBytes: input.entryBytes.slice(),
+    entryFileName: input.entryFileName ?? basename(input.entryPath),
+    entryIdentitySha256: input.entryIdentitySha256,
+    runtimeDirectory,
+    assets: Object.freeze(input.assets.map((asset) => Object.freeze({
+      id: asset.id,
+      sha256: asset.sha256,
+      bytes: asset.bytes.slice(),
+      sourceIdentity: asset.sourceIdentity
+    })))
+  });
 }
 
 async function loadControllerAssets(
@@ -268,6 +496,105 @@ function controllerSourceSha256(
       bytes: bytes.byteLength
     }))
   }));
+}
+
+function persistedControllerSourceArchive(
+  value: unknown
+): PersistedHumanoidControllerSourceArchive {
+  if (!isRecord(value)
+    || value.protocol !== CONTROLLER_SOURCE_ARCHIVE_PROTOCOL
+    || !isSha256(value.source_sha256)
+    || !isArchiveFileName(value.entry_file)
+    || !isControllerEntryFileName(value.entry_file_name)
+    || !isSha256(value.entry_sha256)
+    || !isSha256(value.entry_identity_sha256)
+    || typeof value.runtime_directory !== "string"
+    || !safeRelativePath(value.runtime_directory)
+    || !Array.isArray(value.assets)) {
+    throw new Error("Humanoid controller source archive manifest is invalid");
+  }
+  const assets = value.assets.map((asset, index) => {
+    if (!isRecord(asset)
+      || !isNonEmptyString(asset.id)
+      || !/^[a-z0-9][a-z0-9._-]*$/.test(asset.id)
+      || !isArchiveFileName(asset.file)
+      || !isSha256(asset.sha256)
+      || typeof asset.bytes !== "number"
+      || !Number.isSafeInteger(asset.bytes)
+      || asset.bytes < 0
+      || typeof asset.source_identity !== "boolean") {
+      throw new Error(`Humanoid controller archive asset ${index} is invalid`);
+    }
+    return {
+      id: asset.id,
+      file: asset.file,
+      sha256: asset.sha256,
+      bytes: asset.bytes,
+      source_identity: asset.source_identity
+    };
+  });
+  if (new Set(assets.map(({ id }) => id)).size !== assets.length) {
+    throw new Error("Humanoid controller archive asset identifiers are not unique");
+  }
+  return {
+    protocol: CONTROLLER_SOURCE_ARCHIVE_PROTOCOL,
+    source_sha256: value.source_sha256,
+    entry_file: value.entry_file,
+    entry_file_name: value.entry_file_name,
+    entry_sha256: value.entry_sha256,
+    entry_identity_sha256: value.entry_identity_sha256,
+    runtime_directory: value.runtime_directory,
+    assets
+  };
+}
+
+async function readArchivedBytes(
+  archiveDirectory: string,
+  fileName: string,
+  expectedSha256: string
+): Promise<Uint8Array> {
+  if (!isArchiveFileName(fileName)) {
+    throw new Error("Humanoid controller archive contains an unsafe file name");
+  }
+  const bytes = await readFile(resolve(archiveDirectory, fileName));
+  if (sha256(bytes) !== expectedSha256) {
+    throw new Error(`Humanoid controller archive hash mismatch: ${fileName}`);
+  }
+  return bytes;
+}
+
+function safeRuntimeDirectory(baseDirectory: string, path: string): string {
+  if (!safeRelativePath(path)) {
+    throw new Error("Humanoid controller archive runtime directory is unsafe");
+  }
+  const root = resolve(baseDirectory);
+  const directory = resolve(root, path);
+  const fromRoot = relative(root, directory);
+  if (!safeRelativePath(fromRoot)) {
+    throw new Error("Humanoid controller archive escapes the runtime root");
+  }
+  return directory;
+}
+
+function safeRelativePath(path: string): boolean {
+  return !isAbsolute(path)
+    && !path.includes("\0")
+    && !path.split(/[\\/]+/u).includes("..");
+}
+
+function isArchiveFileName(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && basename(value) === value
+    && !value.includes("\0");
+}
+
+function isControllerEntryFileName(value: unknown): value is string {
+  return isArchiveFileName(value) && /\.(?:cjs|mjs|js)$/u.test(value);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && SHA256_PATTERN.test(value);
 }
 
 function sha256(value: string | Uint8Array): string {
