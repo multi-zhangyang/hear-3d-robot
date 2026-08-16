@@ -648,7 +648,7 @@ export function createHumanoidAgentHierarchy(input: {
           HUMANOID_AGENT_IDS.goalManager,
           goalManager.asTool({
         toolName: goalManagerContract.toolName,
-        toolDescription: "让独立目标管理智能体基于当前物理证据提交 2–3 个候选并显式选择下一 Goal，或证据化退役当前不可达 Goal。",
+        toolDescription: "让独立目标管理智能体基于当前物理证据提交 1–3 个真实候选并显式选择下一 Goal，或证据化退役当前不可达 Goal；没有真实替代方向时允许只提交完整 mission Goal。",
         customOutputExtractor: ({ finalOutput }) => serializeAgentToolOutput(finalOutput),
         parameters: SpecialistDelegationSchema,
         inputBuilder: () => goalManagerInvocationInput(

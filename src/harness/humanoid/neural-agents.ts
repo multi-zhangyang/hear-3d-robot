@@ -1182,7 +1182,12 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       const childInvocationId = continuedChildEpisode?.parentInvocationId
         === parentInvocation.invocationId
         ? continuedChildEpisode.invocationId
-        : stableAgentToolInvocationId(childId, details?.toolCall?.callId);
+        : durablePendingChildInvocationId({
+            runtime: input.runtime,
+            parentNodeId: parentId,
+            childNodeId: childId,
+            parentInvocationId: parentInvocation.invocationId
+          }) ?? stableAgentToolInvocationId(childId, details?.toolCall?.callId);
       scopedInvocationId = childInvocationId;
       try {
         const output = await invoke(context, rawInput, details);
@@ -1530,7 +1535,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       toolUseBehavior: goalValuationToolUseBehavior(),
       extraInstructions: [
         "Use the existing Goal DAG tools for every formal Goal mutation.",
-        "When no Goal is active, use the current world-bounded autonomy frontier and outcome history to submit 2–3 distinct observable Goal candidates, then use a separate model response to select exactly one candidate sequence. Do not wait for an operator to choose.",
+        "When no Goal is active, use the current world-bounded autonomy frontier and outcome history to submit 1–3 distinct observable Goal candidates, then use a separate model response to select exactly one candidate sequence. An exact actionable mission Goal may be the only candidate when no physically grounded alternative exists; never invent filler Goals. Do not wait for an operator to choose.",
         "In continuous mode, continuous_drive_state.drive_phase other than open_ended means the exact mission_goal remains the required long-horizon Goal; include it unchanged in the candidate slate and select it. Route discovery and local waypoints belong to bounded navigation Skills, never replacement Goals. Only after drive_phase=open_ended may novelty and useful interaction outrank repeating the bootstrap mission.",
         "A Goal is a durable desired physical state, not one motor step. Keep the exact mission Goal active across perception, navigation, manipulation, replanning, and recovery; do not replace it with nearby exploration waypoints merely because a frontier has higher information gain.",
         "In mission mode, value candidates by causal progress toward the mission Goal. In either mode, Goal valuation chooses only observable predicates; it never chooses a Skill, hand, interaction point, route, posture, or controller command.",
@@ -4675,6 +4680,48 @@ function requiredParentEpisodeId(expectedParentAgentId: string): string {
     );
   }
   return invocation.parentInvocationId;
+}
+
+/**
+ * Re-enters an unfinished structural child episode after process or transport
+ * recovery. A child publishes its descending inputs before its model runs and
+ * consumes them only after a verified ascending result. Those pending signals
+ * therefore form the durable continuation marker; relying only on an
+ * in-memory closure gives the same recovered SDK Session a new neural
+ * invocation identity after restart and severs its causal joins.
+ */
+function durablePendingChildInvocationId(input: {
+  runtime: HumanoidNeuralAgentRuntime;
+  parentNodeId: string;
+  childNodeId: string;
+  parentInvocationId: string;
+}): ReturnType<typeof stableAgentToolInvocationId> | undefined {
+  const state = input.runtime.neuralHierarchyState();
+  const phase = state.harness_phase;
+  const candidates = Object.values(state.signals).filter((signal) => {
+    if ((signal.status !== "pending" && signal.status !== "expired")
+      || signal.direction !== "descending"
+      || signal.source_node_id !== input.parentNodeId
+      || signal.target_node_id !== input.childNodeId
+      || signal.parent_invocation_id !== input.parentInvocationId
+      || signal.parent_episode_id !== input.parentInvocationId
+      || signal.authority_lease_id === null) return false;
+    const lease = state.authority_leases[signal.authority_lease_id];
+    return lease !== undefined
+      && (lease.status === "active"
+        || lease.status === "closed"
+        || lease.status === "expired")
+      && lease.issuing_parent_node_id === input.parentNodeId
+      && lease.target_child_node_id === input.childNodeId
+      && lease.invocation_id === signal.invocation_id
+      && lease.parent_invocation_id === input.parentInvocationId
+      && lease.parent_episode_id === input.parentInvocationId
+      && lease.goal_epoch_id === phase.goal_epoch_id
+      && lease.commitment_id === phase.commitment_id;
+  }).sort((left, right) => right.sequence - left.sequence);
+  const selected = candidates[0];
+  if (!selected) return undefined;
+  return selected.invocation_id as ReturnType<typeof stableAgentToolInvocationId>;
 }
 
 async function prepareHarnessPhaseForChild(

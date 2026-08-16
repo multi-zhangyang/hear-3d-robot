@@ -340,7 +340,7 @@ function goalTool(
 
 function goalToolDescription(name: string): string {
   if (name === "submit_goal_candidates") {
-    return "一次提交 2–3 个由当前模型提出的长期任务候选。每个候选必须绑定当前物理证据、可观察谓词、依赖和任务推进关系；Harness 不生成或补充候选。";
+    return "一次提交 1–3 个由当前模型提出的长期任务候选。明确可推进且没有真实替代方向的完整 mission Goal 可以单独提交；多个候选必须各有当前物理依据，禁止为凑数编造。每个候选必须绑定当前物理证据、可观察谓词、依赖和任务推进关系；Harness 不生成或补充候选。";
   }
   if (name === "select_goal_candidate") {
     return "用候选回执中的短序号显式选择一个已提交且依赖已完成的 Goal。短序号与持久候选身份一对一对应；Harness 不打分、不随机选择，也不提供替代目标。";
