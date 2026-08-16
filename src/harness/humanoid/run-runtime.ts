@@ -15,6 +15,8 @@ import {
   goalConstraintSha256,
   goalSha256
 } from "../../domain/goal-identity.js";
+import { goalHistoryLifetimeProjection } from
+  "../../domain/goal-history-summary.js";
 import {
   autonomousCycleRef,
   createActiveAutonomousCycle,
@@ -1758,6 +1760,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         "submit_goal_candidates",
         input
       );
+      await this.#assertMissionPriorityCandidateSlate(input.candidates);
       const evidence = this.#requiredContextGoalEvidence(source.agent_id);
       await this.#persistGoalEvidence([evidence.ref]);
       let next = this.#checkpoint.goal_dag;
@@ -1771,7 +1774,16 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         const before = new Set(Object.keys(next.candidates));
         try {
           assertGoalSupported(candidate.goal, this.#scenario);
-          await this.#assertGoalNavigationGrounding(candidate.goal);
+          // The bootstrap mission is a durable desired physical state. A
+          // complete route to a distant zone is deliberately not required at
+          // Goal admission time: Perception, exploration, replanning, and
+          // bounded navigation Skills exist to discover and execute that
+          // route. Requiring a complete current path here promoted a local
+          // frontier waypoint into the long-horizon Goal and displaced the
+          // actual mission.
+          if (goalSha256(candidate.goal) !== goalSha256(this.#missionGoal)) {
+            await this.#assertGoalNavigationGrounding(candidate.goal);
+          }
           next = proposeGoalCandidate(next, {
             proposal_id: candidate.proposal_id,
             source,
@@ -1872,6 +1884,48 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     }
   }
 
+  async #assertMissionPriorityCandidateSlate(
+    candidates: Parameters<GoalManagerRuntime["submitGoalCandidates"]>[0]["candidates"]
+  ): Promise<void> {
+    if (!this.#missionPriorityRequired()) return;
+    const missionIdentity = goalSha256(this.#missionGoal);
+    if (candidates.some((candidate) => (
+      goalSha256(candidate.goal) === missionIdentity
+    ))) return;
+    throw new Error(
+      "The exact mission Goal has not yet completed; the candidate slate must "
+      + "include mission_goal unchanged. Route discovery belongs to bounded "
+      + "Skills and cannot replace the long-horizon Goal with a waypoint"
+    );
+  }
+
+  #missionPriorityRequired(): boolean {
+    if (this.#store.definition.run_mode === "mission") return true;
+    const missionIdentity = goalConstraintSha256(this.#missionGoal);
+    const lifetime = goalHistoryLifetimeProjection(this.#checkpoint.goal_dag);
+    const outcome = lifetime.goal_outcomes.find((entry) => (
+      entry.goal_constraint_sha256 === missionIdentity
+    ));
+    return (outcome?.selected.completed ?? 0) === 0;
+  }
+
+  #assertMissionPrioritySelection(candidate: Goal): void {
+    if (!this.#missionPriorityRequired()) return;
+    const missionIdentity = goalSha256(this.#missionGoal);
+    const exactMissionIsProposed = Object.values(
+      this.#checkpoint.goal_dag.candidates
+    ).some((entry) => (
+      entry.status === "proposed"
+        && goalSha256(entry.goal) === missionIdentity
+    ));
+    if (!exactMissionIsProposed
+      || goalSha256(candidate) === missionIdentity) return;
+    throw new Error(
+      "The bootstrap mission Goal is present in the current slate and "
+      + "must be selected before open-ended successor Goals"
+    );
+  }
+
   async selectGoalCandidate(
     input: Parameters<GoalManagerRuntime["selectGoalCandidate"]>[0],
     authority: GoalToolCallAuthority
@@ -1895,6 +1949,7 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       if (candidate.source.model_call_id === selectedBy.model_call_id) {
         throw new Error("Goal selection requires a distinct model response after proposal");
       }
+      this.#assertMissionPrioritySelection(candidate.goal);
       const evidence = this.#requiredContextGoalEvidence(selectedBy.agent_id);
       await this.#persistGoalEvidence([evidence.ref]);
       const next = selectDomainGoalCandidate(this.#checkpoint.goal_dag, {

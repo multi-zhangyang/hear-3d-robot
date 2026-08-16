@@ -376,6 +376,7 @@ const NeuralModelAgentIdentitySchema = NeuralAgentIdentityBaseSchema.extend({
   instructions_sha256: Sha256Schema,
   tool_schema_sha256: Sha256Schema,
   output_schema_sha256: Sha256Schema,
+  sdk_output_type: z.enum(["text", "structured"]).optional(),
   sdk_model_settings: z.record(z.string(), z.json()),
   reset_tool_choice: z.boolean(),
   settings: AgentModelSettingsIdentitySchema

@@ -27,7 +27,7 @@ import {
   type HumanoidNeuralNodeDescriptor
 } from "./humanoid/neural-hierarchy-contract.js";
 
-const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 42;
+const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 44;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
@@ -81,6 +81,7 @@ export interface NeuralAgentHierarchy {
   agents: ReadonlyMap<string, Agent<any, any>>;
   services: ReadonlyMap<string, NeuralRuntimeService>;
   session(agentId: string): Session | undefined;
+  outputSchema(agentId: string): z.ZodType | undefined;
 }
 
 export function humanoidNeuralAgentToolName(
@@ -150,11 +151,11 @@ export function createHumanoidNeuralAgentManifest(input: {
         ...common,
         execution_kind: "model_agent",
         provider_profile: profile,
-        ...modelIdentity(runtimeAgent, providerConfigForAgent(
-          input.provider,
-          descriptor.id,
-          profile
-        ))
+        ...modelIdentity(
+          runtimeAgent,
+          providerConfigForAgent(input.provider, descriptor.id, profile),
+          requiredNeuralOutputSchema(input.hierarchy, descriptor.id)
+        )
       };
     } else {
       if (!runtimeService) {
@@ -254,6 +255,12 @@ function assertRuntimeHierarchyMatchesContract(
         `Neural Agents cannot attach undeclared MCP tool surfaces: ${agentId}`
       );
     }
+    if (agent.outputType !== "text") {
+      throw new Error(
+        `Neural Agent ${agentId} must reserve final authority for terminal tools`
+      );
+    }
+    requiredNeuralOutputSchema(hierarchy, agentId);
   }
   for (const serviceId of expectedServiceIds) {
     if (!hierarchy.services.has(serviceId) || hierarchy.session(serviceId)) {
@@ -326,11 +333,15 @@ function assertRuntimeHierarchyMatchesContract(
   }
 }
 
-function modelIdentity(agent: Agent, provider: ModelProviderConfig): Pick<
+function modelIdentity(
+  agent: Agent,
+  provider: ModelProviderConfig,
+  outputSchema: z.ZodType
+): Pick<
   Extract<NeuralAgentIdentity, { execution_kind: "model_agent" }>,
   "protocol" | "model" | "endpoint_sha256" | "instructions_sha256"
     | "tool_schema_sha256" | "output_schema_sha256" | "sdk_model_settings"
-    | "reset_tool_choice" | "settings"
+    | "sdk_output_type" | "reset_tool_choice" | "settings"
 > {
   if (typeof agent.instructions !== "string") {
     throw new Error(`Dynamic instructions cannot be persisted for ${agent.name}`);
@@ -354,7 +365,11 @@ function modelIdentity(agent: Agent, provider: ModelProviderConfig): Pick<
     endpoint_sha256: sha256(new URL(provider.baseUrl).href),
     instructions_sha256: sha256(agent.instructions),
     tool_schema_sha256: sha256(canonicalJson(tools)),
-    output_schema_sha256: sha256(canonicalJson(outputTypeIdentity(agent))),
+    output_schema_sha256: sha256(canonicalJson(outputTypeIdentity(
+      agent,
+      outputSchema
+    ))),
+    sdk_output_type: agent.outputType === "text" ? "text" : "structured",
     sdk_model_settings: modelSettingsIdentity(agent.modelSettings),
     reset_tool_choice: agent.resetToolChoice,
     settings: {
@@ -377,16 +392,26 @@ function modelIdentity(agent: Agent, provider: ModelProviderConfig): Pick<
   };
 }
 
-function outputTypeIdentity(agent: Agent): unknown {
-  if (agent.outputType === "text") return "text";
+function outputTypeIdentity(agent: Agent, outputSchema: z.ZodType): unknown {
   try {
-    return z.toJSONSchema(agent.outputType as z.ZodType);
+    return z.toJSONSchema(outputSchema);
   } catch (cause) {
     throw new Error(
-      `Neural Agent ${agent.name} requires a serializable structured outputType`,
+      `Neural Agent ${agent.name} requires a serializable terminal output schema`,
       { cause }
     );
   }
+}
+
+function requiredNeuralOutputSchema(
+  hierarchy: NeuralAgentHierarchy,
+  agentId: string
+): z.ZodType {
+  const schema = hierarchy.outputSchema(agentId);
+  if (!schema) {
+    throw new Error(`Neural Agent terminal output schema is absent: ${agentId}`);
+  }
+  return schema;
 }
 
 function modelSettingsIdentity(

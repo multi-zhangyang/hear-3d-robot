@@ -737,6 +737,7 @@ async function executeHumanoidMission(input: {
       compactionCount: number;
       attempt: number;
     }>();
+    let executiveTurnContinuation: string | undefined;
     for (;;) {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
@@ -815,7 +816,18 @@ async function executeHumanoidMission(input: {
             }, input.runtime.rootAgentId);
             continue;
           }
-        } else runInput = neuralCycleInput(input.runtime, wake);
+        } else {
+          const currentInput = neuralCycleInput(input.runtime, wake);
+          runInput = executiveTurnContinuation === undefined
+            ? currentInput
+            : [
+                currentInput,
+                "SDK turn continuation：The preceding Executive turn ended in assistant text without a verified terminal tool receipt.",
+                "Continue the current durable Harness phase by invoking exactly one enabled formal tool. Do not restate the intended tool or arguments as JSON, markdown, or narration.",
+                `Rejected turn reason：${executiveTurnContinuation}`
+              ].join("\n");
+          executiveTurnContinuation = undefined;
+        }
         const resumedSdkState = serializedState !== undefined;
         serializedState = undefined;
         const stream = await withAgentInvocation(
@@ -868,6 +880,27 @@ async function executeHumanoidMission(input: {
         await input.runtime.setActiveAgent(input.runtime.rootAgentId);
       } catch (error) {
         if (input.signal?.aborted) throw error;
+        if (error instanceof CompletedResponseDecisionStallError) {
+          // One SDK run is one application-level turn. A compatible model may
+          // legally choose a text final answer under tool_choice=auto, but text
+          // has no Harness transition authority. Preserve the independent
+          // Executive Session and continue with an explicit next turn; do not
+          // roll back already-verified child tools or reinterpret prose as a
+          // control action.
+          await input.runtime.store.clearAgentState();
+          serializedState = undefined;
+          executiveTurnContinuation = error.message;
+          await input.runtime.recordProvider({
+            status: "agent_turn_continuation_required",
+            source: "missing_verified_terminal_tool_receipt",
+            sdk_turn_completed: true,
+            session_history_preserved: true,
+            harness_transition_accepted: false,
+            automatic_actuation: false
+          }, input.runtime.rootAgentId);
+          await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+          continue;
+        }
         const decisionStall = modelDecisionStallFrom(error);
         const pendingPhysicalTransactionId = decisionStall
           ? input.runtime.pendingPhysicalExecutionTransactionId()
@@ -1318,7 +1351,7 @@ function neuralCycleInput(
     goalDirection,
     runtime.store.definition.run_mode === "mission"
       ? "运行模式：有限任务。只有完整满足 mission_goal 的物理 predicates 才会结束；summary 不参与物理语义，阶段子目标完成后若长期条件尚未达成，必须继续选择下一 Goal。"
-      : "运行模式：持续自主。完成当前 Goal 后继续从新的物理观察中选择下一 Goal，直到外部明确暂停。",
+      : "运行模式：持续自主。在首次完整完成 mission_goal 前，它仍是 bootstrap 长期目标；不要用局部探索 Goal 替换它。首次完成后再从新的物理观察中持续选择后继 Goal，直到外部明确暂停。",
     `任务：${runtime.store.definition.mission}`,
     `当前循环：${checkpoint.cycle_index + 1}`,
     ...(checkpoint.active_cycle

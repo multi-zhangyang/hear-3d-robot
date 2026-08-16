@@ -52,6 +52,10 @@ export function createHumanoidAutonomyContext(input: {
     : lifetime.goal_outcomes.find((entry) => (
         entry.goal_constraint_sha256 === missionGoalIdentity
       ));
+  const bootstrapMissionGoalCompleted = missionGoalOutcomes.completed > 0
+    || (lifetimeMissionGoal?.selected.completed ?? 0) > 0
+    ? true
+    : lifetime.exact_goal_outcomes_complete ? false : null;
   for (const { epoch, candidate } of history) {
     if (missionGoalIdentity !== null
       && goalConstraintSha256(candidate.goal) === missionGoalIdentity) {
@@ -78,10 +82,15 @@ export function createHumanoidAutonomyContext(input: {
     harness_selection: "none" as const,
     continuous_drive_state: input.runMode === "continuous"
       ? {
-          bootstrap_mission_goal_completed: missionGoalOutcomes.completed > 0
-            || (lifetimeMissionGoal?.selected.completed ?? 0) > 0
-            ? true
-            : lifetime.exact_goal_outcomes_complete ? false : null,
+          drive_phase: bootstrapMissionGoalCompleted === true
+            ? "open_ended"
+            : bootstrapMissionGoalCompleted === false
+              ? "bootstrap_mission"
+              : "history_unknown",
+          bootstrap_mission_goal_completed: bootstrapMissionGoalCompleted,
+          bootstrap_goal_policy: bootstrapMissionGoalCompleted === true
+            ? "model_selected_successor_goals"
+            : "submit_and_select_exact_mission_goal",
           exact_mission_goal_history_complete:
             lifetime.exact_goal_outcomes_complete,
           working_exact_mission_goal_outcomes: missionGoalOutcomes,

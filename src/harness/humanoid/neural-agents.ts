@@ -515,9 +515,10 @@ export interface HumanoidNeuralAgentHierarchy extends Omit<
   NeuralAgentHierarchy,
   "root" | "agents"
 > {
-  root: Agent<unknown, typeof ExecutiveOutputSchema>;
+  root: Agent<unknown, "text">;
   agents: ReadonlyMap<string, Agent<any, any>>;
   agent(agentId: HumanoidNeuralAgentId): Agent<any, any> | undefined;
+  outputSchema(agentId: HumanoidNeuralAgentId): z.ZodObject | undefined;
 }
 
 export function createHumanoidNeuralAgentHierarchy(input: {
@@ -532,6 +533,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
   const sessions = new Map<string, Session>();
   const sessionOwners = new Set<Session>();
   const agents = new Map<string, Agent<any, any>>();
+  const outputSchemas = new Map<string, z.ZodObject>();
   const ownModel = (key: HumanoidNeuralAgentKey): Model => {
     const agentId = HUMANOID_NEURAL_AGENT_IDS[key];
     const profile = humanoidNeuralAgentProfile(agentId);
@@ -571,11 +573,12 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       agentId,
       humanoidNeuralAgentProfile(agentId)
     );
-    // Every neural node advances the control graph through a formal tool: a
-    // child delegation, a state mutation, or submit_neural_output. `auto`
-    // lets a compatible model terminate in prose and silently bypass that
-    // graph, so the neural Harness itself requires tool use on every turn.
-    const toolChoice = options.toolChoice ?? "required";
+    // Formal progress still requires a verified tool result in each node's
+    // ToolUseBehavior. Transport-level tool choice remains provider-neutral:
+    // compatible reasoning models may expose tools while rejecting the
+    // `required` enum, and a prose-only turn cannot satisfy the Harness state
+    // transition or terminate the episode.
+    const toolChoice = options.toolChoice ?? provider.toolChoice ?? "auto";
     return {
       temperature: provider.temperature,
       ...(provider.reasoningEffort === undefined
@@ -599,7 +602,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       extraInstructions?: readonly string[];
       toolUseBehavior?: ToolUseBehavior;
     } = {}
-  ): Agent<unknown, TOutput> => {
+  ): Agent<unknown, "text"> => {
     const descriptor = HUMANOID_NEURAL_NODE_BY_ID.get(
       HUMANOID_NEURAL_AGENT_IDS[key]
     );
@@ -627,7 +630,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       descriptor.id,
       input.runtime
     ));
-    const agent = new Agent({
+    const agent = new Agent<unknown, "text">({
       name: descriptor.name,
       instructions: scopedInstructions(descriptor.id, [
         ...baseInstructions(descriptor.key),
@@ -636,7 +639,12 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       model: ownModel(key),
       modelSettings: settingsFor(key, options),
       tools: capabilityTools,
-      outputType,
+      // A formal Harness transition is a terminal tool result, not a second
+      // competing response_format path. With tool_choice=auto, a structured
+      // SDK output type invites compatible reasoning models to emit a JSON
+      // final answer instead of invoking the tool they selected. Keep the SDK
+      // output textual and validate only the terminal tool receipt below.
+      outputType: "text",
       resetToolChoice: false,
       toolUseBehavior: neuralOutputToolUseBehavior(
         outputType,
@@ -644,12 +652,13 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       )
     });
     agents.set(descriptor.id, agent);
+    outputSchemas.set(descriptor.id, outputType);
     return agent;
   };
-  const asChildTool = <TOutput extends z.ZodObject>(inputTool: {
+  const asChildTool = (inputTool: {
     parentKey: HumanoidNeuralAgentKey;
     childKey: HumanoidNeuralAgentKey;
-    child: Agent<unknown, TOutput>;
+    child: Agent<unknown, "text">;
     description: string;
     requiredSignalKind?: NeuralSignalKind;
     sourceSignalContract?: NeuralDelegationSourceSignalContract;
@@ -659,6 +668,10 @@ export function createHumanoidNeuralAgentHierarchy(input: {
   }): FunctionTool<unknown, any, unknown> => {
     const parentId = HUMANOID_NEURAL_AGENT_IDS[inputTool.parentKey];
     const childId = HUMANOID_NEURAL_AGENT_IDS[inputTool.childKey];
+    const childOutputSchema = outputSchemas.get(childId);
+    if (!childOutputSchema) {
+      throw new Error(`Neural child output schema is unavailable: ${childId}`);
+    }
     const childDescriptor = HUMANOID_NEURAL_NODE_BY_ID.get(childId)!;
     const delegationSchema = neuralDelegationSchema(
       inputTool.parentKey,
@@ -989,8 +1002,16 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       },
       resumeState: { contextStrategy: "replace" },
       customOutputExtractor: ({ finalOutput }) => {
-        const output = inputTool.child.outputType.parse(finalOutput);
-        return JSON.stringify(output);
+        const output = parseNeuralAgentFinalOutput(
+          childOutputSchema,
+          finalOutput
+        );
+        return output.success
+          ? JSON.stringify(output.data)
+          : neuralAgentTurnContinuationReceipt(
+              childId,
+              humanoidNeuralAgentToolName(inputTool.childKey)
+            );
       },
       ...(input.onAgentStream
         ? {
@@ -1156,7 +1177,10 @@ export function createHumanoidNeuralAgentHierarchy(input: {
             `${childId} returned a non-neural Agent.asTool result: ${String(output)}`
           );
         }
-        const childSpecificOutput = inputTool.child.outputType.parse(childOutput);
+        if (isNeuralAgentTurnContinuationReceipt(childOutput)) {
+          return JSON.stringify(childOutput);
+        }
+        const childSpecificOutput = childOutputSchema.parse(childOutput);
         const routingOutput = NeuralAgentOutputSchema.passthrough().parse(
           childSpecificOutput
         );
@@ -1482,12 +1506,12 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     GoalValuationOutputSchema,
     createGoalManagerTools(input.runtime),
     {
-      toolChoice: "required",
       toolUseBehavior: goalValuationToolUseBehavior(),
       extraInstructions: [
         "Use the existing Goal DAG tools for every formal Goal mutation.",
         "When no Goal is active, use the current world-bounded autonomy frontier and outcome history to submit 2–3 distinct observable Goal candidates, then use a separate model response to select exactly one candidate sequence. Do not wait for an operator to choose.",
-        "In continuous mode, keep producing successor Goals after completion. Prefer physically supported novelty and useful interaction over immediately repeating a completed or repeatedly unsuccessful entity/predicate when untouched viable frontiers exist.",
+        "In continuous mode, continuous_drive_state.drive_phase other than open_ended means the exact mission_goal remains the required long-horizon Goal; include it unchanged in the candidate slate and select it. Route discovery and local waypoints belong to bounded navigation Skills, never replacement Goals. Only after drive_phase=open_ended may novelty and useful interaction outrank repeating the bootstrap mission.",
+        "A Goal is a durable desired physical state, not one motor step. Keep the exact mission Goal active across perception, navigation, manipulation, replanning, and recovery; do not replace it with nearby exploration waypoints merely because a frontier has higher information gain.",
         "In mission mode, value candidates by causal progress toward the mission Goal. In either mode, Goal valuation chooses only observable predicates; it never chooses a Skill, hand, interaction point, route, posture, or controller command.",
         "When a recovery escalation returns, continue the active Goal only if current physical evidence still shows a viable unfinished predicate; otherwise retire it with exact evidence and autonomously select a successor.",
         "After a terminal Goal tool result, return goal_selected or escalation as structured output."
@@ -1611,7 +1635,6 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     MotorIntentOutputSchema,
     motorIntentPlanningTools(input.runtime),
     {
-      toolChoice: "required",
       toolUseBehavior: planningReceiptToolUseBehavior(input.runtime),
       extraInstructions: [
         "Complete the existing embodied Skill lifecycle in this one SDK episode: when planning_tool_state requires submit_humanoid_skill_plan, submit the committed short Skill DAG; when it requires begin_humanoid_skill, copy one ready_skill_binding verbatim; only then call the enabled semantic planning tool with the real bound skill_transaction_id.",
@@ -1878,7 +1901,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     agents,
     services,
     session: (agentId) => sessions.get(agentId),
-    agent: (agentId) => agents.get(agentId)
+    agent: (agentId) => agents.get(agentId),
+    outputSchema: (agentId) => outputSchemas.get(agentId)
   };
 }
 
@@ -3108,7 +3132,7 @@ function recoveryAuthorityTool(
             toolExecution: { maxFunctionToolConcurrency: 1 },
             ...(details?.signal ? { signal: details.signal } : {})
           };
-          let parsed: ReturnType<typeof parseNeuralAgentOutput>;
+          let finalOutput: unknown;
           if (!outer.onAgentStream) {
             const result = await runner.run(
               recovery,
@@ -3120,9 +3144,7 @@ function recoveryAuthorityTool(
               ),
               runOptions
             );
-            parsed = parseNeuralAgentOutput(
-              RecoveryOutputSchema.parse(result.finalOutput)
-            );
+            finalOutput = result.finalOutput;
           } else {
             const stream = await runner.run(
               recovery,
@@ -3138,10 +3160,19 @@ function recoveryAuthorityTool(
               await outer.onAgentStream(recoveryId, event);
             }
             await stream.completed;
-            parsed = parseNeuralAgentOutput(
-              RecoveryOutputSchema.parse(stream.finalOutput)
+            finalOutput = stream.finalOutput;
+          }
+          const validatedOutput = parseNeuralAgentFinalOutput(
+            RecoveryOutputSchema,
+            finalOutput
+          );
+          if (!validatedOutput.success) {
+            return neuralAgentTurnContinuationReceipt(
+              recoveryId,
+              humanoidNeuralAgentToolName("recovery")
             );
           }
+          const parsed = parseNeuralAgentOutput(validatedOutput.data);
           const recoveryResult = await runtime.publishNeuralSignal({
             kind: parsed.signal_kind,
             pathway: "interoceptive_risk",
@@ -6938,6 +6969,46 @@ function neuralSkillCommitmentIsOpen(
 function boundedProposedSkillFromPayload(payload: JsonValue): string | undefined {
   const parsed = BoundedSkillProposalPayloadSchema.safeParse(payload);
   return parsed.success ? parsed.data.proposed_skill.skill : undefined;
+}
+
+function parseNeuralAgentFinalOutput<TOutput extends z.ZodObject>(
+  outputSchema: TOutput,
+  output: unknown
+) {
+  let candidate = output;
+  if (typeof output === "string") {
+    try {
+      candidate = JSON.parse(output);
+    } catch {
+      return outputSchema.safeParse(output);
+    }
+  }
+  return outputSchema.safeParse(candidate);
+}
+
+function neuralAgentTurnContinuationReceipt(
+  childNodeId: string,
+  childToolName: string
+): string {
+  return JSON.stringify({
+    accepted: false,
+    code: "neural_agent_turn_requires_tool",
+    child_node_id: childNodeId,
+    automatic_actuation: false,
+    next_response_contract: {
+      mode: "repeat_same_child_tool",
+      tool: childToolName,
+      narration_allowed: false
+    },
+    recovery: "The child SDK turn ended in assistant text without a verified terminal tool receipt. Invoke the same direct-child tool again so its independent Session can continue; do not reinterpret its prose as a neural signal."
+  });
+}
+
+function isNeuralAgentTurnContinuationReceipt(
+  output: Record<string, JsonValue>
+): boolean {
+  return output.accepted === false
+    && output.code === "neural_agent_turn_requires_tool";
 }
 
 function outputObject(output: unknown): Record<string, JsonValue> | undefined {
