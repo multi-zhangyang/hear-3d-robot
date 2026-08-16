@@ -24,6 +24,7 @@ export function alignHumanoidSkillToGoal(input: {
   invocation: HumanoidSkillInvocation;
   observation: HumanoidWorldObservation;
   recoveryAuthorized?: boolean;
+  navigationTargetOverride?: Vec3;
 }): HumanoidSkillGoalAlignment {
   if (input.invocation.skill === "stabilize") {
     return { accepted: true, relation: "safety", predicateIndex: null };
@@ -35,7 +36,8 @@ export function alignHumanoidSkillToGoal(input: {
     const relation = skillPredicateRelation(
       input.invocation,
       predicate,
-      input.observation
+      input.observation,
+      input.navigationTargetOverride
     );
     if (relation) return { accepted: true, relation, predicateIndex };
   }
@@ -68,10 +70,11 @@ function misalignedSkillReason(
 function skillPredicateRelation(
   invocation: HumanoidSkillInvocation,
   predicate: GoalPredicate,
-  observation: HumanoidWorldObservation
+  observation: HumanoidWorldObservation,
+  navigationTargetOverride?: Vec3
 ): "direct" | "prerequisite" | undefined {
   if (predicate.type === "robot_at") {
-    const target = navigationTarget(invocation, observation);
+    const target = navigationTargetOverride ?? navigationTarget(invocation, observation);
     return target && positionAdvances(
       observation.robot.rootPosition,
       target,
@@ -85,7 +88,7 @@ function skillPredicateRelation(
       return "direct";
     }
     const zone = observedZone(observation, predicate.zone_id);
-    const target = navigationTarget(invocation, observation);
+    const target = navigationTargetOverride ?? navigationTarget(invocation, observation);
     return zone && target && zoneDistance(target, zone, predicate.tolerance)
       < zoneDistance(observation.robot.rootPosition, zone, predicate.tolerance)
         - MINIMUM_PROGRESS_METERS

@@ -244,6 +244,7 @@ export function bindHumanoidSkill(input: {
   agentId: string;
   request: BeginHumanoidSkill;
   observation: HumanoidWorldObservation;
+  continuationBinding?: ActiveHumanoidSkillBinding;
   articulationGoal?: HumanoidArticulationGoal;
   activeGoal?: Goal;
   recoveryAuthorized?: boolean;
@@ -251,6 +252,17 @@ export function bindHumanoidSkill(input: {
 }): HumanoidSkillBindingResult {
   const request = BeginHumanoidSkillSchema.parse(input.request);
   const invocation = request.invocation;
+  const continuation = input.continuationBinding;
+  if (continuation) {
+    const identityFailure = validateContinuationIdentity({
+      continuation,
+      transactionId: input.transactionId,
+      agentId: input.agentId,
+      request,
+      observation: input.observation
+    });
+    if (identityFailure) return identityFailure;
+  }
   const contract = HUMANOID_SKILL_CONTRACTS[invocation.skill];
   const process = contract.process.find(({ phase }) => phase === request.phase);
   if (!process) {
@@ -322,6 +334,11 @@ export function bindHumanoidSkill(input: {
         ({ id }) => id === invocation.frontier_id
       )
     : undefined;
+  const continuedExplorationTarget = invocation.skill === "explore"
+    && continuation?.invocation.skill === "explore"
+    && continuation.target_position !== null
+    ? continuation.target_position
+    : undefined;
   const targetZone = invocation.skill === "navigate_to_zone"
     || invocation.skill === "carry_to_zone"
     ? input.observation.interaction.zones.find(
@@ -338,7 +355,8 @@ export function bindHumanoidSkill(input: {
       )
     });
   }
-  if (invocation.skill === "explore" && !explorationFrontier) {
+  if (invocation.skill === "explore" && !explorationFrontier
+    && !continuedExplorationTarget) {
     return rejection("skill_frontier_unavailable", {
       skill: invocation.skill,
       frontier_id: invocation.frontier_id,
@@ -406,6 +424,9 @@ export function bindHumanoidSkill(input: {
       goal: input.activeGoal,
       invocation,
       observation: input.observation,
+      ...(continuedExplorationTarget
+        ? { navigationTargetOverride: continuedExplorationTarget }
+        : {}),
       ...(input.recoveryAuthorized ? { recoveryAuthorized: true } : {})
     });
     if (!alignment.accepted) {
@@ -476,6 +497,7 @@ export function bindHumanoidSkill(input: {
         ? { ...target.pose.position }
         : targetZone ? { ...targetZone.center }
         : explorationFrontier ? { ...explorationFrontier.target }
+        : continuedExplorationTarget ? { ...continuedExplorationTarget }
         : invocation.skill === "navigate_to_point" ? { ...invocation.target }
         : targetSolid ? { ...targetSolid.center }
         : null,
@@ -493,6 +515,7 @@ export function bindHumanoidSkill(input: {
         ? { ...target.pose.position }
         : targetZone ? { ...targetZone.center }
         : explorationFrontier ? { ...explorationFrontier.target }
+        : continuedExplorationTarget ? { ...continuedExplorationTarget }
         : invocation.skill === "navigate_to_point" ? { ...invocation.target }
         : targetSolid ? { ...targetSolid.center } : null,
       target_solid: targetSolid ? {
@@ -512,6 +535,60 @@ export function bindHumanoidSkill(input: {
       control_mode: "learned_policy"
     }
   };
+}
+
+function validateContinuationIdentity(input: {
+  continuation: ActiveHumanoidSkillBinding;
+  transactionId: string;
+  agentId: string;
+  request: BeginHumanoidSkill;
+  observation: HumanoidWorldObservation;
+}): ReturnType<typeof rejection> | null {
+  const previous = ActiveHumanoidSkillBindingSchema.safeParse(input.continuation);
+  if (!previous.success) {
+    return rejection("skill_continuation_binding_invalid", {
+      issues: previous.error.issues.map(({ path, message }) => ({
+        path: path.join("."),
+        message
+      }))
+    });
+  }
+  const binding = previous.data;
+  const invocationSha256 = modelPayloadSha256(input.request.invocation);
+  const identityMatches = binding.transaction_id === input.transactionId
+    && binding.agent_id === input.agentId
+    && binding.skill_plan_transaction_id
+      === input.request.skill_plan_transaction_id
+    && binding.skill_node_id === input.request.skill_node_id
+    && binding.phase === input.request.phase
+    && binding.invocation_sha256 === invocationSha256;
+  if (!identityMatches) {
+    return rejection("skill_continuation_identity_mismatch", {
+      binding_transaction_id: binding.transaction_id,
+      requested_transaction_id: input.transactionId,
+      binding_agent_id: binding.agent_id,
+      requested_agent_id: input.agentId,
+      binding_skill_plan_transaction_id: binding.skill_plan_transaction_id,
+      requested_skill_plan_transaction_id:
+        input.request.skill_plan_transaction_id,
+      binding_skill_node_id: binding.skill_node_id,
+      requested_skill_node_id: input.request.skill_node_id,
+      binding_phase: binding.phase,
+      requested_phase: input.request.phase,
+      binding_invocation_sha256: binding.invocation_sha256,
+      requested_invocation_sha256: invocationSha256
+    });
+  }
+  if (binding.observed_frame > input.observation.frame
+    || binding.observed_world_revision > input.observation.worldRevision) {
+    return rejection("skill_continuation_authority_regressed", {
+      binding_frame: binding.observed_frame,
+      binding_world_revision: binding.observed_world_revision,
+      observed_frame: input.observation.frame,
+      observed_world_revision: input.observation.worldRevision
+    });
+  }
+  return null;
 }
 
 export function validateSkillPlanningReference(input: {

@@ -68,6 +68,7 @@ export function groundHumanoidPhysicalExecution(input: {
           phase: binding.phase
         },
         observation: input.observation,
+        continuationBinding: binding,
         ...(input.activeGoal ? { activeGoal: input.activeGoal } : {}),
         ...(binding.recovery_authorized ? { recoveryAuthorized: true } : {}),
         ...(recoveryInterrupt ? { recoveryInterrupt } : {})

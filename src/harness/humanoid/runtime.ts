@@ -1324,6 +1324,7 @@ export class HumanoidActionRuntime {
         phase: previous.phase
       },
       observation,
+      continuationBinding: previous,
       ...(activeGoal ? { activeGoal } : {}),
       ...((recovery
         && humanoidRecoverySelectionAccepted(recovery, previous.invocation))

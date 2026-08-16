@@ -147,6 +147,7 @@ export async function executeHumanoidArticulationHorizon(input: {
         phase: input.binding.phase
       },
       observation,
+      continuationBinding: input.binding,
       articulationGoal: goal
     });
     if (!rebound.accepted) {

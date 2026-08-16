@@ -133,6 +133,7 @@ export async function executeHumanoidNavigationHorizon(input: {
         phase: input.binding.phase
       },
       observation,
+      continuationBinding: input.binding,
       ...(input.activeGoal ? { activeGoal: input.activeGoal } : {}),
       ...(input.recoveryAuthorized ? { recoveryAuthorized: true } : {})
     });

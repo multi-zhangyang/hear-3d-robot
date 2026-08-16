@@ -148,6 +148,7 @@ import {
   retainRecentActionReceipts
 } from "./embodied-memory.js";
 import { createHumanoidContextAnchor } from "./context-anchor.js";
+import { recentReceiptContext } from "./receipt-context.js";
 import {
   recallHumanoidEmbodiedHistory,
   type HumanoidEmbodiedRecallRequest
@@ -1329,6 +1330,38 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
       signal,
       HUMANOID_NEURAL_AGENT_IDS.recovery
     );
+    if (recoveryAuthorized) {
+      const evidence = object(this.recoveryFailureEvidence());
+      const failureReceipt = object(evidence.failure_receipt ?? null);
+      const originatingPlan = object(
+        evidence.originating_plan_receipt ?? evidence.failure_receipt ?? null
+      );
+      const failureDetail = object(failureReceipt.detail ?? null);
+      const planDetail = object(originatingPlan.detail ?? null);
+      const failedBinding = object(
+        planDetail.skill_binding ?? failureDetail.skill_binding ?? null
+      );
+      const failedInvocation = object(failedBinding.invocation ?? null);
+      const failureClass = typeof failureDetail.failure_class === "string"
+        ? failureDetail.failure_class
+        : null;
+      if (failedInvocation
+        && failureClass !== "dynamic_obstruction"
+        && modelPayloadSha256(json(failedInvocation))
+          === modelPayloadSha256(json(invocation.data))) {
+        return {
+          accepted: false,
+          invocation: json(invocation.data),
+          relation: "recovery",
+          reason: "Recovery repeated the exact invocation whose current durable failure remains unresolved",
+          detail: json({
+            admission_code: "recovery_repeated_failed_invocation",
+            failure_receipt: failureReceipt,
+            originating_plan_receipt: originatingPlan
+          })
+        };
+      }
+    }
     const recoveryInterrupt = recoveryAuthorized
       ? this.#activeRecoverySafetyInterruptAuthority()
       : undefined;
@@ -2475,6 +2508,55 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     ));
     if (!observed) return "observe_or_plan";
     return "plan";
+  }
+
+  recoveryFailureEvidence(): JsonValue | null {
+    const readiness = this.autonomyReadiness();
+    if (readiness !== "post_failure_observation"
+      && readiness !== "replan_or_retire") return null;
+    const activeCycle = this.#checkpoint.active_cycle;
+    if (!activeCycle) return null;
+    const receipts = humanoidActionReceiptsInCommitOrder(
+      this.#checkpoint.committed_actions
+    ).filter((receipt) => sameAutonomousCycle(receipt.cycle, activeCycle));
+    const failureIndex = receipts.findLastIndex((receipt) => (
+      !receipt.accepted && isHumanoidPlanningReceipt(receipt)
+    ) || (
+      physicalExecutionReceipt(receipt) && !completedPhysicalExecution(receipt)
+    ) || (
+      receipt.action === "remove_world_block"
+        && (!receipt.accepted || receipt.code !== "world_block_removal_authorized")
+    ));
+    if (failureIndex < 0) return null;
+    const failure = receipts[failureIndex]!;
+    const planningTransactionId = physicalExecutionReceipt(failure)
+      ? planningTransactionIdFromReceipt(failure)
+      : undefined;
+    const originatingPlan = isHumanoidPlanningReceipt(failure)
+      ? failure
+      : planningTransactionId
+        ? receipts.find((receipt) => (
+            receipt.transactionId === planningTransactionId
+              && receipt.accepted
+              && isHumanoidPlanningReceipt(receipt)
+          ))
+        : undefined;
+    const observation = receipts.slice(failureIndex + 1).findLast((receipt) => (
+      receipt.accepted
+        && receipt.action === "observe_humanoid"
+        && isHumanoidSensorFusionActor(receipt.agentId)
+    ));
+    return json({
+      protocol: "humanoid-durable-recovery-evidence-v1",
+      cycle: autonomousCycleRef(activeCycle),
+      failure_receipt: recentReceiptContext(failure),
+      originating_plan_receipt: originatingPlan
+        ? recentReceiptContext(originatingPlan)
+        : null,
+      post_failure_observation_receipt: observation
+        ? recentReceiptContext(observation)
+        : null
+    });
   }
 
   executorDelegationAvailable(): boolean {

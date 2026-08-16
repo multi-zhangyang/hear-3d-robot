@@ -409,6 +409,7 @@ export interface HumanoidNeuralAgentRuntime extends HumanoidActionInvoker,
     | "execute_plan"
     | "post_execution"
     | "complete_cycle";
+  recoveryFailureEvidence(): JsonValue | null;
   validateCycleEvidence(evidenceTransactionIds: readonly string[]): HumanoidActionReceipt;
   validateSatisfiedGoal(): JsonValue;
   neuralHierarchyState(): NeuralHierarchyState;
@@ -1855,6 +1856,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       extraInstructions: [
         "This is an independent bounded recovery episode under a Harness authority lease.",
         "The current failure receipt and post-failure perceptual belief are already in your directed input. Historical evidence may arrive only through the Perception Manager -> Memory Retriever branch materialized in that belief; never query or assume a shared memory store.",
+        "Read durable_failure_evidence.failure_receipt as the exact failed physical/planning attempt. Do not return the same bounded invocation again while that failure remains unresolved; choose a materially different prerequisite/target/Skill or escalate.",
         "For an unresolved acknowledged stationary_fall, the only admissible local proposal is one bounded stabilize Skill beginning at recover_support, even when a prior partial get-up has already cleared the coarse fallen flag. Do not propose navigation, manipulation, or task continuation until whole-body recovery has stood the robot up and handed control back to the body controller. Escalate only when the live catalog or controller capability evidence makes stabilize recovery unavailable.",
         "Return a recovery skill_proposal or escalation. You never write physical state."
       ]
@@ -2045,7 +2047,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "A replacement Sensorimotor proposal supersedes every earlier proposal in this Action Selection episode. Establish only the newest direct proposal and its exact bounded Skill; never restore a rejected proposal because it matched the previous commitment or intention.",
         "Authorize execution only after the committed branch returns a real accepted rollout_result. Call authorize_skill_execution with the active commitment id and your reason; the Harness binds the unique direct certified rollout, so do not copy a rollout or Predictive signal id into that call.",
         "After authorize_skill_execution returns skill_executing, your bounded decision episode ends. The Harness deterministically routes the unique certified commitment through Sensorimotor to Executor without another model decision; your next wake is typed physical feedback, never a request to wait or redispatch execution.",
-        "A Premotor, planning, or Predictive escalation is a local recovery demand, not a Recovery escalation. First call release_skill_commitment with the direct Sensorimotor failure signal, then delegate that same direct signal back to Sensorimotor so its exclusive Recovery child can propose a replacement. Only an escalation returned by Recovery may propagate to Executive.",
+        "A Premotor, planning, or Predictive escalation is a local recovery demand, not a Recovery escalation. First call release_skill_commitment with the direct Sensorimotor failure signal. If the Harness enters perception, delegate Perception and use that newer belief with the failure; otherwise delegate the same direct failure back to Sensorimotor so its exclusive Recovery child can propose a replacement. Only an escalation returned by Recovery may propagate to Executive.",
         "A successful physical chunk is not automatically Skill completion. complete_skill_commitment is enabled only when the exact committed Skill binding has a successful physical receipt and its authoritative Skill-plan node postcondition is complete. Model-authored prose in the termination contract cannot override that lifecycle. Otherwise release the exhausted bounded plan, obtain fresh Perception, and continue the same Goal through a new bounded Skill commitment.",
         "In recovery, forward the direct failure signal to Sensorimotor. When the failure came from physical execution, also cite the new post-failure perceptual_belief returned after you closed the old commitment. If Recovery returns a replacement skill_proposal, you alone replace the failed commitment; if it escalates, return that typed escalation unchanged to Executive.",
         "In feedback, complete or fail the active commitment before delegating Perception. After completed execution, forward perceptual_belief to Executive. After failed execution, use the new belief to enter Recovery while preserving the active Goal.",
@@ -2649,10 +2651,13 @@ function establishSkillCommitmentTool(
       }
       const admission = runtime.neuralSkillProposalAdmission?.(citedProposal);
       if (admission && !admission.accepted) {
+        const recoveryCorrection = admission.relation === "recovery";
         await runtime.transitionNeuralHarnessPhase({
-          phase: "skill_proposal",
+          phase: recoveryCorrection ? "recovery" : "skill_proposal",
           enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
-          reason: "skill_proposal_admission_rejected",
+          reason: recoveryCorrection
+            ? "recovery_proposal_admission_rejected"
+            : "skill_proposal_admission_rejected",
           commitmentId: null
         });
         return JSON.stringify({
@@ -2665,11 +2670,15 @@ function establishSkillCommitmentTool(
           rejection_detail: admission.detail ?? null,
           automatic_actuation: false,
           next_response_contract: {
-            mode: "new_sensorimotor_proposal_required",
+            mode: recoveryCorrection
+              ? "new_recovery_proposal_required"
+              : "new_sensorimotor_proposal_required",
             preserve_goal_epoch_id: true,
             narration_allowed: false
           },
-          recovery: "Do not establish this commitment. Delegate Sensorimotor again for one bounded Skill whose real invocation advances the active Goal or establishes its next physical prerequisite."
+          recovery: recoveryCorrection
+            ? "Do not establish this commitment. Delegate the current failure and this direct correction through Sensorimotor to Recovery again; choose a materially different bounded invocation or escalate."
+            : "Do not establish this commitment. Delegate Sensorimotor again for one bounded Skill whose real invocation advances the active Goal or establishes its next physical prerequisite."
         });
       }
       const commitment = await runtime.establishNeuralSkillCommitment({
@@ -2692,6 +2701,7 @@ function establishSkillCommitmentTool(
       return JSON.stringify({
         status: "skill_committed",
         commitment,
+        next_phase: runtime.neuralHarnessPhase().phase,
         source_signal_ids: commitmentSourceSignalIds
       });
     }
@@ -2937,10 +2947,25 @@ function transitionSkillCommitmentTool(
           goalEpochId: commitment.goal_epoch_id,
           commitmentId: null
         });
+      } else if (state === "released"
+        && runtime.autonomyReadiness() === "post_failure_observation") {
+        // A rejected plan may not actuate the plant, but its geometry and
+        // availability evidence belongs to an older world cut. Re-enter
+        // Perception before Recovery so the replacement decision joins the
+        // durable rejection with a current belief instead of recycling the
+        // pre-rejection proposal context.
+        await runtime.transitionNeuralHarnessPhase({
+          phase: "perception",
+          enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+          reason: "released_failed_commitment_requires_current_perception",
+          goalEpochId: commitment.goal_epoch_id,
+          commitmentId: null
+        });
       }
       return JSON.stringify({
         status: `skill_${state}`,
         commitment,
+        next_phase: runtime.neuralHarnessPhase().phase,
         source_signal_ids: transitionSourceSignalIds
       });
     }
@@ -3347,7 +3372,27 @@ function directActionSelectionSignalKind(
     }
     throw new Error("Feedback phase has no authoritative physical completion signal");
   }
-  if (phase === "safety_interrupt" || phase === "recovery") {
+  if (phase === "safety_interrupt") {
+    return "prediction_error";
+  }
+  if (phase === "recovery") {
+    // Recovery authority is typed by the failure that opened it. In
+    // particular, skill_failed requires a causally newer perceptual belief,
+    // while escalation must remain eligible for supervisory propagation.
+    // Relabelling either as prediction_error here weakens those contracts and
+    // can send a supervisory escalation back around the local recovery loop.
+    if (source?.kind === "prediction_error"
+      || source?.kind === "skill_failed"
+      || source?.kind === "escalation") {
+      return source.kind;
+    }
+    const durableFailure = jsonRecord(
+      jsonRecord(runtime.recoveryFailureEvidence())?.failure_receipt
+    );
+    if (typeof durableFailure?.action === "string"
+      && durableFailure.action.startsWith("execute_")) {
+      return "skill_failed";
+    }
     return "prediction_error";
   }
   if (["motor_assessment", "motor_planning", "rollout_review"].includes(phase)) {
@@ -3820,25 +3865,37 @@ function recoveryAuthorityTool(
           targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
           kinds: ["prediction_error", "skill_failed", "escalation"]
         });
-        const relevant = recoveryDemands.find((signal) => signal.direction === "descending"
-          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
-          && signal.invocation_id === recoveryInvocation.parentInvocationId);
+        const relevant = recoveryDemands.filter((signal) => (
+          signal.direction === "descending"
+            && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+            && signal.invocation_id === recoveryInvocation.parentInvocationId
+        )).sort((left, right) => (
+          right.world_revision - left.world_revision
+            || right.sequence - left.sequence
+        ))[0];
         const currentBelief = runtime.pendingNeuralSignals({
           targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
           kinds: ["perceptual_belief"]
-        }).find((signal) => signal.direction === "descending"
-          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
-          && signal.invocation_id === recoveryInvocation.parentInvocationId
-          && isCurrentNeuralSignal(runtime, signal));
+        }).filter((signal) => (
+          signal.direction === "descending"
+            && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+            && signal.invocation_id === recoveryInvocation.parentInvocationId
+            && isCurrentNeuralSignal(runtime, signal)
+        )).sort((left, right) => (
+          right.world_revision - left.world_revision
+            || right.sequence - left.sequence
+        ))[0];
         const hierarchyState = runtime.neuralHierarchyState();
         const stationarySafetyInterrupt = runtime.pendingNeuralSafetyInterrupts()
           .find((interrupt) => interrupt.kind === "stationary_fall"
             && interrupt.status === "acknowledged"
             && currentBelief !== undefined
             && currentBelief.world_revision >= interrupt.world_revision);
+        const recoveryReadiness = runtime.autonomyReadiness();
+        const durableFailureEvidence = runtime.recoveryFailureEvidence();
         const freshDurableFailureBelief = !relevant
           && currentBelief
-          && runtime.autonomyReadiness() === "replan_or_retire"
+          && recoveryReadiness === "replan_or_retire"
           && !neuralSkillCommitmentIsOpen(hierarchyState.active_skill_commitment)
           ? currentBelief
           : undefined;
@@ -3848,15 +3905,35 @@ function recoveryAuthorityTool(
             "Recovery requires failure feedback routed through the current Action Selection -> Sensorimotor episode"
           );
         }
-        const postFailureBelief = relevant?.kind === "skill_failed"
-          || freshDurableFailureBelief
-          ? currentBelief
-          : undefined;
-        if (relevant?.kind === "skill_failed"
-          && runtime.autonomyReadiness() === "replan_or_retire"
-          && !postFailureBelief) {
+        // Once durable action state says the failed/rejected attempt has been
+        // observed, every recovery kind must carry that newest belief. A
+        // process-resumed structural edge may be prediction_error even when
+        // the durable root failure was physical; checking only skill_failed
+        // would silently drop the post-failure world state on resume.
+        const postFailureBelief = currentBelief;
+        if (recoveryReadiness === "replan_or_retire" && !postFailureBelief) {
           throw new Error(
-            "Physical failure Recovery requires a current causally bound post-failure perceptual belief"
+            "Durable Recovery requires a current causally bound post-failure perceptual belief"
+          );
+        }
+        if (recoveryReadiness === "replan_or_retire"
+          && durableFailureEvidence === null) {
+          throw new Error(
+            "Durable Recovery requires the current Cycle failure receipt"
+          );
+        }
+        const durableObservation = jsonRecord(
+          jsonRecord(durableFailureEvidence)?.post_failure_observation_receipt
+        );
+        const durableObservationRevision = durableObservation
+          ?.world_after_revision;
+        if (recoveryReadiness === "replan_or_retire"
+          && (typeof durableObservationRevision !== "number"
+            || !Number.isSafeInteger(durableObservationRevision)
+            || !postFailureBelief
+            || postFailureBelief.world_revision < durableObservationRevision)) {
+          throw new Error(
+            "Durable Recovery perceptual belief predates its post-failure observation receipt"
           );
         }
         const suspendLeaseIds = Object.values(hierarchyState.authority_leases)
@@ -3901,27 +3978,33 @@ function recoveryAuthorityTool(
             authorityLeaseId: lease.lease_id,
             invocationId: recoveryInvocation.invocationId,
             parentInvocationId: recoveryInvocation.parentInvocationId,
-            payload: freshDurableFailureBelief
-              ? stationarySafetyInterrupt
-                ? {
-                    recovery_basis:
-                      "stationary_safety_interrupt_and_post_failure_observation",
-                    autonomy_readiness: "replan_or_retire",
-                    safety_interrupt: stationarySafetyInterrupt,
-                    post_failure_belief: freshDurableFailureBelief.payload
-                  }
-                : {
-                  recovery_basis:
-                    "durable_failure_receipt_and_post_failure_observation",
-                  autonomy_readiness: "replan_or_retire",
-                  post_failure_belief: freshDurableFailureBelief.payload
-                }
-              : postFailureBelief
+            payload: stationarySafetyInterrupt && postFailureBelief
               ? {
-                  failure: recoveryRoot.payload,
+                  recovery_basis:
+                    "stationary_safety_interrupt_and_post_failure_observation",
+                  autonomy_readiness: recoveryReadiness,
+                  failure: relevant?.payload ?? null,
+                  durable_failure_evidence: durableFailureEvidence,
+                  safety_interrupt: stationarySafetyInterrupt,
                   post_failure_belief: postFailureBelief.payload
                 }
-              : recoveryRoot.payload
+              : freshDurableFailureBelief
+                ? {
+                    recovery_basis:
+                      "durable_failure_receipt_and_post_failure_observation",
+                    autonomy_readiness: "replan_or_retire",
+                    durable_failure_evidence: durableFailureEvidence,
+                    post_failure_belief: freshDurableFailureBelief.payload
+                  }
+                : postFailureBelief
+                  ? {
+                      failure: recoveryRoot.payload,
+                      ...(durableFailureEvidence === null
+                        ? {}
+                        : { durable_failure_evidence: durableFailureEvidence }),
+                      post_failure_belief: postFailureBelief.payload
+                    }
+                  : recoveryRoot.payload
           });
           const runOptions = {
             session: requiredSession(sessions, "recovery"),
@@ -5752,15 +5835,21 @@ async function advanceHarnessPhaseAfterChild(
   if (childKey === "actionSelection" && signalKind === "skill_commitment") {
     const commitment = runtime.neuralHierarchyState().active_skill_commitment;
     if (commitment) {
-      const nextPhase: NeuralHarnessPhase = commitment.state === "executing"
-        ? "execution"
-        : commitment.state === "committed"
-          ? "motor_assessment"
-          : "skill_proposal";
+      const failureObservationRequired = phase.phase === "perception"
+        && runtime.autonomyReadiness() === "post_failure_observation";
+      const nextPhase: NeuralHarnessPhase = failureObservationRequired
+        ? "perception"
+        : commitment.state === "executing"
+          ? "execution"
+          : commitment.state === "committed"
+            ? "motor_assessment"
+            : "skill_proposal";
       await runtime.transitionNeuralHarnessPhase({
         phase: nextPhase,
         enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
-        reason: `action_selection_returned_${commitment.state}_commitment`,
+        reason: failureObservationRequired
+          ? "released_commitment_returned_before_required_failure_observation"
+          : `action_selection_returned_${commitment.state}_commitment`,
         goalEpochId: commitment.goal_epoch_id,
         commitmentId: ["completed", "failed", "released"].includes(commitment.state)
           ? null
@@ -5875,6 +5964,13 @@ function currentActionSelectionBelief(
   const causallyBound = beliefs.filter((belief) => sourceSignals.some((source) => (
     belief.signal_id === source.signal_id
       || neuralSignalHasAncestorId(state, belief, source.signal_id)
+      || (source.kind === "skill_failed"
+        && neuralSignalsShareAncestorKind(
+          state,
+          belief,
+          source,
+          "skill_failed"
+        ))
   )));
   if (sourceSignals.some((signal) => signal.kind === "skill_failed")) {
     return [...causallyBound].sort(
@@ -6029,7 +6125,9 @@ function currentManagerChildSignals(
 function currentSkillProposalAdmissionCorrection(
   runtime: HumanoidNeuralAgentRuntime
 ): { proposalSignalId: string; payload: JsonValue } | undefined {
-  if (runtime.neuralHarnessPhase().reason !== "skill_proposal_admission_rejected") {
+  if (runtime.neuralHarnessPhase().reason !== "skill_proposal_admission_rejected"
+    && runtime.neuralHarnessPhase().reason
+      !== "recovery_proposal_admission_rejected") {
     return undefined;
   }
   const proposal = currentManagerChildSignals(
@@ -7952,6 +8050,40 @@ function neuralSignalHasAncestorId(
     visited.add(signalId);
     const ancestor = state.signals[signalId];
     if (ancestor) pending.push(...ancestor.causal_parent_ids);
+  }
+  return false;
+}
+
+function neuralSignalsShareAncestorKind(
+  state: NeuralHierarchyState,
+  left: NeuralSignal,
+  right: NeuralSignal,
+  kind: NeuralSignalKind
+): boolean {
+  const leftAncestors = new Set<string>();
+  const leftVisited = new Set<string>();
+  const leftPending = [left.signal_id];
+  while (leftPending.length > 0) {
+    const signalId = leftPending.pop()!;
+    if (leftVisited.has(signalId)) continue;
+    leftVisited.add(signalId);
+    const signal = state.signals[signalId];
+    if (!signal) continue;
+    if (signal.kind === kind) leftAncestors.add(signalId);
+    leftPending.push(...signal.causal_parent_ids);
+  }
+  if (leftAncestors.size === 0) return false;
+
+  const visited = new Set<string>();
+  const rightPending = [right.signal_id];
+  while (rightPending.length > 0) {
+    const signalId = rightPending.pop()!;
+    if (visited.has(signalId)) continue;
+    visited.add(signalId);
+    const signal = state.signals[signalId];
+    if (!signal) continue;
+    if (signal.kind === kind && leftAncestors.has(signalId)) return true;
+    rightPending.push(...signal.causal_parent_ids);
   }
   return false;
 }

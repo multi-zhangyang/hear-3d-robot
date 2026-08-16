@@ -82,6 +82,10 @@ export function planAutonomousHumanoidSkill(input: {
       goal: input.activeGoal,
       invocation: input.binding.invocation,
       observation: input.observation,
+      ...(input.binding.invocation.skill === "explore"
+        && input.binding.target_position
+        ? { navigationTargetOverride: input.binding.target_position }
+        : {}),
       ...(input.recoveryAuthorized ? { recoveryAuthorized: true } : {})
     });
     if (!alignment.accepted) {
@@ -254,19 +258,19 @@ function navigationSkillPlan(
     const selected = observation.spatialBelief.frontiers.find(
       ({ id }) => id === invocation.frontier_id
     );
-    if (!selected) throw new Error("Selected exploration frontier is no longer observable");
+    const target = selected?.target ?? requiredTargetPosition(binding);
     return {
       kind: "navigation",
-      targets: [selected].map((frontier) => ({
-        target: { ...frontier.target },
+      targets: [{
+        target: { ...target },
         arrivalHeading: null,
         acceptedPositionToleranceMeters: clamp(
           observation.spatialBelief.resolution_m * 0.5,
           MINIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS,
           MAXIMUM_SEMANTIC_NAVIGATION_TOLERANCE_METERS
         ),
-        score: explorationScore(frontier, invocation.strategy)
-      })).sort((left, right) => right.score - left.score)
+        score: selected ? explorationScore(selected, invocation.strategy) : 1
+      }]
     };
   }
   if (invocation.skill === "carry"

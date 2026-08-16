@@ -1332,6 +1332,7 @@ const NEURAL_HARNESS_PHASE_TRANSITIONS: Readonly<Record<
   commitment_authorization: new Set([
     "motor_assessment",
     "skill_proposal",
+    "recovery",
     "goal_valuation",
     "safety_interrupt",
     "terminal"
