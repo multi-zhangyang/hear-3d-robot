@@ -10,8 +10,10 @@ import {
 } from "@openai/agents";
 import {
   DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS,
+  providerConfigForAgent,
   providerConfigForProfile,
   providerConfigForRole,
+  type ModelProviderConfig,
   type ProviderConfig,
   type RuntimeCatalog
 } from "../config/load.js";
@@ -379,7 +381,7 @@ async function executeHumanoidMission(input: {
     const manifestEpochId = persistedManifest?.epoch_id ?? randomUUID();
     const promptCacheKeyFor = (
       agentId: string,
-      provider: ReturnType<typeof providerConfigForProfile>
+      provider: ModelProviderConfig
     ): string => promptCacheAffinityKey({
       namespace: HUMANOID_PROMPT_CACHE_NAMESPACE,
       agentId,
@@ -416,7 +418,11 @@ async function executeHumanoidMission(input: {
         recovery_window_reset: true
       }, agentId);
     };
-    const executiveProvider = providerConfigForProfile(input.provider, "executive");
+    const executiveProvider = providerConfigForAgent(
+      input.provider,
+      HUMANOID_NEURAL_AGENT_IDS.executive,
+      "executive"
+    );
     const compactorProvider = providerConfigForRole(input.provider, "compactor");
     const compactorOutputLimit = configuredOutputTokenLimit(
       compactorProvider.compactMaxOutputTokens,
@@ -425,12 +431,13 @@ async function executeHumanoidMission(input: {
     const contextManager = new LongRunContextManager({
       runtime: input.runtime,
       provider: executiveProvider,
-      configForAgent: (agentId) => providerConfigForProfile(
-        input.provider,
-        agentId.startsWith("humanoid-context-compactor:")
-          ? "compactor"
-          : humanoidNeuralAgentProfile(agentId)
-      ),
+      configForAgent: (agentId) => agentId.startsWith("humanoid-context-compactor:")
+        ? providerConfigForProfile(input.provider, "compactor")
+        : providerConfigForAgent(
+            input.provider,
+            agentId,
+            humanoidNeuralAgentProfile(agentId)
+          ),
       compactorProvider,
       createGenerator: (agentId) => new AgentsSdkContextSummaryGenerator({
         model: createConfiguredModel(compactorProvider, {

@@ -310,6 +310,7 @@ AI_PROVIDER=openai_compatible
 AI_BASE_URL=https://api.example.com/v1
 AI_MODEL=your-model-id
 AI_API_KEY=your-api-key
+AI_AGENT_MODELS_JSON={"humanoid-executive":{"model":"reasoning-model","context_window_tokens":1000000,"reasoning_effort":"high"}}
 AI_REQUEST_TIMEOUT_MS=300000
 AI_STREAM_EVENT_IDLE_TIMEOUT_MS=300000
 
@@ -346,7 +347,7 @@ HEAR_WORKYARD_CONTACT_TARGET_ZONE_ID=assembly_bay
 
 `AI_REQUEST_TIMEOUT_MS` 默认是 `300000`，表示 HTTP 建连或相邻响应数据之间允许的最长静默时间。`AI_STREAM_EVENT_IDLE_TIMEOUT_MS` 默认同为 `300000`，约束相邻 Agents SDK 模型事件之间的静默时间；只有真实模型事件会续期。两者均可按端点能力在 5 秒至 10 分钟之间调整，任务总时限、人工停止和进程恢复仍独立生效。
 
-模型节点按四个可独立配置的结构 profile 选择供应商参数；未设置的 profile 变量继承同名 `AI_*` 默认值。旧 `GOAL_MANAGER`、`COORDINATOR`、`MOTION`、`SENTRY` 与 `EXECUTOR` 键只用于读取 V1 运行或兼容旧部署，不再表示 V3 的结构身份：
+模型节点先按四个结构 profile 选择默认参数，压缩器使用独立 profile；未设置的 profile 变量继承同名 `AI_*` 默认值。旧 `GOAL_MANAGER`、`COORDINATOR`、`MOTION`、`SENTRY` 与 `EXECUTOR` 键只用于读取 V1 运行或兼容旧部署，不再表示 V3 的结构身份：
 
 | `PROFILE` | V3 结构职责 |
 |---|---|
@@ -357,6 +358,8 @@ HEAR_WORKYARD_CONTACT_TARGET_ZONE_ID=assembly_bay
 | `COMPACTOR` | 长期上下文压缩 |
 
 `SETTING` 支持 `PROVIDER`、`BASE_URL`、`MODEL`、`API_KEY`、`REQUEST_TIMEOUT_MS`、`STREAM_EVENT_IDLE_TIMEOUT_MS`、`TEMPERATURE`、`REASONING_EFFORT`、`TOOL_CHOICE`、`MAX_OUTPUT_TOKENS`、`CONTEXT_WINDOW_TOKENS`、`COMPACT_TRIGGER_TOKENS`、`COMPACT_RECENT_MODEL_TURNS` 和 `COMPACT_MAX_OUTPUT_TOKENS`。例如 `AI_MOTOR_INTENT_MODEL` 只覆盖 Motor Intent profile；`AI_COMPACTOR_CONTEXT_WINDOW_TOKENS` 只描述压缩模型的真实上下文上限。配置仍基于协议能力，不绑定服务商或模型名称。
+
+`AI_AGENT_MODELS_JSON` 可按结构 `agent_id` 覆盖任一模型节点，优先级高于所属 profile。对象字段使用小写 snake case：`protocol`、`base_url`、`model`、`api_key`、`request_timeout_ms`、`stream_event_idle_timeout_ms`、`temperature`、`reasoning_effort`、`tool_choice`、`max_output_tokens`、`context_window_tokens`、`compact_trigger_tokens`、`compact_recent_model_turns`、`compact_max_output_tokens`。只需填写要覆盖的字段；其余值继续继承所属 profile。五个确定性服务、控制器和物理节点不会读取或分配模型。
 
 十三个推理节点各自持有独立 Model facade 与持久 Session；五个非模型节点只持有实现合约和运行身份；压缩器使用独立模型配置和无历史污染的有界 SDK 回合。每个 Run 会写入不含凭证和端点明文的 V2 Harness 身份清单。恢复时会同时核验控制树、反馈合同、模型配置、工具与输出 Schema、服务实现合约和 Agents SDK 版本；不兼容配置会被明确拒绝，不会静默复用旧 Session。
 

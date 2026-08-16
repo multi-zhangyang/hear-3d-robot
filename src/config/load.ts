@@ -95,11 +95,60 @@ const ModelProviderConfigSchema = z.object(ProviderConfigShape).strict().superRe
   validateProviderBudget
 );
 
+const ModelProviderConfigOverrideSchema = z.object({
+  protocol: ProviderConfigShape.protocol.optional(),
+  baseUrl: z.url().optional(),
+  model: z.string().trim().min(1).optional(),
+  apiKey: z.string().min(1).optional(),
+  requestTimeoutMs: z.number().int().min(5_000).max(10 * 60_000).optional(),
+  streamEventIdleTimeoutMs:
+    z.number().int().min(5_000).max(10 * 60_000).optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  reasoningEffort: ReasoningEffortSchema.optional(),
+  toolChoice: z.enum(["auto", "required", "none"]).optional(),
+  maxOutputTokens: z.number().int().positive().optional(),
+  contextWindowTokens: z.number().int().positive().optional(),
+  compactTriggerTokens: z.number().int().positive().optional(),
+  compactRecentModelTurns: z.number().int().nonnegative().optional(),
+  compactMaxOutputTokens: z.number().int().positive().optional()
+}).strict().refine((value) => Object.keys(value).length > 0, {
+  message: "An Agent model override cannot be empty"
+});
+
+const AgentModelOverrideInputSchema = z.object({
+  protocol: ProviderConfigShape.protocol.optional(),
+  base_url: z.url().optional(),
+  model: z.string().trim().min(1).optional(),
+  api_key: z.string().min(1).optional(),
+  request_timeout_ms: z.number().int().min(5_000).max(10 * 60_000).optional(),
+  stream_event_idle_timeout_ms:
+    z.number().int().min(5_000).max(10 * 60_000).optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  reasoning_effort: ReasoningEffortSchema.optional(),
+  tool_choice: z.enum(["auto", "required", "none"]).optional(),
+  max_output_tokens: z.number().int().positive().optional(),
+  context_window_tokens: z.number().int().positive().optional(),
+  compact_trigger_tokens: z.number().int().positive().optional(),
+  compact_recent_model_turns: z.number().int().nonnegative().optional(),
+  compact_max_output_tokens: z.number().int().positive().optional()
+}).strict().refine((value) => Object.keys(value).length > 0, {
+  message: "An Agent model override cannot be empty"
+});
+
+const AgentModelOverridesInputSchema = z.record(
+  z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
+  AgentModelOverrideInputSchema
+);
+
 const ProviderConfigSchema = z.object({
   ...ProviderConfigShape,
   agentModels: z.record(
     z.enum(AGENT_MODEL_PROFILES),
     ModelProviderConfigSchema
+  ).optional(),
+  agentOverrides: z.record(
+    z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
+    ModelProviderConfigOverrideSchema
   ).optional()
 }).strict().superRefine(validateProviderBudget);
 
@@ -138,6 +187,9 @@ function validateProviderBudget(
 }
 
 export type ModelProviderConfig = z.infer<typeof ModelProviderConfigSchema>;
+export type ModelProviderConfigOverride = z.infer<
+  typeof ModelProviderConfigOverrideSchema
+>;
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
 /**
@@ -198,7 +250,12 @@ export function loadProviderConfig(env: NodeJS.ProcessEnv = process.env): Provid
     profile,
     loadAgentModelConfig(env, profile, inherited)
   ])) as Record<AgentModelProfile, ModelProviderConfig>;
-  return ProviderConfigSchema.parse({ ...inherited, agentModels });
+  const agentOverrides = loadAgentModelOverrides(env);
+  return ProviderConfigSchema.parse({
+    ...inherited,
+    agentModels,
+    ...(agentOverrides ? { agentOverrides } : {})
+  });
 }
 
 export function providerConfigForProfile(
@@ -207,8 +264,33 @@ export function providerConfigForProfile(
 ): ModelProviderConfig {
   const selected = config.agentModels?.[profile];
   if (selected) return ModelProviderConfigSchema.parse(selected);
-  const { agentModels: _agentModels, ...inherited } = config;
+  const {
+    agentModels: _agentModels,
+    agentOverrides: _agentOverrides,
+    ...inherited
+  } = config;
   return ModelProviderConfigSchema.parse(inherited);
+}
+
+export function providerConfigForAgent(
+  config: ProviderConfig,
+  agentId: string,
+  profile: AgentModelProfile
+): ModelProviderConfig {
+  const selected = config.agentOverrides?.[agentId];
+  const inherited = providerConfigForProfile(config, profile);
+  if (!selected) return inherited;
+  const contextWindowTokens = selected.contextWindowTokens
+    ?? inherited.contextWindowTokens;
+  return ModelProviderConfigSchema.parse({
+    ...inherited,
+    ...selected,
+    contextWindowTokens,
+    compactTriggerTokens: selected.compactTriggerTokens
+      ?? (selected.contextWindowTokens === undefined
+        ? inherited.compactTriggerTokens
+        : defaultCompactTriggerTokens(contextWindowTokens))
+  });
 }
 
 export function providerConfigForRole(
@@ -342,6 +424,41 @@ function loadAgentModelConfig(
       inherited.compactMaxOutputTokens
     )
   });
+}
+
+function loadAgentModelOverrides(
+  env: NodeJS.ProcessEnv
+): Record<string, ModelProviderConfigOverride> | undefined {
+  const raw = env.AI_AGENT_MODELS_JSON?.trim();
+  if (!raw) return undefined;
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    throw new Error("AI_AGENT_MODELS_JSON must be a valid JSON object");
+  }
+  const overrides = AgentModelOverridesInputSchema.parse(decoded);
+  return Object.fromEntries(Object.entries(overrides).map(([agentId, override]) => {
+    const entries = [
+      ["protocol", override.protocol],
+      ["baseUrl", override.base_url],
+      ["model", override.model],
+      ["apiKey", override.api_key],
+      ["requestTimeoutMs", override.request_timeout_ms],
+      ["streamEventIdleTimeoutMs", override.stream_event_idle_timeout_ms],
+      ["temperature", override.temperature],
+      ["reasoningEffort", override.reasoning_effort],
+      ["toolChoice", override.tool_choice],
+      ["maxOutputTokens", override.max_output_tokens],
+      ["contextWindowTokens", override.context_window_tokens],
+      ["compactTriggerTokens", override.compact_trigger_tokens],
+      ["compactRecentModelTurns", override.compact_recent_model_turns],
+      ["compactMaxOutputTokens", override.compact_max_output_tokens]
+    ] as const;
+    return [agentId, ModelProviderConfigOverrideSchema.parse(
+      Object.fromEntries(entries.filter((entry) => entry[1] !== undefined))
+    )];
+  }));
 }
 
 function stringFromEnv(value: string | undefined, inherited: string): string {

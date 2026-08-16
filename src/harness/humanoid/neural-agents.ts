@@ -14,7 +14,7 @@ import {
 import { Mutex } from "async-mutex";
 import { z } from "zod";
 import {
-  providerConfigForProfile,
+  providerConfigForAgent,
   type AgentModelProfile,
   type ModelProviderConfig,
   type ProviderConfig
@@ -537,7 +537,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     const profile = humanoidNeuralAgentProfile(agentId);
     const model = input.createModel(
       agentId,
-      providerConfigForProfile(input.provider, profile)
+      providerConfigForAgent(input.provider, agentId, profile)
     );
     if (models.has(model)) {
       throw new Error(`Neural Agents cannot share one Model facade: ${agentId}`);
@@ -562,23 +562,20 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     key: HumanoidNeuralAgentKey,
     options: {
       parallel?: boolean;
-      thinking?: "enabled" | "disabled";
       toolChoice?: "auto" | "required";
     } = {}
   ): ModelSettings => {
-    const provider = providerConfigForProfile(
+    const agentId = HUMANOID_NEURAL_AGENT_IDS[key];
+    const provider = providerConfigForAgent(
       input.provider,
-      humanoidNeuralAgentProfile(HUMANOID_NEURAL_AGENT_IDS[key])
+      agentId,
+      humanoidNeuralAgentProfile(agentId)
     );
     // Every neural node advances the control graph through a formal tool: a
     // child delegation, a state mutation, or submit_neural_output. `auto`
     // lets a compatible model terminate in prose and silently bypass that
     // graph, so the neural Harness itself requires tool use on every turn.
     const toolChoice = options.toolChoice ?? "required";
-    const deepSeekCompatible = provider.protocol === "openai_compatible"
-      && provider.model.toLowerCase().includes("deepseek");
-    const thinking = options.thinking
-      ?? (deepSeekCompatible && toolChoice === "required" ? "disabled" : "enabled");
     return {
       temperature: provider.temperature,
       ...(provider.reasoningEffort === undefined
@@ -587,21 +584,6 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       ...(provider.maxOutputTokens === undefined
         ? {}
         : { maxTokens: provider.maxOutputTokens }),
-      ...(deepSeekCompatible
-        ? {
-            // DeepSeek thinking rejects tool_choice=required. Keep the same
-            // model and disable thinking only for these formal control turns,
-            // matching its OpenAI-compatible transport contract.
-            providerData: {
-              thinking: { type: thinking },
-              providerOptions: {
-                "configured-openai-compatible": {
-                  thinking: { type: thinking }
-                }
-              }
-            }
-          }
-        : {}),
       parallelToolCalls: options.parallel === true
         && humanoidNeuralManagerParallelToolConcurrency(key) > 1,
       toolChoice

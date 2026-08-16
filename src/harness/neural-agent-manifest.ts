@@ -6,6 +6,7 @@ import type { Agent, Session } from "@openai/agents";
 import { z } from "zod";
 import {
   DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
+  providerConfigForAgent,
   providerConfigForProfile,
   type AgentModelProfile,
   type ModelProviderConfig,
@@ -26,7 +27,7 @@ import {
   type HumanoidNeuralNodeDescriptor
 } from "./humanoid/neural-hierarchy-contract.js";
 
-const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 41;
+const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 42;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
@@ -149,7 +150,11 @@ export function createHumanoidNeuralAgentManifest(input: {
         ...common,
         execution_kind: "model_agent",
         provider_profile: profile,
-        ...modelIdentity(runtimeAgent, providerConfigForProfile(input.provider, profile))
+        ...modelIdentity(runtimeAgent, providerConfigForAgent(
+          input.provider,
+          descriptor.id,
+          profile
+        ))
       };
     } else {
       if (!runtimeService) {
@@ -459,6 +464,11 @@ function installedRuntimeSdkIdentity(provider: ProviderConfig): Record<string, s
   ] as const) {
     const selected = providerConfigForProfile(provider, profile);
     packages.add(PROTOCOL_ADAPTER_PACKAGE[selected.protocol]);
+  }
+  for (const override of Object.values(provider.agentOverrides ?? {})) {
+    if (override.protocol !== undefined) {
+      packages.add(PROTOCOL_ADAPTER_PACKAGE[override.protocol]);
+    }
   }
   return {
     node: process.versions.node,
