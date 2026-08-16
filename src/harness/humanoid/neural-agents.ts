@@ -1,5 +1,6 @@
 import {
   Agent,
+  RunContext,
   Runner,
   tool,
   type CallModelInputFilter,
@@ -521,6 +522,14 @@ export interface HumanoidNeuralAgentHierarchy extends Omit<
   outputSchema(agentId: HumanoidNeuralAgentId): z.ZodObject | undefined;
 }
 
+const CERTIFIED_EXECUTION_DISPATCHER_TOOLS = new WeakMap<
+  HumanoidNeuralAgentRuntime,
+  {
+    tool: FunctionTool<unknown, any, unknown>;
+    parent: Agent<unknown, "text">;
+  }
+>();
+
 export function createHumanoidNeuralAgentHierarchy(input: {
   createModel: (agentId: string, provider: ModelProviderConfig) => Model;
   createSession: (agentId: string) => Session;
@@ -537,15 +546,16 @@ export function createHumanoidNeuralAgentHierarchy(input: {
   const ownModel = (key: HumanoidNeuralAgentKey): Model => {
     const agentId = HUMANOID_NEURAL_AGENT_IDS[key];
     const profile = humanoidNeuralAgentProfile(agentId);
-    const model = input.createModel(
+    const provider = providerConfigForAgent(input.provider, agentId, profile);
+    const configuredModel = input.createModel(
       agentId,
-      providerConfigForAgent(input.provider, agentId, profile)
+      provider
     );
-    if (models.has(model)) {
+    if (models.has(configuredModel)) {
       throw new Error(`Neural Agents cannot share one Model facade: ${agentId}`);
     }
-    models.add(model);
-    return model;
+    models.add(configuredModel);
+    return configuredModel;
   };
   const ownSession = (key: HumanoidNeuralAgentKey): Session => {
     const agentId = HUMANOID_NEURAL_AGENT_IDS[key];
@@ -565,6 +575,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     options: {
       parallel?: boolean;
       toolChoice?: "auto" | "required";
+      thinking?: "enabled" | "disabled";
     } = {}
   ): ModelSettings => {
     const agentId = HUMANOID_NEURAL_AGENT_IDS[key];
@@ -574,19 +585,31 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       humanoidNeuralAgentProfile(agentId)
     );
     // Formal progress still requires a verified tool result in each node's
-    // ToolUseBehavior. Transport-level tool choice remains provider-neutral:
-    // compatible reasoning models may expose tools while rejecting the
-    // `required` enum, and a prose-only turn cannot satisfy the Harness state
-    // transition or terminate the episode.
+    // ToolUseBehavior. Reasoning turns stay provider-neutral and auto-select
+    // tools. The deterministic execution phase is advanced directly by the
+    // Harness and never changes one Agent Session's reasoning mode.
     const toolChoice = options.toolChoice ?? provider.toolChoice ?? "auto";
     return {
       temperature: provider.temperature,
-      ...(provider.reasoningEffort === undefined
+      ...(provider.reasoningEffort === undefined || options.thinking === "disabled"
         ? {}
         : { reasoning: { effort: provider.reasoningEffort } }),
       ...(provider.maxOutputTokens === undefined
         ? {}
         : { maxTokens: provider.maxOutputTokens }),
+      ...(provider.protocol === "openai_compatible"
+        && provider.model.toLowerCase().includes("deepseek")
+        ? {
+            providerData: {
+              thinking: { type: options.thinking ?? "enabled" },
+              providerOptions: {
+                "configured-openai-compatible": {
+                  thinking: { type: options.thinking ?? "enabled" }
+                }
+              }
+            }
+          }
+        : {}),
       parallelToolCalls: options.parallel === true
         && humanoidNeuralManagerParallelToolConcurrency(key) > 1,
       toolChoice
@@ -599,6 +622,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     options: {
       parallel?: boolean;
       toolChoice?: "auto" | "required";
+      thinking?: "enabled" | "disabled";
       extraInstructions?: readonly string[];
       toolUseBehavior?: ToolUseBehavior;
     } = {}
@@ -622,7 +646,9 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     // Goal Manager and Motor Intent always terminate through their dedicated
     // domain tools, so their permanently-disabled generic submission endpoint
     // is not a capability and is omitted from the static surface entirely.
-    const capabilityTools = (key === "goalManager" || key === "motorIntent"
+    const capabilityTools = (key === "goalManager"
+      || key === "motorIntent"
+      || key === "executionDispatcher"
       ? [...tools]
       : [...tools, submissionTool]
     ).map((candidate) => stableNeuralToolCapability(
@@ -836,8 +862,10 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           // this historical signal a live causal predecessor, not a fallback.
           routedCausalParentIds.push(directLifecycleFeedback.signal_id);
         }
-        const descendingPayload = inputTool.parentKey === "actionSelection"
-          && inputTool.childKey === "sensorimotorManager"
+        const descendingPayload = ((inputTool.parentKey === "actionSelection"
+          && inputTool.childKey === "sensorimotorManager")
+          || (inputTool.parentKey === "sensorimotorManager"
+            && inputTool.childKey === "executionDispatcher"))
           && activeCommitment !== null
           && params.signal_kind === "skill_commitment"
           ? activeCommitment
@@ -1537,6 +1565,8 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "Use the existing Goal DAG tools for every formal Goal mutation.",
         "When no Goal is active, use the current world-bounded autonomy frontier and outcome history to submit 1–3 distinct observable Goal candidates, then use a separate model response to select exactly one candidate sequence. An exact actionable mission Goal may be the only candidate when no physically grounded alternative exists; never invent filler Goals. Do not wait for an operator to choose.",
         "In continuous mode, continuous_drive_state.drive_phase other than open_ended means the exact mission_goal remains the required long-horizon Goal; include it unchanged in the candidate slate and select it. Route discovery and local waypoints belong to bounded navigation Skills, never replacement Goals. Only after drive_phase=open_ended may novelty and useful interaction outrank repeating the bootstrap mission.",
+        "Treat observable_goal_surface.predicate_types as the exhaustive controller-admitted Goal predicate whitelist for this invocation. Empty manipulation, articulation, or block-removal surfaces mean those Goals are physically unavailable; never propose them from object visibility alone.",
+        "After continuous_drive_state.drive_phase becomes open_ended, every successor Goal must require a real change from the current MuJoCo state. Use the current robot root, zone geometry, and reachable exploration frontiers; never select a position or zone the robot already satisfies.",
         "A Goal is a durable desired physical state, not one motor step. Keep the exact mission Goal active across perception, navigation, manipulation, replanning, and recovery; do not replace it with nearby exploration waypoints merely because a frontier has higher information gain.",
         "In mission mode, value candidates by causal progress toward the mission Goal. In either mode, Goal valuation chooses only observable predicates; it never chooses a Skill, hand, interaction point, route, posture, or controller command.",
         "When a recovery escalation returns, continue the active Goal only if current physical evidence still shows a viable unfinished predicate; otherwise retire it with exact evidence and autonomously select a successor.",
@@ -1715,6 +1745,34 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       ]
     }
   );
+  const executionDispatcher = register(
+    "executionDispatcher",
+    SensorimotorOutputSchema,
+    [serialExecutionTool(input.runtime)],
+    {
+      toolChoice: "required",
+      thinking: "disabled",
+      toolUseBehavior: certifiedExecutionDispatcherToolUseBehavior(input.runtime),
+      extraInstructions: [
+        "This is a pure execution node. The Harness has already fixed the commitment, rollout certificate, and serial writer.",
+        "Call execute_certified_motor_intent exactly once. Copy the one direct skill_commitment signal_id from this invocation into source_signal_ids and use a short execution objective.",
+        "Do not plan, compare options, reason about alternatives, submit a separate neural output, or return prose."
+      ]
+    }
+  );
+  const executionDispatcherTool = asChildTool({
+    parentKey: "sensorimotorManager",
+    childKey: "executionDispatcher",
+    child: executionDispatcher,
+    description: "Dispatch the already-certified commitment through the serial physical writer.",
+    requiredSignalKind: "skill_commitment",
+    phases: ["execution"],
+    requireCommitment: true,
+    isEnabled: () => input.runtime.neuralExecutionAvailable()
+      && input.runtime.neuralHarnessPhase().phase === "execution"
+      && input.runtime.neuralHierarchyState().active_skill_commitment?.state
+        === "executing"
+  });
   const sensorimotorManager = register(
     "sensorimotorManager",
     SensorimotorOutputSchema,
@@ -1796,7 +1854,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           )
       }),
       recoveryAuthorityTool(input.runtime, recovery, sessions, input),
-      serialExecutionTool(input.runtime)
+      executionDispatcherTool
     ],
     {
       parallel: true,
@@ -1812,7 +1870,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "Premotor waits for Action Selection to accept that joined proposal as the active commitment. When the current phase is motor_assessment or motor_planning and the invocation contains the direct skill_commitment, call Premotor immediately; Affordance/Risk belong only to skill_proposal and must not be repeated. Predictive waits for a real rollout result.",
         "Predictive judges admission of the current bounded rollout chunk, not whether that chunk already completes the final Goal predicate.",
         "Predictive acceptance completes the motor-assessment episode and returns a certified rollout to Action Selection; do not call or synthesize execution in that episode.",
-        "Call execute_certified_motor_intent only in a later execution-phase invocation after Action Selection has moved the commitment to executing. Pass only the one direct skill_commitment signal from the current invocation; the Harness resolves its certificate and plan.",
+        "In execution, delegate the one direct executing skill_commitment to Certified Execution Dispatcher. The Dispatcher owns the required non-thinking tool call; do not execute or restate it yourself.",
         "Recovery freezes normal selection, runs one independent episode, and returns before execution resumes."
       ]
     }
@@ -1860,6 +1918,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       })
     ],
     {
+      toolChoice: "auto",
       toolUseBehavior: actionSelectionToolUseBehavior(input.runtime),
       extraInstructions: [
         "In safety_interrupt, acknowledge the exact pending Body→Reflex afferent interrupt first. This is independent plant provenance, not an Agent signal and not a reason to invent source_signal_ids. The Harness atomically fails any interrupted commitment and then requires fresh Perception at the fallen world revision.",
@@ -1870,6 +1929,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "You alone establish one durable skill commitment. Copy the outer delegate_sensorimotor_manager.source_signal_ids into establish_skill_commitment.source_signal_ids; nested Affordance/Risk ids do not authorize commitment. Then invoke Sensorimotor again with the resulting skill_commitment signal.",
         "A replacement Sensorimotor proposal supersedes every earlier proposal in this Action Selection episode. Establish only the newest direct proposal and its exact bounded Skill; never restore a rejected proposal because it matched the previous commitment or intention.",
         "Authorize execution only after the committed branch returns a real accepted rollout_result. Call authorize_skill_execution with the active commitment id and your reason; the Harness binds the unique direct certified rollout, so do not copy a rollout or Predictive signal id into that call.",
+        "After authorize_skill_execution returns skill_executing, your bounded decision episode ends. The Harness deterministically routes the unique certified commitment through Sensorimotor to Executor without another model decision; your next wake is typed physical feedback, never a request to wait or redispatch execution.",
         "A Premotor, planning, or Predictive escalation is a local recovery demand, not a Recovery escalation. First call release_skill_commitment with the direct Sensorimotor failure signal, then delegate that same direct signal back to Sensorimotor so its exclusive Recovery child can propose a replacement. Only an escalation returned by Recovery may propagate to Executive.",
         "A successful physical chunk is not automatically Skill completion. complete_skill_commitment is enabled only when the exact committed Skill binding has a successful physical receipt and its authoritative Skill-plan node postcondition is complete. Model-authored prose in the termination contract cannot override that lifecycle. Otherwise release the exhausted bounded plan, obtain fresh Perception, and continue the same Goal through a new bounded Skill commitment.",
         "In recovery, forward the direct failure signal to Sensorimotor. When the failure came from physical execution, also cite the new post-failure perceptual_belief returned after you closed the old commitment. If Recovery returns a replacement skill_proposal, you alone replace the failed commitment; if it escalates, return that typed escalation unchanged to Executive.",
@@ -1926,6 +1986,13 @@ export function createHumanoidNeuralAgentHierarchy(input: {
   );
 
   const services = createRuntimeServices();
+  CERTIFIED_EXECUTION_DISPATCHER_TOOLS.set(
+    input.runtime,
+    {
+      tool: executionDispatcherTool,
+      parent: sensorimotorManager
+    }
+  );
   return {
     root: executive,
     agents,
@@ -2844,6 +2911,255 @@ function authorizeSkillExecutionTool(
   });
 }
 
+/**
+ * Advance the one phase that contains no cognitive choice. The Harness opens
+ * the fixed Executive -> Action Selection -> Sensorimotor control path, then
+ * invokes the independent non-thinking Execution Dispatcher Agent. Its real
+ * required tool call is the model authority for the physical transaction;
+ * cognitive Agent Sessions never change reasoning mode.
+ */
+export async function orchestrateCertifiedNeuralExecution(
+  runtime: HumanoidNeuralAgentRuntime,
+  signal?: AbortSignal
+): Promise<boolean> {
+  const state = runtime.neuralHierarchyState();
+  if (state.harness_phase.phase !== "execution") return false;
+  const commitment = state.active_skill_commitment;
+  if (!commitment || commitment.state !== "executing"
+    || state.harness_phase.commitment_id !== commitment.commitment_id) {
+    throw new Error(
+      "Deterministic execution phase requires one Action Selection-authorized commitment"
+    );
+  }
+  const certificates = Object.values(state.rollout_certificates).filter(
+    (candidate) => candidate.status === "active"
+      && candidate.commitment_id === commitment.commitment_id
+  );
+  if (certificates.length !== 1) {
+    throw new Error(
+      `Deterministic execution phase requires one active Predictive certificate; found ${certificates.length}`
+    );
+  }
+  if (!runtime.neuralExecutionAvailable()) {
+    throw new Error("Certified deterministic execution is not physically available");
+  }
+  const certificate = certificates[0]!;
+  const dispatcherBinding = CERTIFIED_EXECUTION_DISPATCHER_TOOLS.get(runtime);
+  if (!dispatcherBinding) {
+    throw new Error(
+      "Certified Execution Dispatcher is not bound to the active neural hierarchy"
+    );
+  }
+  const { tool: dispatcherTool, parent: sensorimotorManager } = dispatcherBinding;
+  const orchestrationKey = [
+    "certified-execution-v1",
+    commitment.commitment_id,
+    certificate.certificate_id
+  ].join(":");
+  const executiveInvocationId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    orchestrationKey
+  );
+  const actionInvocationId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+    orchestrationKey
+  );
+  const sensorimotorInvocationId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+    orchestrationKey
+  );
+  const dispatcherToolCallId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
+    orchestrationKey
+  );
+
+  return withAgentInvocation(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    () => withAgentInvocation(
+      HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      async () => {
+        const actionInvocation = requiredHarnessInvocation(
+          HUMANOID_NEURAL_AGENT_IDS.actionSelection
+        );
+        const actionLease = await runtime.issueNeuralAuthorityLease({
+          issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+          targetChildNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+          allowedSignalKinds: ["skill_commitment"],
+          ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+          ttlMs: 600_000,
+          invocationId: actionInvocation.invocationId,
+          parentInvocationId: actionInvocation.parentInvocationId,
+          parentEpisodeId: executiveInvocationId
+        });
+        let executiveAdmission: NeuralSignal | undefined;
+        try {
+          executiveAdmission = await runtime.publishNeuralSignal({
+            kind: "skill_commitment",
+            pathway: "executive_control",
+            direction: "descending",
+            sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+            targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+            ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+            priority: 100,
+            causalParentIds: [
+              certificate.predictive_signal_id,
+              certificate.rollout_signal_id
+            ],
+            authorityLeaseId: actionLease.lease_id,
+            invocationId: actionLease.invocation_id,
+            parentInvocationId: actionLease.parent_invocation_id,
+            payload: commitment
+          });
+
+          return await withAgentInvocation(
+            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+            async () => {
+              const sensorimotorInvocation = requiredHarnessInvocation(
+                HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+              );
+              const sensorimotorLease = await runtime.issueNeuralAuthorityLease({
+                issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+                targetChildNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+                allowedSignalKinds: ["skill_commitment"],
+                ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+                ttlMs: 600_000,
+                invocationId: sensorimotorInvocation.invocationId,
+                parentInvocationId: sensorimotorInvocation.parentInvocationId,
+                parentEpisodeId: actionInvocation.invocationId
+              });
+              let sensorimotorAdmission: NeuralSignal | undefined;
+              try {
+                sensorimotorAdmission = await runtime.publishNeuralSignal({
+                  kind: "skill_commitment",
+                  pathway: "sensorimotor_selection",
+                  direction: "descending",
+                  sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+                  targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+                  ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+                  priority: 100,
+                  causalParentIds: [
+                    executiveAdmission!.signal_id,
+                    certificate.predictive_signal_id,
+                    certificate.rollout_signal_id
+                  ],
+                  authorityLeaseId: sensorimotorLease.lease_id,
+                  invocationId: sensorimotorLease.invocation_id,
+                  parentInvocationId: sensorimotorLease.parent_invocation_id,
+                  payload: commitment
+                });
+                const rawInput = JSON.stringify({
+                  signal_kind: "skill_commitment",
+                  source_signal_ids: [sensorimotorAdmission.signal_id],
+                  ttl_revisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+                  priority: 100
+                });
+                const dispatcherContext = new RunContext();
+                const dispatcherEnabled = dispatcherTool.isEnabled
+                  ? await dispatcherTool.isEnabled(
+                      dispatcherContext,
+                      sensorimotorManager
+                    )
+                  : true;
+                if (!dispatcherEnabled) {
+                  throw new Error(
+                    "Certified Execution Dispatcher is disabled in execution phase"
+                  );
+                }
+                const output = await dispatcherTool.invoke(
+                  dispatcherContext,
+                  rawInput,
+                  {
+                    toolCall: {
+                      type: "function_call",
+                      callId: dispatcherToolCallId,
+                      name: dispatcherTool.name,
+                      arguments: rawInput
+                    },
+                    ...(signal ? { signal } : {})
+                  }
+                );
+                const parsed = outputObject(output);
+                if (!parsed) {
+                  throw new Error(
+                    "Certified Execution Dispatcher returned a non-object receipt"
+                  );
+                }
+                const sourceSignalIds = z.array(z.string().uuid()).max(64).parse(
+                  parsed.source_signal_ids
+                );
+                const afterExecution = runtime.neuralHierarchyState();
+                const completionSignals = sourceSignalIds.map(
+                  (signalId) => afterExecution.signals[signalId]
+                ).filter((candidate): candidate is NeuralSignal => (
+                  candidate !== undefined
+                    && (candidate.kind === "skill_completed"
+                      || candidate.kind === "skill_failed")
+                    && candidate.source_node_id
+                      === HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
+                    && candidate.target_node_id
+                      === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+                ));
+                if (completionSignals.length !== 1) {
+                  throw new Error(
+                    `Certified execution requires one Dispatcher completion signal; found ${completionSignals.length}`
+                  );
+                }
+                const receipt = JsonValueSchema.parse(parsed.payload);
+                await runtime.publishNeuralSignal({
+                  kind: completionSignals[0]!.kind,
+                  pathway: "sensorimotor_selection",
+                  direction: "ascending",
+                  sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+                  targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+                  ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+                  priority: 100,
+                  causalParentIds: [
+                    sensorimotorAdmission.signal_id,
+                    ...sourceSignalIds
+                  ],
+                  sourceAuthorityLeaseId: sensorimotorLease.lease_id,
+                  invocationId: sensorimotorLease.invocation_id,
+                  parentInvocationId: sensorimotorLease.parent_invocation_id,
+                  payload: receipt
+                });
+                await runtime.consumeNeuralSignals(
+                  HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+                  [sensorimotorAdmission.signal_id, ...sourceSignalIds]
+                );
+                return true;
+              } finally {
+                await runtime.closeNeuralAuthorityLease({
+                  leaseId: sensorimotorLease.lease_id,
+                  closedByNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+                  reason: "certified_dispatcher_execution_returned"
+                });
+              }
+            },
+            false,
+            sensorimotorInvocationId
+          );
+        } finally {
+          if (executiveAdmission) {
+            await runtime.consumeNeuralSignals(
+              HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+              [executiveAdmission.signal_id]
+            );
+          }
+          await runtime.closeNeuralAuthorityLease({
+            leaseId: actionLease.lease_id,
+            closedByNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+            reason: "certified_action_execution_returned"
+          });
+        }
+      },
+      false,
+      actionInvocationId
+    ),
+    false,
+    executiveInvocationId
+  );
+}
+
 function serialExecutionTool(
   runtime: HumanoidNeuralAgentRuntime
 ): FunctionTool<unknown, typeof ExecutionTaskSchema, string> {
@@ -2864,7 +3180,7 @@ function serialExecutionTool(
       && runtime.neuralHierarchyState().active_skill_commitment?.state === "executing"
       && hasCurrentManagerEpisodeSignal(
         runtime,
-        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
         "skill_commitment"
       )
       && Object.values(runtime.neuralHierarchyState().rollout_certificates).filter(
@@ -2874,7 +3190,7 @@ function serialExecutionTool(
       ).length === 1,
     execute: (params, _context, details) => executionMutex.runExclusive(async () => {
       const managerInvocation = requiredHarnessInvocation(
-        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+        HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
       );
       return withAgentInvocation(HUMANOID_NEURAL_AGENT_IDS.executor, async () => {
       const executorInvocation = requiredHarnessInvocation(
@@ -2892,12 +3208,12 @@ function serialExecutionTool(
         && signal.status === "pending"
         && signal.kind === "skill_commitment"
         && signal.direction === "descending"
-        && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
-        && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+        && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+        && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
         && signal.invocation_id === managerInvocation.invocationId);
       if (directCommitmentSignals.length !== 1) {
         throw new Error(
-          "Serial execution requires the one direct Action Selection skill_commitment signal from this episode"
+          "Serial execution requires the one direct Sensorimotor skill_commitment signal from this Dispatcher episode"
         );
       }
       const directCommitment = NeuralSkillCommitmentSchema.parse(
@@ -2928,7 +3244,7 @@ function serialExecutionTool(
         execution
       };
       const lease = await runtime.issueNeuralAuthorityLease({
-        issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
         targetChildNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
         allowedSignalKinds: ["skill_commitment", "motor_intent", "rollout_result"],
         ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
@@ -2936,7 +3252,7 @@ function serialExecutionTool(
         invocationId: executorInvocation.invocationId,
         parentInvocationId: executorInvocation.parentInvocationId,
         parentEpisodeId: requiredParentEpisodeId(
-          HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+          HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
         )
       });
       const selected = executionAction(execution);
@@ -2949,7 +3265,7 @@ function serialExecutionTool(
           kind: "skill_commitment",
           pathway: "physical_execution",
           direction: "descending",
-          sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+          sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
           targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
           ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
           priority: 100,
@@ -2994,7 +3310,7 @@ function serialExecutionTool(
       } finally {
         await runtime.closeNeuralAuthorityLease({
           leaseId: lease.lease_id,
-          closedByNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+          closedByNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
           reason: "serial_execution_returned"
         });
       }
@@ -3659,7 +3975,7 @@ async function publishExecutorPhysicalFeedback(input: {
   let executionReceipt = executionFeedbackSignal(input.runtime, {
     kind: "execution_receipt",
     sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
-    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
     executionTransactionId: input.executionTransactionId
   });
   executionReceipt ??= await input.runtime.publishNeuralSignal({
@@ -3667,7 +3983,7 @@ async function publishExecutorPhysicalFeedback(input: {
     pathway: "physical_execution",
     direction: "ascending",
     sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
-    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
     ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
     priority: 90,
     causalParentIds: [input.lowerLoop.executionReceiptSignal.signal_id],
@@ -3686,7 +4002,7 @@ async function publishExecutorPhysicalFeedback(input: {
     executionPredictionError = executionFeedbackSignal(input.runtime, {
       kind: "prediction_error",
       sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
-      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
       causalParentSignalId: input.lowerLoop.predictionErrorSignal.signal_id
     });
     executionPredictionError ??= await input.runtime.publishNeuralSignal({
@@ -3694,7 +4010,7 @@ async function publishExecutorPhysicalFeedback(input: {
       pathway: "ascending_feedback",
       direction: "ascending",
       sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
-      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+      targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
       ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
       priority: 100,
       causalParentIds: [input.lowerLoop.predictionErrorSignal.signal_id],
@@ -3708,7 +4024,7 @@ async function publishExecutorPhysicalFeedback(input: {
   let completionSignal = executionFeedbackSignal(input.runtime, {
     kind: skillCompleted ? "skill_completed" : "skill_failed",
     sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
-    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
     executionTransactionId: input.executionTransactionId
   });
   completionSignal ??= await input.runtime.publishNeuralSignal({
@@ -3716,7 +4032,7 @@ async function publishExecutorPhysicalFeedback(input: {
     pathway: "physical_execution",
     direction: "ascending",
     sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
-    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
     ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
     priority: 95,
     causalParentIds: [...new Set([
@@ -3737,7 +4053,7 @@ async function publishExecutorPhysicalFeedback(input: {
       // close the executing commitment. Recovery starts only after a fresh
       // Sensor Fusion observation is causally bound to that failure.
       phase: "feedback",
-      enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+      enteredByNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
       reason: skillCompleted
         ? "physical_execution_completed"
         : "physical_execution_failed_requires_commitment_resolution"
@@ -3893,13 +4209,33 @@ export async function recoverCommittedNeuralPhysicalExecutionFeedback(
   if (!admission
     || admission.kind !== "skill_commitment"
     || admission.direction !== "descending"
-    || admission.source_node_id !== HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+    || admission.source_node_id !== HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
     || admission.target_node_id !== HUMANOID_NEURAL_AGENT_IDS.executor
     || !admittedCommitment?.success
     || admittedCommitment.data.commitment_id !== commitment.commitment_id
     || admittedCommitment.data.state !== "executing") {
     throw new Error(
-      `Recovered physical transaction has no Sensorimotor execution admission: ${receipt.transactionId}`
+      `Recovered physical transaction has no Dispatcher execution admission: ${receipt.transactionId}`
+    );
+  }
+  const dispatcherAdmissions = admission.causal_parent_ids.flatMap((signalId) => {
+    const signal = state.signals[signalId];
+    const parsed = signal
+      ? NeuralSkillCommitmentSchema.safeParse(signal.payload)
+      : undefined;
+    return signal
+      && signal.kind === "skill_commitment"
+      && signal.direction === "descending"
+      && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+      && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
+      && parsed?.success
+      && parsed.data.commitment_id === commitment.commitment_id
+      ? [signal]
+      : [];
+  });
+  if (dispatcherAdmissions.length !== 1) {
+    throw new Error(
+      `Recovered physical transaction has no unique Sensorimotor Dispatcher admission: ${receipt.transactionId}`
     );
   }
 
@@ -3951,47 +4287,61 @@ export async function recoverCommittedNeuralPhysicalExecutionFeedback(
         operation: (sensorimotorLease) => withRecoveredFeedbackLease({
           runtime,
           parentNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-          childNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
+          childNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
           allowedSignalKinds: ["skill_commitment"],
           recoveryKey,
-          operation: (executorLease) => withRecoveredFeedbackLease({
+          operation: (dispatcherLease) => withRecoveredFeedbackLease({
             runtime,
-            parentNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
-            childNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
-            allowedSignalKinds: ["motor_intent"],
+            parentNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
+            childNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
+            allowedSignalKinds: ["skill_commitment"],
             recoveryKey,
-            operation: (reflexLease) => withRecoveredFeedbackLease({
+            operation: (executorLease) => withRecoveredFeedbackLease({
               runtime,
-              parentNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
-              childNodeId: HUMANOID_NEURAL_AGENT_IDS.body,
+              parentNodeId: HUMANOID_NEURAL_AGENT_IDS.executor,
+              childNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
               allowedSignalKinds: ["motor_intent"],
               recoveryKey,
-              operation: async (bodyLease) => {
-                const lowerLoop = await publishCertifiedLowerMotorFeedback({
-                  runtime,
-                  physicalReceipt: receipt,
-                  commitment,
-                  executionTransactionId: receipt.transactionId,
-                  motorIntent,
-                  bodyIntent,
-                  bodyLease,
-                  reflexLease
-                });
-                const executorFeedback = await publishExecutorPhysicalFeedback({
-                  runtime,
-                  receiptPayload,
-                  executionTransactionId: receipt.transactionId,
-                  executorLease,
-                  lowerLoop
-                });
-                await publishRecoveredSensorimotorCompletion({
-                  runtime,
-                  receiptPayload,
-                  executionTransactionId: receipt.transactionId,
-                  sensorimotorLease,
-                  executorFeedback
-                });
-              }
+              operation: (reflexLease) => withRecoveredFeedbackLease({
+                runtime,
+                parentNodeId: HUMANOID_NEURAL_AGENT_IDS.reflex,
+                childNodeId: HUMANOID_NEURAL_AGENT_IDS.body,
+                allowedSignalKinds: ["motor_intent"],
+                recoveryKey,
+                operation: async (bodyLease) => {
+                  const lowerLoop = await publishCertifiedLowerMotorFeedback({
+                    runtime,
+                    physicalReceipt: receipt,
+                    commitment,
+                    executionTransactionId: receipt.transactionId,
+                    motorIntent,
+                    bodyIntent,
+                    bodyLease,
+                    reflexLease
+                  });
+                  const executorFeedback = await publishExecutorPhysicalFeedback({
+                    runtime,
+                    receiptPayload,
+                    executionTransactionId: receipt.transactionId,
+                    executorLease,
+                    lowerLoop
+                  });
+                  const dispatcherCompletion = await publishRecoveredDispatcherCompletion({
+                    runtime,
+                    receiptPayload,
+                    executionTransactionId: receipt.transactionId,
+                    dispatcherLease,
+                    executorFeedback
+                  });
+                  await publishRecoveredSensorimotorCompletion({
+                    runtime,
+                    receiptPayload,
+                    executionTransactionId: receipt.transactionId,
+                    sensorimotorLease,
+                    dispatcherCompletion
+                  });
+                }
+              })
             })
           })
         })
@@ -4038,13 +4388,9 @@ async function publishRecoveredSensorimotorCompletion(input: {
   receiptPayload: JsonValue;
   executionTransactionId: string;
   sensorimotorLease: NeuralAuthorityLease;
-  executorFeedback: {
-    executionReceiptSignal: NeuralSignal;
-    predictionErrorSignal?: NeuralSignal;
-    completionSignal: NeuralSignal;
-  };
+  dispatcherCompletion: NeuralSignal;
 }): Promise<NeuralSignal> {
-  const kind = input.executorFeedback.completionSignal.kind === "skill_completed"
+  const kind = input.dispatcherCompletion.kind === "skill_completed"
     ? "skill_completed"
     : "skill_failed";
   const existing = executionFeedbackSignal(input.runtime, {
@@ -4062,6 +4408,43 @@ async function publishRecoveredSensorimotorCompletion(input: {
     targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
     ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
     priority: 100,
+    causalParentIds: [input.dispatcherCompletion.signal_id],
+    sourceAuthorityLeaseId: input.sensorimotorLease.lease_id,
+    invocationId: input.sensorimotorLease.invocation_id,
+    parentInvocationId: input.sensorimotorLease.parent_invocation_id,
+    payload: input.receiptPayload
+  });
+}
+
+async function publishRecoveredDispatcherCompletion(input: {
+  runtime: HumanoidNeuralAgentRuntime;
+  receiptPayload: JsonValue;
+  executionTransactionId: string;
+  dispatcherLease: NeuralAuthorityLease;
+  executorFeedback: {
+    executionReceiptSignal: NeuralSignal;
+    predictionErrorSignal?: NeuralSignal;
+    completionSignal: NeuralSignal;
+  };
+}): Promise<NeuralSignal> {
+  const kind = input.executorFeedback.completionSignal.kind === "skill_completed"
+    ? "skill_completed"
+    : "skill_failed";
+  const existing = executionFeedbackSignal(input.runtime, {
+    kind,
+    sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+    executionTransactionId: input.executionTransactionId
+  });
+  if (existing) return existing;
+  return input.runtime.publishNeuralSignal({
+    kind,
+    pathway: "physical_execution",
+    direction: "ascending",
+    sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
+    targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+    ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+    priority: 100,
     causalParentIds: [...new Set([
       input.executorFeedback.executionReceiptSignal.signal_id,
       ...(input.executorFeedback.predictionErrorSignal
@@ -4069,9 +4452,9 @@ async function publishRecoveredSensorimotorCompletion(input: {
         : []),
       input.executorFeedback.completionSignal.signal_id
     ])],
-    sourceAuthorityLeaseId: input.sensorimotorLease.lease_id,
-    invocationId: input.sensorimotorLease.invocation_id,
-    parentInvocationId: input.sensorimotorLease.parent_invocation_id,
+    sourceAuthorityLeaseId: input.dispatcherLease.lease_id,
+    invocationId: input.dispatcherLease.invocation_id,
+    parentInvocationId: input.dispatcherLease.parent_invocation_id,
     payload: input.receiptPayload
   });
 }
@@ -5287,6 +5670,14 @@ function joinedManagerSignals(
       "skill_completed",
       "skill_failed"
     ];
+  } else if (childKey === "executionDispatcher"
+    && (outputKind === "skill_completed" || outputKind === "skill_failed")) {
+    kinds = [
+      "execution_receipt",
+      "prediction_error",
+      "skill_completed",
+      "skill_failed"
+    ];
   }
   return kinds.length === 0 ? [] : durableManagerEpisodeSignals(
     runtime,
@@ -5515,6 +5906,7 @@ export function humanoidNeuralAgentProfile(
     predictive: "sensorimotor",
     premotor: "sensorimotor",
     motorIntent: "motor_intent",
+    executionDispatcher: "sensorimotor",
     recovery: "sensorimotor"
   };
   const descriptor = HUMANOID_NEURAL_NODE_BY_ID.get(agentId);
@@ -5561,6 +5953,14 @@ function stableNeuralToolCapability(
 function baseInstructions(key: HumanoidNeuralAgentKey): string[] {
   const descriptor = HUMANOID_NEURAL_NODE_BY_ID.get(HUMANOID_NEURAL_AGENT_IDS[key]);
   if (!descriptor) throw new Error(`Unknown neural node: ${key}`);
+  const outputInstructions = key === "executionDispatcher"
+    ? [
+        "Your only valid response is the required execute_certified_motor_intent tool call. Its result terminates this episode."
+      ]
+    : [
+        `Submit every final neural signal through ${NEURAL_OUTPUT_SUBMISSION_TOOL_NAME}; never return the envelope as assistant text.`,
+        "Pass the structured signal body directly in the submission tool's payload field; do not JSON-stringify it."
+      ];
   return [
     `You are ${descriptor.name}, structural id ${descriptor.id}.`,
     `Your one control parent is ${descriptor.parentKey === null
@@ -5573,8 +5973,7 @@ function baseInstructions(key: HumanoidNeuralAgentKey): string[] {
     "Treat only directed world-versioned neural signals and your bounded invocation anchor as current.",
     "When delegating, choose only one owned child edge, an allowed signal_kind, and exact causal source_signal_ids. The structural edge and current Harness phase define the child's bounded responsibility; there is no free-text delegation channel and you cannot prescribe a lower layer's Skill, hand, interaction point, route, posture, coordinates, or motor parameters.",
     "For source_signal_ids copy only exact signal_id values present in the current invocation. Use [] when none exists; never invent a UUID or placeholder.",
-    `Submit every final neural signal through ${NEURAL_OUTPUT_SUBMISSION_TOOL_NAME}; never return the envelope as assistant text.`,
-    "Pass the structured signal body directly in the submission tool's payload field; do not JSON-stringify it.",
+    ...outputInstructions,
     "The Harness canonicalizes the payload after schema validation. Escalate only errors outside your local correction scope."
   ];
 }
@@ -5752,7 +6151,7 @@ function neuralSubmissionBarrierTools(
       return [humanoidNeuralAgentToolName("predictive")];
     }
     if (phase === "execution") {
-      return [humanoidNeuralAgentToolName("executor")];
+      return [humanoidNeuralAgentToolName("executionDispatcher")];
     }
     if (phase === "recovery") {
       return [humanoidNeuralAgentToolName("recovery")];
@@ -6105,6 +6504,7 @@ function neuralOutputSubmissionAvailable(
   switch (key) {
     case "goalManager":
     case "motorIntent":
+    case "executionDispatcher":
       // Their formal mutation/planning tools terminate the SDK episode and
       // synthesize the typed output from the real tool receipt.
       return false;
@@ -6680,7 +7080,9 @@ function sensorimotorToolUseBehavior(
 ): ToolUseBehavior {
   const predictiveToolName = humanoidNeuralAgentToolName("predictive");
   const premotorToolName = humanoidNeuralAgentToolName("premotor");
-  const executorToolName = humanoidNeuralAgentToolName("executor");
+  const executionDispatcherToolName = humanoidNeuralAgentToolName(
+    "executionDispatcher"
+  );
   const recoveryToolName = humanoidNeuralAgentToolName("recovery");
   return (_context, results) => {
     for (const result of results) {
@@ -6813,35 +7215,65 @@ function sensorimotorToolUseBehavior(
           })
         };
       }
-      if (result.tool.name === executorToolName) {
-        const sourceSignalIds = z.array(z.string().uuid()).max(64).parse(
-          parsed.source_signal_ids
+      if (result.tool.name === executionDispatcherToolName
+        && (parsed.signal_kind === "skill_completed"
+          || parsed.signal_kind === "skill_failed")) {
+        const finalOutput = directChildNeuralOutput(
+          SensorimotorOutputSchema,
+          parsed
         );
-        const state = runtime.neuralHierarchyState();
-        const completionSignals = sourceSignalIds.map(
-          (signalId) => state.signals[signalId]
-        ).filter((signal): signal is NeuralSignal => signal !== undefined
-          && (signal.kind === "skill_completed" || signal.kind === "skill_failed"));
-        if (completionSignals.length !== 1) {
-          throw new Error(
-            `Serial execution must return one physical completion signal; found ${completionSignals.length}`
-          );
-        }
-        const { source_signal_ids: _sourceSignalIds, ...payload } = parsed;
+        if (!finalOutput) continue;
         return {
           isFinalOutput: true,
           isInterrupted: undefined,
-          finalOutput: JSON.stringify({
-            signal_kind: completionSignals[0]!.kind,
-            summary: typeof parsed.code === "string"
-              ? parsed.code
-              : completionSignals[0]!.kind,
-            payload_json: JSON.stringify(payload),
-            source_signal_ids: sourceSignalIds,
-            confidence: parsed.accepted === true ? 1 : 0.5
-          })
+          finalOutput: JSON.stringify(finalOutput)
         };
       }
+    }
+    return { isFinalOutput: false, isInterrupted: undefined };
+  };
+}
+
+function certifiedExecutionDispatcherToolUseBehavior(
+  runtime: HumanoidNeuralAgentRuntime
+): ToolUseBehavior {
+  const executorToolName = humanoidNeuralAgentToolName("executor");
+  return (_context, results) => {
+    for (const result of results) {
+      if (result.type !== "function_output"
+        || result.tool.name !== executorToolName) continue;
+      const parsed = outputObject(result.output);
+      if (!parsed) continue;
+      const sourceSignalIds = z.array(z.string().uuid()).max(64).parse(
+        parsed.source_signal_ids
+      );
+      const state = runtime.neuralHierarchyState();
+      const completionSignals = sourceSignalIds.map(
+        (signalId) => state.signals[signalId]
+      ).filter((signal): signal is NeuralSignal => signal !== undefined
+        && (signal.kind === "skill_completed" || signal.kind === "skill_failed")
+        && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.executor
+        && signal.target_node_id
+          === HUMANOID_NEURAL_AGENT_IDS.executionDispatcher);
+      if (completionSignals.length !== 1) {
+        throw new Error(
+          `Serial execution must return one physical completion signal; found ${completionSignals.length}`
+        );
+      }
+      const { source_signal_ids: _sourceSignalIds, ...payload } = parsed;
+      return {
+        isFinalOutput: true,
+        isInterrupted: undefined,
+        finalOutput: JSON.stringify({
+          signal_kind: completionSignals[0]!.kind,
+          summary: typeof parsed.code === "string"
+            ? parsed.code
+            : completionSignals[0]!.kind,
+          payload_json: JSON.stringify(payload),
+          source_signal_ids: sourceSignalIds,
+          confidence: parsed.accepted === true ? 1 : 0.5
+        })
+      };
     }
     return { isFinalOutput: false, isInterrupted: undefined };
   };

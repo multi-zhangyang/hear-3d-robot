@@ -25,8 +25,9 @@ The hierarchy is a recursive control system rather than a long prompt chain:
   completion, and failure;
 - every layer has a bounded local correction scope and a distinct cadence;
 - only an error outside that scope is escalated to its parent;
-- cognition stops at semantic motor intent; trajectories and per-frame
-  control stay deterministic or learned;
+- free cognition stops at semantic motor intent; a lower non-thinking model
+  Dispatcher performs only the one required execution tool call, while
+  trajectories and per-frame control stay deterministic or learned;
 - exactly one serial authority can write physical state.
 
 Every model-to-model delegation has the same wire law:
@@ -65,8 +66,9 @@ and only one parent.
 
 Legend: `A` is an OpenAI Agents SDK model Agent, `D` is a deterministic
 runtime service, `L` is a learned/reference controller loop, and `P` is the
-physical plant. **Eighteen structural nodes do not mean eighteen LLMs:** this
-contract contains thirteen model Agents and five non-model nodes.
+physical plant. **Nineteen structural nodes do not mean nineteen reasoning
+LLMs:** this contract contains thirteen cognitive model Agents, one non-thinking
+execution Dispatcher Agent, and five non-model nodes.
 
 ```mermaid
 flowchart TD
@@ -86,8 +88,9 @@ flowchart TD
     PM["A · Premotor Skill Composer"]
     RC["A · Recovery Control Specialist\nbounded authority lease"]
 
-    MI["A · Motor Intent Compiler\nlowest LLM boundary"]
+    MI["A · Motor Intent Compiler\nlowest cognitive planning boundary"]
     RG["D · MuJoCo Rollout Gate"]
+    ED["A · Certified Execution Dispatcher\nrequired tool · thinking disabled"]
     EX["D · Serial Physical Execution Gate\nsole physical writer"]
     CR["L · Learned Controller / Reflex Loop"]
     B["P · MuJoCo Body"]
@@ -104,7 +107,8 @@ flowchart TD
     SM --> CP
     SM --> PM
     SM --> RC
-    SM --> EX
+    SM --> ED
+    ED --> EX
     PM --> MI
     MI --> RG
     EX --> CR
@@ -114,7 +118,7 @@ flowchart TD
     classDef deterministic fill:#f3f4f6,stroke:#4b5563,stroke-width:1.5px
     classDef learned fill:#ecfdf5,stroke:#059669,stroke-width:1.5px
     classDef plant fill:#fff7ed,stroke:#ea580c,stroke-width:2px
-    class E,G,A,P,SI,MR,SM,AF,RI,CP,PM,RC,MI model
+    class E,G,A,P,SI,MR,SM,AF,RI,CP,PM,RC,MI,ED model
     class SF,RG,EX deterministic
     class CR learned
     class B plant
@@ -176,8 +180,9 @@ Selection before Executive can revalue the Goal. Recovery has no
 replacement Skill or escalate.
 
 A failed physical transaction does not jump directly from Serial Executor into
-Recovery. Its `skill_failed` result first unwinds through Sensorimotor and Action
-Selection, where the old executing commitment is closed. The next event runs
+Recovery. Its `skill_failed` result first unwinds through the Certified Execution
+Dispatcher, Sensorimotor, and Action Selection, where the old executing
+commitment is closed. The next event runs
 `Action Selection -> Perception Manager -> Sensor Fusion`, causally binding a
 current world observation to that exact failure. Only then can the strict
 `Executive -> Action Selection -> Sensorimotor -> Recovery` episode open. This
@@ -235,7 +240,7 @@ flowchart TB
     subgraph T2["Skill / Rollout events · local correction"]
       CP3["A · Predictive Critic\nrollout_event"]
       PM3["A · Premotor\nskill_event"]
-      MI3["A · Motor Intent\nrollout_event · lowest LLM"]
+      MI3["A · Motor Intent\nrollout_event · lowest cognitive planner"]
       RG3["D · MuJoCo Rollout Gate\nrollout_event"]
       SM3 --> CP3
       SM3 --> PM3
@@ -244,8 +249,9 @@ flowchart TB
     end
 
     subgraph T3["One admitted physical transaction"]
+      ED3["A · Certified Execution Dispatcher\nskill_event · required tool"]
       EX3["D · Serial Executor\nsole physical writer"]
-      SM3 --> EX3
+      SM3 --> ED3 --> EX3
     end
 
     subgraph T4["Continuous embodied loop"]
@@ -259,7 +265,7 @@ flowchart TB
     classDef deterministic fill:#f3f4f6,stroke:#4b5563,stroke-width:1.5px
     classDef learned fill:#ecfdf5,stroke:#059669,stroke-width:1.5px
     classDef plant fill:#fff7ed,stroke:#ea580c,stroke-width:2px
-    class E3,G3,AS3,PA3,SI3,MR3,SM3,AF3,RI3,RC3,CP3,PM3,MI3 model
+    class E3,G3,AS3,PA3,SI3,MR3,SM3,AF3,RI3,RC3,CP3,PM3,MI3,ED3 model
     class SF3,RG3,EX3 deterministic
     class CR3 learned
     class B3 plant
@@ -295,6 +301,7 @@ flowchart LR
     end
 
     subgraph Fast["Embodied · controller / physics ticks"]
+      ED2["Certified Dispatcher"]
       EX2["Serial Gate"] --> C2["Controller / Reflex"] --> B2["Body"]
       B2 --> C2
     end
@@ -305,7 +312,10 @@ flowchart LR
     SM2 -->|"semantic skill"| PM2
     RG2 -->|"rollout result"| PC2
     PC2 -->|"prediction error"| SM2
-    SM2 -->|"admitted certified plan"| EX2
+    SM2 -->|"fixed executing commitment"| ED2
+    ED2 -->|"required execution tool"| EX2
+    EX2 -->|"physical receipt"| ED2
+    ED2 -->|"typed completion"| SM2
     B2 -->|"sensory evidence"| P2
     C2 -->|"local control error"| SM2
     SM2 -->|"unresolved error only"| A2
@@ -419,6 +429,7 @@ sequenceDiagram
     participant SR as Skill Runtime
     participant RG as MuJoCo Rollout Gate
     participant PC as Predictive Critic
+    participant ED as Certified Execution Dispatcher
     participant EX as Serial Executor
     participant RF as Learned Controller / Reflex
     participant BD as MuJoCo Body
@@ -437,13 +448,15 @@ sequenceDiagram
     SM->>PC: Agent.asTool(current direct rollout id; Harness resolves reentrant provenance)
     PC-->>SM: accepted forward_prediction or prediction_error
     SM-->>AS: certificate-bound rollout_result
-    AS->>SM: transition same commitment to executing
-    SM->>EX: execute one certified planning transaction
+    AS->>SM: Harness rebinds the same executing commitment
+    SM->>ED: deterministic Agent.asTool activation
+    ED->>EX: required execute_certified_motor_intent call
     EX->>RF: certificate-bound motor_intent
     RF->>BD: controller reference command
     BD-->>RF: authoritative sensory_evidence / prediction_error
     RF-->>EX: execution_receipt + local correction outcome
-    EX-->>SM: execution_receipt + skill_completed / failed
+    EX-->>ED: execution_receipt + skill_completed / failed
+    ED-->>SM: typed execution completion
 ```
 
 `submit_humanoid_skill_plan` and `begin_humanoid_skill` are state transitions
@@ -557,6 +570,7 @@ not recreate those facilities in HEAR:
 | Affordance / Risk / Predictive / Premotor | child `Agent.asTool()` | Sensorimotor Manager retains control | independent each |
 | Recovery Control | independent SDK run under an exclusive parent-issued Harness lease | Sensorimotor remains the parent and freezes its ordinary branch | independent |
 | Motor Intent | child `Agent.asTool()` | Premotor retains control | independent |
+| Certified Execution Dispatcher | deterministically invoked child `Agent.asTool()` with one tool | Sensorimotor retains control; Dispatcher must call the serial writer | independent, fixed non-thinking mode |
 
 `Agent.asTool()` is the default parent-child mechanism because the OpenAI
 Agents SDK keeps the original Agent active after the nested Agent returns,
@@ -599,10 +613,12 @@ parent-owned publication before they affect control.
 
 ## Node and implementation audit
 
-The thirteen current model nodes have distinct schemas, tool surfaces, evidence
-or decision contracts, and Sessions. The remaining five structural nodes stay
-outside the LLM boundary. This is the current implementation split, not a claim
-that a neuroscience label intrinsically deserves a model call.
+The fourteen current model nodes have distinct schemas, tool surfaces, evidence
+or decision contracts, and Sessions. Thirteen are cognitive Agents; Certified
+Execution Dispatcher is a pure required-tool Agent with thinking disabled. The
+remaining five structural nodes stay outside the model boundary. This is the
+current implementation split, not a claim that a neuroscience label
+intrinsically deserves a model call.
 
 | Model Agent | Unique contract that justifies isolation | Must not own |
 | --- | --- | --- |
@@ -618,6 +634,7 @@ that a neuroscience label intrinsically deserves a model call.
 | Predictive Critic | Compare real rollout with terminal contract | Rollout ownership or actuation |
 | Premotor | Compose a short semantic Skill DAG | Geometry, trajectories or physics |
 | Motor Intent | Bind one Skill to one existing deterministic planner | Joint values or MuJoCo writes |
+| Certified Execution Dispatcher | Submit one already-certified commitment through the required serial-execution tool | Planning, comparison, recovery, or alternate action selection |
 | Recovery | Exclusive bounded recovery decision under lease | Premotor bypass or physical execution |
 
 | Non-model node | Why it is not an Agent |
@@ -649,7 +666,7 @@ Agent epoch.
 | --- | --- | --- | --- |
 | `mission_event` / `goal_event` | Executive, Goal Valuation | mission start, Goal conflict, Goal completion | revalue the Goal epoch |
 | `world_event` | perception subtree | new/stale authoritative observation | update belief only |
-| `skill_event` | Action Selection, Sensorimotor, Affordance, Risk, Premotor | missing/failed/completed commitment or relevant world change | propose, inhibit, or replace one Skill |
+| `skill_event` | Action Selection, Sensorimotor, Affordance, Risk, Premotor, Certified Execution Dispatcher | missing/failed/completed commitment or relevant world change | propose, inhibit, replace, or dispatch one already-certified Skill |
 | `rollout_event` | Motor Intent, Rollout Gate, Predictive | one bound candidate requires simulation or review | certify/reject that candidate |
 | `execution_transaction` | Serial Executor | one committed and certified plan | mutate physical state through one mutex |
 | `recovery_event` | Recovery | risk/error exceeds ordinary local scope | return one bounded proposal or escalate |
@@ -680,6 +697,7 @@ sequenceDiagram
     participant MI as Motor Intent
     participant RG as Rollout Gate
     participant CP as Predictive Critic
+    participant ED as Certified Execution Dispatcher
     participant EX as Serial Executor
     participant RF as Learned Controller / Reflex
     participant BD as MuJoCo Body
@@ -711,8 +729,10 @@ sequenceDiagram
     CP-->>SM: Harness issues one rollout_certificate
     SM-->>AS: accepted rollout_result + certificate binding
     AS->>AS: authorize commitment -> executing
-    AS->>SM: new agent.asTool execution episode
-    SM->>EX: atomically admit transaction + consume certificate
+    AS->>SM: Harness opens fixed execution control path
+    SM->>ED: deterministic Agent.asTool(executing commitment)
+    ED->>EX: required execute_certified_motor_intent
+    EX->>EX: atomically admit transaction + consume certificate
     EX->>RF: publish certified motor_intent under child lease
     RF->>BD: publish controller reference under child lease
     BD->>BD: execute real MuJoCo frames in the Executor-owned transaction
@@ -722,7 +742,8 @@ sequenceDiagram
       RF-->>EX: typed local prediction_error
     end
     RF-->>EX: execution_receipt + skill_completed / failed
-    EX-->>SM: causally derived execution_receipt + skill_completed / failed
+    EX-->>ED: causally derived execution_receipt + skill_completed / failed
+    ED-->>SM: typed execution completion
     SM-->>AS: typed execution feedback
     AS->>AS: resolve the commitment
     AS->>PM: post-execution sensing request bound to completion feedback
@@ -741,11 +762,13 @@ not a new ownership link.
 The physical tail is equally strict. The SDK tool call and action ledger keep
 Serial Executor as the sole physical writer, while the actual controller and
 plant are represented by nested deterministic child episodes. The unprojected
-physical receipt is never handed to a model; it is reduced to bounded body
-sensation (endpoint, trajectory identity and controller-usage evidence), then
-returned along `Body -> Reflex -> Executor -> Sensorimotor`. A failed physical
-result additionally creates a durable Reflex prediction-error record. There is
-no direct `Body -> Sensorimotor` shortcut and no LLM activation per frame.
+physical receipt is never exposed to a cognitive model; it is reduced to bounded
+body sensation (endpoint, trajectory identity and controller-usage evidence),
+then returned along
+`Body -> Reflex -> Executor -> Certified Dispatcher -> Sensorimotor`. A failed
+physical result additionally creates a durable Reflex prediction-error record.
+There is no direct `Body -> Sensorimotor` shortcut and no model activation per
+frame.
 
 Both SDK layers must permit the two explicit fan-outs: model settings allow
 parallel tool calls, and Runner tool execution allows more than one concurrent
@@ -795,9 +818,11 @@ Premotor forwards only bounded belief and commitment state to Motor Intent. The
 Rollout Gate returns the exact IDs of both its Motor Intent return signal and its
 reentrant Predictive feedback without adding those IDs to the physics receipt
 payload. Predictive selects only the `Rollout Gate -> Predictive` reentrant
-signal, and a successful Serial Executor returns the exact execution-receipt and
-completion signal IDs to Sensorimotor. This keeps payload hashes stable while
-preserving end-to-end causal identity.
+signal. Once Action Selection authorizes the certified commitment, the Harness
+wakes only Certified Execution Dispatcher; its required tool call reaches the
+Serial Executor, whose exact execution-receipt and completion IDs return through
+Dispatcher to Sensorimotor. This keeps payload hashes stable while preserving
+end-to-end causal identity.
 
 ## Typed neural signal protocol
 
@@ -969,15 +994,18 @@ Below it:
 3. Predictive acceptance mints one single-use, hash-bound rollout certificate;
 4. Action Selection changes the same commitment to `executing` only from the
    certificate-bound ascending chain;
-5. the single Execution Gate writes the certificate binding into the execution
+5. the non-thinking Certified Execution Dispatcher makes one required
+   `execute_certified_motor_intent` tool call for the already-fixed commitment;
+6. the single Execution Gate writes the certificate binding into the execution
    ledger and consumes it for exactly one physical transaction in the same
    durable admission cut; crash recovery reconstructs both sides from that one
    transaction identity;
-6. Executor publishes a certified `motor_intent` to Reflex, Reflex publishes
+7. Executor publishes a certified `motor_intent` to Reflex, Reflex publishes
    the controller reference to Body, and learned/reference controllers plus
    contact reflex logic run at control rate inside the admitted transaction;
-7. Body sensation and any physical prediction error ascend strictly through
-   `Body -> Reflex -> Executor -> Sensorimotor` as typed signals.
+8. Body sensation and any physical prediction error ascend strictly through
+   `Body -> Reflex -> Executor -> Certified Dispatcher -> Sensorimotor` as typed
+   signals.
 
 HEAR's existing `HumanoidRunRuntime.#actionMutex` remains the sole physical
 write serialization boundary. While no physical transaction owns the plant,

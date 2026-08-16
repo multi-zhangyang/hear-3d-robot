@@ -77,6 +77,23 @@ describe("humanoid agent hierarchy", () => {
       goal_context: {
         evidence_ref: evidenceRef,
         autonomy: {
+          capability_surface: {
+            embodiment_predicates: [
+              "robot_at",
+              "robot_in_zone",
+              "end_effector_at"
+            ],
+            manipulable_object_predicates: [
+              "object_grasped",
+              "object_at",
+              "object_in_zone",
+              "object_placed",
+              "object_inside",
+              "object_on"
+            ],
+            articulated_object_predicates: ["articulation_state"],
+            static_solid_predicates: ["block_removed"]
+          },
           history: {
             lifetime_outcomes: {
               total_selected_epoch_count: 14,
@@ -141,9 +158,8 @@ describe("humanoid agent hierarchy", () => {
     expect(rendered).toContain(
       '"mission_link":"直接推进长期任务","dependency_candidate_ids":[],"dependency_candidates":[]'
     );
-    expect(rendered).toContain(
-      '"visible_object_ids":["courtyard_crate"],"portable_object_ids":["courtyard_crate"]'
-    );
+    expect(rendered).toContain('"visible_object_ids":["courtyard_crate"]');
+    expect(rendered).toContain('"portable_object_ids":["courtyard_crate"]');
     expect(rendered).toContain('"removable_block_ids":["stone_column"]');
     expect(rendered).toContain('"predicate_types":["robot_at","robot_in_zone"');
     expect(rendered).toContain(

@@ -8,7 +8,7 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 
 ## 核心能力
 
-- 神经启发式层级 Agent Harness：18 个结构节点组成严格单父控制树，其中 13 个 OpenAI Agents SDK 模型 Agent 各自拥有独立 Model 与持久 Session，5 个低层节点是确定性服务、控制器或物理本体
+- 神经启发式层级 Agent Harness：19 个结构节点组成严格单父控制树，其中 13 个认知 Agent 与 1 个非思考执行 Dispatcher 各自拥有独立 OpenAI Agents SDK Model 与持久 Session，5 个低层节点是确定性服务、控制器或物理本体
 - 遮挡感知的持久空间信念、未知区域 frontier、对象中心世界模型、可供性目录与模型提交的 Skill DAG
 - G1 29 个全身关节与 14 个手部关节、双足接触、质心、支撑面和跌倒检测
 - 模型选择 Goal、Skill、对象、手、交互点和策略；通用求解层自动生成可达站位与任务空间轨迹
@@ -27,7 +27,7 @@ HEAR 是一个由层级智能体自主驱动的虚拟 3D 人形机器人运行�
 - 追加式事件日志、可寻址具身历史、物理检查点、独立会话和结构化上下文压缩
 - 中文实时界面，展示 3D 世界、层级执行流、动作回执、模型活动与物理状态
 - React Three Fiber + Drei 声明式管理 Three.js 舞台，优先使用 WebGPU 并自动回落 WebGL2
-- React Flow + d3-hierarchy 显示可缩放的 18 节点严格单父控制权树
+- React Flow + d3-hierarchy 显示可缩放的 19 节点严格单父控制权树
 - 一键导出 Foxglove MCAP：包含运行事件、权威世界、43 关节、坐标变换、接触/质心和导航线，且没有命令通道
 - Windows 与 Linux/WSL 开发运行；训练任务通过 Colab GPU 执行
 
@@ -50,17 +50,18 @@ Executive
       ├─ Risk / Interoception
       ├─ Predictive Critic
       ├─ Premotor
-      │  └─ Motor Intent（最低 LLM 边界）
+      │  └─ Motor Intent（最低认知规划边界）
       │     └─ MuJoCo Rollout Gate（确定性）
-      ├─ Serial Executor（唯一物理写入者）
-      │  └─ Controller / Reflex（训练策略 + 快速闭环）
-      │     └─ MuJoCo Body
+      ├─ Certified Execution Dispatcher（required 工具、禁用思考）
+      │  └─ Serial Executor（唯一物理写入者）
+      │     └─ Controller / Reflex（训练策略 + 快速闭环）
+      │        └─ MuJoCo Body
       └─ Recovery（父级签发的独占 authority lease episode）
 ```
 
 ```mermaid
 flowchart TB
-    subgraph COG["认知控制层 · 13 个 OpenAI Agents SDK 模型 Agent"]
+    subgraph COG["模型控制层 · 14 个独立 OpenAI Agents SDK Agent"]
         E["Executive<br/>唯一根"]
         G["Goal Valuation"]
         AS["Action Selection<br/>唯一 Skill commitment 权限"]
@@ -72,7 +73,8 @@ flowchart TB
         RI["Risk / Interoception"]
         PC["Predictive Critic"]
         PM["Premotor"]
-        MI["Motor Intent<br/>最低 LLM 边界"]
+        MI["Motor Intent<br/>最低认知规划边界"]
+        ED["Certified Execution Dispatcher<br/>required tool · thinking disabled"]
         RC["Recovery<br/>独占 lease episode"]
     end
 
@@ -98,12 +100,14 @@ flowchart TB
     SM --> RC
     PM --> MI
     MI --> RG
-    SM --> EX
+    SM --> ED
+    ED --> EX
     EX --> CR
     CR --> B
 
     RG -. "rollout_result · 反馈无控制权" .-> PC
-    CR -. "执行回执 / 预测误差 · 反馈无控制权" .-> SM
+    EX -. "执行回执 · 反馈无控制权" .-> ED
+    ED -. "typed completion · 反馈无控制权" .-> SM
     B -. "身体感知 · 反馈无控制权" .-> P
 
     classDef model fill:#173a31,stroke:#65e6bb,color:#e9fff6,stroke-width:1.4px
@@ -111,16 +115,16 @@ flowchart TB
     classDef writer fill:#214c3e,stroke:#9bf3d4,color:#ffffff,stroke-width:2.6px
     classDef controller fill:#41331f,stroke:#d8ad67,color:#fff7e8,stroke-width:1.8px
     classDef plant fill:#302e3b,stroke:#9a95b5,color:#f4f1ff,stroke-width:1.8px
-    class E,G,AS,P,SI,MR,SM,AF,RI,PC,PM,MI,RC model
+    class E,G,AS,P,SI,MR,SM,AF,RI,PC,PM,MI,ED,RC model
     class SF,RG runtime
     class EX writer
     class CR controller
     class B plant
 ```
 
-上图的 **17 条实线**只表示控制权所有权；三条虚线只概括带因果来源的闭环反馈。Rollout、身体感知、预测误差和执行回执都不是第二父级，也不会把树改成平级 Agent 网络。
+上图的 **18 条实线**只表示控制权所有权；虚线只概括带因果来源的闭环反馈。Rollout、身体感知、预测误差和执行回执都不是第二父级，也不会把树改成平级 Agent 网络。
 
-![HEAR 18 节点严格单父层级](docs/screenshots/hierarchy.png)
+![HEAR 19 节点严格单父层级](docs/screenshots/hierarchy.png)
 
 这是控制权树，不是平级多 Agent 网络。除 Executive 外，每个节点只有一个直接父级；父级通常通过 `Agent.asTool()` 调用模型子级并保留控制权。兄弟节点不互相通信、不共享 Session，只允许由共同父级发起并汇合两组只读并行：Scene + Memory、Affordance + Risk。每次直接子级调用都有独立 `invocation_id`，并绑定共同父级的 `parent_episode_id`；共同父级只能汇合属于自己本次 episode 的返回，禁止依靠队列顺序、payload 相等或“第一个 pending 信号”猜测配对。父子委派没有自由文本 `intent` 通道：父级只能选择自己拥有的子边和当前父 episode 真正拥有的 pending `source_signal_ids`；允许多种信号的边仍受合同约束，而当前相位只有一种合法输入的边会把 `signal_kind` 收窄为单一 schema 字面值。旧 episode、兄弟、其他父级、已消费或过期信号即使 UUID 仍在历史中也会被代码拒绝。反馈信号可以沿白名单回路唤醒最近责任层，但不会生成第二父级。
 
@@ -131,10 +135,13 @@ Action Selection 使用两阶段技能协议：Sensorimotor 第一次只能返�
 终止条件绑定的 durable commitment，然后用新的父子 authority lease 再次下发。
 真实 MuJoCo rollout 被 Predictive 显式以 `accepted=true` 接受后，Harness 才会
 签发一次性、载荷哈希绑定的 rollout certificate；仍只有 Action Selection 能把
-同一 commitment 转为 `executing`。Serial Executor 在此之前不可见。certificate
-的消费与 physical execution ledger 准入在同一个持久提交点完成，崩溃恢复也只
-允许同一个 transaction 继续。执行结果沿原树逐层返回，完成或失败也只能由
-Action Selection 根据真实回执解析 commitment。
+同一 commitment 转为 `executing`。此时 Harness 只唤醒独立 Certified Execution
+Dispatcher：它固定 `tool_choice=required`、禁用思考，唯一能力是调用
+`execute_certified_motor_intent`。Serial Executor 在此之前不可见。certificate 的
+消费与 physical execution ledger 准入在同一个持久提交点完成，崩溃恢复也只允许
+同一个 transaction 继续。执行结果沿
+`Body -> Reflex -> Executor -> Dispatcher -> Sensorimotor -> Action Selection`
+逐层返回，完成或失败也只能由 Action Selection 根据真实回执解析 commitment。
 
 事件 Scheduler 不是 Agent、不是 Manager，也不是第二根。它只把世界变化、
 rollout、执行反馈和预测误差解析为“期望责任层”，再沿单父树上溯到最近仍有
@@ -151,7 +158,7 @@ navigation；两种模态都被真实 Rollout Gate 拒绝后，Harness 将两条
 typed escalation，沿 Premotor 逐级上送。Action Selection 随后关闭已被证伪的
 commitment，再让独占 Recovery 选择新 Skill，避免在旧承诺内无限改坐标。
 
-控制树、反馈图和执行状态机的完整定义见 [`docs/architecture/neural-hierarchy-v3.md`](docs/architecture/neural-hierarchy-v3.md)。模型认知在 Motor Intent 截止；规划求解、MuJoCo 预演、唯一串行执行、训练策略和控制器闭环都位于其下。Harness 按事件唤醒路径，并在代码层强制“感知 → 父级并行汇合 → 技能 → rollout → 预测评估 → 串行执行 → 反馈”，不依赖模型按提示词自行维持安全顺序。
+控制树、反馈图和执行状态机的完整定义见 [`docs/architecture/neural-hierarchy-v3.md`](docs/architecture/neural-hierarchy-v3.md)。自由认知与规划在 Motor Intent 截止；其下只有无选择的 Dispatcher 模型工具回合、规划求解、MuJoCo 预演、唯一串行执行、训练策略和控制器闭环。Harness 按事件唤醒路径，并在代码层强制“感知 → 父级并行汇合 → 技能 → rollout → 预测评估 → certified dispatch → 串行执行 → 反馈”，不依赖模型按提示词自行维持安全顺序。
 
 认知层、权限 Harness、离线训练、快速控制闭环与可视化之间的完整边界见 [`docs/architecture/system-overview.md`](docs/architecture/system-overview.md)。
 
@@ -165,7 +172,7 @@ commitment，再让独占 Recovery 选择新 Skill，避免在旧承诺内无限
 4. 通用求解器至少生成一个与该语义身份一致的可达任务空间候选。
 5. 被选候选的完整 MuJoCo 预演没有跌倒、非法接触、持续条件违规或缺失的必需接触。
 6. Predictive 对该精确 rollout 显式接受，并由 Harness 签发绑定 Goal、commitment、规划事务、rollout/Predictive invocation、两个因果信号与 payload SHA-256 的一次性 certificate。
-7. certificate 消费与 Serial Executor 的 durable physical admission 原子提交；同一证书不能驱动第二个物理事务。
+7. Certified Execution Dispatcher 以真实 `required` 模型工具调用提交唯一执行意图；certificate 消费与 Serial Executor 的 durable physical admission 原子提交，同一证书不能驱动第二个物理事务。
 8. 真实执行逐帧满足物理 Option；目标稳定达成后立即停止，持续偏离预演或违反条件时立即交回重规划。
 
 自主差异来自模型对实时观察、空间 frontier、对象可供性、目标和历史回执的决策，以及每次任务独立生成的世界。程序不会从预设动作表挑选行为，也不会用随机电机噪声代替自主决策。Harness 只把模型选定的语义 Skill 求解为物理候选，不会改换目标、对象、手或策略。
@@ -223,7 +230,7 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 
 ## 长期运行
 
-十三个模型节点分别拥有独立的 Agents SDK Session 和 Model facade；Sensor Fusion、Rollout Gate、Serial Executor、Controller / Reflex 与 MuJoCo Body 不创建模型 Session。稳定指令和各节点自己的历史位于请求前缀，实时世界权限与定向神经信号位于末尾；缓存亲和键按凭证、协议、模型和结构 Agent ID 保持稳定。亲和键只影响供应商缓存路由，不承载对话内容；不同 Agent、不同 Run 的 Session 和物理状态始终隔离，父子间只交换有世界版本、TTL 和因果来源的类型化信号。
+十四个模型节点分别拥有独立的 Agents SDK Session 和 Model facade；其中十三个认知节点固定思考模式与 `tool_choice=auto`，Certified Execution Dispatcher 固定禁用思考与 `tool_choice=required`，同一 Session 从不切换模式。Sensor Fusion、Rollout Gate、Serial Executor、Controller / Reflex 与 MuJoCo Body 不创建模型 Session。稳定指令和各节点自己的历史位于请求前缀，实时世界权限与定向神经信号位于末尾；缓存亲和键按凭证、协议、模型和结构 Agent ID 保持稳定。亲和键只影响供应商缓存路由，不承载对话内容；不同 Agent、不同 Run 的 Session 和物理状态始终隔离，父子间只交换有世界版本、TTL 和因果来源的类型化信号。
 
 每个 Agent 的上下文只压缩自己的历史，不接收兄弟或父子 Agent 的压缩摘要。完整事件、模型生命周期、动作、具身经历、检查器和上下文记录继续保存在追加式日志中。Goal DAG 与可寻址具身记忆仍是长期事实来源；历史召回只能由 Memory Retriever 进行有界查询，再经 Perception Manager 汇合为上行证据，不能作为跨 Agent 共享上下文或替代当前 Sensor Fusion。结构 Agent、其 Session、工具 Schema、输出 Schema、控制边、反馈合同和运行时服务身份全部写入 V3 Agent Manifest，恢复时不允许旧 Coordinator epoch 静默复用新层级 Session。
 
@@ -241,15 +248,15 @@ pnpm train:g1:colab -- --gpu H100 --iterations 1000 --num-envs 4096
 - 具名末端目标的逐帧稳定进度与 Goal 身份校验
 - 已提交动作回执、候选筛选证据和待处理生命周期事件
 - 不可变运动制品、物理预演轨迹、Option 监控状态与执行游标
-- 十三个模型智能体的独立 Session、五个非模型节点身份、控制树、反馈合同、authority lease 与可恢复 SDK 状态
+- 十四个模型智能体的独立 Session、五个非模型节点身份、控制树、反馈合同、authority lease 与可恢复 SDK 状态
 
 Operator 异常退出后，未完成任务会转为可恢复状态。恢复操作从持久化物理状态和上下文继续，不播放录制动画。尚未完成的物理动作使用原 transaction ID 和原规划制品续接，完成后才恢复上层模型循环；正常暂停会把不足周期的执行尾帧一并写入账本。旧检查点若已保存更靠后的精确 MuJoCo 状态，只在规划进度与世界版本完全一致时从该状态继续，无法重建的中间轨迹明确标记为不完整。有限任务的最终 Goal 验收、Run 成功状态和生命周期事件在同一检查点事务中提交，恢复后不会继续创建多余 Goal。
 
 ## Web 界面
 
-3D 世界始终保持在主视图。界面从当前运行的 hierarchy contract 动态显示 18 节点控制树，而不是写死旧版角色数量；同时提供跟随、世界和头部三个观察视角，并实时显示：
+3D 世界始终保持在主视图。界面从当前运行的 hierarchy contract 动态显示 19 节点控制树，而不是写死旧版角色数量；同时提供跟随、世界和头部三个观察视角，并实时显示：
 
-- 当前活动节点与 18 节点单父层级
+- 当前活动节点与 19 节点单父层级
 - 身体通道活动状态
 - 世界版本、物理时间、双脚法向力、支撑和直立度
 - 当前实际执行的学习或参考控制器，以及连续交接进度

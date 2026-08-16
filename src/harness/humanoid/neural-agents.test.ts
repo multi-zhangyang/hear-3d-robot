@@ -28,6 +28,7 @@ import type { JsonValue } from "../../domain/schema.js";
 import { withAgentInvocation } from "../agent-scope.js";
 import {
   createHumanoidNeuralAgentHierarchy,
+  orchestrateCertifiedNeuralExecution,
   type HumanoidNeuralAgentRuntime
 } from "./neural-agents.js";
 import {
@@ -175,7 +176,7 @@ describe("humanoid neural Agent hierarchy", () => {
     expect(goalHistory).toContain("continue_goal_epoch");
   });
 
-  it("gives every model node one schema-bound neural submission tool", async () => {
+  it("gives every interpretive model node one schema-bound neural submission tool", async () => {
     const runtime = inMemoryNeuralRuntime();
     const hierarchy = createHumanoidNeuralAgentHierarchy({
       provider,
@@ -190,10 +191,19 @@ describe("humanoid neural Agent hierarchy", () => {
       callModelInputFilter: ({ modelData }) => modelData
     });
 
-    for (const agent of hierarchy.agents.values()) {
+    const dedicatedTerminalAgents = new Set([
+      HUMANOID_NEURAL_AGENT_IDS.goalManager,
+      HUMANOID_NEURAL_AGENT_IDS.motorIntent,
+      HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
+    ]);
+    for (const [agentId, agent] of hierarchy.agents) {
       const submissionTools = agent.tools.filter(
         (candidate) => candidate.name === "submit_neural_output"
       );
+      if (dedicatedTerminalAgents.has(agentId)) {
+        expect(submissionTools).toHaveLength(0);
+        continue;
+      }
       expect(submissionTools).toHaveLength(1);
       expect(submissionTools[0]).toMatchObject({
         type: "function",
@@ -207,10 +217,14 @@ describe("humanoid neural Agent hierarchy", () => {
     if (!sceneSubmission || sceneSubmission.type !== "function") {
       throw new Error("Scene Interpreter has no neural submission tool");
     }
+    const sceneAgent = hierarchy.agent(HUMANOID_NEURAL_AGENT_IDS.sceneInterpreter);
+    if (!sceneAgent) throw new Error("Scene Interpreter was not registered");
+    const sceneContext = new RunContext();
+    await sceneSubmission.isEnabled(sceneContext, sceneAgent);
     const submitted = await withAgentInvocation(
       HUMANOID_NEURAL_AGENT_IDS.sceneInterpreter,
       () => sceneSubmission.invoke(
-        new RunContext(),
+        sceneContext,
         JSON.stringify({
           signal_kind: "scene_interpretation",
           summary: "native structured scene payload",
@@ -311,7 +325,7 @@ describe("humanoid neural Agent hierarchy", () => {
     ]);
   });
 
-  it("keeps authority turns required while read-only DeepSeek specialists think", () => {
+  it("keeps one stable reasoning mode per model Agent Session", () => {
     const runtime = inMemoryNeuralRuntime();
     const deepSeekProvider: ProviderConfig = {
       ...provider,
@@ -332,27 +346,30 @@ describe("humanoid neural Agent hierarchy", () => {
       callModelInputFilter: ({ modelData }) => modelData
     });
 
-    const thinkingSpecialists = new Set([
-      HUMANOID_NEURAL_AGENT_IDS.sceneInterpreter,
-      HUMANOID_NEURAL_AGENT_IDS.memoryRetriever,
-      HUMANOID_NEURAL_AGENT_IDS.affordance,
-      HUMANOID_NEURAL_AGENT_IDS.risk,
-      HUMANOID_NEURAL_AGENT_IDS.predictive,
-      HUMANOID_NEURAL_AGENT_IDS.recovery
-    ]);
     for (const [agentId, agent] of hierarchy.agents) {
-      const thinking = thinkingSpecialists.has(agentId) ? "enabled" : "disabled";
-      expect(agent.modelSettings.toolChoice).toBe(
-        thinkingSpecialists.has(agentId) ? "auto" : "required"
-      );
-      expect(agent.modelSettings.providerData).toMatchObject({
-        thinking: { type: thinking },
-        providerOptions: {
-          "configured-openai-compatible": {
-            thinking: { type: thinking }
+      if (agentId === HUMANOID_NEURAL_AGENT_IDS.executionDispatcher) {
+        expect(agent.modelSettings.toolChoice).toBe("required");
+        expect(agent.modelSettings.reasoning).toBeUndefined();
+        expect(agent.modelSettings.providerData).toMatchObject({
+          thinking: { type: "disabled" },
+          providerOptions: {
+            "configured-openai-compatible": {
+              thinking: { type: "disabled" }
+            }
           }
-        }
-      });
+        });
+      } else {
+        expect(agent.modelSettings.toolChoice).toBe("auto");
+        expect(agent.modelSettings.reasoning).toEqual({ effort: "high" });
+        expect(agent.modelSettings.providerData).toMatchObject({
+          thinking: { type: "enabled" },
+          providerOptions: {
+            "configured-openai-compatible": {
+              thinking: { type: "enabled" }
+            }
+          }
+        });
+      }
     }
   });
 
@@ -1229,39 +1246,7 @@ describe("humanoid neural Agent hierarchy", () => {
       goalEpochId,
       commitmentId: commitment.commitment_id
     });
-    const sensorimotorTool = actionSelection.tools.find(
-      (candidate) => candidate.name === "delegate_sensorimotor_manager"
-    );
-    if (!sensorimotorTool || sensorimotorTool.type !== "function") {
-      throw new Error("Action Selection has no owned Sensorimotor Manager tool");
-    }
-    const executionOutput = await withAgentInvocation(
-      HUMANOID_NEURAL_AGENT_IDS.actionSelection,
-      () => sensorimotorTool.invoke(
-        new RunContext(),
-        JSON.stringify({
-          signal_kind: "skill_commitment",
-          source_signal_ids: authorization.finalOutput!.source_signal_ids,
-          ttl_revisions: 64,
-          priority: 100
-        }),
-        {
-          toolCall: {
-            type: "function_call",
-            callId: "action-selection-certified-execution",
-            name: "delegate_sensorimotor_manager",
-            arguments: "{}",
-            status: "completed"
-          }
-        }
-      ),
-      false,
-      randomUUID()
-    );
-    expect(JSON.parse(String(executionOutput))).toMatchObject({
-      signal_kind: "skill_completed",
-      source_signal_ids: [expect.any(String)]
-    });
+    expect(await orchestrateCertifiedNeuralExecution(runtime)).toBe(true);
     expect(actions).toEqual([
       "plan_humanoid_navigation",
       "execute_humanoid_navigation"
@@ -1294,7 +1279,7 @@ describe("humanoid neural Agent hierarchy", () => {
     expect(reflexReceipt?.causal_parent_ids).toEqual([bodySensation!.signal_id]);
     const physicalSignals = Object.values(executed.signals).filter((signal) => (
       signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.executor
-        && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+        && signal.target_node_id === HUMANOID_NEURAL_AGENT_IDS.executionDispatcher
     ));
     expect(physicalSignals.map((signal) => signal.kind)).toEqual(expect.arrayContaining([
       "execution_receipt",
@@ -1303,6 +1288,7 @@ describe("humanoid neural Agent hierarchy", () => {
     expect(physicalSignals.find(
       (signal) => signal.kind === "execution_receipt"
     )?.causal_parent_ids).toEqual([reflexReceipt!.signal_id]);
+    expect(calls).toContain(HUMANOID_NEURAL_AGENT_IDS.executionDispatcher);
     expect(Object.values(executed.authority_leases).every(
       (lease) => lease.status === "closed"
     )).toBe(true);
@@ -2125,38 +2111,6 @@ function certifiedMotionHierarchyModel(
         );
       }
       if (agentId === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager) {
-        const execution = results.find((record) => (
-          record.action === "execute_humanoid_navigation"
-            && Array.isArray(record.source_signal_ids)
-        ));
-        if (execution) {
-          return textResponse("sensorimotor-execution-completed", JSON.stringify({
-            signal_kind: "skill_completed",
-            summary: "Serial Executor completed the certified navigation Skill",
-            payload_json: JSON.stringify(withoutSignalIds(execution)),
-            source_signal_ids: execution.source_signal_ids,
-            confidence: 1
-          }));
-        }
-        if (runtime.neuralHarnessPhase().phase === "execution") {
-          const directCommitment = runtime.pendingNeuralSignals({
-            targetNodeId: HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            kinds: ["skill_commitment"]
-          }).find((signal) => signal.direction === "descending"
-            && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
-            && (signal.payload as { state?: string }).state === "executing");
-          if (!directCommitment) {
-            throw new Error("Sensorimotor has no direct executing commitment signal");
-          }
-          return functionCallResponse(
-            "serial-executor-certified-navigation",
-            "execute_certified_motor_intent",
-            {
-              objective: "Execute the one Predictive-certified navigation rollout",
-              source_signal_ids: [directCommitment.signal_id]
-            }
-          );
-        }
         const premotor = results.find((record) => (
           record.signal_kind === "rollout_result"
             && stringSignalIds(record.source_signal_ids).length === 1
@@ -2212,6 +2166,25 @@ function certifiedMotionHierarchyModel(
             source_signal_ids: [commitmentSignal.signal_id],
             ttl_revisions: 64,
             priority: 90
+          }
+        );
+      }
+      if (agentId === HUMANOID_NEURAL_AGENT_IDS.executionDispatcher) {
+        const directCommitment = runtime.pendingNeuralSignals({
+          targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
+          kinds: ["skill_commitment"]
+        }).find((signal) => signal.direction === "descending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager
+          && (signal.payload as { state?: string }).state === "executing");
+        if (!directCommitment) {
+          throw new Error("Execution Dispatcher has no direct executing commitment signal");
+        }
+        return functionCallResponse(
+          "dispatcher-executes-certified-navigation",
+          "execute_certified_motor_intent",
+          {
+            objective: "Execute the one Predictive-certified navigation rollout",
+            source_signal_ids: [directCommitment.signal_id]
           }
         );
       }

@@ -27,12 +27,15 @@ export async function inspectLiveRunEvidence(input) {
   // tools, or execution-kind metadata.
   const manifests = [manifest];
   const authorityManifests = [...archivedManifests, manifest];
-  const manifestsByIdentity = new Map();
+  const manifestsByAuthority = new Map();
   for (const candidate of authorityManifests) {
-    const existing = manifestsByIdentity.get(candidate.identity_sha256);
-    assert.ok(!existing || existing.epoch_id === candidate.epoch_id,
-      `Agent manifest identity was rebound: ${candidate.identity_sha256}`);
-    manifestsByIdentity.set(candidate.identity_sha256, candidate);
+    const authorityKey = manifestAuthorityKey(
+      candidate.identity_sha256,
+      candidate.epoch_id
+    );
+    assert.ok(!manifestsByAuthority.has(authorityKey),
+      `Agent manifest authority was duplicated: ${authorityKey}`);
+    manifestsByAuthority.set(authorityKey, candidate);
   }
 
   assert.equal(checkpoint.status, input.expectedStatus,
@@ -134,14 +137,15 @@ export async function inspectLiveRunEvidence(input) {
       `Action model call belongs to another decision Agent: ${receipt.transactionId}`);
     assert.deepEqual(modelCall.cycle, receipt.cycle,
       `Action model call belongs to another cycle: ${receipt.transactionId}`);
-    const decisionAuthority = actionDecisionAuthority(receipt);
-    assert.equal(decision.agent_id, decisionAuthority.agentId,
-      `Action decision belongs to the wrong hierarchy authority: ${receipt.transactionId}`);
-    const decisionManifest = manifestsByIdentity.get(decision.agent_manifest_sha256);
+    const decisionManifest = manifestsByAuthority.get(manifestAuthorityKey(
+      decision.agent_manifest_sha256,
+      decision.agent_manifest_epoch_id
+    ));
     assert.ok(decisionManifest,
       `Action decision references an unknown Agent manifest: ${receipt.transactionId}`);
-    assert.equal(decision.agent_manifest_epoch_id, decisionManifest.epoch_id,
-      `Action decision uses another manifest epoch: ${receipt.transactionId}`);
+    const decisionAuthority = actionDecisionAuthority(receipt, decisionManifest);
+    assert.equal(decision.agent_id, decisionAuthority.agentId,
+      `Action decision belongs to the wrong hierarchy authority: ${receipt.transactionId}`);
     assert.equal(decision.response_id, modelCall.response_id,
       `Action response identity changed: ${receipt.transactionId}`);
     assert.equal(decision.response_output_sha256, modelCall.response_output_sha256,
@@ -179,7 +183,7 @@ export async function inspectLiveRunEvidence(input) {
       toolName: plan.action
     }, "Physical plan has no matching real-model tool call");
     assert.deepEqual(modelToolCalls.get(execution.transactionId), {
-      agentId: "humanoid-sensorimotor-manager",
+      agentId: execution.decision.agent_id,
       toolName: "execute_certified_motor_intent"
     }, "Physical execution has no matching real-model tool call");
   }
@@ -188,7 +192,12 @@ export async function inspectLiveRunEvidence(input) {
   assert.ok(isRecord(neuralState) && isRecord(neuralState.signals),
     "Live run has no durable V3 neural signal graph");
   const neuralSignals = Object.values(neuralState.signals).filter(isRecord);
-  for (const execution of executions) {
+  const currentEpochExecutions = executions.filter((execution) => (
+    execution.decision?.agent_manifest_epoch_id === manifest.epoch_id
+  ));
+  assert.ok(currentEpochExecutions.length > 0,
+    "Current Agent epoch contains no accepted physical execution");
+  for (const execution of currentEpochExecutions) {
     const executorIntent = findNeuralSignal(neuralSignals, {
       kind: "motor_intent",
       source: "humanoid-executor",
@@ -212,8 +221,22 @@ export async function inspectLiveRunEvidence(input) {
     const executorReceipt = findNeuralSignal(neuralSignals, {
       kind: "execution_receipt",
       source: "humanoid-executor",
+      target: "humanoid-certified-execution-dispatcher"
+    }, execution.transactionId);
+    const executorCompletions = findNeuralSignals(neuralSignals, {
+      kinds: ["skill_completed", "skill_failed"],
+      source: "humanoid-executor",
+      target: "humanoid-certified-execution-dispatcher"
+    }, execution.transactionId);
+    assert.equal(executorCompletions.length, 1,
+      `Physical execution has no unique Executor completion: ${execution.transactionId}`);
+    const dispatcherCompletions = findNeuralSignals(neuralSignals, {
+      kinds: ["skill_completed", "skill_failed"],
+      source: "humanoid-certified-execution-dispatcher",
       target: "humanoid-sensorimotor-manager"
     }, execution.transactionId);
+    assert.equal(dispatcherCompletions.length, 1,
+      `Physical execution has no unique Dispatcher completion: ${execution.transactionId}`);
     assert.deepEqual(bodyIntent.causal_parent_ids, [executorIntent.signal_id],
       "Reflex motor intent bypassed its Executor parent");
     assert.deepEqual(bodySensation.causal_parent_ids, [bodyIntent.signal_id],
@@ -222,6 +245,9 @@ export async function inspectLiveRunEvidence(input) {
       "Reflex receipt bypassed authoritative body sensation");
     assert.deepEqual(executorReceipt.causal_parent_ids, [reflexReceipt.signal_id],
       "Executor receipt bypassed the learned controller/reflex loop");
+    assert.ok(dispatcherCompletions[0].causal_parent_ids.includes(
+      executorCompletions[0].signal_id
+    ), "Dispatcher completion bypassed the Serial Executor result");
   }
 
   const evidenceRefs = new Set(goalEvidence.flatMap((record) => (
@@ -264,6 +290,7 @@ export async function inspectLiveRunEvidence(input) {
     "humanoid-action-selection-gate",
     "humanoid-perceptual-association-manager",
     "humanoid-sensorimotor-manager",
+    "humanoid-certified-execution-dispatcher",
     "humanoid-motor-intent-compiler"
   ]) {
     assert.ok(exercisedAgents.includes(agentId), `Live run never exercised ${agentId}`);
@@ -376,7 +403,7 @@ function isPlanningAction(action) {
     || action === "plan_humanoid_skill";
 }
 
-function actionDecisionAuthority(receipt) {
+function actionDecisionAuthority(receipt, decisionManifest) {
   if (receipt.action === "observe_humanoid") {
     return {
       agentId: "humanoid-perceptual-association-manager",
@@ -386,12 +413,25 @@ function actionDecisionAuthority(receipt) {
   if (receipt.action === "execute_whole_body_motion"
     || receipt.action === "execute_humanoid_navigation"
     || receipt.action === "execute_humanoid_skill") {
+    const agentIds = new Set(Array.isArray(decisionManifest.agent_ids)
+      ? decisionManifest.agent_ids
+      : Object.values(decisionManifest.agents ?? {}).flatMap((agent) => (
+          isRecord(agent) && typeof agent.agent_id === "string"
+            ? [agent.agent_id]
+            : []
+        )));
     return {
-      agentId: "humanoid-sensorimotor-manager",
+      agentId: agentIds.has("humanoid-certified-execution-dispatcher")
+        ? "humanoid-certified-execution-dispatcher"
+        : "humanoid-sensorimotor-manager",
       toolName: "execute_certified_motor_intent"
     };
   }
   return { agentId: receipt.agentId, toolName: receipt.action };
+}
+
+function manifestAuthorityKey(identitySha256, epochId) {
+  return `${identitySha256}:${epochId}`;
 }
 
 function selectedGoals(checkpoint) {
@@ -416,4 +456,14 @@ function findNeuralSignal(signals, route, transactionId) {
   assert.equal(matches.length, 1,
     `Expected one ${route.source} -> ${route.target} ${route.kind} signal for ${transactionId}; found ${matches.length}`);
   return matches[0];
+}
+
+function findNeuralSignals(signals, route, transactionId) {
+  return signals.filter((signal) => route.kinds.includes(signal.kind)
+    && signal.source_node_id === route.source
+    && signal.target_node_id === route.target
+    && isRecord(signal.payload)
+    && (signal.payload.execution_transaction_id === transactionId
+      || signal.payload.transaction_id === transactionId
+      || signal.payload.transactionId === transactionId));
 }

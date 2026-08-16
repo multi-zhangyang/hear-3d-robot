@@ -116,6 +116,8 @@ import {
 import { reconcileActionCommitOutbox } from "../../persistence/action-commit-reconciler.js";
 import type { RuntimeEvent, RuntimeEventSink } from "../../runtime/events.js";
 import { assertGoalSupported } from "../../runtime/goal-validation.js";
+import { assertHumanoidGoalControllerAdmission } from
+  "../../runtime/humanoid-goal-controller-admission.js";
 import {
   advanceHumanoidGoal,
   assertHumanoidGoalProgressIntegrity,
@@ -1774,6 +1776,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         const before = new Set(Object.keys(next.candidates));
         try {
           assertGoalSupported(candidate.goal, this.#scenario);
+          assertHumanoidGoalControllerAdmission(
+            candidate.goal,
+            this.#world.snapshot().robot.controller
+          );
+          this.#assertContinuousGoalRequiresPhysicalChange(candidate.goal);
           // The bootstrap mission is a durable desired physical state. A
           // complete route to a distant zone is deliberately not required at
           // Goal admission time: Perception, exploration, replanning, and
@@ -1926,6 +1933,24 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
     );
   }
 
+  #assertContinuousGoalRequiresPhysicalChange(candidate: Goal): void {
+    if (this.#store.definition.run_mode !== "continuous"
+      || this.#missionPriorityRequired()) return;
+    const world = this.#world.snapshot();
+    const checker = inspectHumanoidGoal(
+      candidate,
+      this.#scenario,
+      world,
+      createHumanoidGoalProgress(candidate, world)
+    );
+    if (!checker.success) return;
+    throw new Error(
+      "An open-ended continuous successor Goal must require a real physical "
+        + "state change; the candidate Goal is already satisfied in the current "
+        + "MuJoCo world. Propose a different observable state instead of a no-op Goal"
+    );
+  }
+
   async selectGoalCandidate(
     input: Parameters<GoalManagerRuntime["selectGoalCandidate"]>[0],
     authority: GoalToolCallAuthority
@@ -1950,6 +1975,11 @@ export class HumanoidRunRuntime implements LongRunContextRuntime {
         throw new Error("Goal selection requires a distinct model response after proposal");
       }
       this.#assertMissionPrioritySelection(candidate.goal);
+      assertHumanoidGoalControllerAdmission(
+        candidate.goal,
+        this.#world.snapshot().robot.controller
+      );
+      this.#assertContinuousGoalRequiresPhysicalChange(candidate.goal);
       const evidence = this.#requiredContextGoalEvidence(selectedBy.agent_id);
       await this.#persistGoalEvidence([evidence.ref]);
       const next = selectDomainGoalCandidate(this.#checkpoint.goal_dag, {

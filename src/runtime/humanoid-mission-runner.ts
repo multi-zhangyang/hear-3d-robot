@@ -44,7 +44,8 @@ import { withAgentInvocation } from "../harness/agent-scope.js";
 import {
   createHumanoidNeuralAgentHierarchy,
   humanoidNeuralContextProjection,
-  humanoidNeuralAgentProfile
+  humanoidNeuralAgentProfile,
+  orchestrateCertifiedNeuralExecution
 } from "../harness/humanoid/neural-agents.js";
 import { HUMANOID_NEURAL_AGENT_IDS } from
   "../harness/humanoid/neural-hierarchy-contract.js";
@@ -742,6 +743,20 @@ async function executeHumanoidMission(input: {
       input.signal?.throwIfAborted();
       await input.runtime.ensureAutonomousCycle();
       await input.runtime.reconcileNeuralHarnessPhase();
+      if (await orchestrateCertifiedNeuralExecution(
+        input.runtime,
+        input.signal
+      )) {
+        // The execution phase bypasses another cognitive Executive turn and
+        // wakes only the non-thinking required-tool Dispatcher. Its direct
+        // Sensorimotor feedback then resumes the normal reasoning hierarchy in
+        // feedback phase with every Agent Session left in a stable mode.
+        await input.runtime.store.clearAgentState();
+        serializedState = undefined;
+        executiveTurnContinuation = undefined;
+        await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+        continue;
+      }
       // Scheduler callbacks may arrive while the previous Executive episode is
       // still running.  They are wake hints, not durable authority: after that
       // episode the Harness phase, Goal epoch, commitment, leases, or world may

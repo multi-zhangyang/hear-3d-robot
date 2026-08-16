@@ -797,10 +797,10 @@ function executionManagerIdentity(
   manifest: AgentManifest
 ): { agent_id: string } {
   const identity = manifest.version === 3
-    ? manifest.agents[HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager]
+    ? manifest.agents[HUMANOID_NEURAL_AGENT_IDS.executionDispatcher]
     : manifest.agents.coordinator;
   if (!identity || (manifest.version === 3 && identity.execution_kind !== "model_agent")) {
-    throw new Error("Agent manifest has no structural Sensorimotor Manager authority");
+    throw new Error("Agent manifest has no structural Certified Execution Dispatcher authority");
   }
   return identity;
 }

@@ -12,7 +12,7 @@ flowchart LR
     API["Authoritative Operator API\ncheckpoint + event stream"]
     FB["HumanoidFrameBuffer\nmonotonic visual projection"]
     R3F["React Three Fiber + Drei\nproduct 3D stage"]
-    TREE["React Flow + d3-hierarchy\n18-node ownership tree"]
+    TREE["React Flow + d3-hierarchy\n19-node ownership tree"]
     UI["HEAR Operator\nmission + world + causality"]
     MCAP["Read-only MCAP exporter\nevents + world + TF + joints + scene"]
     FOX["Foxglove\nengineering timeline / 3D / plots"]
@@ -26,7 +26,7 @@ flowchart LR
 ```
 
 - **Product world:** React Three Fiber 9 and Drei own the Three.js scene lifecycle, camera controls, WebGPU initialization, WebGL2 fallback, resize, invalidation, and React cleanup. The MuJoCo snapshot remains the only pose authority.
-- **Agent architecture:** React Flow renders the live 18-node control tree; d3-hierarchy performs deterministic single-root layout. Edges represent direct ownership only. Feedback never creates a visual second parent.
+- **Agent architecture:** React Flow renders the live 19-node control tree; d3-hierarchy performs deterministic single-root layout. Edges represent direct ownership only. Feedback never creates a visual second parent.
 - **Engineering diagnostics:** Every Operator run can now be exported as a self-contained MCAP file. It carries durable runtime events, authoritative world snapshots, 43 joint states, Z-up Foxglove frame transforms, contact/center-of-mass SceneUpdate markers, and navigation lines. The exporter registers no command channel. A future Foxglove WebSocket server may stream the same projection live, but it is not required for replay or analysis.
 - **Recording and replay:** Rerun Web Viewer is the preferred optional embedded replay surface after HEAR can emit version-matched RRD recordings or a Rerun gRPC stream. The RRD compatibility boundary must be pinned to the viewer version.
 

@@ -20,6 +20,7 @@ export const HUMANOID_NEURAL_AGENT_IDS = {
   premotor: "humanoid-premotor-skill-composer",
   motorIntent: "humanoid-motor-intent-compiler",
   rolloutGate: "humanoid-rollout-gate",
+  executionDispatcher: "humanoid-certified-execution-dispatcher",
   executor: "humanoid-executor",
   reflex: "humanoid-controller-reflex",
   body: "humanoid-mujoco-body",
@@ -254,7 +255,7 @@ export const HUMANOID_NEURAL_NODES: readonly HumanoidNeuralNodeDescriptor[] = [
       "risk",
       "predictive",
       "premotor",
-      "executor",
+      "executionDispatcher",
       "recovery"
     ],
     layer: "sensorimotor",
@@ -397,10 +398,33 @@ export const HUMANOID_NEURAL_NODES: readonly HumanoidNeuralNodeDescriptor[] = [
     physicalWriteAuthority: false
   },
   {
+    key: "executionDispatcher",
+    id: HUMANOID_NEURAL_AGENT_IDS.executionDispatcher,
+    name: "Certified Execution Dispatcher",
+    parentKey: "sensorimotorManager",
+    childKeys: ["executor"],
+    layer: "controller",
+    pathway: "physical_execution",
+    executionKind: "model_agent",
+    orchestrationKind: "agent_tool",
+    sessionMode: "independent_file_session",
+    cadence: "skill_event",
+    maximumCorrectionScope: "local",
+    objective: "Dispatch the one already-certified motor intent through the serial physical writer.",
+    criteria: [
+      "Run only after Action Selection authorization and invoke exactly one required execution tool.",
+      "Make no planning, selection, or recovery decision."
+    ],
+    capabilities: ["dispatch_certified_execution"],
+    mayDelegate: true,
+    parallelSafe: false,
+    physicalWriteAuthority: false
+  },
+  {
     key: "executor",
     id: HUMANOID_NEURAL_AGENT_IDS.executor,
     name: "Serial Physical Execution Gate",
-    parentKey: "sensorimotorManager",
+    parentKey: "executionDispatcher",
     childKeys: ["reflex"],
     layer: "controller",
     pathway: "physical_execution",
@@ -544,8 +568,10 @@ export const HUMANOID_NEURAL_SIGNAL_CONTRACTS = [
   signalContract("motorIntent", "premotor", "ascending", "rollout_result", "escalation"),
   signalContract("motorIntent", "rolloutGate", "descending", "motor_intent"),
   signalContract("rolloutGate", "motorIntent", "ascending", "rollout_result", "escalation"),
-  signalContract("sensorimotorManager", "executor", "descending", "skill_commitment", "motor_intent", "rollout_result"),
-  signalContract("executor", "sensorimotorManager", "ascending", "execution_receipt", "prediction_error", "skill_completed", "skill_failed", "escalation"),
+  signalContract("sensorimotorManager", "executionDispatcher", "descending", "skill_commitment"),
+  signalContract("executionDispatcher", "sensorimotorManager", "ascending", "execution_receipt", "prediction_error", "skill_completed", "skill_failed", "escalation"),
+  signalContract("executionDispatcher", "executor", "descending", "skill_commitment", "motor_intent", "rollout_result"),
+  signalContract("executor", "executionDispatcher", "ascending", "execution_receipt", "prediction_error", "skill_completed", "skill_failed", "escalation"),
   signalContract("executor", "reflex", "descending", "skill_commitment", "motor_intent"),
   signalContract("reflex", "executor", "ascending", "execution_receipt", "prediction_error", "skill_completed", "skill_failed", "escalation"),
   signalContract("reflex", "body", "descending", "motor_intent"),
@@ -719,6 +745,12 @@ export function assertHumanoidNeuralHierarchyContract(): void {
     || byKey.get("body")?.cadence !== "physics_tick") {
     throw new Error(
       "Execution, controller, and body nodes require distinct transaction/control/physics cadences"
+    );
+  }
+  if (byKey.get("executionDispatcher")?.parentKey !== "sensorimotorManager"
+    || byKey.get("executor")?.parentKey !== "executionDispatcher") {
+    throw new Error(
+      "Certified Execution Dispatcher must isolate Sensorimotor reasoning from the Serial Executor"
     );
   }
   if (byKey.get("recovery")?.orchestrationKind !== "exclusive_lease_episode"

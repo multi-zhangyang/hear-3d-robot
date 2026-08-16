@@ -85,7 +85,8 @@ describe("Goal evidence artifacts", () => {
 
     const autonomy = createHumanoidAutonomyContext({
       goalDAG: createGoalDAG(),
-      worldEvidence: artifact
+      worldEvidence: artifact,
+      controllerCapabilities: ["contact_rich_manipulation"]
     });
     expect(autonomy).toMatchObject({
       source_world_revision: 12,

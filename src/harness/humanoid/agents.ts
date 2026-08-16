@@ -48,7 +48,6 @@ import { createToolInputRecovery } from "../tool-input-recovery.js";
 import { ModelDecisionStallError } from "../model-telemetry.js";
 import type { HumanoidCycleCompletionReadiness } from "./cycle-causal-evidence.js";
 import type { HumanoidAutonomyReadiness } from "./run-runtime.js";
-import { GOAL_HISTORY_PREDICATE_TYPES } from "./goal-history.js";
 
 const SpecialistDelegationSchema = z.object({}).strict();
 const ExecutePlanTaskSchema = z.object({
@@ -116,6 +115,7 @@ export function goalManagerInvocationInput(
   const goalDAG = jsonRecord(root.goal_dag);
   const goalContext = jsonRecord(root.goal_context);
   const autonomy = jsonRecord(goalContext.autonomy);
+  const capabilitySurface = jsonRecord(autonomy.capability_surface);
   const autonomyHistory = jsonRecord(autonomy.history);
   const continuousDriveState = jsonRecord(autonomy.continuous_drive_state);
   const observation = jsonRecord(goalContext.observation);
@@ -144,6 +144,19 @@ export function goalManagerInvocationInput(
   const objects = Array.isArray(observation.objects)
     ? observation.objects.map(jsonRecord)
     : [];
+  const zones = Array.isArray(observation.zones)
+    ? observation.zones.map(jsonRecord)
+    : [];
+  const admittedPredicateTypes = [...new Set([
+    ...stringArray(capabilitySurface.embodiment_predicates),
+    ...stringArray(capabilitySurface.manipulable_object_predicates),
+    ...stringArray(capabilitySurface.articulated_object_predicates),
+    ...stringArray(capabilitySurface.static_solid_predicates)
+  ])];
+  const contactGoalsAdmitted = stringArray(
+    capabilitySurface.manipulable_object_predicates
+  ).length > 0;
+  const blockRemovalAdmitted = admittedPredicateTypes.includes("block_removed");
   const interaction = jsonRecord(root.interaction);
   const spatialBelief = jsonRecord(root.spatial_belief);
   const carrying = jsonRecord(interaction.carrying);
@@ -186,8 +199,11 @@ export function goalManagerInvocationInput(
       lifetime_outcomes: autonomyHistory.lifetime_outcomes ?? null
     },
     continuous_drive_state: {
+      drive_phase: continuousDriveState.drive_phase ?? null,
       bootstrap_mission_goal_completed:
         continuousDriveState.bootstrap_mission_goal_completed ?? null,
+      bootstrap_goal_policy:
+        continuousDriveState.bootstrap_goal_policy ?? null,
       exact_mission_goal_history_complete:
         continuousDriveState.exact_mission_goal_history_complete ?? null,
       working_exact_mission_goal_outcomes:
@@ -199,11 +215,19 @@ export function goalManagerInvocationInput(
       untried_zone_ids: stringArray(continuousDriveState.untried_zone_ids)
     },
     observable_goal_surface: {
-      predicate_types: [...GOAL_HISTORY_PREDICATE_TYPES],
+      predicate_types: admittedPredicateTypes,
+      robot_root_position: observation.root_position ?? null,
+      world_bounds: observation.bounds ?? null,
       zone_ids: stringArray(observation.zone_ids),
+      zones,
       visible_object_ids: stringArray(observation.visible_object_ids),
+      objects,
       portable_object_ids: objects.flatMap((object) => (
-        object.portable === true && typeof object.id === "string" ? [object.id] : []
+        contactGoalsAdmitted
+          && object.portable === true
+          && typeof object.id === "string"
+          ? [object.id]
+          : []
       )),
       object_affordances: objects.flatMap((object) => (
         typeof object.id === "string"
@@ -215,8 +239,13 @@ export function goalManagerInvocationInput(
           : []
       )),
       removable_block_ids: solids.flatMap((solid) => (
-        solid.kind === "block" && typeof solid.id === "string" ? [solid.id] : []
+        blockRemovalAdmitted
+          && solid.kind === "block"
+          && typeof solid.id === "string"
+          ? [solid.id]
+          : []
       )),
+      solids,
       carrying: {
         phase: carrying.phase ?? null,
         object_ids: carryBindings.flatMap((binding) => (
@@ -509,7 +538,7 @@ export function createHumanoidAgentHierarchy(input: {
     const provider = providerConfigForRole(input.provider, humanoidAgentRole(agentId));
     return {
       temperature: provider.temperature,
-      ...(provider.reasoningEffort === undefined
+      ...(provider.reasoningEffort === undefined || overrides.thinking === "disabled"
         ? {}
         : { reasoning: { effort: provider.reasoningEffort } }),
       ...(provider.maxOutputTokens === undefined
@@ -1363,11 +1392,13 @@ function goalManagerInstructions(): string {
     "run_mode=mission 且 mission_goal 的谓词已有对应能力、当前没有规划拒绝证明其受阻时，候选中必须包含完整 mission_goal，并优先选择它；阶段 Goal 只用于有当前物理证据的必要前置条件，不能无端扩大任务范围。",
     "区域是具有水平范围与支撑面的语义对象：要求物体进入或稳放到区域时使用 object_in_zone 或 object_placed 并逐字复制 zone_id，不能把 zone.center 当作物体中心的 object_at target。zone.center.y 描述区域平面，不是物体落稳后的中心高度。一个 Goal 内不得重复相同 predicate。",
     "robot_at 阶段 Goal 的 target 必须是机器人根可实际占据的自由站位，不能直接复制动态物体、承托台或障碍物中心。已有导航拒绝回执给出 projected target、partial endpoint 或 chunk target 时，应把这些物理可行性证据与阶段目的结合，而不是再次提交同一个不可占据点。",
-    "导航的 target.y 不参与平面可达性，投影拒绝中的 distance 衡量 XZ 平面偏差；把 y 改成地面高度不能修复同一 XZ 站位。相邻 robot_at 站位已被物理规划连续拒绝、但当前观察显示目标物体仍可见且双腕距离已进入全身操作可达范围时，不得继续提交物体中心或同一障碍边界附近的 robot_at 变体；应选择 object_grasped 或完整 mission_goal，让 Motion 用实时末端几何继续操作。",
+    "导航的 target.y 不参与平面可达性，投影拒绝中的 distance 衡量 XZ 平面偏差；把 y 改成地面高度不能修复同一 XZ 站位。相邻 robot_at 站位已被物理规划连续拒绝、但当前观察显示目标物体仍可见且双腕距离已进入全身操作可达范围时，不得继续提交物体中心或同一障碍边界附近的 robot_at 变体；只有谓词白名单允许时才能选择 object_grasped 或操作类完整 mission_goal，让 Motion 用实时末端几何继续操作。",
     "goal_dag.status=awaiting_model_selection 时，先检查 CURRENT GOAL MANAGER INVOCATION 的 existing_goal_candidates。若仍有 status=proposed、dependency_candidates 均为 completed、且符合当前证据与长期任务的候选，可直接调用 select_goal_candidate；若没有合适候选，才调用 submit_goal_candidates 一次提交 1–3 个内容不同的新候选。明确且当前可直接推进的 mission_goal 可以是唯一候选；只有物理证据支持真实不同的阶段方向时才提交多个候选，禁止为凑数编造替代 Goal。不得重复提交已有 Goal 内容来代替选择。Harness 会把提交与随后选择分别绑定到对应模型请求所见的当前物理证据，不要求你转录证据哈希。候选间不能引用本批 proposal_id 或尚未生成的 candidate_id；dependency_candidate_ids 只能逐字引用 existing_goal_candidate_ids，列表为空时每个候选都必须填写 []。每个谓词必须能由当前证据和后续 checker 真实观察。goal_context.observation 提供当前可见物体、视觉或接触可观察静态方块的真实位姿、关系、接触和区域；block_removed 只能逐字引用当前 solids 中 kind=block 的 id。candidate_history.lifetime_outcomes 汇总整个运行期按谓词、对象、区域、方块和末端划分的 selected、not_selected 与真实终态，只提供历史，不包含 Harness 评分或候选；records_without_alternate_history 大于 0 表示相应旧记录没有保存未采用候选，不得把未知解释为零次。",
     "候选必须根据当前可供性和长期约束产生，并主动比较近期 Goal 的对象、区域、谓词组合和结果。context_projection.total_epoch_count 大于 visible_epoch_count 时，选择或提交任何包含 robot_at、object_at 或 world-frame end_effector_at 的候选之前，必须先调用 recall_goal_history.world_region 查询你准备选择的世界坐标；水平半径不得小于对应谓词 tolerance。其他 history_truncated=true 或需要核对更早结果的情况也应调用 recall_goal_history 检索完整持久 Goal DAG。召回只筛选历史，不能代替当前观察，也不能替你选择候选；除非恢复、依赖或当前物理状态确有必要，不要重复已完成的相同空间目标。自主差异来自你的模型选择，不得用随机坐标、随机电机动作或固定目标表冒充新颖性。",
+    "observable_goal_surface.predicate_types 是本次调用唯一允许的控制器准入谓词白名单。即使物体或方块当前可见，只要对应 manipulation、articulation 或 block-removal 谓词未出现在该列表，就不得提出相关 Goal；可见性不是身体能力。",
+    "continuous_drive_state.drive_phase=open_ended 时，新 Goal 必须改变当前 MuJoCo 物理状态。结合 observable_goal_surface.robot_root_position、zones 和 exploration 选择尚未满足的可达状态；不得用机器人已经所在的位置或区域制造零动作循环。",
     "直接选择既有候选时，逐字复制 CURRENT GOAL MANAGER INVOCATION 中的 candidate_sequence；提交成功后必须在新的模型响应中从提交回执里选择 candidate_sequence 并调用 select_goal_candidate。同一次 submit_goal_candidates 调用产生一个互斥决策批次：模型选中一个候选后，该批其余候选会以 expired 结果随所选 epoch 持久归档；以后若新物理证据使其中一种方向重新合适，应在新的模型调用中重新提出，而不能复用旧批次。该短序号与持久哈希身份一对一对应，不能猜测。必须显式选择一个依赖已完成的候选；不能让程序随机选择，也不能让 Harness 替你插入固定候选。",
-    "涉及便携物体时必须按当前物理依赖判断 Goal：未持握物体就不能把远离该物体、仅进入目标区域当成放置任务的充分前置；observable_goal_surface.carrying 只有在列出该物体且 continuation_verified=true 时才证明它可随导航继续携带。可见且可操作的目标物体、其双腕距离、当前抓取评估与目标区域共同决定是直接选择完整 mission_goal，还是先选择 object_grasped 等可验收前置 Goal；不得用固定抓取顺序替代这一判断。",
+    "涉及便携物体且谓词白名单允许操作 Goal 时，必须按当前物理依赖判断：未持握物体就不能把远离该物体、仅进入目标区域当成放置任务的充分前置；observable_goal_surface.carrying 只有在列出该物体且 continuation_verified=true 时才证明它可随导航继续携带。可见且可操作的目标物体、其双腕距离、当前抓取评估与目标区域共同决定是直接选择完整 mission_goal，还是先选择 object_grasped 等可验收前置 Goal；不得用固定抓取顺序替代这一判断。",
     "goal_dag.status=active 时不得提交或选择新目标。只有当前观察与物理 action receipt 证明 Goal 谓词本身不可继续时，才能调用 retire_goal_epoch；若当前物理状态已满足完整 mission_goal、但 active Goal 是阶段目标，应引用 current_goal_evidence_ref 将阶段目标退役为 superseded，使下一轮能选择完整 mission_goal 验收。blocked 必须引用 CURRENT GOAL MANAGER INVOCATION.recent_action_evidence 中真实存在的 action evidence_ref。零物理帧的规划拒绝、plan_revalidation_failed、repeated_planning_failure 只否定一次策略，不能证明 Goal blocked；Goal 重评时若 Goal 仍可达，必须调用 continue_goal_epoch 保留它。Goal Manager 只能说明 Goal 为何仍应继续，不得为下一周期指定 Skill、手、交互点、坐标、路线或动作参数；下一周期必须从新鲜物理观察重新选择。Harness 会结束当前失败周期、刷新 compact replan 预算，但不会替 Motion 选择 Skill 或参数。manipulation_base_placement_required 且 detail.reachable_base_placements 非空只证明需要先移动基座。退役不会自动选择替代目标。",
     "active Goal 可以跨越导航、重新观察、接触和操作多个周期。候选若在 mission_link 中声明依赖另一个阶段，该依赖必须已经是 completed candidate 并写入 dependency_candidate_ids；不能把尚未完成的前置阶段和后继阶段放进同一批后直接选择后继。",
     "retire_goal_epoch 的 evidence_refs 必须逐字复制 current_goal_evidence_ref 或 recent_action_evidence.evidence_ref，绝不能填写裸 transaction_id；一次退役引用的全部证据必须属于同一 world revision。select_goal_candidate 的 candidate_sequence 与所有 dependency_candidate_ids 也必须逐字使用上下文或工具回执中真实存在的标识，不得猜测。",

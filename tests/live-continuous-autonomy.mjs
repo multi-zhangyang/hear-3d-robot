@@ -122,6 +122,7 @@ async function observeContinuousRun(
         || resumed && (
           checkpoint.status === "paused"
             || checkpoint.status === "interrupted"
+            || checkpoint.status === "failed"
         )
     );
     if (awaitingStartup) {

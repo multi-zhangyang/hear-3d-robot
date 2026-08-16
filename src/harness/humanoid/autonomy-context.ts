@@ -1,7 +1,11 @@
 import type { GoalDAG } from "../../domain/goal-epoch.js";
 import { goalConstraintSha256 } from "../../domain/goal-identity.js";
 import type { HumanoidRunMode } from "../../domain/run-mode.js";
+import type { HumanoidLearnedPolicyCapability } from
+  "../../domain/humanoid-policy.js";
 import type { Goal, GoalPredicate } from "../../domain/schema.js";
+import { humanoidGoalControllerCapabilitySurface } from
+  "../../runtime/humanoid-goal-controller-admission.js";
 import { goalHistoryLifetimeProjection } from
   "../../domain/goal-history-summary.js";
 import type { HumanoidSpatialBeliefObservation } from
@@ -17,6 +21,7 @@ export function createHumanoidAutonomyContext(input: {
   runMode?: HumanoidRunMode;
   missionGoal?: Goal;
   spatialBelief?: HumanoidSpatialBeliefObservation;
+  controllerCapabilities?: readonly HumanoidLearnedPolicyCapability[] | undefined;
 }) {
   if ((input.worldEvidence.version !== 2
     && input.worldEvidence.version !== 3
@@ -25,6 +30,11 @@ export function createHumanoidAutonomyContext(input: {
     throw new Error("Autonomy context requires current affordance-bearing world evidence");
   }
   const observation = input.worldEvidence.observation;
+  const capabilitySurface = humanoidGoalControllerCapabilitySurface(
+    input.controllerCapabilities
+  );
+  const contactRichManipulation =
+    capabilitySurface.manipulable_object_predicates.length > 0;
   const lifetime = goalHistoryLifetimeProjection(input.goalDAG);
   const epochs = input.goalDAG.epochs.slice(-HISTORY_WINDOW);
   const history = epochs.flatMap((epoch) => {
@@ -119,23 +129,7 @@ export function createHumanoidAutonomyContext(input: {
             : null
         }
       : null,
-    capability_surface: {
-      embodiment_predicates: [
-        "robot_at",
-        "robot_in_zone",
-        "end_effector_at"
-      ],
-      manipulable_object_predicates: [
-        "object_grasped",
-        "object_at",
-        "object_in_zone",
-        "object_placed",
-        "object_inside",
-        "object_on"
-      ],
-      articulated_object_predicates: ["articulation_state"],
-      static_solid_predicates: ["block_removed"]
-    },
+    capability_surface: capabilitySurface,
     object_frontier: observation.objects.map((object) => ({
       object_id: object.id,
       role: object.role,
@@ -143,7 +137,7 @@ export function createHumanoidAutonomyContext(input: {
       affordances: "affordances" in object ? object.affordances : [],
       articulation: "articulation" in object ? object.articulation : null,
       prior_goal_outcomes: outcome(objectCounts.get(object.id)),
-      supported_goal_predicates: [
+      supported_goal_predicates: contactRichManipulation ? [
         ...(object.portable
           ? [
             "object_grasped",
@@ -157,7 +151,7 @@ export function createHumanoidAutonomyContext(input: {
         ...("articulation" in object && object.articulation
           ? ["articulation_state"]
           : [])
-      ]
+      ] : []
     })),
     solid_frontier: "solids" in observation
       ? observation.solids.map((solid) => ({
@@ -165,7 +159,7 @@ export function createHumanoidAutonomyContext(input: {
           source_id: solid.source_id,
           kind: solid.kind,
           prior_goal_outcomes: outcome(solidCounts.get(solid.id)),
-          supported_goal_predicates: solid.kind === "block"
+          supported_goal_predicates: contactRichManipulation && solid.kind === "block"
             ? ["block_removed"]
             : []
         }))
@@ -173,7 +167,10 @@ export function createHumanoidAutonomyContext(input: {
     zone_frontier: observation.zones.map((zone) => ({
       zone_id: zone.id,
       prior_goal_outcomes: outcome(zoneCounts.get(zone.id)),
-      supported_goal_predicates: ["robot_in_zone", "object_in_zone", "object_placed"]
+      supported_goal_predicates: [
+        "robot_in_zone",
+        ...(contactRichManipulation ? ["object_in_zone", "object_placed"] : [])
+      ]
     })),
     history: {
       total_epoch_count: input.goalDAG.next_epoch_index,

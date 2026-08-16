@@ -101,7 +101,9 @@ export function createHumanoidContextAnchor(input: {
           worldEvidence,
           runMode: input.runMode,
           missionGoal: input.missionGoal,
-          spatialBelief: input.observation.spatialBelief
+          spatialBelief: input.observation.spatialBelief,
+          controllerCapabilities:
+            input.world.robot.controller.learnedPolicy?.capabilities
         })
       },
       cycle_index: input.checkpoint.cycle_index,

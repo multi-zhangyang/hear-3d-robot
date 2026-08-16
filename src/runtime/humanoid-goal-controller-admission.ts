@@ -4,16 +4,56 @@ import type { Goal } from "../domain/schema.js";
 import type { HumanoidControllerDescriptor } from
   "../world/humanoid/whole-body-controller.js";
 
-const CONTACT_GOAL_PREDICATES = new Set<Goal["predicates"][number]["type"]>([
-  "block_removed",
+type HumanoidGoalPredicateType = Goal["predicates"][number]["type"];
+
+const EMBODIMENT_GOAL_PREDICATES = [
+  "robot_at",
+  "robot_in_zone",
+  "end_effector_at"
+] as const satisfies readonly HumanoidGoalPredicateType[];
+
+const MANIPULABLE_OBJECT_GOAL_PREDICATES = [
+  "object_grasped",
+  "object_at",
   "object_in_zone",
   "object_placed",
-  "object_at",
-  "object_grasped",
   "object_inside",
-  "object_on",
+  "object_on"
+] as const satisfies readonly HumanoidGoalPredicateType[];
+
+const ARTICULATED_OBJECT_GOAL_PREDICATES = [
   "articulation_state"
+] as const satisfies readonly HumanoidGoalPredicateType[];
+
+const STATIC_SOLID_GOAL_PREDICATES = [
+  "block_removed"
+] as const satisfies readonly HumanoidGoalPredicateType[];
+
+const CONTACT_GOAL_PREDICATES = new Set<HumanoidGoalPredicateType>([
+  ...MANIPULABLE_OBJECT_GOAL_PREDICATES,
+  ...ARTICULATED_OBJECT_GOAL_PREDICATES,
+  ...STATIC_SOLID_GOAL_PREDICATES
 ]);
+
+export function humanoidGoalControllerCapabilitySurface(
+  capabilities: readonly HumanoidLearnedPolicyCapability[] | undefined
+) {
+  const contactRichManipulation = capabilities?.includes(
+    "contact_rich_manipulation"
+  ) ?? false;
+  return {
+    embodiment_predicates: [...EMBODIMENT_GOAL_PREDICATES],
+    manipulable_object_predicates: contactRichManipulation
+      ? [...MANIPULABLE_OBJECT_GOAL_PREDICATES]
+      : [],
+    articulated_object_predicates: contactRichManipulation
+      ? [...ARTICULATED_OBJECT_GOAL_PREDICATES]
+      : [],
+    static_solid_predicates: contactRichManipulation
+      ? [...STATIC_SOLID_GOAL_PREDICATES]
+      : []
+  };
+}
 
 /**
  * Rejects a permanently impossible controller/Goal pairing before the first

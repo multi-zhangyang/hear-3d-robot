@@ -27,7 +27,7 @@ import {
   type HumanoidNeuralNodeDescriptor
 } from "./humanoid/neural-hierarchy-contract.js";
 
-const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 44;
+const HUMANOID_NEURAL_HARNESS_CONTRACT_VERSION = 45;
 const CORE_SDK_PACKAGES = [
   "@openai/agents",
   "@openai/agents-extensions",
@@ -102,6 +102,7 @@ export function humanoidNeuralAgentToolName(
     premotor: "delegate_premotor_composition",
     motorIntent: "delegate_motor_intent",
     rolloutGate: "run_mujoco_rollout_gate",
+    executionDispatcher: "delegate_certified_execution_dispatcher",
     executor: "execute_certified_motor_intent",
     reflex: "track_motor_reference",
     body: "step_mujoco_body",
@@ -359,6 +360,7 @@ function modelIdentity(
       ...(tool.outputSchema === undefined ? {} : { output_schema: tool.outputSchema })
     };
   });
+  const reasoningEffort = agent.modelSettings.reasoning?.effort ?? undefined;
   return {
     protocol: provider.protocol,
     model: provider.model,
@@ -376,9 +378,9 @@ function modelIdentity(
       request_timeout_ms:
         provider.requestTimeoutMs ?? DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
       temperature: provider.temperature,
-      ...(provider.reasoningEffort === undefined
+      ...(reasoningEffort === undefined
         ? {}
-        : { reasoning_effort: provider.reasoningEffort }),
+        : { reasoning_effort: reasoningEffort }),
       ...(provider.maxOutputTokens === undefined
         ? {}
         : { max_output_tokens: provider.maxOutputTokens }),
@@ -450,6 +452,7 @@ function modelProfileForNode(key: HumanoidNeuralAgentKey): Exclude<
     premotor: "sensorimotor",
     motorIntent: "motor_intent",
     rolloutGate: null,
+    executionDispatcher: "sensorimotor",
     executor: null,
     reflex: null,
     body: null,

@@ -19,7 +19,7 @@ flowchart TB
       CONTRACT --> TRAIN --> GATE --> POLICY
     end
 
-    subgraph CORTEX["Semantic control · 13 isolated OpenAI Agents SDK Agents"]
+    subgraph CORTEX["Model control · 14 isolated OpenAI Agents SDK Agents"]
       EXEC["Executive<br/>only root"]
       GOAL["Goal Valuation"]
       SELECT["Action Selection<br/>only Skill commitment owner"]
@@ -31,7 +31,8 @@ flowchart TB
       RISK["Risk / Interoception<br/>safety inhibition"]
       PREDICTIVE["Predictive Critic<br/>rollout comparison"]
       PREMOTOR["Premotor"]
-      INTENT["Motor Intent<br/>lowest LLM boundary"]
+      INTENT["Motor Intent<br/>lowest cognitive planning boundary"]
+      DISPATCH["Certified Execution Dispatcher<br/>required tool · thinking disabled"]
       RECOVERY["Recovery<br/>exclusive bounded lease"]
 
       EXEC --> GOAL
@@ -44,6 +45,7 @@ flowchart TB
       SENSORIMOTOR --> RISK
       SENSORIMOTOR --> PREDICTIVE
       SENSORIMOTOR --> PREMOTOR --> INTENT
+      SENSORIMOTOR --> DISPATCH
       SENSORIMOTOR --> RECOVERY
     end
 
@@ -78,13 +80,17 @@ flowchart TB
     SENSORIMOTOR --> SIGNALS
     SELECT --> COMMIT
     INTENT --> ROLLOUT
-    ROLLOUT --> CERT --> LEDGER --> WRITER
+    ROLLOUT --> CERT
+    CERT -. "one-use certificate input" .-> DISPATCH
+    DISPATCH --> LEDGER --> WRITER
     WRITER --> CONTROL --> PLANT
     PLANT -. "body sensation" .-> FUSION
     FUSION -. "sensory evidence" .-> PERCEPTION
     ROLLOUT -. "rollout result" .-> PREDICTIVE
     PREDICTIVE -. "prediction verdict" .-> SENSORIMOTOR
-    WRITER -. "physical receipt" .-> SCHED
+    WRITER -. "physical receipt" .-> DISPATCH
+    DISPATCH -. "typed completion" .-> SENSORIMOTOR
+    WRITER -. "physical event" .-> SCHED
     SCHED -. "wake nearest responsible ancestor" .-> EXEC
     PLANT --> API
     SIGNALS --> API
@@ -95,7 +101,7 @@ flowchart TB
     classDef writer fill:#214c3e,stroke:#9bf3d4,color:#ffffff,stroke-width:2.8px
     classDef offline fill:#302e3b,stroke:#9a95b5,color:#f6f3ff,stroke-width:1.3px
     classDef ui fill:#26352f,stroke:#7ca38f,color:#edf7f1,stroke-width:1.2px
-    class EXEC,GOAL,SELECT,PERCEPTION,SCENE,MEMORY,SENSORIMOTOR,AFFORDANCE,RISK,PREDICTIVE,PREMOTOR,INTENT,RECOVERY agent
+    class EXEC,GOAL,SELECT,PERCEPTION,SCENE,MEMORY,SENSORIMOTOR,AFFORDANCE,RISK,PREDICTIVE,PREMOTOR,INTENT,DISPATCH,RECOVERY agent
     class SIGNALS,COMMIT,SCHED,CERT,LEDGER harness
     class FUSION,ROLLOUT,CONTROL,PLANT physical
     class WRITER writer
@@ -106,13 +112,14 @@ flowchart TB
 ## How to read the diagram
 
 - Solid arrows in the Agent region are direct control ownership. The complete
-  18-node single-parent tree is defined in
+  19-node single-parent tree is defined in
   [neural-hierarchy-v3.md](neural-hierarchy-v3.md).
 - Dotted arrows are evidence, feedback, offline deployment, or scheduler
   wake-up. They never create another control parent.
-- The model boundary ends at Motor Intent. It emits bounded semantic motor
-  intent, not joint values, trajectories, poses selected by Executive, or
-  physical writes.
+- Free cognition and planning end at Motor Intent. It emits bounded semantic
+  motor intent, not joint values, trajectories, poses selected by Executive, or
+  physical writes. The only lower model node is the non-thinking Certified
+  Execution Dispatcher, whose required call can target only the serial writer.
 - A rollout result must be accepted and converted to a one-use certificate
   before the atomic ledger can admit Serial Executor. Only that executor can
   mutate the authoritative MuJoCo body.
@@ -130,5 +137,5 @@ flowchart TB
 | Executive / Goal | mission and terminal events | goal continuation or retirement |
 | Perception / Sensorimotor | world and Skill events | belief and bounded Skill proposal |
 | Premotor / Motor Intent | committed Skill and rollout events | semantic motor intent |
-| Rollout / Serial Executor | one admitted physical transaction | certificate and sole write |
+| Dispatcher / Serial Executor | one admitted physical transaction | required model dispatch and sole write |
 | Controller / MuJoCo | 50 Hz / 200 Hz continuous loop | actuator command / physical truth |

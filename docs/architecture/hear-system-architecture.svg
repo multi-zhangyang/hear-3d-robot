@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040" viewBox="0 0 1600 1040" role="img" aria-labelledby="title desc">
   <title id="title">HEAR hierarchical embodied agent architecture</title>
-  <desc id="desc">A layered architecture diagram showing the OpenAI Agents SDK semantic hierarchy, causal authority harness, deterministic embodied control, offline policy training, and read-only operator projections.</desc>
+  <desc id="desc">A layered architecture diagram showing the OpenAI Agents SDK hierarchy, its non-thinking certified execution dispatcher, causal authority harness, deterministic embodied control, offline policy training, and read-only operator projections.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#071015"/>
@@ -71,7 +71,7 @@
   <g transform="translate(64 156)">
     <rect width="1110" height="354" rx="22" fill="#0d1818" stroke="#5ca98f" stroke-opacity=".23"/>
     <text class="section" x="24" y="31">SEMANTIC CORTEX · OPENAI AGENTS SDK</text>
-    <text class="sectionNote" x="1084" y="31" text-anchor="end">13 个独立 Session · 严格单父树 · 并行叶节点</text>
+    <text class="sectionNote" x="1084" y="31" text-anchor="end">14 个独立 Session · 严格单父树 · 认知与执行模式隔离</text>
 
     <rect class="card managerBox" x="442" y="52" width="226" height="62" rx="12"/>
     <text class="boxTitle" x="555" y="78" text-anchor="middle">Executive</text>
@@ -94,16 +94,19 @@
     <text class="boxSub" x="555" y="296" text-anchor="middle">并行汇合：可供性 · 风险 · 预测 · 运动规划</text>
     <text class="tiny" x="555" y="312" text-anchor="middle">Affordance · Risk/Interoception · Predictive Critic · Premotor → Motor Intent</text>
 
-    <rect class="card agentBox" x="830" y="248" width="224" height="74" rx="12"/>
-    <text class="boxTitle" x="942" y="276" text-anchor="middle">Recovery</text>
-    <text class="boxSub" x="942" y="296" text-anchor="middle">Sensorimotor 子级 · 独占有界 lease</text>
-    <text class="tiny" x="942" y="312" text-anchor="middle">不是默认 fallback 链</text>
+    <rect class="card agentBox" x="814" y="222" width="270" height="54" rx="12"/>
+    <text class="boxTitle" x="949" y="244" text-anchor="middle">Certified Execution Dispatcher</text>
+    <text class="boxSub" x="949" y="263" text-anchor="middle">required tool · thinking disabled</text>
+    <rect class="card agentBox" x="814" y="290" width="270" height="48" rx="12"/>
+    <text class="boxTitle" x="949" y="310" text-anchor="middle">Recovery</text>
+    <text class="boxSub" x="949" y="329" text-anchor="middle">Sensorimotor 子级 · 独占有界 lease</text>
 
     <path class="control" d="M555 114V146"/>
     <path class="control" d="M520 114V130H270V146"/>
     <path class="control" d="M510 208V229H168V248"/>
     <path class="control" d="M555 208V248"/>
-    <path class="control" d="M792 285H830"/>
+    <path class="control" d="M792 270H814"/>
+    <path class="control" d="M792 300H814"/>
   </g>
 
   <g transform="translate(64 530)">
@@ -144,6 +147,8 @@
 
   <path class="control" d="M619 510V520H198V588"/>
   <text class="tiny" x="211" y="548" fill="#6ee7bd">类型化语义信号</text>
+  <path class="control" d="M1013 432H869V588"/>
+  <path class="feedback" d="M1110 588C1190 520 1190 405 1148 405"/>
 
   <g transform="translate(64 746)">
     <rect width="1110" height="224" rx="22" fill="#18150f" stroke="#c29a59" stroke-opacity=".28"/>
