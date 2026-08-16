@@ -458,9 +458,15 @@ export class NavigationMesh {
 
     for (const [id, descriptor] of requested) {
       if (this.#obstacles.has(id)) continue;
+      // Tile-cache contours are quantized to the Recast cell grid. Give the
+      // rasterized obstacle one extra cell of skin so the generated corridor
+      // stays outside the exact body-clearance shape checked below. Using the
+      // skin in both places makes a valid straight path that follows the
+      // rasterized contour look like a collision with that same contour.
       const navigationHalfExtents = expandedObstacleHalfExtents(
         descriptor.halfExtents,
-        this.#profile.radius
+        navigationObstaclePlanarExpansion(this.#profile.radius)
+          + NAVIGATION_OBSTACLE_SKIN
       );
       let added = this.#tileCache.addBoxObstacle(
         descriptor.center,
@@ -724,11 +730,13 @@ export function navigationObstaclePlanarExpansion(agentRadius: number): number {
   if (!Number.isFinite(agentRadius) || agentRadius < 0) {
     throw new Error("Navigation agent radius must be finite and non-negative");
   }
-  return agentRadius + NAVIGATION_OBSTACLE_SKIN;
+  return agentRadius;
 }
 
-function expandedObstacleHalfExtents(halfExtents: Vec3, agentRadius: number): Vec3 {
-  const planarExpansion = navigationObstaclePlanarExpansion(agentRadius);
+function expandedObstacleHalfExtents(
+  halfExtents: Vec3,
+  planarExpansion: number
+): Vec3 {
   return {
     x: halfExtents.x + planarExpansion,
     y: halfExtents.y,
@@ -744,7 +752,7 @@ function pathIntersectedObstacle(
   for (const obstacle of obstacles) {
     const halfExtents = expandedObstacleHalfExtents(
       obstacle.halfExtents,
-      agentRadius
+      navigationObstaclePlanarExpansion(agentRadius)
     );
     for (let index = 1; index < path.length; index += 1) {
       if (segmentIntersectsOrientedBox(

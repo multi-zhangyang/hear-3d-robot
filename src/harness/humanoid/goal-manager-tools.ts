@@ -39,7 +39,7 @@ const SubmitGoalCandidatesSchema = z.object({
     goal: GoalSchema,
     dependency_candidate_ids: z.array(CandidateIdSchema).max(32)
       .describe("仅引用提交前已经存在的 Goal candidate；初始候选批次填写 []")
-  }).strict()).min(2).max(3)
+  }).strict()).min(1).max(3)
 }).strict().superRefine((input, context) => {
   const proposalIds = input.candidates.map((candidate) => candidate.proposal_id);
   if (new Set(proposalIds).size !== proposalIds.length) {
@@ -49,7 +49,16 @@ const SubmitGoalCandidatesSchema = z.object({
       message: "Goal candidate proposal identities must be unique"
     });
   }
-  const contentHashes = input.candidates.map((candidate) => goalSha256(candidate.goal));
+  // Zod still runs parent refinements when a nested Goal has validation
+  // issues. Never call a throwing identity parser on that partial value: an
+  // invalid model tool call must remain a recoverable tool rejection instead
+  // of escaping safeParse and terminating the entire Agent run.
+  const validGoals = input.candidates.map((candidate) => (
+    GoalSchema.safeParse(candidate.goal)
+  ));
+  const contentHashes = validGoals.flatMap((result) => (
+    result.success ? [goalSha256(result.data)] : []
+  ));
   if (new Set(contentHashes).size !== contentHashes.length) {
     context.addIssue({
       code: "custom",
@@ -57,8 +66,9 @@ const SubmitGoalCandidatesSchema = z.object({
       message: "A Goal candidate batch must contain distinct Goal contents"
     });
   }
-  input.candidates.forEach((candidate, candidateIndex) => {
-    const predicateHashes = candidate.goal.predicates.map(modelPayloadSha256);
+  validGoals.forEach((result, candidateIndex) => {
+    if (!result.success) return;
+    const predicateHashes = result.data.predicates.map(modelPayloadSha256);
     if (new Set(predicateHashes).size === predicateHashes.length) return;
     context.addIssue({
       code: "custom",

@@ -531,6 +531,8 @@ export class HumanoidWorld {
       );
       return observation;
     }
+    const interactionTargets = manipulationInteractionTargets(observation);
+    if (interactionTargets.length === 0) return observation;
     const authoritativeState = this.#simulation.captureState();
     const evidence = await this.#rolloutPool.lease(
       authoritativeState,
@@ -542,7 +544,7 @@ export class HumanoidWorld {
         objectTokens: observation.objectTokens,
         solidTokens: observation.solidTokens,
         handSurfaces: observation.handSurfaces,
-        interactionTargets: manipulationInteractionTargets(observation)
+        interactionTargets
       })
     );
     if (this.#worldRevision !== observation.worldRevision) {

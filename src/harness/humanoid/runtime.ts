@@ -1485,6 +1485,7 @@ export class HumanoidActionRuntime {
     if (name === "observe_humanoid") {
       HumanoidActionInputs.observe_humanoid.parse(rawInput);
       const observation = invocation.agentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion
+        && goalRequiresManipulationReachability(this.#activeGoal?.())
         ? await this.#world.observeManipulationReachability()
         : await this.#world.captureObservation();
       const authorityOwners = invocation.agentId === HUMANOID_NEURAL_AGENT_IDS.sensorFusion
@@ -2926,6 +2927,14 @@ function humanoidSkillObservationCompatible(
       || pointDistance(before.size, after.size) > 1e-9) return false;
   }
   return true;
+}
+
+function goalRequiresManipulationReachability(goal: Goal | undefined): boolean {
+  return goal?.predicates.some((predicate) => (
+    predicate.type !== "robot_at"
+      && predicate.type !== "robot_in_zone"
+      && predicate.type !== "block_removed"
+  )) ?? false;
 }
 
 function retainCompatibleManipulationEvidence(

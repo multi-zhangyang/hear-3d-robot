@@ -685,6 +685,14 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     let descendingSignal: NeuralSignal | undefined;
     let authorityLease: NeuralAuthorityLease | undefined;
     let invocationInputSignalIds: string[] = [];
+    let scopedInvocationId: ReturnType<typeof stableAgentToolInvocationId> | undefined;
+    // A compatible model may end one SDK run turn in prose after a child tool
+    // returns. The parent retries the same structural edge, but that retry is
+    // still the same logical child episode and must retain its signal scope.
+    let continuedChildEpisode: {
+      parentInvocationId: string;
+      invocationId: ReturnType<typeof stableAgentToolInvocationId>;
+    } | undefined;
     const invocationMutex = new Mutex();
     const childTool = scopeAgentToolInvocation(
       childId,
@@ -1021,7 +1029,9 @@ export function createHumanoidNeuralAgentHierarchy(input: {
             )
           }
         : {})
-      })
+      }),
+      (toolCallId) => scopedInvocationId
+        ?? stableAgentToolInvocationId(childId, toolCallId)
     );
     const sdkEnabled = childTool.isEnabled;
     childTool.isEnabled = async (context, agent) => (
@@ -1169,6 +1179,11 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           });
         }
       }
+      const childInvocationId = continuedChildEpisode?.parentInvocationId
+        === parentInvocation.invocationId
+        ? continuedChildEpisode.invocationId
+        : stableAgentToolInvocationId(childId, details?.toolCall?.callId);
+      scopedInvocationId = childInvocationId;
       try {
         const output = await invoke(context, rawInput, details);
         const childOutput = outputObject(output);
@@ -1178,8 +1193,13 @@ export function createHumanoidNeuralAgentHierarchy(input: {
           );
         }
         if (isNeuralAgentTurnContinuationReceipt(childOutput)) {
+          continuedChildEpisode = {
+            parentInvocationId: parentInvocation.invocationId,
+            invocationId: childInvocationId
+          };
           return JSON.stringify(childOutput);
         }
+        continuedChildEpisode = undefined;
         const childSpecificOutput = childOutputSchema.parse(childOutput);
         const routingOutput = NeuralAgentOutputSchema.passthrough().parse(
           childSpecificOutput
@@ -1491,6 +1511,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         authorityLease = undefined;
         descendingSignal = undefined;
         invocationInputSignalIds = [];
+        scopedInvocationId = undefined;
       }
     });
     // Agent.asTool delegation is an episode-stable capability surface.  The
@@ -1525,7 +1546,9 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     {
       toolChoice: "auto",
       extraInstructions: [
-        "Return scene_interpretation only from current sensory evidence."
+        "Return scene_interpretation only from current sensory evidence.",
+        "Describe geometry, topology, object state, visibility, and uncertainty. Never choose or recommend an action, waypoint, route side, Skill, hand, interaction point, motor program, or plan; those decisions belong to Sensorimotor and Motor Intent.",
+        "Report sensed frontiers and their measured scores as observations, never as an imperative next step."
       ]
     }
   );
@@ -1613,6 +1636,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     [],
     { toolChoice: "auto", extraInstructions: [
       "During skill_proposal there is no committed Skill yet. Assess current balance, contact, collision, and environmental bounds without inventing or selecting a Skill, hand, interaction point, or motor program.",
+      "State hazards, uncertainty, and admissible safety bounds only. Never recommend an action, waypoint, frontier, route side, Skill, or plan; Action Selection and Sensorimotor own those choices.",
       "Return risk_assessment when at least one lower-level option may proceed under stated bounds.",
       "Return escalation when risk requires inhibition or Recovery; never invent an alternate motor command."
     ] }
@@ -1777,6 +1801,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "A skill_proposal must cite the current perceptual_belief plus both Affordance and Risk harness signal ids in source_signal_ids.",
         "If directed input contains direct_parent_correction, treat it as binding causal feedback from Action Selection. Do not repeat the rejected invocation while its physical preconditions are unchanged; select the structured required prerequisite Skill when present, using the current observation and specialist evidence.",
         "Return exactly one next bounded catalog Skill as proposed_skill={skill, phase, params, rationale}. Future steps may appear only in phase_sequence; never make a compound skill_name or the whole task the proposal.",
+        "Every normal proposal must make measurable physical progress toward an active Goal predicate or establish its real prerequisite. For robot_in_zone, prefer navigate_to_zone; a navigate_to_point or explore frontier is admissible only when its actual target reduces distance to that zone. Information gain never authorizes movement away from the active Goal.",
         "For an object placement Goal whose object is not grasped, preparation is object-relative: propose approach(object_id), then reach/grasp/lift, before carry_to_zone/place. Never approach the destination zone to make the source object reachable.",
         "For approach, params are exactly object_id, interaction_point_id, hand, and standoff_m. Preserve the selected live hand+interaction-point pair, but never add root_world_target, root_yaw_radians, or base_placement; the Harness binds that pair to its authoritative IK placement.",
         "Premotor waits for Action Selection to accept that joined proposal as the active commitment. When the current phase is motor_assessment or motor_planning and the invocation contains the direct skill_commitment, call Premotor immediately; Affordance/Risk belong only to skill_proposal and must not be repeated. Predictive waits for a real rollout result.",

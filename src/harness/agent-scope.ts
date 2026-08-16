@@ -123,7 +123,11 @@ export function scopeAgentToolInvocation<
   TParameters extends ToolInputParameters,
   TResult,
   TTool extends FunctionTool<TContext, TParameters, TResult>
->(agentId: string, agentTool: TTool): TTool {
+>(
+  agentId: string,
+  agentTool: TTool,
+  resolveInvocationId?: (toolCallId: string | undefined) => UUID
+): TTool {
   assertAgentId(agentId);
   const invoke = agentTool.invoke;
   agentTool.invoke = async (context, input, details) => runAgentInvocation(
@@ -146,7 +150,8 @@ export function scopeAgentToolInvocation<
       if (scope.decisionInterruption) throw promoteDecisionInterruption(scope);
       return output;
     },
-    stableAgentToolInvocationId(agentId, details?.toolCall?.callId)
+    resolveInvocationId?.(details?.toolCall?.callId)
+      ?? stableAgentToolInvocationId(agentId, details?.toolCall?.callId)
   );
   return agentTool;
 }
