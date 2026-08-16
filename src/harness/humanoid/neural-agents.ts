@@ -2044,6 +2044,27 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       && input.runtime.neuralHierarchyState().active_skill_commitment?.state
         === "executing"
   });
+  const sensorimotorPremotorTool = asChildTool({
+    parentKey: "sensorimotorManager",
+    childKey: "premotor",
+    child: premotor,
+    description: "Compose and compile one bounded motor skill after assessment.",
+    phases: ["motor_assessment", "motor_planning"],
+    requireCommitment: true,
+    isEnabled: () => !hasCurrentRecoveryDemand(input.runtime)
+      && input.runtime.neuralHierarchyState().active_skill_commitment?.state
+        === "committed"
+      && hasCurrentManagerEpisodeSignal(
+        input.runtime,
+        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        "skill_commitment"
+      )
+      && !hasCurrentManagerEpisodeSignalsAny(
+        input.runtime,
+        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        ["rollout_result", "escalation"]
+      )
+  });
   const sensorimotorAffordanceTool = asChildTool({
     parentKey: "sensorimotorManager",
     childKey: "affordance",
@@ -2088,16 +2109,14 @@ export function createHumanoidNeuralAgentHierarchy(input: {
   });
   const invokeSensorimotorAffordance = sensorimotorAffordanceTool.invoke;
   const invokeSensorimotorRisk = sensorimotorRiskTool.invoke;
+  const invokeSensorimotorPremotor = sensorimotorPremotorTool.invoke;
   const prepareSensorimotorModelInput = async (prepared: {
     invocationId: string;
     authorityLeaseId: string;
     signal?: AbortSignal;
   }): Promise<void> => {
-    if (input.runtime.neuralHarnessPhase().phase !== "skill_proposal"
-      || hasCurrentRecoveryDemand(input.runtime)
-      || neuralSkillCommitmentIsOpen(
-        input.runtime.neuralHierarchyState().active_skill_commitment
-      )) return;
+    const phase = input.runtime.neuralHarnessPhase().phase;
+    if (hasCurrentRecoveryDemand(input.runtime)) return;
     prepared.signal?.throwIfAborted();
     const currentSignals = (
       kinds: readonly NeuralSignalKind[]
@@ -2110,6 +2129,104 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         : signal.parent_episode_id === prepared.invocationId)
         && isCurrentNeuralSignal(input.runtime, signal)
     ));
+    const retireSupersededControlSubtrees = async (
+      roots: readonly NeuralSignal[]
+    ): Promise<void> => {
+      if (roots.length === 0) return;
+      const state = input.runtime.neuralHierarchyState();
+      const rootIds = new Set(roots.map((signal) => signal.signal_id));
+      const byTarget = new Map<string, string[]>();
+      const targetNodeIds = new Set(Object.values(state.signals).map(
+        (signal) => signal.target_node_id
+      ));
+      for (const targetNodeId of targetNodeIds) {
+        for (const signal of input.runtime.pendingNeuralSignals({
+          targetNodeId
+        })) {
+          if (!rootIds.has(signal.signal_id)
+            && !roots.some((root) => neuralSignalHasAncestorId(
+              state,
+              signal,
+              root.signal_id
+            ))) continue;
+          const targetSignals = byTarget.get(targetNodeId) ?? [];
+          targetSignals.push(signal.signal_id);
+          byTarget.set(targetNodeId, targetSignals);
+        }
+      }
+      for (const [targetNodeId, signalIds] of byTarget) {
+        await input.runtime.consumeNeuralSignals(targetNodeId, signalIds);
+      }
+    };
+    if ((phase === "motor_assessment" || phase === "motor_planning")
+      && input.runtime.neuralHierarchyState().active_skill_commitment?.state
+        === "committed") {
+      const directCommitments = currentSignals(["skill_commitment"]).filter(
+        (signal) => signal.direction === "descending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+      );
+      const supersededCommitmentInputs = directCommitments.filter(
+        (signal) => signal.authority_lease_id !== prepared.authorityLeaseId
+      );
+      await retireSupersededControlSubtrees(supersededCommitmentInputs);
+      const commitments = currentSignals(["skill_commitment"]).filter(
+        (signal) => signal.direction === "descending"
+          && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+          && signal.authority_lease_id === prepared.authorityLeaseId
+      );
+      if (commitments.length !== 1) {
+        throw new Error(
+          `Sensorimotor motor input requires one current-authority commitment; found ${commitments.length}`
+        );
+      }
+      const commitment = commitments[0]!;
+      const currentPremotorReturns = (): NeuralSignal[] => currentSignals([
+        "rollout_result",
+        "escalation"
+      ]).filter((signal) => signal.source_node_id
+          === HUMANOID_NEURAL_AGENT_IDS.premotor
+        && neuralSignalHasAncestorId(
+          input.runtime.neuralHierarchyState(),
+          signal,
+          commitment.signal_id
+        ));
+      if (currentPremotorReturns().length === 0) {
+        const delegationInput = JSON.stringify({
+          signal_kind: "skill_commitment",
+          source_signal_ids: [commitment.signal_id],
+          ttl_revisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+          priority: 90
+        });
+        await invokeSensorimotorPremotor(
+          new RunContext(),
+          delegationInput,
+          {
+            toolCall: {
+              type: "function_call",
+              callId: stableAgentToolInvocationId(
+                HUMANOID_NEURAL_AGENT_IDS.premotor,
+                `sensorimotor-input:${prepared.invocationId}`
+              ),
+              name: sensorimotorPremotorTool.name,
+              arguments: delegationInput
+            },
+            ...(prepared.signal ? { signal: prepared.signal } : {})
+          }
+        );
+      }
+      prepared.signal?.throwIfAborted();
+      const premotorReturns = currentPremotorReturns();
+      if (premotorReturns.length !== 1) {
+        throw new Error(
+          `Sensorimotor motor input requires one causally bound Premotor return; found ${premotorReturns.length}`
+        );
+      }
+      return;
+    }
+    if (phase !== "skill_proposal"
+      || neuralSkillCommitmentIsOpen(
+        input.runtime.neuralHierarchyState().active_skill_commitment
+      )) return;
     const directBeliefs = currentSignals(["perceptual_belief"]).filter(
       (signal) => signal.direction === "descending"
         && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
@@ -2118,15 +2235,10 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     // but the new process owns a new lease. Retire inputs from the abandoned
     // control edge before forking specialists so one episode cannot join
     // beliefs from two process lifetimes.
-    const supersededInputIds = directBeliefs.filter(
+    const supersededInputs = directBeliefs.filter(
       (signal) => signal.authority_lease_id !== prepared.authorityLeaseId
-    ).map((signal) => signal.signal_id);
-    if (supersededInputIds.length > 0) {
-      await input.runtime.consumeNeuralSignals(
-        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-        supersededInputIds
-      );
-    }
+    );
+    await retireSupersededControlSubtrees(supersededInputs);
     const beliefs = currentSignals(["perceptual_belief"]).filter(
       (signal) => signal.direction === "descending"
         && signal.source_node_id === HUMANOID_NEURAL_AGENT_IDS.actionSelection
@@ -2223,20 +2335,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
     [
       sensorimotorAffordanceTool,
       sensorimotorRiskTool,
-      asChildTool({
-        parentKey: "sensorimotorManager",
-        childKey: "premotor",
-        child: premotor,
-        description: "Compose and compile one bounded motor skill after assessment.",
-        phases: ["motor_assessment", "motor_planning"],
-        requireCommitment: true,
-        isEnabled: () => !hasCurrentRecoveryDemand(input.runtime)
-          && hasCurrentManagerEpisodeSignal(
-            input.runtime,
-            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            "skill_commitment"
-          )
-      }),
+      sensorimotorPremotorTool,
       asChildTool({
         parentKey: "sensorimotorManager",
         childKey: "predictive",
@@ -2271,7 +2370,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "Every normal proposal must make measurable physical progress toward an active Goal predicate or establish its real prerequisite. For robot_in_zone, prefer navigate_to_zone; a navigate_to_point or explore frontier is admissible only when its actual target reduces distance to that zone. Information gain never authorizes movement away from the active Goal.",
         "For an object placement Goal whose object is not grasped, preparation is object-relative: propose approach(object_id), then reach/grasp/lift, before carry_to_zone/place. Never approach the destination zone to make the source object reachable.",
         "For approach, params are exactly object_id, interaction_point_id, hand, and standoff_m. Preserve the selected live hand+interaction-point pair, but never add root_world_target, root_yaw_radians, or base_placement; the Harness binds that pair to its authoritative IK placement.",
-        "Premotor waits for Action Selection to accept that joined proposal as the active commitment. When the current phase is motor_assessment or motor_planning and the invocation contains the direct skill_commitment, call Premotor immediately; Affordance/Risk belong only to skill_proposal and must not be repeated. Predictive waits for a real rollout result.",
+        "After Action Selection accepts the proposal, the Harness completes the mandatory Premotor -> Motor Intent branch before your first committed-branch reasoning turn. Do not call Premotor again in that episode; inspect its exact rollout_result and delegate Predictive. Affordance/Risk belong only to skill_proposal and must not be repeated.",
         "Predictive judges admission of the current bounded rollout chunk, not whether that chunk already completes the final Goal predicate.",
         "Predictive acceptance completes the motor-assessment episode and returns a certified rollout to Action Selection; do not call or synthesize execution in that episode.",
         "In execution, delegate the one direct executing skill_commitment to Certified Execution Dispatcher. The Dispatcher owns the required non-thinking tool call; do not execute or restate it yourself.",
