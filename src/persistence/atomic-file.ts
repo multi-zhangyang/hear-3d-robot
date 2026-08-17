@@ -3,7 +3,7 @@ import { mkdir, open, rename, stat, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
-const RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100] as const;
+const RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 250, 500, 1_000] as const;
 
 /**
  * Replaces a UTF-8 file from a same-directory temporary file. The temporary is
@@ -53,6 +53,19 @@ async function ensureDirectoryDurably(directory: string): Promise<void> {
 
 /** Publishes an already flushed same-directory temporary file. */
 export async function replaceFileAtomically(source: string, destination: string): Promise<void> {
+  await publishPathAtomically(source, destination);
+}
+
+/**
+ * Publishes a same-parent staged file or directory and durably records the new
+ * directory entry. Windows scanners and indexers can briefly hold a sharing
+ * lease on either path, so directory epochs use the same bounded transient
+ * rename retry as atomic files instead of failing an otherwise valid resume.
+ */
+export async function publishPathAtomically(
+  source: string,
+  destination: string
+): Promise<void> {
   await renameWithRetry(source, destination);
   await syncDirectory(dirname(destination));
 }

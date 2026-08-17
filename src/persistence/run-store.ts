@@ -6,7 +6,6 @@ import {
   mkdir,
   readFile,
   readdir,
-  rename,
   rm,
   unlink
 } from "node:fs/promises";
@@ -55,7 +54,10 @@ import {
   readIndexedWindow
 } from "./journal-index.js";
 import { runtimeEventCursor } from "./event-cursor.js";
-import { writeTextAtomically } from "./atomic-file.js";
+import {
+  publishPathAtomically,
+  writeTextAtomically
+} from "./atomic-file.js";
 import {
   runFencedMutation,
   type MutationFence
@@ -581,7 +583,7 @@ export class RunStore {
               errorOnExist: true
             });
           }
-          await rename(staging, destination);
+          await publishPathAtomically(staging, destination);
         } catch (error) {
           await rm(staging, { recursive: true, force: true });
           throw error;
@@ -640,7 +642,7 @@ export class RunStore {
               errorOnExist: true
             });
           }
-          await rename(staging, destination);
+          await publishPathAtomically(staging, destination);
         } catch (error) {
           await rm(staging, { recursive: true, force: true });
           throw error;
