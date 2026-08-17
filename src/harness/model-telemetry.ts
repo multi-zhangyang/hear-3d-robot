@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Model, ModelResponse } from "@openai/agents";
 import {
   modelPayloadSha256,
@@ -41,7 +41,8 @@ export function withModelTelemetry(
     usage: { inputTokens: number }
   ) => void | Promise<void>,
   streamEventIdleTimeoutMs?: number,
-  requestTimeoutMs?: number
+  requestTimeoutMs?: number,
+  canonicalizeToolCallIds = false
 ): Model {
   const progressGuard = runtime.modelProgressSnapshot
     ? new AuthoritativeModelProgressGuard(runtime.modelProgressSnapshot(boundAgentId))
@@ -63,6 +64,7 @@ export function withModelTelemetry(
       assertModelBinding(boundAgentId, agentId);
       runtime.activeNode(agentId);
       const modelCallId = await runtime.recordModelCallStarted(agentId);
+      const localResponseIdentity = modelCallId ?? randomUUID();
       let response: ModelResponse;
       try {
         response = normalizeModelResponseIdentity(
@@ -71,8 +73,11 @@ export function withModelTelemetry(
             request,
             streamEventIdleTimeoutMs
           ),
-          modelCallId ?? randomUUID()
+          localResponseIdentity
         );
+        if (canonicalizeToolCallIds) {
+          response = canonicalModelToolCallIds(response, localResponseIdentity);
+        }
       } catch (error) {
         if (modelCallId) await runtime.recordModelCallFailed?.(modelCallId, agentId);
         throw preserveModelInterruption(error, agentId);
@@ -104,7 +109,8 @@ export function withModelTelemetry(
       request,
       onModelResponseCompleted,
       streamEventIdleTimeoutMs,
-      requestTimeoutMs
+      requestTimeoutMs,
+      canonicalizeToolCallIds
     ),
     ...(model.getRetryAdvice
       ? { getRetryAdvice: (request) => model.getRetryAdvice!(request) }
@@ -154,7 +160,8 @@ async function* claimAndStream(
     usage: { inputTokens: number }
   ) => void | Promise<void>,
   streamEventIdleTimeoutMs?: number,
-  requestTimeoutMs?: number
+  requestTimeoutMs?: number,
+  canonicalizeToolCallIds = false
 ) {
   const agentId = requestAgentId(request.systemInstructions, runtime.rootAgentId);
   assertModelBinding(boundAgentId, agentId);
@@ -186,10 +193,13 @@ async function* claimAndStream(
       }
       const event = next.value;
       if (event.type === "response_done") {
-        const response = normalizeStreamResponseIdentity(
+        let response = normalizeStreamResponseIdentity(
           event.response,
           localResponseIdentity
         );
+        if (canonicalizeToolCallIds) {
+          response = canonicalStreamToolCallIds(response, localResponseIdentity);
+        }
         if (modelCallId) {
           await runtime.recordModelCallCompleted?.(completedModelCall(
             modelCallId,
@@ -347,6 +357,66 @@ function outputWithResponseIdentity(
       responseId
     }
   })) as ModelResponse["output"];
+}
+
+function canonicalModelToolCallIds(
+  response: ModelResponse,
+  modelCallId: string
+): ModelResponse {
+  const output = canonicalToolCallOutput(response.output, modelCallId);
+  return output === response.output ? response : { ...response, output };
+}
+
+function canonicalStreamToolCallIds<T extends {
+  output: ModelResponse["output"];
+}>(response: T, modelCallId: string): T {
+  const output = canonicalToolCallOutput(response.output, modelCallId);
+  return output === response.output ? response : { ...response, output };
+}
+
+/**
+ * Chat-compatible providers only promise that a tool call ID pairs one call
+ * with its result inside a response. Convert that response-local token into a
+ * run-unique decision identity before the SDK, durable model authority, and
+ * physical transaction ledger observe it.
+ */
+function canonicalToolCallOutput(
+  output: ModelResponse["output"],
+  modelCallId: string
+): ModelResponse["output"] {
+  let changed = false;
+  const canonical = output.map((item, index) => {
+    if (item.type !== "function_call") return item;
+    const callId = compatibleToolCallId(
+      modelCallId,
+      index,
+      item.callId,
+      item.name
+    );
+    changed = changed || callId !== item.callId;
+    return callId === item.callId ? item : { ...item, callId };
+  }) as ModelResponse["output"];
+  return changed ? canonical : output;
+}
+
+function compatibleToolCallId(
+  modelCallId: string,
+  outputIndex: number,
+  providerCallId: string,
+  toolName: string
+): string {
+  const digest = createHash("sha256")
+    .update("hear-compatible-tool-call-v1\0")
+    .update(modelCallId)
+    .update("\0")
+    .update(String(outputIndex))
+    .update("\0")
+    .update(toolName)
+    .update("\0")
+    .update(providerCallId)
+    .digest("hex")
+    .slice(0, 24);
+  return `call_${digest}`;
 }
 
 function usableResponseId(responseId: string | undefined): responseId is string {

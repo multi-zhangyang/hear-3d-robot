@@ -151,7 +151,7 @@ export function scopeAgentToolInvocation<
       return output;
     },
     resolveInvocationId?.(details?.toolCall?.callId)
-      ?? stableAgentToolInvocationId(agentId, details?.toolCall?.callId)
+      ?? scopedAgentToolInvocationId(agentId, details?.toolCall?.callId)
   );
   return agentTool;
 }
@@ -202,11 +202,50 @@ export function stableAgentToolInvocationId(
   toolCallId?: string
 ): UUID {
   if (!toolCallId) return randomUUID();
-  const bytes = createHash("sha256")
-    .update("hear-agent-tool-invocation-v1\0")
-    .update(agentId)
-    .update("\0")
-    .update(toolCallId)
+  return stableInvocationId(
+    "hear-agent-tool-invocation-v1",
+    agentId,
+    toolCallId
+  );
+}
+
+/**
+ * Bind a structural child episode to both the parent episode and the SDK tool
+ * call that opened the edge. OpenAI-compatible call IDs are response-local;
+ * they may legally repeat in another Agent Session, while a parent episode is
+ * the durable causal namespace that must remain distinct across cycles.
+ */
+export function stableAgentChildInvocationId(
+  parentInvocationId: string,
+  agentId: string,
+  toolCallId?: string
+): UUID {
+  if (!toolCallId) return randomUUID();
+  return stableInvocationId(
+    "hear-agent-child-invocation-v2",
+    parentInvocationId,
+    agentId,
+    toolCallId
+  );
+}
+
+function scopedAgentToolInvocationId(
+  agentId: string,
+  toolCallId?: string
+): UUID {
+  const parent = invocationScope.getStore();
+  return parent
+    ? stableAgentChildInvocationId(parent.invocationId, agentId, toolCallId)
+    : stableAgentToolInvocationId(agentId, toolCallId);
+}
+
+function stableInvocationId(namespace: string, ...parts: string[]): UUID {
+  const hash = createHash("sha256").update(namespace).update("\0");
+  parts.forEach((part, index) => {
+    hash.update(part);
+    if (index < parts.length - 1) hash.update("\0");
+  });
+  const bytes = hash
     .digest()
     .subarray(0, 16);
   // Encode an RFC 4122 variant, version-5-shaped UUID.  The namespace is

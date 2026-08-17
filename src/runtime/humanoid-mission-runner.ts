@@ -671,7 +671,8 @@ async function executeHumanoidMission(input: {
         onModelResponseCompleted,
         provider.streamEventIdleTimeoutMs
           ?? DEFAULT_MODEL_STREAM_EVENT_IDLE_TIMEOUT_MS,
-        provider.requestTimeoutMs
+        provider.requestTimeoutMs,
+        provider.protocol === "openai_compatible"
       ),
       createSession: sessionForAgent,
       callModelInputFilter: contextManager.filter,

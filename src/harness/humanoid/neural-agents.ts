@@ -49,6 +49,7 @@ import {
   currentAgentHarnessInvocation,
   currentAgentHarnessInvocationChain,
   scopeAgentToolInvocation,
+  stableAgentChildInvocationId,
   stableAgentToolInvocationId,
   withAgentInvocation
 } from "../agent-scope.js";
@@ -1174,7 +1175,11 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         : {})
       }),
       (toolCallId) => scopedInvocationId
-        ?? stableAgentToolInvocationId(childId, toolCallId)
+        ?? stableAgentChildInvocationId(
+          requiredHarnessInvocation(parentId).invocationId,
+          childId,
+          toolCallId
+        )
     );
     const sdkEnabled = childTool.isEnabled;
     childTool.isEnabled = async (context, agent) => (
@@ -1339,7 +1344,11 @@ export function createHumanoidNeuralAgentHierarchy(input: {
             parentNodeId: parentId,
             childNodeId: childId,
             parentInvocationId: parentInvocation.invocationId
-          }) ?? stableAgentToolInvocationId(childId, details?.toolCall?.callId);
+          }) ?? stableAgentChildInvocationId(
+            parentInvocation.invocationId,
+            childId,
+            details?.toolCall?.callId
+          );
       scopedInvocationId = childInvocationId;
       scopedSignal = details?.signal;
       try {
