@@ -194,22 +194,47 @@ function normalizedOpenAICompatibleBody(
   for (let index = messages.length - 2; index >= 0; index -= 1) {
     const message = messages[index];
     const next = messages[index + 1];
-    if (!isEmptyAssistantMessage(message) || !isRecord(next)
-      || next.role !== "assistant") continue;
+    if (!isRecord(message) || message.role !== "assistant"
+      || !isRecord(next) || next.role !== "assistant"
+      || !Array.isArray(next.tool_calls) || next.tool_calls.length === 0) {
+      continue;
+    }
     const reasoning = message.reasoning_content;
     if (typeof reasoning === "string" && reasoning.length > 0
       && !(typeof next.reasoning_content === "string"
         && next.reasoning_content.length > 0)) {
       next.reasoning_content = reasoning;
+      next.content = mergedCompatibleAssistantContent(
+        message.content,
+        next.content
+      );
+      messages.splice(index, 1);
+      changed = true;
     }
-    messages.splice(index, 1);
-    changed = true;
   }
   const toolHistory = normalizedOpenAICompatibleToolHistory(messages);
   messages = toolHistory.messages;
   changed = changed || toolHistory.changed;
   if (!changed) return body;
   return JSON.stringify({ ...value, messages });
+}
+
+function mergedCompatibleAssistantContent(
+  first: unknown,
+  second: unknown
+): unknown {
+  const firstText = typeof first === "string" ? first : "";
+  const secondText = typeof second === "string" ? second : "";
+  if (firstText.length > 0 || secondText.length > 0) {
+    return `${firstText}${secondText}`;
+  }
+  if (Array.isArray(first) || Array.isArray(second)) {
+    return [
+      ...(Array.isArray(first) ? first : []),
+      ...(Array.isArray(second) ? second : [])
+    ];
+  }
+  return second ?? first ?? null;
 }
 
 function normalizedOpenAICompatibleToolHistory(
