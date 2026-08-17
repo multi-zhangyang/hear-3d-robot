@@ -3212,9 +3212,13 @@ function establishSkillCommitmentTool(
       });
       return JSON.stringify({
         status: "skill_committed",
-        commitment,
+        commitment: neuralModelSkillCommitmentProjection(commitment),
         next_phase: runtime.neuralHarnessPhase().phase,
-        source_signal_ids: commitmentSourceSignalIds
+        next_required_action: {
+          tool: humanoidNeuralAgentToolName("sensorimotorManager"),
+          signal_kind: "skill_commitment",
+          source_signal_ids: []
+        }
       });
     }
   });
@@ -3476,9 +3480,9 @@ function transitionSkillCommitmentTool(
       }
       return JSON.stringify({
         status: `skill_${state}`,
-        commitment,
+        commitment: neuralModelSkillCommitmentProjection(commitment),
         next_phase: runtime.neuralHarnessPhase().phase,
-        source_signal_ids: transitionSourceSignalIds
+        source_selection: "Harness-owned; omit source_signal_ids on the next structural delegation."
       });
     }
   });
@@ -5789,13 +5793,98 @@ function neuralInvocationInput(
   return [
     `PARENT_CONTROL_AUTHORITY=${parentAgentId}`,
     `CHILD_STRUCTURAL_ID=${childAgentId}`,
-    `HARNESS_INVOCATION_ID=${invocationId}`,
     "Only the following bounded typed state is current. No parent, sibling, or compacted transcript is transferred.",
+    "Routing UUIDs, authority leases, invocation identities, and causal bookkeeping are Harness-owned and omitted. A signal_id is exposed only when multiple current signals of the same semantic kind require an explicit choice.",
     JSON.stringify({
       anchor,
-      directed_signals: signals
+      directed_signals: neuralModelSignalProjections(signals)
     })
   ].join("\n");
+}
+
+function neuralModelSkillCommitmentProjection(
+  commitment: NeuralSkillCommitment
+): JsonValue {
+  return jsonValue({
+    commitment_id: commitment.commitment_id,
+    goal_epoch_id: commitment.goal_epoch_id,
+    skill: commitment.skill,
+    state: commitment.state,
+    termination_contract: commitment.termination_contract
+  });
+}
+
+/**
+ * Model Agents receive the semantic contents of their directed edge, not the
+ * Harness transport envelope. Keeping leases, invocation ids, causal ids, and
+ * delivery status out of the prompt prevents an Agent from treating protocol
+ * bookkeeping as a planning problem. A signal id is retained only when two
+ * same-kind candidates are genuinely ambiguous and the model must select one.
+ */
+function neuralModelSignalProjections(
+  signals: readonly NeuralSignal[]
+): JsonValue[] {
+  const kindCounts = new Map<NeuralSignalKind, number>();
+  for (const signal of signals) {
+    kindCounts.set(signal.kind, (kindCounts.get(signal.kind) ?? 0) + 1);
+  }
+  return signals.map((signal) => jsonValue({
+    ...(kindCounts.get(signal.kind)! > 1
+      ? { signal_id: signal.signal_id }
+      : {}),
+    kind: signal.kind,
+    source_node_id: signal.source_node_id,
+    world_revision: signal.world_revision,
+    priority: signal.priority,
+    payload: neuralModelSignalPayloadProjection(signal.payload)
+  }));
+}
+
+function neuralModelSignalPayloadProjection(value: JsonValue): JsonValue {
+  const record = jsonRecord(value);
+  const control = jsonRecord(record?.control);
+  if (!record
+    || control?.protocol !== "structural_neural_delegation_v1"
+    || !Array.isArray(record.causal_inputs)) return value;
+
+  const causalInputs = record.causal_inputs.flatMap((candidate) => {
+    const input = jsonRecord(candidate);
+    return input && typeof input.kind === "string"
+      && typeof input.source_node_id === "string"
+      && typeof input.world_revision === "number"
+      && input.payload !== undefined
+      ? [{
+          signalId: typeof input.signal_id === "string"
+            ? input.signal_id
+            : undefined,
+          kind: input.kind,
+          sourceNodeId: input.source_node_id,
+          worldRevision: input.world_revision,
+          payload: JsonValueSchema.parse(input.payload)
+        }]
+      : [];
+  });
+  const kindCounts = new Map<string, number>();
+  for (const input of causalInputs) {
+    kindCounts.set(input.kind, (kindCounts.get(input.kind) ?? 0) + 1);
+  }
+  const {
+    control: _control,
+    causal_inputs: _causalInputs,
+    ...semanticPayload
+  } = record;
+  return jsonValue({
+    ...semanticPayload,
+    causal_inputs: causalInputs.map((input) => ({
+      ...(kindCounts.get(input.kind)! > 1 && input.signalId
+        ? { signal_id: input.signalId }
+        : {}),
+      kind: input.kind,
+      source_node_id: input.sourceNodeId,
+      world_revision: input.worldRevision,
+      payload: neuralModelSignalPayloadProjection(input.payload)
+    }))
+  });
 }
 
 export function humanoidNeuralContextProjection(
@@ -5806,7 +5895,14 @@ export function humanoidNeuralContextProjection(
   const record = jsonRecord(anchor);
   const neuralHierarchy = jsonRecord(record?.neural_hierarchy);
   if (!record || !neuralHierarchy) return anchor;
-  const { directed_signals: _allPendingSignals, ...scopedHierarchy } = neuralHierarchy;
+  const {
+    directed_signals: _allPendingSignals,
+    epoch_id: _epochId,
+    endpoint_authority_leases: _endpointAuthorityLeases,
+    active_rollout_certificates: _activeRolloutCertificates,
+    pathway_cadence: _pathwayCadence,
+    ...scopedHierarchy
+  } = neuralHierarchy;
   const key = HUMANOID_NEURAL_NODE_BY_ID.get(agentId)?.key;
   if (!key) return { ...record, neural_hierarchy: scopedHierarchy };
 
