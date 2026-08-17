@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import importlib.metadata
 import json
@@ -36,10 +37,13 @@ HEARTBEAT_SECONDS = 900
 
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser()
-  parser.add_argument("--mode", choices=("smoke", "train"), default="train")
+  parser.add_argument(
+    "--mode", choices=("smoke", "train", "evaluate"), default="train"
+  )
   parser.add_argument("--iterations", type=int, default=5000)
   parser.add_argument("--num-envs", type=int, default=2048)
   parser.add_argument("--eval-envs", type=int, default=500)
+  parser.add_argument("--eval-batch-size", type=int, default=64)
   parser.add_argument("--eval-steps", type=int, default=750)
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--output-root", default="/content/hear-g1-getup")
@@ -55,11 +59,15 @@ def parse_args() -> argparse.Namespace:
   args, unknown = parser.parse_known_args()
   if unknown and not (len(unknown) == 2 and unknown[0] == "-f"):
     parser.error("unrecognized arguments: " + " ".join(unknown))
-  for name in ("iterations", "num_envs", "eval_envs", "eval_steps"):
+  for name in (
+    "iterations", "num_envs", "eval_envs", "eval_batch_size", "eval_steps"
+  ):
     if getattr(args, name) <= 0:
       parser.error(f"--{name.replace('_', '-')} must be positive")
-  if args.mode == "train" and args.eval_envs < 500:
+  if args.mode in ("train", "evaluate") and args.eval_envs < 500:
     parser.error("formal get-up evaluation requires at least 500 environments")
+  if args.eval_batch_size > args.eval_envs:
+    parser.error("--eval-batch-size cannot exceed --eval-envs")
   return args
 
 
@@ -340,7 +348,6 @@ def train(
     )
   training = {
     "iterations": completed,
-    "resumed_iterations": completed_before_resume,
     "environment_count": args.num_envs,
     "steps_per_environment_per_iteration": agent_cfg.num_steps_per_env,
     "environment_steps": completed * args.num_envs * agent_cfg.num_steps_per_env,
@@ -348,6 +355,37 @@ def train(
     "cuda_version": torch.version.cuda,
   }
   return staging, checkpoint, onnx, training
+
+
+def load_trained_artifacts(
+  args: argparse.Namespace,
+  module: ModuleType,
+  output_root: Path,
+) -> tuple[Path, Path, Path, dict[str, object]]:
+  import torch
+  from mjlab.tasks.registry import load_rl_cfg
+
+  staging = output_root / "artifacts"
+  checkpoint = staging / "g1_getup.pt"
+  onnx = staging / "g1_getup.onnx"
+  for artifact in (checkpoint, onnx):
+    if not artifact.is_file():
+      raise FileNotFoundError(f"Trained G1 get-up artifact is missing: {artifact}")
+  checkpoint_data = torch.load(checkpoint, map_location="cpu", weights_only=False)
+  completed = int(checkpoint_data.get("iter", -1)) + 1
+  if completed < args.iterations:
+    raise RuntimeError(
+      f"Get-up checkpoint contains {completed} iterations below {args.iterations}"
+    )
+  agent_cfg = load_rl_cfg(module.TASK_ID)
+  return staging, checkpoint, onnx, {
+    "iterations": completed,
+    "environment_count": args.num_envs,
+    "steps_per_environment_per_iteration": agent_cfg.num_steps_per_env,
+    "environment_steps": completed * args.num_envs * agent_cfg.num_steps_per_env,
+    "accelerator": torch.cuda.get_device_name(0),
+    "cuda_version": torch.version.cuda,
+  }
 
 
 def evaluate(
@@ -360,82 +398,139 @@ def evaluate(
   from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 
-  env_cfg = load_env_cfg(module.TASK_ID, play=True)
-  env_cfg.scene.num_envs = args.eval_envs
-  env_cfg.seed = args.seed + 10_000
-  agent_cfg = load_rl_cfg(module.TASK_ID)
-  raw_env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
-  env = RslRlVecEnvWrapper(raw_env, clip_actions=agent_cfg.clip_actions)
-  try:
-    runner_cls = load_runner_cls(module.TASK_ID) or MjlabOnPolicyRunner
-    runner = runner_cls(env, asdict(agent_cfg), device="cuda:0")
-    runner.load(
-      str(checkpoint),
-      load_cfg={"actor": True},
-      strict=True,
-      map_location="cuda:0",
-    )
-    policy = runner.get_inference_policy(device="cuda:0")
-    observations = env.get_observations()
-    if tuple(observations["actor"].shape) != (
-      args.eval_envs, module.OBSERVATION_SIZE
-    ):
-      raise RuntimeError("Get-up evaluation observation shape drifted")
-    categories = raw_env.getup_reset_category.clone()
-    active = torch.ones(args.eval_envs, dtype=torch.bool, device="cuda:0")
-    succeeded = torch.zeros_like(active)
-    completion_step = torch.full(
-      (args.eval_envs,), args.eval_steps, dtype=torch.long, device="cuda:0"
-    )
-    non_finite_action_count = 0
-    maximum_action = 0.0
-    with torch.inference_mode():
-      for step in range(args.eval_steps):
-        actions = policy(observations)
-        finite = torch.isfinite(actions).all(dim=-1)
-        non_finite_action_count += int((~finite & active).sum().item())
-        if not finite.all():
-          actions = torch.where(finite.unsqueeze(-1), actions, torch.zeros_like(actions))
-        maximum_action = max(maximum_action, float(actions.abs().max().item()))
-        active_before = active.clone()
-        observations, _, dones, _ = env.step(actions)
-        stable_done = raw_env.termination_manager.get_term("stable_standing")
-        newly_succeeded = active_before & stable_done
-        succeeded |= newly_succeeded
-        completion_step[newly_succeeded] = step + 1
-        active &= ~(dones.bool() & active_before)
-        if not active.any():
-          break
+  episode_count = 0
+  success_count = 0
+  category_counts = {name: 0 for name in module.RESET_POSE_NAMES}
+  category_successes = {name: 0 for name in module.RESET_POSE_NAMES}
+  recovery_seconds: list[float] = []
+  non_finite_action_count = 0
+  maximum_action = 0.0
+  batch_index = 0
+  while episode_count < args.eval_envs:
+    batch_size = min(args.eval_batch_size, args.eval_envs - episode_count)
+    env_cfg = load_env_cfg(module.TASK_ID, play=True)
+    env_cfg.scene.num_envs = batch_size
+    env_cfg.seed = args.seed + 10_000 + batch_index
+    agent_cfg = load_rl_cfg(module.TASK_ID)
+    raw_env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
+    env = RslRlVecEnvWrapper(raw_env, clip_actions=agent_cfg.clip_actions)
+    runner = None
+    policy = None
+    observations = None
+    categories = None
+    active = None
+    succeeded = None
+    completion_step = None
+    actions = None
+    finite = None
+    active_before = None
+    stable_done = None
+    newly_succeeded = None
+    try:
+      runner_cls = load_runner_cls(module.TASK_ID) or MjlabOnPolicyRunner
+      runner = runner_cls(env, asdict(agent_cfg), device="cuda:0")
+      runner.load(
+        str(checkpoint),
+        load_cfg={"actor": True},
+        strict=True,
+        map_location="cuda:0",
+      )
+      policy = runner.get_inference_policy(device="cuda:0")
+      observations = env.get_observations()
+      if tuple(observations["actor"].shape) != (
+        batch_size, module.OBSERVATION_SIZE
+      ):
+        raise RuntimeError("Get-up evaluation observation shape drifted")
+      categories = raw_env.getup_reset_category.clone()
+      active = torch.ones(batch_size, dtype=torch.bool, device="cuda:0")
+      succeeded = torch.zeros_like(active)
+      completion_step = torch.full(
+        (batch_size,), args.eval_steps, dtype=torch.long, device="cuda:0"
+      )
+      with torch.inference_mode():
+        for step in range(args.eval_steps):
+          actions = policy(observations)
+          finite = torch.isfinite(actions).all(dim=-1)
+          non_finite_action_count += int((~finite & active).sum().item())
+          if not finite.all():
+            actions = torch.where(
+              finite.unsqueeze(-1), actions, torch.zeros_like(actions)
+            )
+          maximum_action = max(maximum_action, float(actions.abs().max().item()))
+          active_before = active.clone()
+          observations, _, dones, _ = env.step(actions)
+          stable_done = raw_env.termination_manager.get_term("stable_standing")
+          newly_succeeded = active_before & stable_done
+          succeeded |= newly_succeeded
+          completion_step[newly_succeeded] = step + 1
+          active &= ~(dones.bool() & active_before)
+          if not active.any():
+            break
+      for index, name in enumerate(module.RESET_POSE_NAMES):
+        category_mask = categories == index
+        category_counts[name] += int(category_mask.sum().item())
+        category_successes[name] += int((succeeded & category_mask).sum().item())
+      success_count += int(succeeded.sum().item())
+      recovery_seconds.extend(
+        float(value) * module.CONTROL_STEP_SECONDS
+        for value in completion_step.cpu().tolist()
+      )
+      episode_count += batch_size
+      batch_index += 1
+      print(json.dumps({
+        "event": "g1_getup_evaluation_batch_complete",
+        "episodes_completed": episode_count,
+        "episodes_target": args.eval_envs,
+        "batch_size": batch_size,
+        "successes": success_count,
+      }), flush=True)
+    finally:
+      env.close()
+      runner = None
+      policy = None
+      observations = None
+      categories = None
+      active = None
+      succeeded = None
+      completion_step = None
+      actions = None
+      finite = None
+      active_before = None
+      stable_done = None
+      newly_succeeded = None
+      del env, raw_env
+      gc.collect()
+      torch.cuda.empty_cache()
 
-    def rate(mask: torch.Tensor) -> float:
-      denominator = int(mask.sum().item())
-      return float((succeeded & mask).sum().item() / denominator) if denominator else 0.0
+  def category_rate(*names: str) -> float:
+    denominator = sum(category_counts[name] for name in names)
+    numerator = sum(category_successes[name] for name in names)
+    return numerator / denominator if denominator else 0.0
 
-    prone = categories == module.RESET_POSE_NAMES.index("prone")
-    supine = categories == module.RESET_POSE_NAMES.index("supine")
-    side = (categories == module.RESET_POSE_NAMES.index("left_side")) | (
-      categories == module.RESET_POSE_NAMES.index("right_side")
-    )
-    times = completion_step.float() * module.CONTROL_STEP_SECONDS
-    quantiles = torch.quantile(times, torch.tensor((0.50, 0.95), device="cuda:0"))
-    return {
-      "episode_count": args.eval_envs,
-      "overall_success_rate": rate(torch.ones_like(succeeded)),
-      "prone_success_rate": rate(prone),
-      "supine_success_rate": rate(supine),
-      "side_success_rate": rate(side),
-      "reset_category_counts": {
-        name: int((categories == index).sum().item())
-        for index, name in enumerate(module.RESET_POSE_NAMES)
-      },
-      "median_recovery_seconds": float(quantiles[0].item()),
-      "p95_recovery_seconds": float(quantiles[1].item()),
-      "stable_exit_rate": rate(torch.ones_like(succeeded)),
-      "non_finite_action_count": non_finite_action_count,
-      "maximum_absolute_action": maximum_action,
-    }
-  finally:
-    env.close()
+  return {
+    "episode_count": episode_count,
+    "overall_success_rate": success_count / episode_count,
+    "prone_success_rate": category_rate("prone"),
+    "supine_success_rate": category_rate("supine"),
+    "side_success_rate": category_rate("left_side", "right_side"),
+    "reset_category_counts": category_counts,
+    "median_recovery_seconds": quantile(recovery_seconds, 0.50),
+    "p95_recovery_seconds": quantile(recovery_seconds, 0.95),
+    "stable_exit_rate": success_count / episode_count,
+    "non_finite_action_count": non_finite_action_count,
+    "maximum_absolute_action": maximum_action,
+  }
+
+
+def quantile(values: list[float], probability: float) -> float:
+  if not values:
+    raise ValueError("Cannot calculate a quantile from no values")
+  ordered = sorted(values)
+  position = (len(ordered) - 1) * probability
+  lower = int(position)
+  upper = min(lower + 1, len(ordered) - 1)
+  fraction = position - lower
+  return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
 def onnx_identity(path: Path) -> dict[str, object]:
@@ -498,9 +593,16 @@ def worker_main(args: argparse.Namespace) -> None:
       raise RuntimeError(
         "Drive checkpoint identity differs from the requested training source"
       )
+  elif args.mode == "evaluate":
+    raise FileNotFoundError("G1 evaluation requires a Drive resume identity")
   else:
     atomic_json(resume_path, resume_identity)
-  staging, checkpoint, onnx, training = train(args, module, output_root)
+  if args.mode == "evaluate":
+    staging, checkpoint, onnx, training = load_trained_artifacts(
+      args, module, output_root
+    )
+  else:
+    staging, checkpoint, onnx, training = train(args, module, output_root)
   atomic_json(output_root / "training-state.json", {
     "protocol": "hear-g1-getup-training-state-v1",
     "stage": "evaluating",
@@ -580,7 +682,7 @@ def worker_main(args: argparse.Namespace) -> None:
     "deployment_accepted": gate_passed,
     "evaluation": evaluation,
   }, ensure_ascii=False))
-  if args.mode == "train" and not gate_passed:
+  if args.mode in ("train", "evaluate") and not gate_passed:
     raise RuntimeError("G1 get-up policy did not pass the deployment gate")
 
 

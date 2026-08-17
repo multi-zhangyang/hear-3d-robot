@@ -8,7 +8,7 @@ import {
   rmdirSync,
   writeFileSync
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { create, extract } from "tar";
 
@@ -16,6 +16,7 @@ const REMOTE_BUNDLE = "/content/hear-g1-getup-bundle.tar.gz";
 const REMOTE_CONFIG = "/content/hear-g1-getup-config.json";
 const REMOTE_ARCHIVE = "/content/hear-g1-getup-artifacts.tar.gz";
 const REMOTE_REPORT = "/content/hear-g1-getup-report.json";
+const REMOTE_ROOT = "/content/hear-g1-getup-source";
 const BUNDLE_PATHS = [
   "training/colab_g1_getup.py",
   "training/g1_getup_mjlab_env.py",
@@ -41,7 +42,7 @@ const session = options.session
 const distro = options.distro ?? "HEAR-Linux";
 const colabPath = options.colabPath ?? "/home/hear/.local/bin/colab";
 const output = resolve(options.output ?? (
-  mode === "train"
+  mode !== "smoke"
     ? `artifacts/training/g1-getup/${session}`
     : `artifacts/training/g1-getup-smoke/${session}`
 ));
@@ -51,6 +52,10 @@ const temporaryDirectory = resolve(".tmp/g1-getup-colab");
 const bundle = resolve(temporaryDirectory, `${session}.tar.gz`);
 const config = resolve(temporaryDirectory, `${session}.json`);
 const driveBackup = resolve(temporaryDirectory, `${session}-drive-backup.py`);
+const evaluationInput = resolve(temporaryDirectory, `${session}-input`);
+const evaluationInputRelative = relative(workspace, evaluationInput)
+  .replaceAll("\\", "/");
+const remoteEvaluationInput = `${REMOTE_ROOT}/${evaluationInputRelative}`;
 const driveDirectory = options.driveDirectory ?? `HEAR/g1-getup/${session}`;
 const remoteDriveOutputRoot = `/content/drive/MyDrive/${driveDirectory}`;
 const desktopDriveRoot = options.desktopDriveRoot
@@ -78,17 +83,23 @@ async function main() {
   }
   mkdirSync(dirname(output), { recursive: true });
   mkdirSync(temporaryDirectory, { recursive: true });
+  if (mode === "evaluate") prepareEvaluationInput();
   writeFileSync(config, JSON.stringify({
     mode,
-    iterations: options.iterations ?? (mode === "train" ? 5000 : 2),
-    num_envs: options.numEnvs ?? (mode === "train" ? 2048 : 16),
-    eval_envs: options.evalEnvs ?? (mode === "train" ? 500 : 32),
-    eval_steps: options.evalSteps ?? (mode === "train" ? 750 : 20),
+    iterations: options.iterations ?? (mode === "smoke" ? 2 : 5000),
+    num_envs: options.numEnvs ?? (mode === "smoke" ? 16 : 2048),
+    eval_envs: options.evalEnvs ?? (mode === "smoke" ? 32 : 500),
+    eval_batch_size: options.evalBatchSize ?? (mode === "smoke" ? 32 : 64),
+    eval_steps: options.evalSteps ?? (mode === "smoke" ? 20 : 750),
     seed: options.seed ?? 42,
     archive: REMOTE_ARCHIVE,
-    ...(mode === "train" ? { output_root: remoteTrainingOutputRoot } : {})
+    ...(mode === "train" ? { output_root: remoteTrainingOutputRoot } : {}),
+    ...(mode === "evaluate" ? { output_root: remoteEvaluationInput } : {})
   }), "utf8");
-  await create({ gzip: true, file: bundle, cwd: workspace }, BUNDLE_PATHS);
+  await create({ gzip: true, file: bundle, cwd: workspace }, [
+    ...BUNDLE_PATHS,
+    ...(mode === "evaluate" ? [evaluationInputRelative] : [])
+  ]);
   writeDriveBackup();
 
   let failure;
@@ -116,7 +127,7 @@ async function main() {
       ], 900_000), "mount Google Drive for G1 get-up checkpoints");
     }
     const timeoutSeconds = options.timeoutSeconds
-      ?? (mode === "train" ? 64_800 : 1_800);
+      ?? (mode === "smoke" ? 1_800 : 64_800);
     executionStatus = colab([
       "exec", "--session", session,
       "--file", toWslPath(resolve("training/colab_g1_getup.py")),
@@ -131,10 +142,11 @@ async function main() {
     ]), "download G1 get-up artifacts");
     await extractArtifacts();
     const parsed = validateReport();
+    if (mode === "evaluate") persistDesktopDriveEvaluation(parsed);
     if (executionStatus !== 0
-      || (mode === "train" && parsed.evaluation.deployment_accepted !== true)) {
+      || (mode !== "smoke" && parsed.evaluation.deployment_accepted !== true)) {
       throw new Error(
-        `G1 get-up training completed but did not pass deployment: ${report}`
+        `G1 get-up ${mode} completed but did not pass deployment: ${report}`
       );
     }
     if (mode === "train") {
@@ -161,6 +173,7 @@ async function main() {
     rmSync(bundle, { force: true });
     rmSync(config, { force: true });
     rmSync(driveBackup, { force: true });
+    rmSync(evaluationInput, { recursive: true, force: true });
     try { rmdirSync(temporaryDirectory); } catch {}
     if (stopStatus !== 0) {
       const cleanup = new Error(`Failed to stop Colab session ${session}`);
@@ -170,6 +183,57 @@ async function main() {
     }
   }
   if (failure) throw failure;
+}
+
+function prepareEvaluationInput() {
+  const source = options.evaluationSource
+    ? resolve(options.evaluationSource)
+    : desktopDriveRoot
+      ? resolve(desktopDriveRoot, ...driveDirectory.split("/"))
+      : undefined;
+  if (!source) {
+    throw new Error(
+      "G1 evaluation requires --evaluation-source or --desktop-drive-root"
+    );
+  }
+  const files = [
+    "resume-identity.json",
+    "artifacts/agent.yaml",
+    "artifacts/env.yaml",
+    "artifacts/g1_getup.pt",
+    "artifacts/g1_getup.onnx"
+  ];
+  mkdirSync(resolve(evaluationInput, "artifacts"), { recursive: true });
+  for (const file of files) {
+    const input = resolve(source, file);
+    if (!existsSync(input)) {
+      throw new Error(`G1 evaluation input is missing: ${input}`);
+    }
+    copyFileSync(input, resolve(evaluationInput, file));
+  }
+}
+
+function persistDesktopDriveEvaluation(parsed) {
+  if (!desktopDriveRoot) return;
+  const destination = resolve(
+    desktopDriveRoot, ...driveDirectory.split("/")
+  );
+  const artifacts = resolve(destination, "artifacts");
+  mkdirSync(artifacts, { recursive: true });
+  copyFileSync(
+    resolve(output, "getup-policy-report.json"),
+    resolve(artifacts, "getup-policy-report.json")
+  );
+  copyFileSync(report, resolve(destination, "hear-g1-getup-report.json"));
+  copyFileSync(archive, resolve(destination, "hear-g1-getup-artifacts.tar.gz"));
+  writeFileSync(resolve(destination, "training-state.json"), `${JSON.stringify({
+    protocol: "hear-g1-getup-training-state-v1",
+    stage: parsed.evaluation.deployment_accepted ? "completed" : "rejected",
+    checkpoint_iteration: parsed.training.iterations - 1,
+    target_iterations: parsed.training.iterations,
+    deployment_accepted: parsed.evaluation.deployment_accepted,
+    updated_at: new Date().toISOString()
+  }, null, 2)}\n`, "utf8");
 }
 
 function assertInputs() {
@@ -282,7 +346,7 @@ function parseOptions(args) {
   if (args[0] === "--") args = args.slice(1);
   const parsed = {};
   const names = new Map([
-    ["--mode", ["mode", enumValue(["smoke", "train"])]],
+    ["--mode", ["mode", enumValue(["smoke", "train", "evaluate"])]],
     ["--distro", ["distro", String]],
     ["--colab-path", ["colabPath", String]],
     ["--gpu", ["gpu", String]],
@@ -290,9 +354,11 @@ function parseOptions(args) {
     ["--output", ["output", String]],
     ["--drive-directory", ["driveDirectory", String]],
     ["--desktop-drive-root", ["desktopDriveRoot", String]],
+    ["--evaluation-source", ["evaluationSource", String]],
     ["--iterations", ["iterations", positiveInteger]],
     ["--num-envs", ["numEnvs", positiveInteger]],
     ["--eval-envs", ["evalEnvs", positiveInteger]],
+    ["--eval-batch-size", ["evalBatchSize", positiveInteger]],
     ["--eval-steps", ["evalSteps", positiveInteger]],
     ["--seed", ["seed", nonnegativeInteger]],
     ["--timeout-seconds", ["timeoutSeconds", positiveInteger]],
