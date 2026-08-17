@@ -569,6 +569,15 @@ const DIRECT_ACTION_SELECTION_TOOLS = new WeakMap<
   }
 >();
 
+const DETERMINISTIC_POST_EXECUTION_FEEDBACK_TOOLS = new WeakMap<
+  HumanoidNeuralAgentRuntime,
+  {
+    completeCommitment: FunctionTool<unknown, any, unknown>;
+    perception: FunctionTool<unknown, any, unknown>;
+    parent: Agent<unknown, "text">;
+  }
+>();
+
 const DETERMINISTIC_CYCLE_TOOLS = new WeakMap<
   HumanoidNeuralAgentRuntime,
   {
@@ -2461,6 +2470,22 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       ]
     }
   );
+  const completeCommitmentTool = transitionSkillCommitmentTool(
+    input.runtime,
+    "completed"
+  );
+  const actionSelectionPerceptionTool = asChildTool({
+    parentKey: "actionSelection",
+    childKey: "perceptionManager",
+    child: perceptionManager,
+    description: "Build one current perceptual belief through the owned perception subtree.",
+    phases: ["perception", "feedback"],
+    prepareModelInput: preparePerceptionModelInput,
+    isEnabled: () => input.runtime.neuralHarnessPhase().phase !== "feedback"
+      || ["completed", "released"].includes(
+        input.runtime.neuralHierarchyState().active_skill_commitment?.state ?? ""
+      )
+  });
   const actionSelection = register(
     "actionSelection",
     ActionSelectionOutputSchema,
@@ -2468,21 +2493,10 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       acknowledgeSafetyInterruptTool(input.runtime),
       establishSkillCommitmentTool(input.runtime),
       authorizeSkillExecutionTool(input.runtime),
-      transitionSkillCommitmentTool(input.runtime, "completed"),
+      completeCommitmentTool,
       transitionSkillCommitmentTool(input.runtime, "failed"),
       transitionSkillCommitmentTool(input.runtime, "released"),
-      asChildTool({
-        parentKey: "actionSelection",
-        childKey: "perceptionManager",
-        child: perceptionManager,
-        description: "Build one current perceptual belief through the owned perception subtree.",
-        phases: ["perception", "feedback"],
-        prepareModelInput: preparePerceptionModelInput,
-        isEnabled: () => input.runtime.neuralHarnessPhase().phase !== "feedback"
-          || ["completed", "released"].includes(
-            input.runtime.neuralHierarchyState().active_skill_commitment?.state ?? ""
-          )
-      }),
+      actionSelectionPerceptionTool,
       asChildTool({
         parentKey: "actionSelection",
         childKey: "sensorimotorManager",
@@ -2590,6 +2604,11 @@ export function createHumanoidNeuralAgentHierarchy(input: {
   DIRECT_ACTION_SELECTION_TOOLS.set(input.runtime, {
     tool: actionSelectionTool,
     parent: executive
+  });
+  DETERMINISTIC_POST_EXECUTION_FEEDBACK_TOOLS.set(input.runtime, {
+    completeCommitment: completeCommitmentTool,
+    perception: actionSelectionPerceptionTool,
+    parent: actionSelection
   });
   DETERMINISTIC_CYCLE_TOOLS.set(input.runtime, {
     completion: cycleCompletionTool,
@@ -3766,6 +3785,238 @@ export async function orchestrateDeterministicNeuralCycleCompletion(
         confidence: 1
       });
     },
+    false,
+    executiveInvocationId
+  );
+}
+
+/**
+ * Close a physically and semantically completed Skill, then open the only
+ * legal post-execution Perception edge. Action Selection retains lifecycle
+ * ownership, while the Harness performs the two structural operations whose
+ * inputs are already unique in durable state. Perception, Scene, and Memory
+ * remain independent reasoning Agents with their own Sessions.
+ */
+export async function orchestrateDeterministicPostExecutionFeedback(
+  runtime: HumanoidNeuralAgentRuntime,
+  signal?: AbortSignal
+): Promise<boolean> {
+  const initialState = runtime.neuralHierarchyState();
+  if (initialState.harness_phase.phase !== "feedback") return false;
+  const initialCommitment = initialState.active_skill_commitment;
+  if (!initialCommitment
+    || (initialCommitment.state !== "executing"
+      && initialCommitment.state !== "completed")) return false;
+
+  const lifecycleFeedback = currentCommitmentLifecycleFeedback(
+    runtime,
+    initialCommitment,
+    { pendingOnly: false }
+  );
+  if (!lifecycleFeedback || lifecycleFeedback.kind !== "skill_completed") {
+    return false;
+  }
+  if (initialCommitment.state === "executing"
+    && runtime.neuralSkillCommitmentOutcome(initialCommitment).status
+      !== "completed") return false;
+
+  const binding = DETERMINISTIC_POST_EXECUTION_FEEDBACK_TOOLS.get(runtime);
+  if (!binding) {
+    throw new Error(
+      "Deterministic post-execution feedback tools are not bound to the active hierarchy"
+    );
+  }
+  const orchestrationKey = [
+    "deterministic-post-execution-feedback-v1",
+    initialCommitment.commitment_id,
+    lifecycleFeedback.signal_id
+  ].join(":");
+  const executiveInvocationId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    orchestrationKey
+  );
+  const actionInvocationId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+    orchestrationKey
+  );
+  const completionToolCallId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+    `${orchestrationKey}:complete`
+  );
+  const perceptionToolCallId = stableAgentToolInvocationId(
+    HUMANOID_NEURAL_AGENT_IDS.perceptionManager,
+    `${orchestrationKey}:perception`
+  );
+
+  return withAgentInvocation(
+    HUMANOID_NEURAL_AGENT_IDS.executive,
+    () => withAgentInvocation(
+      HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+      async () => {
+        signal?.throwIfAborted();
+        const actionInvocation = requiredHarnessInvocation(
+          HUMANOID_NEURAL_AGENT_IDS.actionSelection
+        );
+        const actionLease = await runtime.issueNeuralAuthorityLease({
+          issuingParentNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+          targetChildNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+          allowedSignalKinds: ["skill_completed", "perceptual_belief"],
+          ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+          ttlMs: 600_000,
+          invocationId: actionInvocation.invocationId,
+          parentInvocationId: actionInvocation.parentInvocationId,
+          parentEpisodeId: executiveInvocationId
+        });
+        let executiveAdmission: NeuralSignal | undefined;
+        try {
+          executiveAdmission = await runtime.publishNeuralSignal({
+            kind: "skill_completed",
+            pathway: "executive_control",
+            direction: "descending",
+            sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+            targetNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+            ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+            priority: 100,
+            causalParentIds: [lifecycleFeedback.signal_id],
+            authorityLeaseId: actionLease.lease_id,
+            invocationId: actionLease.invocation_id,
+            parentInvocationId: actionLease.parent_invocation_id,
+            payload: lifecycleFeedback.payload
+          });
+
+          if (initialCommitment.state === "executing") {
+            const completionInput = JSON.stringify({
+              commitment_id: initialCommitment.commitment_id,
+              source_signal_ids: [],
+              reason: "Verified physical receipt satisfies the authoritative Skill termination contract."
+            });
+            const completionContext = new RunContext();
+            const completionEnabled = binding.completeCommitment.isEnabled
+              ? await binding.completeCommitment.isEnabled(
+                  completionContext,
+                  binding.parent
+                )
+              : true;
+            if (!completionEnabled) {
+              throw new Error(
+                "Deterministic Skill completion is disabled in feedback phase"
+              );
+            }
+            const completionOutput = outputObject(
+              await binding.completeCommitment.invoke(
+                completionContext,
+                completionInput,
+                {
+                  toolCall: {
+                    type: "function_call",
+                    callId: completionToolCallId,
+                    name: binding.completeCommitment.name,
+                    arguments: completionInput
+                  },
+                  ...(signal ? { signal } : {})
+                }
+              )
+            );
+            if (completionOutput?.status !== "skill_completed") {
+              throw new Error(
+                "Deterministic Skill completion returned no completed commitment"
+              );
+            }
+          }
+
+          const completedCommitment = runtime.neuralHierarchyState()
+            .active_skill_commitment;
+          if (!completedCommitment
+            || completedCommitment.commitment_id
+              !== initialCommitment.commitment_id
+            || completedCommitment.state !== "completed") {
+            throw new Error(
+              "Post-execution Perception requires the completed active commitment"
+            );
+          }
+
+          const perceptionInput = JSON.stringify({
+            signal_kind: "skill_completed",
+            source_signal_ids: [],
+            ttl_revisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+            priority: 100
+          });
+          const perceptionContext = new RunContext();
+          const perceptionOutput = outputObject(
+            await binding.perception.invoke(
+              perceptionContext,
+              perceptionInput,
+              {
+                toolCall: {
+                  type: "function_call",
+                  callId: perceptionToolCallId,
+                  name: binding.perception.name,
+                  arguments: perceptionInput
+                },
+                ...(signal ? { signal } : {})
+              }
+            )
+          );
+          const perceptionResult = perceptionOutput
+            ? directChildNeuralOutput(PerceptionOutputSchema, perceptionOutput)
+            : undefined;
+          if (!perceptionResult
+            || perceptionResult.signal_kind !== "perceptual_belief") {
+            throw new Error(
+              "Deterministic post-execution Perception returned no perceptual belief"
+            );
+          }
+          const perceptionSignalIds = perceptionResult.source_signal_ids;
+          const perceptionSignals = perceptionSignalIds.map(
+            (signalId) => runtime.neuralHierarchyState().signals[signalId]
+          ).filter((candidate): candidate is NeuralSignal => (
+            candidate !== undefined
+              && candidate.kind === "perceptual_belief"
+              && candidate.source_node_id
+                === HUMANOID_NEURAL_AGENT_IDS.perceptionManager
+              && candidate.target_node_id
+                === HUMANOID_NEURAL_AGENT_IDS.actionSelection
+          ));
+          if (perceptionSignals.length !== 1) {
+            throw new Error(
+              `Post-execution feedback requires one direct Perception belief; found ${perceptionSignals.length}`
+            );
+          }
+          await runtime.publishNeuralSignal({
+            kind: "perceptual_belief",
+            pathway: "executive_control",
+            direction: "ascending",
+            sourceNodeId: HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+            targetNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+            ttlRevisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+            priority: 100,
+            causalParentIds: [
+              executiveAdmission.signal_id,
+              perceptionSignals[0]!.signal_id
+            ],
+            sourceAuthorityLeaseId: actionLease.lease_id,
+            invocationId: actionLease.invocation_id,
+            parentInvocationId: actionLease.parent_invocation_id,
+            payload: JsonValueSchema.parse(JSON.parse(
+              perceptionResult.payload_json
+            ))
+          });
+          await runtime.consumeNeuralSignals(
+            HUMANOID_NEURAL_AGENT_IDS.actionSelection,
+            [executiveAdmission.signal_id, ...perceptionSignalIds]
+          );
+          return true;
+        } finally {
+          await runtime.closeNeuralAuthorityLease({
+            leaseId: actionLease.lease_id,
+            closedByNodeId: HUMANOID_NEURAL_AGENT_IDS.executive,
+            reason: "deterministic_post_execution_feedback_returned"
+          });
+        }
+      },
+      false,
+      actionInvocationId
+    ),
     false,
     executiveInvocationId
   );

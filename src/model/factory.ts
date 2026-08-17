@@ -99,7 +99,10 @@ function agentsModelFromAiSdk(
 ): Model {
   const adapted = aisdk(model);
   const getResponse: Model["getResponse"] = async (request) => {
-    const rawResponse = await adapted.getResponse(request);
+    const preparedRequest = normalizeCompatibleToolArguments
+      ? openAICompatibleReasoningRequest(request)
+      : request;
+    const rawResponse = await adapted.getResponse(preparedRequest);
     const response = normalizeCompatibleToolArguments
       ? normalizedCompatibleModelResponse(rawResponse)
       : rawResponse;
@@ -112,7 +115,10 @@ function agentsModelFromAiSdk(
   const getStreamedResponse: Model["getStreamedResponse"] = async function* (
     request
   ) {
-    for await (const event of adapted.getStreamedResponse(request)) {
+    const preparedRequest = normalizeCompatibleToolArguments
+      ? openAICompatibleReasoningRequest(request)
+      : request;
+    for await (const event of adapted.getStreamedResponse(preparedRequest)) {
       if (normalizeCompatibleToolArguments && event.type === "response_done") {
         yield {
           ...event,
@@ -127,6 +133,29 @@ function agentsModelFromAiSdk(
     getResponse,
     getStreamedResponse,
     getRetryAdvice: (input) => adapted.getRetryAdvice(input)
+  };
+}
+
+/**
+ * The Agents SDK expresses reasoning in provider-neutral ModelSettings, while
+ * the AI SDK OpenAI-compatible adapter reads it from its provider options.
+ * Bind the two at this single protocol boundary so every cognitive Agent and
+ * the compactor send the configured effort, while execution-only Agents that
+ * deliberately omit reasoning remain non-thinking.
+ */
+function openAICompatibleReasoningRequest(request: ModelRequest): ModelRequest {
+  const effort = request.modelSettings.reasoning?.effort;
+  if (effort === undefined) return request;
+  return {
+    ...request,
+    modelSettings: {
+      ...request.modelSettings,
+      providerData: mergeProviderOptions(
+        request.modelSettings.providerData ?? {},
+        "configured-openai-compatible",
+        { reasoningEffort: effort }
+      )
+    }
   };
 }
 

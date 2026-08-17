@@ -47,6 +47,7 @@ import {
   humanoidNeuralAgentProfile,
   orchestrateCertifiedNeuralExecution,
   orchestrateDeterministicNeuralCycleCompletion,
+  orchestrateDeterministicPostExecutionFeedback,
   orchestrateDirectNeuralActionSelection,
   orchestrateDirectNeuralGoalValuation
 } from "../harness/humanoid/neural-agents.js";
@@ -906,6 +907,20 @@ async function executeHumanoidMission(input: {
         // wakes only the non-thinking required-tool Dispatcher. Its direct
         // Sensorimotor feedback then resumes the normal reasoning hierarchy in
         // feedback phase with every Agent Session left in a stable mode.
+        await input.runtime.store.clearAgentState();
+        serializedState = undefined;
+        executiveTurnContinuation = undefined;
+        await input.runtime.setActiveAgent(input.runtime.rootAgentId);
+        continue;
+      }
+      if (await orchestrateDeterministicPostExecutionFeedback(
+        input.runtime,
+        input.signal
+      )) {
+        // The physical and semantic result fixed both the commitment
+        // transition and the next structural Perception edge. Perception still
+        // ran as an independent reasoning episode; Action Selection was not
+        // woken merely to repeat those two already-determined operations.
         await input.runtime.store.clearAgentState();
         serializedState = undefined;
         executiveTurnContinuation = undefined;
