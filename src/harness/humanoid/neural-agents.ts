@@ -2087,6 +2087,26 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         ["rollout_result", "escalation"]
       )
   });
+  const sensorimotorPredictiveTool = asChildTool({
+    parentKey: "sensorimotorManager",
+    childKey: "predictive",
+    child: predictive,
+    description: "Interpret a completed MuJoCo rollout result.",
+    requiredSignalKind: "rollout_result",
+    phases: ["rollout_review"],
+    requireCommitment: true,
+    isEnabled: () => !hasCurrentRecoveryDemand(input.runtime)
+      && hasCurrentSignal(
+        input.runtime,
+        HUMANOID_NEURAL_AGENT_IDS.predictive,
+        "rollout_result"
+      )
+      && !hasCurrentSignalsAny(
+        input.runtime,
+        HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+        ["forward_prediction", "prediction_error", "escalation"]
+      )
+  });
   const sensorimotorAffordanceTool = asChildTool({
     parentKey: "sensorimotorManager",
     childKey: "affordance",
@@ -2132,6 +2152,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
   const invokeSensorimotorAffordance = sensorimotorAffordanceTool.invoke;
   const invokeSensorimotorRisk = sensorimotorRiskTool.invoke;
   const invokeSensorimotorPremotor = sensorimotorPremotorTool.invoke;
+  const invokeSensorimotorPredictive = sensorimotorPredictiveTool.invoke;
   const prepareSensorimotorModelInput = async (prepared: {
     invocationId: string;
     authorityLeaseId: string;
@@ -2241,6 +2262,55 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       if (premotorReturns.length !== 1) {
         throw new Error(
           `Sensorimotor motor input requires one causally bound Premotor return; found ${premotorReturns.length}`
+        );
+      }
+      const premotorReturn = premotorReturns[0]!;
+      if (premotorReturn.kind === "escalation") return;
+      const rawRollout = resolveReentrantRolloutAncestor(
+        input.runtime.neuralHierarchyState(),
+        [premotorReturn],
+        HUMANOID_NEURAL_AGENT_IDS.predictive
+      );
+      const currentPredictiveReturns = (): NeuralSignal[] => currentSignals([
+        "forward_prediction",
+        "prediction_error",
+        "escalation"
+      ]).filter((signal) => signal.source_node_id
+          === HUMANOID_NEURAL_AGENT_IDS.predictive
+        && neuralSignalHasAncestorId(
+          input.runtime.neuralHierarchyState(),
+          signal,
+          rawRollout.signal_id
+        ));
+      if (currentPredictiveReturns().length === 0) {
+        const delegationInput = JSON.stringify({
+          signal_kind: "rollout_result",
+          source_signal_ids: [premotorReturn.signal_id],
+          ttl_revisions: MODEL_EPISODE_SIGNAL_TTL_REVISIONS,
+          priority: 90
+        });
+        await invokeSensorimotorPredictive(
+          new RunContext(),
+          delegationInput,
+          {
+            toolCall: {
+              type: "function_call",
+              callId: stableAgentToolInvocationId(
+                HUMANOID_NEURAL_AGENT_IDS.predictive,
+                `sensorimotor-input:${prepared.invocationId}`
+              ),
+              name: sensorimotorPredictiveTool.name,
+              arguments: delegationInput
+            },
+            ...(prepared.signal ? { signal: prepared.signal } : {})
+          }
+        );
+      }
+      prepared.signal?.throwIfAborted();
+      const predictiveReturns = currentPredictiveReturns();
+      if (predictiveReturns.length !== 1) {
+        throw new Error(
+          `Sensorimotor motor input requires one causally bound Predictive return; found ${predictiveReturns.length}`
         );
       }
       return;
@@ -2358,26 +2428,7 @@ export function createHumanoidNeuralAgentHierarchy(input: {
       sensorimotorAffordanceTool,
       sensorimotorRiskTool,
       sensorimotorPremotorTool,
-      asChildTool({
-        parentKey: "sensorimotorManager",
-        childKey: "predictive",
-        child: predictive,
-        description: "Interpret a completed MuJoCo rollout result.",
-        requiredSignalKind: "rollout_result",
-        phases: ["rollout_review"],
-        requireCommitment: true,
-        isEnabled: () => !hasCurrentRecoveryDemand(input.runtime)
-          && hasCurrentSignal(
-            input.runtime,
-            HUMANOID_NEURAL_AGENT_IDS.predictive,
-            "rollout_result"
-          )
-          && !hasCurrentSignalsAny(
-            input.runtime,
-            HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
-            ["forward_prediction", "prediction_error", "escalation"]
-          )
-      }),
+      sensorimotorPredictiveTool,
       recoveryAuthorityTool(input.runtime, recovery, sessions, input),
       executionDispatcherTool
     ],
@@ -2392,8 +2443,9 @@ export function createHumanoidNeuralAgentHierarchy(input: {
         "Every normal proposal must make measurable physical progress toward an active Goal predicate or establish its real prerequisite. For robot_in_zone, prefer navigate_to_zone; a navigate_to_point or explore frontier is admissible only when its actual target reduces distance to that zone. Information gain never authorizes movement away from the active Goal.",
         "For an object placement Goal whose object is not grasped, preparation is object-relative: propose approach(object_id), then reach/grasp/lift, before carry_to_zone/place. Never approach the destination zone to make the source object reachable.",
         "For approach, params are exactly object_id, interaction_point_id, hand, and standoff_m. Preserve the selected live hand+interaction-point pair, but never add root_world_target, root_yaw_radians, or base_placement; the Harness binds that pair to its authoritative IK placement.",
-        "After Action Selection accepts the proposal, the Harness completes the mandatory Premotor -> Motor Intent branch before your first committed-branch reasoning turn. Do not call Premotor again in that episode; inspect its exact rollout_result and delegate Predictive. Affordance/Risk belong only to skill_proposal and must not be repeated.",
+        "After Action Selection accepts the proposal, the Harness completes the mandatory Premotor -> Motor Intent -> Predictive chain before your first committed-branch reasoning turn. Premotor composes, Motor Intent compiles and rolls out, and the independent Predictive Agent judges admission in its own Session. Do not call any of those children again in that episode; Affordance/Risk belong only to skill_proposal and must not be repeated.",
         "Predictive judges admission of the current bounded rollout chunk, not whether that chunk already completes the final Goal predicate.",
+        "Join the exact Premotor rollout with the exact Predictive result already directed to you. On acceptance, submit rollout_result with the unchanged rollout payload; on rejection, submit the exact prediction_error or escalation. The Harness binds the formal child sources, so omit protocol UUID bookkeeping.",
         "Predictive acceptance completes the motor-assessment episode and returns a certified rollout to Action Selection; do not call or synthesize execution in that episode.",
         "In execution, delegate the one direct executing skill_commitment to Certified Execution Dispatcher. The Dispatcher owns the required non-thinking tool call; do not execute or restate it yourself.",
         "Recovery freezes normal selection, runs one independent episode, and returns before execution resumes."
@@ -6755,6 +6807,12 @@ function joinedManagerSignals(
       "skill_proposal"
     ];
   } else if (childKey === "sensorimotorManager"
+    && outputKind === "rollout_result") {
+    kinds = ["rollout_result", "forward_prediction"];
+  } else if (childKey === "sensorimotorManager"
+    && (outputKind === "prediction_error" || outputKind === "escalation")) {
+    kinds = [outputKind];
+  } else if (childKey === "sensorimotorManager"
     && (outputKind === "execution_receipt"
       || outputKind === "skill_completed"
       || outputKind === "skill_failed")) {
@@ -6892,6 +6950,11 @@ function managerJoinEvidence(
     ? ["sensory_evidence", "scene_interpretation", "memory_retrieval"]
     : managerKey === "sensorimotorManager" && outputKind === "skill_proposal"
       ? ["perceptual_belief", "affordance_hypothesis", "risk_assessment"]
+      : managerKey === "sensorimotorManager" && outputKind === "rollout_result"
+        ? ["rollout_result", "forward_prediction"]
+        : managerKey === "sensorimotorManager"
+          && (outputKind === "prediction_error" || outputKind === "escalation")
+          ? [outputKind]
       : [];
   if (requirements.length === 0) return [];
   const targetNodeId = HUMANOID_NEURAL_AGENT_IDS[managerKey];
@@ -7117,18 +7180,22 @@ function neuralOutputSubmissionTool<TOutput extends z.ZodObject>(
     errorFunction: (_context, error) => neuralSubmissionRejection(error),
     // The Agents SDK materializes an Agent's tool surface at episode start and
     // does not add a dynamically enabled tool after earlier calls complete.
-    // Keep the endpoint discoverable for manager-authored join episodes, but
-    // remove it entirely from Sensorimotor recovery. Recovery owns that
-    // decision domain and its direct typed child result terminates the parent
-    // episode through sensorimotorToolUseBehavior; exposing this competing
-    // endpoint lets compatible models restate the child proposal and loop on a
-    // barrier that can never be satisfied in a recovery episode.
+    // Keep the endpoint discoverable for manager-authored join episodes. A
+    // committed lower-path failure enters the recovery phase before it crosses
+    // the Sensorimotor -> Action Selection edge, so that one still-committed
+    // Manager episode must be able to publish the exact Premotor/Predictive
+    // failure. Once Action Selection releases the commitment, Recovery owns
+    // the decision domain and its direct typed child result terminates the
+    // parent through sensorimotorToolUseBehavior; the generic endpoint is then
+    // removed to prevent a competing restatement loop.
     isEnabled: () => key !== "goalManager"
       && key !== "motorIntent"
       && (key !== "actionSelection"
         || runtime.neuralHarnessPhase().phase === "cycle_completion")
       && (key !== "sensorimotorManager"
-        || runtime.neuralHarnessPhase().phase !== "recovery"),
+        || runtime.neuralHarnessPhase().phase !== "recovery"
+        || runtime.neuralHierarchyState().active_skill_commitment?.state
+          === "committed"),
     execute: (params: unknown) => {
       const submitted = z.record(z.string(), z.unknown()).parse(params);
       const { payload, ...envelope } = submitted;
@@ -7697,6 +7764,10 @@ function neuralOutputSubmissionAvailable(
           runtime,
           HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
           ["rollout_result", "forward_prediction"]
+        ) || hasCurrentManagerEpisodeSignalsAny(
+          runtime,
+          HUMANOID_NEURAL_AGENT_IDS.sensorimotorManager,
+          ["prediction_error", "escalation"]
         );
       }
       return hasCurrentManagerEpisodeSignalsAny(
